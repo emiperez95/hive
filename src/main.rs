@@ -15,8 +15,9 @@ use std::time::Duration;
 use crate::common::debug::{debug_log, init_debug};
 use crate::common::persistence::{
     is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_skipped_sessions,
-    save_parked_sessions, sesh_connect,
+    save_parked_sessions,
 };
+use crate::common::projects::connect_project;
 use crate::common::tmux::{
     get_current_tmux_session, get_current_tmux_session_names, switch_to_session,
 };
@@ -267,11 +268,11 @@ fn run_tui(
                                             app.search_results.clear();
                                             needs_redraw = true;
                                         }
-                                        SearchResult::SeshProject(name) => {
+                                        SearchResult::Project(name) => {
                                             app.input_mode = InputMode::Normal;
                                             app.search_query.clear();
                                             app.search_results.clear();
-                                            if sesh_connect(&name) {
+                                            if connect_project(&name) {
                                                 app.save_restorable();
                                                 return Ok(());
                                             } else {
@@ -432,7 +433,7 @@ fn run_tui(
                             }
                             KeyCode::Enter => {
                                 if let Some(name) = app.showing_parked_detail.take() {
-                                    if sesh_connect(&name) {
+                                    if connect_project(&name) {
                                         app.parked_sessions.remove(&name);
                                         save_parked_sessions(&app.parked_sessions);
                                         should_refresh = true;
@@ -499,7 +500,7 @@ fn run_tui(
                                 app.input_mode = InputMode::Search;
                                 app.search_query.clear();
                                 app.search_scroll_offset = 0;
-                                app.load_sesh_projects();
+                                app.load_project_names();
                                 app.update_search_results();
                                 app.selected = 0;
                                 needs_redraw = true;

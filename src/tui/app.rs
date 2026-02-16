@@ -2,11 +2,13 @@
 
 use crate::common::debug::debug_log;
 use crate::common::persistence::{
-    has_sesh_config, is_globally_muted, list_sesh_projects, load_auto_approve_sessions,
-    load_muted_sessions, load_parked_sessions, load_session_todos, load_skipped_sessions,
-    save_auto_approve_sessions, save_muted_sessions, save_parked_sessions,
-    save_restorable_sessions, save_session_todos, save_skipped_sessions, sesh_connect,
+    is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_parked_sessions,
+    load_session_todos, load_skipped_sessions, save_auto_approve_sessions, save_muted_sessions,
+    save_parked_sessions, save_restorable_sessions, save_session_todos, save_skipped_sessions,
     set_global_mute,
+};
+use crate::common::projects::{
+    connect_project, has_project_config, list_project_names, ProjectRegistry,
 };
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
@@ -35,7 +37,7 @@ pub enum InputMode {
 pub enum SearchResult {
     Active(usize),       // Index into session_infos
     Parked(String),      // Session name from parked_sessions
-    SeshProject(String), // Sesh project name (not active, not parked)
+    Project(String), // Project name from registry (not active, not parked)
 }
 
 /// TUI application state
@@ -72,7 +74,7 @@ pub struct App {
     pub search_query: String,
     pub search_results: Vec<SearchResult>,
     pub search_scroll_offset: usize, // Scroll offset for search results
-    pub sesh_projects: Vec<String>,  // Cached list of all sesh projects
+    pub project_names: Vec<String>, // Cached list of all project session names
     // Parked session detail view
     pub showing_parked_detail: Option<String>, // parked session name being viewed
     // Per-session auto-approve toggle
@@ -122,7 +124,7 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_scroll_offset: 0,
-            sesh_projects: Vec::new(),
+            project_names: Vec::new(),
             showing_parked_detail: None,
             auto_approve_sessions: load_auto_approve_sessions(),
             muted_sessions: load_muted_sessions(),
@@ -157,14 +159,14 @@ impl App {
             }
         }
 
-        // Add matching sesh projects that are not active and not parked
-        for name in &self.sesh_projects {
+        // Add matching projects that are not active and not parked
+        for name in &self.project_names {
             if active_names.contains(name) || self.parked_sessions.contains_key(name) {
                 continue;
             }
             if query.is_empty() || name.to_lowercase().contains(&query) {
                 self.search_results
-                    .push(SearchResult::SeshProject(name.clone()));
+                    .push(SearchResult::Project(name.clone()));
             }
         }
 
@@ -174,9 +176,9 @@ impl App {
         }
     }
 
-    /// Load sesh projects list (called when entering search mode)
-    pub fn load_sesh_projects(&mut self) {
-        self.sesh_projects = list_sesh_projects();
+    /// Load project names list (called when entering search mode)
+    pub fn load_project_names(&mut self) {
+        self.project_names = list_project_names();
     }
 
     /// Calculate lines needed to display a search result
@@ -191,7 +193,7 @@ impl App {
                 }
                 1
             }
-            SearchResult::SeshProject(_) => 1,
+            SearchResult::Project(_) => 1,
         }
     }
 
@@ -492,9 +494,9 @@ impl App {
     pub fn start_park_session(&mut self, idx: usize) {
         if let Some(session_info) = self.session_infos.get(idx) {
             let name = session_info.name.clone();
-            if !has_sesh_config(&name) {
+            if !has_project_config(&name) {
                 self.error_message = Some((
-                    format!("Cannot park '{}': no sesh config", name),
+                    format!("Cannot park '{}': no project config", name),
                     Instant::now(),
                 ));
                 return;
@@ -537,7 +539,7 @@ impl App {
         let list = self.parked_list();
         if let Some((name, _note)) = list.get(self.parked_selected) {
             let name = name.clone();
-            if sesh_connect(&name) {
+            if connect_project(&name) {
                 self.parked_sessions.remove(&name);
                 save_parked_sessions(&self.parked_sessions);
                 self.showing_parked = false;
@@ -653,10 +655,11 @@ impl App {
     }
 
     pub fn save_restorable(&self) {
+        let registry = ProjectRegistry::load();
         let restorable: Vec<String> = self
             .session_infos
             .iter()
-            .filter(|s| has_sesh_config(&s.name))
+            .filter(|s| registry.has_project(&s.name))
             .map(|s| s.name.clone())
             .collect();
         save_restorable_sessions(&restorable);

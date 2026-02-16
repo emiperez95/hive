@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 38 unit tests
+cargo test                # 51 unit tests
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -50,6 +50,7 @@ src/
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
 │   ├── jsonl.rs            JSONL parsing for Claude status from ~/.claude/projects/
 │   ├── persistence.rs      file persistence for all txt-based state (parked, todos, muted, etc.)
+│   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
 │   └── debug.rs            debug logging to cache dir
 ├── daemon/
 │   ├── hooks.rs            handle_hook_event(): maps HookEvent → SessionState updates
@@ -69,6 +70,16 @@ src/
 - `App` (tui/app.rs) — all TUI state: sessions, selection, input mode, parked, todos, flags
 - `SessionInfo` (common/types.rs) — enriched session data for display (processes, ports, status)
 - `ClaudeStatus` (common/types.rs) — TUI-side status enum mapped from SessionStatus
+- `ProjectRegistry` (common/projects.rs) — `HashMap<name, ProjectConfig>`, loaded from projects.toml
+- `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, etc.)
+
+## Config Directory
+
+`~/Library/Application Support/hive/` (macOS) or `~/.config/hive/` (Linux):
+
+| File | Format | Purpose |
+|------|--------|---------|
+| projects.toml | TOML | project registry (name, path, emoji, startup, ports, etc.) |
 
 ## Cache Directory
 
@@ -105,7 +116,7 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 7. Parked detail → unpark, back
 8. Normal list → navigate, switch (exits app), approve permissions, search, quit
 
-Switching sessions (1-9, Enter in detail, sesh connect) always exits the app.
+Switching sessions (1-9, Enter in detail, connect project) always exits the app.
 
 ## Tmux Integration
 
@@ -116,7 +127,7 @@ Switching sessions (1-9, Enter in detail, sesh connect) always exits the app.
 
 ## Testing
 
-38 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
+51 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
 
 ## Conventions
 
