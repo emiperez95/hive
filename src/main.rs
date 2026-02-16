@@ -799,6 +799,12 @@ fn run_setup() -> Result<()> {
             && line.contains("hive")
             && line.contains("--detail")
     });
+    let tmux_cn_bound = tmux_keys
+        .lines()
+        .any(|line| line.contains("C-n") && line.contains("hive") && line.contains("cycle-next"));
+    let tmux_cp_bound = tmux_keys
+        .lines()
+        .any(|line| line.contains("C-p") && line.contains("hive") && line.contains("cycle-prev"));
 
     // Report status
     println!("hive setup status:");
@@ -830,10 +836,21 @@ fn run_setup() -> Result<()> {
     } else {
         println!("  [missing] tmux prefix+d keybinding (detail)");
     }
+    if tmux_cn_bound {
+        println!("  [ok]      tmux Ctrl+n keybinding (cycle next)");
+    } else {
+        println!("  [missing] tmux Ctrl+n keybinding (cycle next)");
+    }
+    if tmux_cp_bound {
+        println!("  [ok]      tmux Ctrl+p keybinding (cycle prev)");
+    } else {
+        println!("  [missing] tmux Ctrl+p keybinding (cycle prev)");
+    }
 
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();
+    let all_tmux_bound = tmux_s_bound && tmux_d_bound && tmux_cn_bound && tmux_cp_bound;
 
-    if !needs_hook_changes && tmux_s_bound && tmux_d_bound {
+    if !needs_hook_changes && all_tmux_bound {
         println!();
         println!("Everything is already set up!");
         return Ok(());
@@ -960,17 +977,30 @@ fn run_setup() -> Result<()> {
     }
 
     // Install tmux keybindings
-    let tmux_s_cmd = format!("display-popup -E -w 80% -h 70% \"{}\"", binary_str);
-    let tmux_d_cmd = format!("display-popup -E -w 80% -h 70% \"{} --detail\"", binary_str);
+    if !all_tmux_bound {
+        let tmux_s_cmd = format!("display-popup -E -w 80% -h 70% \"{}\"", binary_str);
+        let tmux_d_cmd = format!("display-popup -E -w 80% -h 70% \"{} --detail\"", binary_str);
+        let tmux_cn_cmd = format!("run-shell \"{} cycle-next\"", binary_str);
+        let tmux_cp_cmd = format!("run-shell \"{} cycle-prev\"", binary_str);
 
-    if !tmux_s_bound || !tmux_d_bound {
+        let bindings: Vec<(&str, &str, &str, bool)> = vec![
+            ("prefix", "s", &tmux_s_cmd, tmux_s_bound),
+            ("prefix", "d", &tmux_d_cmd, tmux_d_bound),
+            ("root", "C-n", &tmux_cn_cmd, tmux_cn_bound),
+            ("root", "C-p", &tmux_cp_cmd, tmux_cp_bound),
+        ];
+
+        let missing: Vec<_> = bindings.iter().filter(|(_, _, _, bound)| !bound).collect();
+
         println!();
         println!("Register tmux keybindings?");
-        if !tmux_s_bound {
-            println!("  prefix+s -> hive (list view)");
-        }
-        if !tmux_d_bound {
-            println!("  prefix+d -> hive --detail (detail view)");
+        for (table, key, _cmd, _) in &missing {
+            let label = if *table == "root" {
+                key.to_string()
+            } else {
+                format!("prefix+{}", key)
+            };
+            println!("  {} -> hive", label);
         }
         print!("[Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -982,33 +1012,33 @@ fn run_setup() -> Result<()> {
             let mut registered = Vec::new();
             let mut failed = Vec::new();
 
-            if !tmux_s_bound {
-                match std::process::Command::new("tmux")
-                    .args(["bind-key", "s", &tmux_s_cmd])
-                    .status()
-                {
-                    Ok(s) if s.success() => registered.push("s"),
-                    _ => failed.push("s"),
+            for (table, key, cmd, bound) in &bindings {
+                if *bound {
+                    continue;
                 }
-            }
-            if !tmux_d_bound {
-                match std::process::Command::new("tmux")
-                    .args(["bind-key", "d", &tmux_d_cmd])
-                    .status()
-                {
-                    Ok(s) if s.success() => registered.push("d"),
-                    _ => failed.push("d"),
+                let args = if *table == "root" {
+                    vec!["bind-key", "-n", key, cmd]
+                } else {
+                    vec!["bind-key", key, cmd]
+                };
+                match std::process::Command::new("tmux").args(&args).status() {
+                    Ok(s) if s.success() => registered.push(*key),
+                    _ => failed.push(*key),
                 }
             }
 
             if !registered.is_empty() {
                 println!("Tmux keybindings registered (current session only).");
                 println!("Add to ~/.tmux.conf to persist:");
-                if !tmux_s_bound && registered.contains(&"s") {
-                    println!("  bind-key s {}", tmux_s_cmd);
-                }
-                if !tmux_d_bound && registered.contains(&"d") {
-                    println!("  bind-key d {}", tmux_d_cmd);
+                for (table, key, cmd, bound) in &bindings {
+                    if *bound || !registered.contains(key) {
+                        continue;
+                    }
+                    if *table == "root" {
+                        println!("  bind-key -n {} {}", key, cmd);
+                    } else {
+                        println!("  bind-key {} {}", key, cmd);
+                    }
                 }
             }
             if !failed.is_empty() {
@@ -1128,7 +1158,7 @@ fn run_uninstall() -> Result<()> {
 
     // Offer to unbind tmux keys
     println!();
-    println!("Unbind tmux keybindings (prefix+s, prefix+d)?");
+    println!("Unbind tmux keybindings (prefix+s, prefix+d, Ctrl+n, Ctrl+p)?");
     print!("[Y/n] ");
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
@@ -1139,6 +1169,11 @@ fn run_uninstall() -> Result<()> {
         for key in &["s", "d"] {
             let _ = std::process::Command::new("tmux")
                 .args(["unbind-key", key])
+                .status();
+        }
+        for key in &["C-n", "C-p"] {
+            let _ = std::process::Command::new("tmux")
+                .args(["unbind-key", "-n", key])
                 .status();
         }
         println!("Tmux keybindings unbound (current session only).");
