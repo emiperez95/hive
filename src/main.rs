@@ -722,8 +722,7 @@ fn run_setup() -> Result<()> {
     let binary_path = if installed_path.exists() {
         installed_path
     } else {
-        std::env::current_exe()
-            .unwrap_or_else(|_| installed_path.clone())
+        std::env::current_exe().unwrap_or_else(|_| installed_path.clone())
     };
 
     let binary_str = binary_path.to_string_lossy();
@@ -791,11 +790,14 @@ fn run_setup() -> Result<()> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
 
-    let tmux_s_bound = tmux_keys.lines().any(|line| {
-        line.contains("prefix") && line.contains(" s ") && line.contains("hive")
-    });
+    let tmux_s_bound = tmux_keys
+        .lines()
+        .any(|line| line.contains("prefix") && line.contains(" s ") && line.contains("hive"));
     let tmux_d_bound = tmux_keys.lines().any(|line| {
-        line.contains("prefix") && line.contains(" d ") && line.contains("hive") && line.contains("--detail")
+        line.contains("prefix")
+            && line.contains(" d ")
+            && line.contains("hive")
+            && line.contains("--detail")
     });
 
     // Report status
@@ -889,9 +891,7 @@ fn run_setup() -> Result<()> {
 
                 // Remove any existing hive hooks from all groups
                 for group in groups.iter_mut() {
-                    if let Some(hooks_arr) =
-                        group.get_mut("hooks").and_then(|h| h.as_array_mut())
-                    {
+                    if let Some(hooks_arr) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
                         hooks_arr.retain(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
@@ -931,8 +931,7 @@ fn run_setup() -> Result<()> {
                         }));
                     }
                 } else {
-                    let no_matcher_group =
-                        groups.iter_mut().find(|g| g.get("matcher").is_none());
+                    let no_matcher_group = groups.iter_mut().find(|g| g.get("matcher").is_none());
 
                     if let Some(group) = no_matcher_group {
                         if let Some(hooks_arr) =
@@ -1031,7 +1030,10 @@ fn run_uninstall() -> Result<()> {
     let settings_path = home.join(".claude").join("settings.json");
 
     if !settings_path.exists() {
-        println!("No settings file found at {:?}, nothing to do.", settings_path);
+        println!(
+            "No settings file found at {:?}, nothing to do.",
+            settings_path
+        );
         return Ok(());
     }
 
@@ -1040,10 +1042,7 @@ fn run_uninstall() -> Result<()> {
         serde_json::from_str(&content)?
     };
 
-    let hooks_map = match settings
-        .get_mut("hooks")
-        .and_then(|h| h.as_object_mut())
-    {
+    let hooks_map = match settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         Some(map) => map,
         None => {
             println!("No hooks found in settings, nothing to do.");
@@ -1120,12 +1119,7 @@ fn run_uninstall() -> Result<()> {
     }
 
     // Remove event keys that now have empty arrays
-    hooks_map.retain(|_, groups| {
-        groups
-            .as_array()
-            .map(|a| !a.is_empty())
-            .unwrap_or(true)
-    });
+    hooks_map.retain(|_, groups| groups.as_array().map(|a| !a.is_empty()).unwrap_or(true));
 
     let content = serde_json::to_string_pretty(&settings)?;
     fs::write(&settings_path, content)?;

@@ -132,7 +132,6 @@ pub fn get_restore_file_path() -> Option<PathBuf> {
     cache_dir().map(|p| p.join("restore.txt"))
 }
 
-
 /// Save restorable session names to disk (only sessions with sesh config)
 pub fn save_restorable_sessions(session_names: &[String]) {
     let Some(path) = get_restore_file_path() else {
