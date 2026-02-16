@@ -17,7 +17,9 @@ use crate::common::persistence::{
     is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_skipped_sessions,
     save_parked_sessions,
 };
-use crate::common::projects::connect_project;
+use crate::common::projects::{
+    connect_project, DatabaseConfig, FilePatterns, PortConfig, ProjectConfig, ProjectRegistry,
+};
 use crate::common::tmux::{
     get_current_tmux_session, get_current_tmux_session_names, switch_to_session,
 };
@@ -67,6 +69,77 @@ enum Command {
     CycleNext,
     /// Cycle to previous tmux session (skipping skipped sessions)
     CyclePrev,
+    /// Create/attach to a tmux session for a registered project
+    Connect {
+        /// Project key from the registry
+        key: String,
+    },
+    /// Manage the project registry
+    Project {
+        #[command(subcommand)]
+        command: Box<ProjectCommand>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+enum ProjectCommand {
+    /// Add a project to the registry
+    Add {
+        /// Project key (used as identifier)
+        key: String,
+        /// Emoji identifier for session names
+        #[arg(short, long)]
+        emoji: String,
+        /// Project root path (defaults to current directory)
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Display name override (defaults to key)
+        #[arg(short = 'd', long)]
+        display_name: Option<String>,
+        /// Command to run on session startup
+        #[arg(short = 's', long)]
+        startup: Option<String>,
+        /// Directory for worktrees
+        #[arg(long)]
+        worktrees_dir: Option<String>,
+        /// Default git base branch for worktrees
+        #[arg(long)]
+        base_branch: Option<String>,
+        /// Package manager (npm, pnpm, yarn, etc.)
+        #[arg(long)]
+        package_manager: Option<String>,
+        /// Enable port management
+        #[arg(long)]
+        ports_enabled: bool,
+        /// Base port number
+        #[arg(long)]
+        base_port: Option<u16>,
+        /// Port increment between worktrees
+        #[arg(long)]
+        port_increment: Option<u16>,
+        /// Enable database management
+        #[arg(long)]
+        db_enabled: bool,
+        /// Database name prefix
+        #[arg(long)]
+        db_prefix: Option<String>,
+        /// Files to copy into worktrees (repeatable)
+        #[arg(long = "copy")]
+        copy_files: Vec<String>,
+        /// Files to symlink into worktrees (repeatable)
+        #[arg(long = "symlink")]
+        symlink_files: Vec<String>,
+    },
+    /// Remove a project from the registry
+    Remove {
+        /// Project key to remove
+        key: String,
+    },
+    /// List all configured projects
+    List,
+    /// Import projects from sesh.toml
+    Import,
 }
 
 fn run_tui(
@@ -1246,6 +1319,193 @@ fn run_cycle(forward: bool) -> Result<()> {
     Ok(())
 }
 
+/// Connect to a registered project by key
+fn run_connect(key: &str) -> Result<()> {
+    let registry = ProjectRegistry::load();
+    let config = registry
+        .projects
+        .get(key)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", key))?;
+
+    let session_name = ProjectRegistry::session_name(key, config);
+    if !connect_project(&session_name) {
+        anyhow::bail!("Failed to create/connect session for '{}'", key);
+    }
+    switch_to_session(&session_name);
+    Ok(())
+}
+
+/// Add a project to the registry
+#[allow(clippy::too_many_arguments)]
+fn run_project_add(
+    key: String,
+    emoji: String,
+    path: Option<String>,
+    display_name: Option<String>,
+    startup: Option<String>,
+    worktrees_dir: Option<String>,
+    base_branch: Option<String>,
+    package_manager: Option<String>,
+    ports_enabled: bool,
+    base_port: Option<u16>,
+    port_increment: Option<u16>,
+    db_enabled: bool,
+    db_prefix: Option<String>,
+    copy_files: Vec<String>,
+    symlink_files: Vec<String>,
+) -> Result<()> {
+    let mut registry = ProjectRegistry::load();
+
+    if registry.projects.contains_key(&key) {
+        anyhow::bail!("Project '{}' already exists. Remove it first to re-add.", key);
+    }
+
+    let project_root = path.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+
+    let config = ProjectConfig {
+        emoji: emoji.clone(),
+        project_root,
+        display_name: display_name.clone(),
+        startup_command: startup,
+        worktrees_dir,
+        default_base_branch: base_branch,
+        worktree_types: Vec::new(),
+        package_manager,
+        ports: PortConfig {
+            enabled: ports_enabled,
+            base_port: base_port.unwrap_or(0),
+            increment: port_increment.unwrap_or(1),
+        },
+        database: DatabaseConfig {
+            enabled: db_enabled,
+            prefix: db_prefix,
+        },
+        files: FilePatterns {
+            copy: copy_files,
+            symlink: symlink_files,
+        },
+    };
+
+    let session_name = ProjectRegistry::session_name(&key, &config);
+    registry.add_project(key, config);
+    registry.save()?;
+    println!("Added project '{}'", session_name);
+    Ok(())
+}
+
+/// Remove a project from the registry
+fn run_project_remove(key: &str) -> Result<()> {
+    let mut registry = ProjectRegistry::load();
+    if !registry.remove_project(key) {
+        anyhow::bail!("Project '{}' not found in registry", key);
+    }
+    registry.save()?;
+    println!("Removed project '{}'", key);
+    Ok(())
+}
+
+/// List all configured projects
+fn run_project_list() -> Result<()> {
+    let registry = ProjectRegistry::load();
+
+    if registry.projects.is_empty() {
+        println!("No projects configured. Use 'hive project add' or 'hive project import'.");
+        return Ok(());
+    }
+
+    // Sort by key for consistent output
+    let mut entries: Vec<_> = registry.projects.iter().collect();
+    entries.sort_by_key(|(k, _)| k.as_str());
+
+    // Calculate column widths
+    let max_key = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let max_session = entries
+        .iter()
+        .map(|(k, c)| ProjectRegistry::session_name(k, c).len())
+        .max()
+        .unwrap_or(0);
+
+    println!(
+        "{:<width_k$}  {:<width_s$}  PATH",
+        "KEY",
+        "SESSION",
+        width_k = max_key,
+        width_s = max_session
+    );
+    println!(
+        "{:<width_k$}  {:<width_s$}  ----",
+        "-".repeat(max_key),
+        "-".repeat(max_session),
+        width_k = max_key,
+        width_s = max_session
+    );
+
+    for (key, config) in &entries {
+        let session = ProjectRegistry::session_name(key, config);
+        println!(
+            "{:<width_k$}  {:<width_s$}  {}",
+            key,
+            session,
+            config.project_root,
+            width_k = max_key,
+            width_s = max_session
+        );
+    }
+
+    println!("\n{} project(s)", entries.len());
+    Ok(())
+}
+
+/// Import projects from sesh.toml
+fn run_project_import() -> Result<()> {
+    use crate::common::projects::parse_sesh_toml;
+
+    // Check ~/.config/sesh/sesh.toml first (common on macOS), then XDG config dir
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let dot_config_path = home.join(".config").join("sesh").join("sesh.toml");
+    let xdg_path = dirs::config_dir().map(|p| p.join("sesh").join("sesh.toml"));
+
+    let sesh_path = if dot_config_path.exists() {
+        dot_config_path
+    } else if let Some(ref xdg) = xdg_path {
+        if xdg.exists() {
+            xdg.clone()
+        } else {
+            anyhow::bail!(
+                "sesh.toml not found at {:?} or {:?}",
+                dot_config_path,
+                xdg
+            );
+        }
+    } else {
+        anyhow::bail!("sesh.toml not found at {:?}", dot_config_path);
+    };
+
+    let entries = parse_sesh_toml(&sesh_path)?;
+    let mut registry = ProjectRegistry::load();
+    let mut added = 0;
+    let mut skipped = 0;
+
+    for (key, config) in entries {
+        if registry.projects.contains_key(&key) {
+            skipped += 1;
+        } else {
+            let name = ProjectRegistry::session_name(&key, &config);
+            println!("  + {}", name);
+            registry.add_project(key, config);
+            added += 1;
+        }
+    }
+
+    registry.save()?;
+    println!("\nImported {} project(s), skipped {} existing", added, skipped);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     init_debug(args.debug);
@@ -1256,6 +1516,45 @@ fn main() -> Result<()> {
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::CycleNext) => run_cycle(true),
         Some(Command::CyclePrev) => run_cycle(false),
+        Some(Command::Connect { key }) => run_connect(&key),
+        Some(Command::Project { command }) => match *command {
+            ProjectCommand::Add {
+                key,
+                emoji,
+                path,
+                display_name,
+                startup,
+                worktrees_dir,
+                base_branch,
+                package_manager,
+                ports_enabled,
+                base_port,
+                port_increment,
+                db_enabled,
+                db_prefix,
+                copy_files,
+                symlink_files,
+            } => run_project_add(
+                key,
+                emoji,
+                path,
+                display_name,
+                startup,
+                worktrees_dir,
+                base_branch,
+                package_manager,
+                ports_enabled,
+                base_port,
+                port_increment,
+                db_enabled,
+                db_prefix,
+                copy_files,
+                symlink_files,
+            ),
+            ProjectCommand::Remove { key } => run_project_remove(&key),
+            ProjectCommand::List => run_project_list(),
+            ProjectCommand::Import => run_project_import(),
+        },
         Some(Command::Tui) | None => {
             // Set up signal handler for graceful shutdown
             let running = Arc::new(AtomicBool::new(true));

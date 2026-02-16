@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 51 unit tests
+cargo test                # 56 unit tests
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -33,6 +33,11 @@ hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostT
 hive setup              # register hooks in ~/.claude/settings.json + tmux keybind
 hive cycle-next         # switch to next tmux session (skipping skipped)
 hive cycle-prev         # switch to previous tmux session
+hive connect <key>      # create/attach tmux session for a registered project
+hive project add <key>  # add a project to the registry (supports all config flags)
+hive project remove <key> # remove a project from the registry
+hive project list       # list all configured projects
+hive project import     # import projects from sesh.toml
 ```
 
 ## Project Structure
