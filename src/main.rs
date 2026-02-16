@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use crate::common::debug::{debug_log, init_debug};
 use crate::common::persistence::{
-    is_globally_muted, load_muted_sessions, load_skipped_sessions, save_parked_sessions,
-    sesh_connect,
+    is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_skipped_sessions,
+    save_parked_sessions, sesh_connect,
 };
 use crate::common::tmux::{
     get_current_tmux_session, get_current_tmux_session_names, switch_to_session,
@@ -660,9 +660,31 @@ fn run_hook(event_type: &str) -> Result<()> {
     // Load state, process event, save state
     let mut state = HookState::load();
 
+    // Check auto-approve before notifications so we can skip alerting for auto-approved requests
+    let mut auto_approved = false;
+    if event_type == "PermissionRequest" {
+        if let Some(tmux_session) = get_current_tmux_session() {
+            let auto_approve = load_auto_approve_sessions();
+            if auto_approve.contains(&tmux_session) {
+                auto_approved = true;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": {
+                                "behavior": "allow"
+                            }
+                        }
+                    })
+                );
+            }
+        }
+    }
+
     if let Some(updated_session) = handle_hook_event(&mut state, hook_event) {
-        // Send notification if session needs attention and not muted
-        if updated_session.needs_attention {
+        // Send notification if session needs attention, not muted, and not auto-approved
+        if updated_session.needs_attention && !auto_approved {
             let muted = load_muted_sessions();
             let global_mute = is_globally_muted();
 
