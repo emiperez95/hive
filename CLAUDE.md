@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 56 unit tests
+cargo test                # 72 unit tests
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -38,6 +38,9 @@ hive project add <key>  # add a project to the registry (supports all config fla
 hive project remove <key> # remove a project from the registry
 hive project list       # list all configured projects
 hive project import     # import projects from sesh.toml
+hive wt new <project> <branch>  # create worktree + tmux session (with hooks)
+hive wt delete <project> <branch>  # delete worktree + session + branch
+hive wt list [project]  # list registered worktrees with tmux status
 ```
 
 ## Project Structure
@@ -56,6 +59,7 @@ src/
 │   ├── jsonl.rs            JSONL parsing for Claude status from ~/.claude/projects/
 │   ├── persistence.rs      file persistence for all txt-based state (parked, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
+│   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
 │   └── debug.rs            debug logging to cache dir
 ├── daemon/
 │   ├── hooks.rs            handle_hook_event(): maps HookEvent → SessionState updates
@@ -76,7 +80,9 @@ src/
 - `SessionInfo` (common/types.rs) — enriched session data for display (processes, ports, status)
 - `ClaudeStatus` (common/types.rs) — TUI-side status enum mapped from SessionStatus
 - `ProjectRegistry` (common/projects.rs) — `HashMap<name, ProjectConfig>`, loaded from projects.toml
-- `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, etc.)
+- `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, etc.)
+- `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
+- `WorktreeEntry` (common/worktree.rs) — worktree record (project_key, branch, type, path, session_name, metadata, created_at)
 
 ## Config Directory
 
@@ -100,6 +106,7 @@ src/
 | skipped.txt | lines | skipped-from-cycling session names |
 | restore.txt | lines | sessions to restore |
 | muted-global | empty file | global mute flag |
+| worktrees.json | JSON | registered worktrees (project, branch, path, session, metadata) |
 | debug.log | text | debug log (--debug) |
 
 ## Platform Guards
@@ -132,7 +139,7 @@ Switching sessions (1-9, Enter in detail, connect project) always exits the app.
 
 ## Testing
 
-51 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
+72 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
 
 ## Conventions
 
@@ -141,3 +148,20 @@ Switching sessions (1-9, Enter in detail, connect project) always exits the app.
 - `anyhow::Result` for error handling throughout
 - `sysinfo::System` is kept alive in `App` for CPU delta accuracy (needs two refresh_all calls)
 - Stale sessions cleaned up after 10 minutes of inactivity (in hook handler)
+
+## Worktree Hooks
+
+Project hooks live in `<project_root>/.hive/hooks/` (or custom `hooks_dir`). Shell scripts named `<hook>.sh`:
+
+| Hook | When | Use case |
+|------|------|----------|
+| pre-create | Before git worktree add | Validation, pre-checks |
+| post-worktree | After git worktree add | Port allocation, resource setup |
+| post-copy | After file copy/symlink + memory seed | Database setup, env config |
+| post-setup | After tmux session + registry | Final setup steps |
+| pre-delete | Before cleanup starts | Database teardown, resource cleanup |
+| post-delete | After full cleanup | Final teardown steps |
+
+**Hook env vars**: `HIVE_PROJECT_KEY`, `HIVE_BRANCH`, `HIVE_WORKTREE_PATH`, `HIVE_PROJECT_ROOT`, `HIVE_SESSION_NAME`, `HIVE_WORKTREE_TYPE`, `HIVE_METADATA` (JSON), `HIVE_METADATA_FILE` (write path).
+
+**Metadata protocol**: Hooks write JSON to `$HIVE_METADATA_FILE`. If `session_name` key is present, it overrides the default. All keys are stored in `worktrees.json` and passed to future hooks.

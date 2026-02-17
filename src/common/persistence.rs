@@ -34,7 +34,7 @@ fn unescape_newlines(s: &str) -> String {
 }
 
 /// Get the cache directory for hive
-fn cache_dir() -> Option<PathBuf> {
+pub(crate) fn cache_dir() -> Option<PathBuf> {
     dirs::cache_dir().map(|p| p.join("hive"))
 }
 

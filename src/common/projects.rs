@@ -72,11 +72,17 @@ pub struct ProjectConfig {
     /// File patterns for worktree setup (Phase 3)
     #[serde(default)]
     pub files: FilePatterns,
+    /// Custom hooks directory (defaults to <project_root>/.hive/hooks/)
+    #[serde(default)]
+    pub hooks_dir: Option<String>,
 }
 
 /// Root configuration containing all projects
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectRegistry {
+    /// Global default root for worktrees: {worktrees_root}/{project_key}/
+    #[serde(default)]
+    pub worktrees_root: Option<String>,
     #[serde(default)]
     pub projects: HashMap<String, ProjectConfig>,
 }
@@ -92,7 +98,7 @@ pub fn get_projects_file_path() -> Option<PathBuf> {
 }
 
 /// Expand ~ to home directory in a path string
-fn expand_tilde(path: &str) -> PathBuf {
+pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
@@ -156,6 +162,20 @@ impl ProjectRegistry {
             .iter()
             .find(|(key, config)| Self::session_name(key, config) == session_name)
             .map(|(key, config)| (key.as_str(), config))
+    }
+
+    /// Resolve the worktrees directory for a project.
+    /// 1. project.worktrees_dir (explicit override)
+    /// 2. registry.worktrees_root / project_key (global default)
+    /// 3. None → error
+    pub fn resolve_worktrees_dir(&self, key: &str, config: &ProjectConfig) -> Option<PathBuf> {
+        if let Some(ref dir) = config.worktrees_dir {
+            return Some(expand_tilde(dir));
+        }
+        if let Some(ref root) = self.worktrees_root {
+            return Some(expand_tilde(root).join(key));
+        }
+        None
     }
 
     /// List all project session names
@@ -318,6 +338,7 @@ pub fn parse_sesh_toml(path: &std::path::Path) -> anyhow::Result<Vec<(String, Pr
                 ports: PortConfig::default(),
                 database: DatabaseConfig::default(),
                 files: FilePatterns::default(),
+                hooks_dir: None,
             },
         ));
     }
@@ -343,6 +364,7 @@ mod tests {
             ports: PortConfig::default(),
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
+            hooks_dir: None,
         };
         assert_eq!(ProjectRegistry::session_name("hive", &config), "🐝 hive");
     }
@@ -361,6 +383,7 @@ mod tests {
             ports: PortConfig::default(),
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
+            hooks_dir: None,
         };
         assert_eq!(
             ProjectRegistry::session_name("my-app", &config),
@@ -545,6 +568,7 @@ base_port = 3000
             ports: PortConfig::default(),
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
+            hooks_dir: None,
         };
         registry.add_project("test".to_string(), config);
         assert_eq!(registry.projects.len(), 1);
@@ -566,6 +590,7 @@ base_port = 3000
             ports: PortConfig::default(),
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
+            hooks_dir: None,
         };
         registry.add_project("test".to_string(), config);
         assert!(registry.remove_project("test"));

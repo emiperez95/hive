@@ -10,3 +10,4 @@ pub mod process;
 pub mod projects;
 pub mod tmux;
 pub mod types;
+pub mod worktree;
