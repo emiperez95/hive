@@ -28,7 +28,7 @@ pub fn init_debug(enabled: bool) {
 
 /// Get the path to the debug log file
 pub fn debug_log_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|c| c.join("hive").join("debug.log"))
+    crate::common::persistence::cache_dir().map(|c| c.join("debug.log"))
 }
 
 /// Check if debug logging is enabled

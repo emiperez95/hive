@@ -175,8 +175,7 @@ impl HookState {
 
 /// State file path for hook-to-TUI communication
 pub fn get_state_file_path() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("hive")
+    crate::common::persistence::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/.hive/cache"))
         .join("state.json")
 }

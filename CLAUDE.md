@@ -84,30 +84,29 @@ src/
 - `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
 - `WorktreeEntry` (common/worktree.rs) — worktree record (project_key, branch, type, path, session_name, metadata, created_at)
 
-## Config Directory
+## Data Directory
 
-`~/Library/Application Support/hive/` (macOS) or `~/.config/hive/` (Linux):
+All hive data lives under `~/.hive/`:
 
-| File | Format | Purpose |
-|------|--------|---------|
-| projects.toml | TOML | project registry (name, path, emoji, startup, ports, etc.) |
-
-## Cache Directory
-
-`~/Library/Caches/hive/` (macOS) or `~/.cache/hive/` (Linux):
-
-| File | Format | Purpose |
-|------|--------|---------|
-| state.json | JSON | hook state (session statuses) |
-| parked.txt | lines: `name\tnote` | parked sessions |
-| todos.txt | TOML | per-session todo lists |
-| muted.txt | lines | muted session names |
-| auto-approve.txt | lines | auto-approve session names |
-| skipped.txt | lines | skipped-from-cycling session names |
-| restore.txt | lines | sessions to restore |
-| muted-global | empty file | global mute flag |
-| worktrees.json | JSON | registered worktrees (project, branch, path, session, metadata) |
-| debug.log | text | debug log (--debug) |
+```
+~/.hive/
+├── projects.toml              # project registry
+├── cache/                     # runtime state
+│   ├── state.json             # hook state (session statuses)
+│   ├── worktrees.json         # registered worktrees
+│   ├── parked.txt             # parked sessions (name\tnote)
+│   ├── todos.txt              # per-session todo lists
+│   ├── muted.txt              # muted session names
+│   ├── auto-approve.txt       # auto-approve session names
+│   ├── skipped.txt            # skipped-from-cycling session names
+│   ├── restore.txt            # sessions to restore
+│   ├── muted-global           # global mute flag (empty file)
+│   └── debug.log              # debug log (--debug)
+└── projects/                  # per-project config
+    └── {project_key}/
+        ├── hooks/             # lifecycle hook scripts
+        └── lib/               # shared shell libraries for hooks
+```
 
 ## Platform Guards
 
@@ -151,7 +150,7 @@ Switching sessions (1-9, Enter in detail, connect project) always exits the app.
 
 ## Worktree Hooks
 
-Project hooks live in `<project_root>/.hive/hooks/` (or custom `hooks_dir`). Shell scripts named `<hook>.sh`:
+Project hooks live in `~/.hive/projects/{project_key}/hooks/` (or custom `hooks_dir`). Shell scripts named `<hook>.sh`:
 
 | Hook | When | Use case |
 |------|------|----------|

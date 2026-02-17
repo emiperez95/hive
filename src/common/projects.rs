@@ -16,6 +16,12 @@ pub struct PortConfig {
     pub increment: u16,
 }
 
+impl PortConfig {
+    pub fn is_default(&self) -> bool {
+        !self.enabled && self.base_port == 0
+    }
+}
+
 fn default_port_increment() -> u16 {
     1
 }
@@ -29,6 +35,12 @@ pub struct DatabaseConfig {
     pub prefix: Option<String>,
 }
 
+impl DatabaseConfig {
+    pub fn is_default(&self) -> bool {
+        !self.enabled && self.prefix.is_none()
+    }
+}
+
 /// File patterns for worktree setup
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FilePatterns {
@@ -36,6 +48,12 @@ pub struct FilePatterns {
     pub copy: Vec<String>,
     #[serde(default)]
     pub symlink: Vec<String>,
+}
+
+impl FilePatterns {
+    pub fn is_default(&self) -> bool {
+        self.copy.is_empty() && self.symlink.is_empty()
+    }
 }
 
 /// A single project configuration
@@ -46,34 +64,34 @@ pub struct ProjectConfig {
     /// Project root path (supports ~ expansion)
     pub project_root: String,
     /// Display name override (defaults to table key)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// Command to run on session startup
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_command: Option<String>,
-    /// Directory for worktrees (Phase 3)
-    #[serde(default)]
+    /// Directory for worktrees
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktrees_dir: Option<String>,
-    /// Default git base branch for worktrees (Phase 3)
-    #[serde(default)]
+    /// Default git base branch for worktrees
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_base_branch: Option<String>,
-    /// Worktree types (Phase 3)
-    #[serde(default)]
+    /// Worktree types
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worktree_types: Vec<String>,
     /// Package manager (npm, pnpm, yarn, etc.)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_manager: Option<String>,
-    /// Port configuration (Phase 3)
-    #[serde(default)]
+    /// Port configuration
+    #[serde(default, skip_serializing_if = "PortConfig::is_default")]
     pub ports: PortConfig,
-    /// Database configuration (Phase 3)
-    #[serde(default)]
+    /// Database configuration
+    #[serde(default, skip_serializing_if = "DatabaseConfig::is_default")]
     pub database: DatabaseConfig,
-    /// File patterns for worktree setup (Phase 3)
-    #[serde(default)]
+    /// File patterns for worktree setup
+    #[serde(default, skip_serializing_if = "FilePatterns::is_default")]
     pub files: FilePatterns,
     /// Custom hooks directory (defaults to <project_root>/.hive/hooks/)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_dir: Option<String>,
 }
 
@@ -81,15 +99,15 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectRegistry {
     /// Global default root for worktrees: {worktrees_root}/{project_key}/
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktrees_root: Option<String>,
     #[serde(default)]
     pub projects: HashMap<String, ProjectConfig>,
 }
 
-/// Get config directory for hive
+/// Get config directory for hive: ~/.hive/
 fn config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("hive"))
+    crate::common::persistence::hive_home()
 }
 
 /// Get the path to projects.toml

@@ -33,9 +33,14 @@ fn unescape_newlines(s: &str) -> String {
     result
 }
 
-/// Get the cache directory for hive
+/// Get the hive home directory: ~/.hive/
+pub(crate) fn hive_home() -> Option<PathBuf> {
+    dirs::home_dir().map(|p| p.join(".hive"))
+}
+
+/// Get the cache directory for hive: ~/.hive/cache/
 pub(crate) fn cache_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|p| p.join("hive"))
+    hive_home().map(|p| p.join("cache"))
 }
 
 /// Get the path to the parked sessions file

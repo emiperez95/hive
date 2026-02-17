@@ -102,6 +102,91 @@ pub fn build_session_name(config: &ProjectConfig, wt_type: &str, branch: &str) -
     format!("{} {}-{}", config.emoji, wt_type, branch)
 }
 
+// ─── Import ─────────────────────────────────────────────────────────────────
+
+/// Import existing git worktrees into worktrees.json.
+/// Scans `git worktree list` from project_root, matches paths against worktrees_dir,
+/// and registers any that aren't already tracked.
+/// Returns the list of newly imported entries.
+pub fn import_worktrees(
+    project_key: &str,
+    config: &ProjectConfig,
+    worktrees_dir: &Path,
+    tmux_sessions: &[String],
+) -> Result<Vec<WorktreeEntry>> {
+    let project_root = expand_tilde(&config.project_root);
+
+    // Run git worktree list --porcelain for reliable parsing
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&project_root)
+        .output()
+        .context("Failed to run git worktree list")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git worktree list failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut state = WorktreeState::load();
+    let mut imported = Vec::new();
+
+    // Parse porcelain output: blocks separated by blank lines
+    // Each block has: worktree <path>\nHEAD <sha>\nbranch refs/heads/<name>\n
+    let worktrees_dir_str = worktrees_dir.to_string_lossy();
+
+    let mut current_path: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+
+    for line in stdout.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            // End of block — process if we have path + branch
+            if let (Some(ref wt_path), Some(ref branch)) = (&current_path, &current_branch) {
+                // Only import worktrees under the worktrees_dir (not the main project root)
+                if wt_path.starts_with(worktrees_dir_str.as_ref())
+                    && wt_path != project_root.to_string_lossy().as_ref()
+                    && state.get(project_key, branch).is_none()
+                {
+                    // Try to find a matching tmux session
+                    let session_name = tmux_sessions
+                        .iter()
+                        .find(|s| s.contains(branch))
+                        .cloned()
+                        .unwrap_or_else(|| build_session_name(config, "worktree", branch));
+
+                    let entry = WorktreeEntry {
+                        project_key: project_key.to_string(),
+                        branch: branch.to_string(),
+                        worktree_type: "worktree".to_string(),
+                        path: wt_path.to_string(),
+                        session_name,
+                        metadata: serde_json::json!({}),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    state.add(entry.clone());
+                    imported.push(entry);
+                }
+            }
+            current_path = None;
+            current_branch = None;
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(path.to_string());
+        } else if let Some(branch_ref) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(branch_ref.to_string());
+        }
+    }
+
+    if !imported.is_empty() {
+        state.save()?;
+    }
+
+    Ok(imported)
+}
+
 // ─── Git operations ──────────────────────────────────────────────────────────
 
 /// Create a git worktree.
@@ -341,12 +426,14 @@ fn path_to_claude_dir_name(path: &Path) -> String {
 // ─── Hooks ──────────────────────────────────────────────────────────────────
 
 /// Resolve the hooks directory for a project config.
-/// Uses `hooks_dir` if set, otherwise defaults to `<project_root>/.hive/hooks/`.
-pub fn resolve_hooks_dir(config: &ProjectConfig) -> PathBuf {
+/// Uses `hooks_dir` if set, otherwise defaults to `~/.hive/projects/{project_key}/hooks/`.
+pub fn resolve_hooks_dir(config: &ProjectConfig, project_key: &str) -> PathBuf {
     if let Some(ref dir) = config.hooks_dir {
         expand_tilde(dir)
     } else {
-        expand_tilde(&config.project_root).join(".hive").join("hooks")
+        dirs::home_dir()
+            .map(|p| p.join(".hive").join("projects").join(project_key).join("hooks"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/.hive/projects").join(project_key).join("hooks"))
     }
 }
 
@@ -601,17 +688,17 @@ mod tests {
     #[test]
     fn test_resolve_hooks_dir_default() {
         let config = test_config("🐝");
-        let hooks_dir = resolve_hooks_dir(&config);
-        assert!(hooks_dir.to_string_lossy().ends_with(".hive/hooks"));
+        let hooks_dir = resolve_hooks_dir(&config, "hive");
+        let path_str = hooks_dir.to_string_lossy();
+        assert!(path_str.contains(".hive/projects/hive/hooks"));
     }
 
     #[test]
     fn test_resolve_hooks_dir_custom() {
         let mut config = test_config("🐝");
         config.hooks_dir = Some("~/my-hooks".to_string());
-        let hooks_dir = resolve_hooks_dir(&config);
+        let hooks_dir = resolve_hooks_dir(&config, "hive");
         assert!(hooks_dir.to_string_lossy().ends_with("my-hooks"));
-        assert!(!hooks_dir.to_string_lossy().contains(".hive"));
     }
 
     #[test]

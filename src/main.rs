@@ -189,6 +189,11 @@ enum WtCommand {
         /// Optional project key to filter by
         project: Option<String>,
     },
+    /// Import existing git worktrees into worktrees.json
+    Import {
+        /// Project key to import worktrees for
+        project: String,
+    },
 }
 
 fn run_tui(
@@ -1592,7 +1597,7 @@ fn run_wt_new(
         .unwrap_or_else(|| "main".to_string());
 
     let mut session_name = build_session_name(config, wt_type, branch);
-    let hooks_dir = resolve_hooks_dir(config);
+    let hooks_dir = resolve_hooks_dir(config, project);
     let mut metadata = serde_json::json!({});
 
     // Check if already registered
@@ -1779,7 +1784,7 @@ fn run_wt_delete(project: &str, branch: &str, keep_branch: bool, force: bool) ->
         }
     }
 
-    let hooks_dir = resolve_hooks_dir(config);
+    let hooks_dir = resolve_hooks_dir(config, project);
     let env = build_hook_env(
         project,
         branch,
@@ -1897,6 +1902,45 @@ fn run_wt_list(project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Import existing git worktrees into worktrees.json
+fn run_wt_import(project: &str) -> Result<()> {
+    use crate::common::worktree::import_worktrees;
+
+    let registry = ProjectRegistry::load();
+    let config = registry
+        .projects
+        .get(project)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", project))?;
+
+    let worktrees_dir = registry
+        .resolve_worktrees_dir(project, config)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No worktrees directory configured for '{}'. Set 'worktrees_dir' on the project or 'worktrees_root' globally.",
+                project
+            )
+        })?;
+
+    let tmux_sessions = get_current_tmux_session_names();
+
+    println!("Scanning git worktrees for '{}'...", project);
+    let imported = import_worktrees(project, config, &worktrees_dir, &tmux_sessions)?;
+
+    if imported.is_empty() {
+        println!("No new worktrees found to import.");
+    } else {
+        for entry in &imported {
+            println!(
+                "  + {}/{} → session '{}'",
+                entry.project_key, entry.branch, entry.session_name
+            );
+        }
+        println!("\nImported {} worktree(s)", imported.len());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     init_debug(args.debug);
@@ -1971,6 +2015,7 @@ fn main() -> Result<()> {
                 force,
             } => run_wt_delete(&project, &branch, keep_branch, force),
             WtCommand::List { project } => run_wt_list(project.as_deref()),
+            WtCommand::Import { project } => run_wt_import(&project),
         },
         Some(Command::Tui) | None => {
             // Set up signal handler for graceful shutdown
