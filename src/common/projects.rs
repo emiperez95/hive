@@ -18,7 +18,7 @@ pub struct PortConfig {
 
 impl PortConfig {
     pub fn is_default(&self) -> bool {
-        !self.enabled && self.base_port == 0
+        !self.enabled && self.base_port == 0 && self.increment == 0
     }
 }
 
@@ -90,7 +90,7 @@ pub struct ProjectConfig {
     /// File patterns for worktree setup
     #[serde(default, skip_serializing_if = "FilePatterns::is_default")]
     pub files: FilePatterns,
-    /// Custom hooks directory (defaults to <project_root>/.hive/hooks/)
+    /// Custom hooks directory (defaults to ~/.hive/projects/{key}/hooks/)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_dir: Option<String>,
 }
@@ -105,14 +105,9 @@ pub struct ProjectRegistry {
     pub projects: HashMap<String, ProjectConfig>,
 }
 
-/// Get config directory for hive: ~/.hive/
-fn config_dir() -> Option<PathBuf> {
-    crate::common::persistence::hive_home()
-}
-
 /// Get the path to projects.toml
 pub fn get_projects_file_path() -> Option<PathBuf> {
-    config_dir().map(|p| p.join("projects.toml"))
+    crate::common::persistence::hive_home().map(|p| p.join("projects.toml"))
 }
 
 /// Expand ~ to home directory in a path string
@@ -134,7 +129,10 @@ impl ProjectRegistry {
         let Ok(content) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        toml::from_str(&content).unwrap_or_default()
+        toml::from_str(&content).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to parse {}: {}", path.display(), e);
+            Self::default()
+        })
     }
 
     /// Save the registry to disk atomically (write .tmp, rename).
@@ -220,6 +218,41 @@ pub fn connect_session(session_name: &str) -> bool {
     crate::common::worktree::connect_worktree(session_name)
 }
 
+/// Ensure a tmux session exists, creating it at the given path if needed.
+/// Optionally runs a startup command in the new session.
+/// Returns true on success, false on failure.
+pub fn ensure_tmux_session(
+    session_name: &str,
+    cwd: &str,
+    startup_cmd: Option<&str>,
+) -> bool {
+    let exists = Command::new("tmux")
+        .args(["has-session", "-t", session_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !exists {
+        let success = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session_name, "-c", cwd])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !success {
+            return false;
+        }
+
+        if let Some(cmd) = startup_cmd {
+            let _ = Command::new("tmux")
+                .args(["send-keys", "-t", session_name, cmd, "Enter"])
+                .output();
+        }
+    }
+
+    true
+}
+
 /// Connect/create a tmux session for a project (replaces sesh_connect)
 pub fn connect_project(session_name: &str) -> bool {
     let registry = ProjectRegistry::load();
@@ -229,49 +262,11 @@ pub fn connect_project(session_name: &str) -> bool {
 
     let sess_name = ProjectRegistry::session_name(key, config);
     let root = expand_tilde(&config.project_root);
-
-    // Check if session already exists
-    let exists = Command::new("tmux")
-        .args(["has-session", "-t", &sess_name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !exists {
-        // Create new detached session at project root
-        let success = Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &sess_name,
-                "-c",
-                &root.to_string_lossy(),
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if !success {
-            return false;
-        }
-
-        // Run startup command if configured
-        if let Some(ref cmd) = config.startup_command {
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &sess_name, cmd, "Enter"])
-                .output();
-        }
-    }
-
-    true
-}
-
-/// List all project and worktree session names
-pub fn list_project_names() -> Vec<String> {
-    let mut names = ProjectRegistry::load().list_session_names();
-    names.extend(crate::common::worktree::list_worktree_session_names());
-    names
+    ensure_tmux_session(
+        &sess_name,
+        &root.to_string_lossy(),
+        config.startup_command.as_deref(),
+    )
 }
 
 /// Sesh session entry for parsing sesh.toml

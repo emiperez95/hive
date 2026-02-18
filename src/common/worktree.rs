@@ -46,7 +46,10 @@ impl WorktreeState {
         let Ok(content) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        serde_json::from_str(&content).unwrap_or_default()
+        serde_json::from_str(&content).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to parse {}: {}", path.display(), e);
+            Self::default()
+        })
     }
 
     /// Save worktree state to disk atomically (write .tmp, rename).
@@ -104,28 +107,6 @@ pub fn build_session_name(config: &ProjectConfig, wt_type: &str, branch: &str) -
 
 // ─── Worktree lookup helpers ─────────────────────────────────────────────────
 
-/// List all worktree session names from worktrees.json
-pub fn list_worktree_session_names() -> Vec<String> {
-    WorktreeState::load()
-        .worktrees
-        .values()
-        .map(|e| e.session_name.clone())
-        .collect()
-}
-
-/// List worktree session names grouped by project key.
-/// Returns a map of project_key → Vec<session_name>.
-pub fn worktree_names_by_project() -> HashMap<String, Vec<String>> {
-    let state = WorktreeState::load();
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in state.worktrees.values() {
-        map.entry(entry.project_key.clone())
-            .or_default()
-            .push(entry.session_name.clone());
-    }
-    map
-}
-
 /// Find a worktree entry by its session name. Returns None if not found.
 pub fn find_worktree_by_session_name(session_name: &str) -> Option<WorktreeEntry> {
     WorktreeState::load()
@@ -142,50 +123,18 @@ pub fn connect_worktree(session_name: &str) -> bool {
         return false;
     };
 
-    let path = &entry.path;
+    // Look up startup command from parent project config
+    let registry = crate::common::projects::ProjectRegistry::load();
+    let startup_cmd = registry
+        .projects
+        .get(&entry.project_key)
+        .and_then(|c| c.startup_command.as_deref());
 
-    // Check if session already exists
-    let exists = Command::new("tmux")
-        .args(["has-session", "-t", &entry.session_name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !exists {
-        // Create new detached session at worktree path
-        let success = Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &entry.session_name,
-                "-c",
-                path,
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if !success {
-            return false;
-        }
-
-        // Run startup command from the parent project config if available
-        let registry = crate::common::projects::ProjectRegistry::load();
-        if let Some((_, config)) = registry
-            .projects
-            .iter()
-            .find(|(k, _)| **k == entry.project_key)
-        {
-            if let Some(ref cmd) = config.startup_command {
-                let _ = Command::new("tmux")
-                    .args(["send-keys", "-t", &entry.session_name, cmd, "Enter"])
-                    .output();
-            }
-        }
-    }
-
-    true
+    crate::common::projects::ensure_tmux_session(
+        &entry.session_name,
+        &entry.path,
+        startup_cmd,
+    )
 }
 
 // ─── Import ─────────────────────────────────────────────────────────────────
@@ -505,8 +454,8 @@ pub fn seed_memory(project_root: &Path, worktree_path: &Path) -> Result<()> {
 /// Convert an absolute path to the Claude project directory name format.
 /// `/Users/foo/project` → `-Users-foo-project`
 fn path_to_claude_dir_name(path: &Path) -> String {
-    let canonical = path.to_string_lossy();
-    canonical.replace('/', "-")
+    let path_str = path.to_string_lossy();
+    path_str.replace('/', "-")
 }
 
 // ─── Hooks ──────────────────────────────────────────────────────────────────
@@ -539,12 +488,28 @@ pub fn run_hook(
         return Ok(metadata.clone());
     }
 
-    // Create a temp file for metadata exchange
-    let metadata_file = std::env::temp_dir().join(format!("hive-hook-metadata-{}-{}", name, std::process::id()));
+    // Create a temp file for metadata exchange (timestamp suffix to avoid predictable paths)
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let metadata_file = std::env::temp_dir().join(format!(
+        "hive-hook-metadata-{}-{}-{}",
+        name,
+        std::process::id(),
+        unique
+    ));
 
     let mut cmd = Command::new("bash");
     cmd.arg(&script);
-    cmd.current_dir(hooks_dir);
+    // Run hooks in the worktree directory (or project root for pre-create when worktree doesn't exist)
+    let worktree_cwd = env_vars.get("HIVE_WORKTREE_PATH").map(Path::new);
+    let project_cwd = env_vars.get("HIVE_PROJECT_ROOT").map(Path::new);
+    if let Some(cwd) = worktree_cwd.filter(|p| p.exists()).or(project_cwd) {
+        cmd.current_dir(cwd);
+    } else {
+        cmd.current_dir(hooks_dir);
+    }
 
     // Set all provided env vars
     for (key, value) in env_vars {
@@ -559,10 +524,8 @@ pub fn run_hook(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("Warning: hook '{}' failed: {}", name, stderr.trim());
-        // Clean up metadata file
         let _ = std::fs::remove_file(&metadata_file);
-        return Ok(metadata.clone());
+        bail!("Hook '{}' failed: {}", name, stderr.trim());
     }
 
     // Read metadata file if the hook wrote one
@@ -606,6 +569,7 @@ pub fn build_hook_env(
     project_root: &Path,
     session_name: &str,
     wt_type: &str,
+    hooks_dir: &Path,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
     env.insert("HIVE_PROJECT_KEY".to_string(), project_key.to_string());
@@ -620,6 +584,10 @@ pub fn build_hook_env(
     );
     env.insert("HIVE_SESSION_NAME".to_string(), session_name.to_string());
     env.insert("HIVE_WORKTREE_TYPE".to_string(), wt_type.to_string());
+    env.insert(
+        "HIVE_HOOKS_DIR".to_string(),
+        hooks_dir.to_string_lossy().to_string(),
+    );
     env
 }
 
@@ -823,6 +791,7 @@ mod tests {
             Path::new("/home/user/projects/my-proj"),
             "📦 worktree-feat-1",
             "worktree",
+            Path::new("/home/user/.hive/projects/my-proj/hooks"),
         );
         assert_eq!(env["HIVE_PROJECT_KEY"], "my-proj");
         assert_eq!(env["HIVE_BRANCH"], "feat-1");
@@ -830,6 +799,7 @@ mod tests {
         assert_eq!(env["HIVE_PROJECT_ROOT"], "/home/user/projects/my-proj");
         assert_eq!(env["HIVE_SESSION_NAME"], "📦 worktree-feat-1");
         assert_eq!(env["HIVE_WORKTREE_TYPE"], "worktree");
+        assert_eq!(env["HIVE_HOOKS_DIR"], "/home/user/.hive/projects/my-proj/hooks");
     }
 
     #[test]

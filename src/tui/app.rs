@@ -7,10 +7,7 @@ use crate::common::persistence::{
     save_parked_sessions, save_restorable_sessions, save_session_todos, save_skipped_sessions,
     set_global_mute,
 };
-use crate::common::projects::{
-    connect_session, has_project_config, list_project_names, ProjectRegistry,
-};
-use crate::common::worktree::{list_worktree_session_names, worktree_names_by_project};
+use crate::common::projects::{connect_session, has_project_config, ProjectRegistry};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
@@ -145,6 +142,7 @@ impl App {
     /// Update search results based on current query.
     /// Projects and their worktrees are grouped together: project first, then its worktrees.
     /// Searching for a project name also shows its worktrees.
+    /// Uses cached project_names and worktrees_by_project (loaded in load_project_names).
     pub fn update_search_results(&mut self) {
         self.search_results.clear();
         let query = self.search_query.to_lowercase();
@@ -153,8 +151,6 @@ impl App {
         let active_names: HashSet<String> =
             self.session_infos.iter().map(|s| s.name.clone()).collect();
 
-        // Build reverse map: session_name → project_key for grouping
-        let registry = ProjectRegistry::load();
         let worktree_names_set: HashSet<String> =
             self.worktree_names.iter().cloned().collect();
 
@@ -176,61 +172,58 @@ impl App {
         }
 
         // Add projects with their worktrees grouped underneath.
-        // A project's worktrees also show when the project name matches the query.
-        for (key, config) in &registry.projects {
-            let session_name = ProjectRegistry::session_name(key, config);
-
-            // Skip if this is a worktree name (shouldn't be in projects, but guard)
-            if worktree_names_set.contains(&session_name) {
+        // Uses cached project_names (loaded once when entering search mode).
+        for session_name in &self.project_names {
+            // Skip if this is a worktree name
+            if worktree_names_set.contains(session_name) {
                 continue;
             }
 
             let project_matches = query.is_empty()
-                || session_name.to_lowercase().contains(&query)
-                || key.to_lowercase().contains(&query);
+                || session_name.to_lowercase().contains(&query);
 
-            // Get worktrees for this project
-            let worktrees = self.worktrees_by_project.get(key.as_str());
+            // Find worktrees for this project by checking worktrees_by_project keys
+            // The key in worktrees_by_project is the project_key, not session_name.
+            // We need to check all project keys whose worktrees might match.
+            let mut matching_worktrees: Vec<&String> = Vec::new();
+            let mut any_worktree_matches = false;
+            for (proj_key, wt_names) in &self.worktrees_by_project {
+                // Check if this project key is associated with this session_name
+                // by checking if the session_name contains the project key
+                if !session_name.to_lowercase().contains(&proj_key.to_lowercase()) {
+                    continue;
+                }
+                for wt in wt_names {
+                    if wt.to_lowercase().contains(&query) {
+                        any_worktree_matches = true;
+                    }
+                    matching_worktrees.push(wt);
+                }
+            }
 
-            // Check if any worktree name matches the query
-            let any_worktree_matches = worktrees
-                .map(|wts| {
-                    wts.iter()
-                        .any(|wt| wt.to_lowercase().contains(&query))
-                })
-                .unwrap_or(false);
-
-            // Show project if it matches or any of its worktrees match
             let show_project = project_matches || any_worktree_matches;
 
             if show_project {
-                // Add project entry (if not active/parked)
-                if !active_names.contains(&session_name)
-                    && !self.parked_sessions.contains_key(&session_name)
+                if !active_names.contains(session_name)
+                    && !self.parked_sessions.contains_key(session_name)
                 {
                     self.search_results
                         .push(SearchResult::Project(session_name.clone()));
                 }
 
-                // Add worktrees: show all if project matches, or just matching ones
-                if let Some(wt_names) = worktrees {
-                    for wt_name in wt_names {
-                        if added_worktrees.contains(wt_name) {
-                            continue;
-                        }
-                        if active_names.contains(wt_name)
-                            || self.parked_sessions.contains_key(wt_name)
-                        {
-                            continue;
-                        }
-                        // If project matched, show all its worktrees; otherwise only matching ones
-                        if project_matches
-                            || wt_name.to_lowercase().contains(&query)
-                        {
-                            self.search_results
-                                .push(SearchResult::Worktree(wt_name.clone()));
-                            added_worktrees.insert(wt_name.clone());
-                        }
+                for wt_name in &matching_worktrees {
+                    if added_worktrees.contains(*wt_name) {
+                        continue;
+                    }
+                    if active_names.contains(*wt_name)
+                        || self.parked_sessions.contains_key(*wt_name)
+                    {
+                        continue;
+                    }
+                    if project_matches || wt_name.to_lowercase().contains(&query) {
+                        self.search_results
+                            .push(SearchResult::Worktree((*wt_name).clone()));
+                        added_worktrees.insert((*wt_name).clone());
                     }
                 }
             }
@@ -258,9 +251,21 @@ impl App {
 
     /// Load project and worktree names lists (called when entering search mode)
     pub fn load_project_names(&mut self) {
-        self.project_names = list_project_names();
-        self.worktree_names = list_worktree_session_names();
-        self.worktrees_by_project = worktree_names_by_project();
+        self.project_names = ProjectRegistry::load().list_session_names();
+        let wt_state = crate::common::worktree::WorktreeState::load();
+        self.worktree_names = wt_state
+            .worktrees
+            .values()
+            .map(|e| e.session_name.clone())
+            .collect();
+        let mut by_project: HashMap<String, Vec<String>> = HashMap::new();
+        for entry in wt_state.worktrees.values() {
+            by_project
+                .entry(entry.project_key.clone())
+                .or_default()
+                .push(entry.session_name.clone());
+        }
+        self.worktrees_by_project = by_project;
     }
 
     /// Calculate lines needed to display a search result
@@ -735,11 +740,10 @@ impl App {
     }
 
     pub fn save_restorable(&self) {
-        let registry = ProjectRegistry::load();
         let restorable: Vec<String> = self
             .session_infos
             .iter()
-            .filter(|s| registry.has_project(&s.name))
+            .filter(|s| has_project_config(&s.name))
             .map(|s| s.name.clone())
             .collect();
         save_restorable_sessions(&restorable);

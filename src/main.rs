@@ -136,7 +136,7 @@ enum ProjectCommand {
         /// Files to symlink into worktrees (repeatable)
         #[arg(long = "symlink")]
         symlink_files: Vec<String>,
-        /// Custom hooks directory (defaults to <project_root>/.hive/hooks/)
+        /// Custom hooks directory (defaults to ~/.hive/projects/{key}/hooks/)
         #[arg(long)]
         hooks_dir: Option<String>,
     },
@@ -1392,25 +1392,29 @@ fn run_connect(key: &str) -> Result<()> {
 }
 
 /// Add a project to the registry
-#[allow(clippy::too_many_arguments)]
-fn run_project_add(
-    key: String,
-    emoji: String,
-    path: Option<String>,
-    display_name: Option<String>,
-    startup: Option<String>,
-    worktrees_dir: Option<String>,
-    base_branch: Option<String>,
-    package_manager: Option<String>,
-    ports_enabled: bool,
-    base_port: Option<u16>,
-    port_increment: Option<u16>,
-    db_enabled: bool,
-    db_prefix: Option<String>,
-    copy_files: Vec<String>,
-    symlink_files: Vec<String>,
-    hooks_dir: Option<String>,
-) -> Result<()> {
+fn run_project_add(cmd: ProjectCommand) -> Result<()> {
+    let ProjectCommand::Add {
+        key,
+        emoji,
+        path,
+        display_name,
+        startup,
+        worktrees_dir,
+        base_branch,
+        package_manager,
+        ports_enabled,
+        base_port,
+        port_increment,
+        db_enabled,
+        db_prefix,
+        copy_files,
+        symlink_files,
+        hooks_dir,
+    } = cmd
+    else {
+        unreachable!()
+    };
+
     let mut registry = ProjectRegistry::load();
 
     if registry.projects.contains_key(&key) {
@@ -1424,9 +1428,9 @@ fn run_project_add(
     });
 
     let config = ProjectConfig {
-        emoji: emoji.clone(),
+        emoji,
         project_root,
-        display_name: display_name.clone(),
+        display_name,
         startup_command: startup,
         worktrees_dir,
         default_base_branch: base_branch,
@@ -1573,6 +1577,7 @@ fn run_wt_new(
     wt_type: &str,
     prompt: Option<&str>,
 ) -> Result<()> {
+    use anyhow::Context;
     use crate::common::projects::expand_tilde;
     use crate::common::worktree::*;
 
@@ -1602,8 +1607,8 @@ fn run_wt_new(
     let hooks_dir = resolve_hooks_dir(config, project);
     let mut metadata = serde_json::json!({});
 
-    // Check if already registered
-    let state = WorktreeState::load();
+    // Check if already registered (single load, reused for insertion later)
+    let mut state = WorktreeState::load();
     if state.get(project, branch).is_some() {
         bail!(
             "Worktree '{}/{}' already exists in registry. Delete it first.",
@@ -1614,16 +1619,17 @@ fn run_wt_new(
 
     println!("Creating worktree {}/{}...", project, branch);
 
-    // 2. pre-create hook
-    let env = build_hook_env(
+    // 2. pre-create hook (uses estimated worktree path since it doesn't exist yet)
+    let pre_env = build_hook_env(
         project,
         branch,
         &worktrees_dir.join(branch),
         &project_root,
         &session_name,
         wt_type,
+        &hooks_dir,
     );
-    metadata = run_hook(&hooks_dir, "pre-create", &env, &metadata)?;
+    metadata = run_hook(&hooks_dir, "pre-create", &pre_env, &metadata)?;
 
     // 3. git worktree add
     let worktree_path = create_git_worktree(
@@ -1635,102 +1641,112 @@ fn run_wt_new(
     )?;
     println!("  Created worktree at {}", worktree_path.display());
 
-    // 4. post-worktree hook
-    let env = build_hook_env(
-        project,
-        branch,
-        &worktree_path,
-        &project_root,
-        &session_name,
-        wt_type,
-    );
-    metadata = run_hook(&hooks_dir, "post-worktree", &env, &metadata)?;
+    // Steps 4-12: any failure triggers cleanup of everything created so far.
+    // Track what was created so cleanup knows what to tear down.
+    let mut tmux_session_created = false;
 
-    // 5. Copy/symlink file patterns
-    if !config.files.copy.is_empty() {
-        copy_file_patterns(&project_root, &worktree_path, &config.files.copy)?;
-        println!("  Copied {} file pattern(s)", config.files.copy.len());
-    }
-    if !config.files.symlink.is_empty() {
-        symlink_file_patterns(&project_root, &worktree_path, &config.files.symlink)?;
-        println!("  Symlinked {} file pattern(s)", config.files.symlink.len());
-    }
-
-    // 6. Seed Claude memory
-    seed_memory(&project_root, &worktree_path)?;
-    println!("  Seeded Claude memory");
-
-    // 7. post-copy hook
-    let env = build_hook_env(
-        project,
-        branch,
-        &worktree_path,
-        &project_root,
-        &session_name,
-        wt_type,
-    );
-    metadata = run_hook(&hooks_dir, "post-copy", &env, &metadata)?;
-
-    // 8. Check metadata for session name override, create tmux session
-    if let Some(name_override) = metadata.get("session_name").and_then(|v| v.as_str()) {
-        session_name = name_override.to_string();
-    }
-
-    let tmux_created = std::process::Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
+    let result = (|| -> Result<()> {
+        // Build hook env once (reused for post-worktree, post-copy, post-setup)
+        let mut env = build_hook_env(
+            project,
+            branch,
+            &worktree_path,
+            &project_root,
             &session_name,
-            "-c",
-            &worktree_path.to_string_lossy(),
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+            wt_type,
+            &hooks_dir,
+        );
 
-    if !tmux_created {
-        bail!("Failed to create tmux session '{}'", session_name);
-    }
-    println!("  Created tmux session '{}'", session_name);
+        // 4. post-worktree hook
+        metadata = run_hook(&hooks_dir, "post-worktree", &env, &metadata)?;
 
-    // 9. Register in worktrees.json
-    let mut state = WorktreeState::load();
-    state.add(WorktreeEntry {
-        project_key: project.to_string(),
-        branch: branch.to_string(),
-        worktree_type: wt_type.to_string(),
-        path: worktree_path.to_string_lossy().to_string(),
-        session_name: session_name.clone(),
-        metadata: metadata.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    });
-    state.save()?;
+        // 5. Copy/symlink file patterns
+        if !config.files.copy.is_empty() {
+            copy_file_patterns(&project_root, &worktree_path, &config.files.copy)?;
+            println!("  Copied {} file pattern(s)", config.files.copy.len());
+        }
+        if !config.files.symlink.is_empty() {
+            symlink_file_patterns(&project_root, &worktree_path, &config.files.symlink)?;
+            println!("  Symlinked {} file pattern(s)", config.files.symlink.len());
+        }
 
-    // 10. post-setup hook
-    let env = build_hook_env(
-        project,
-        branch,
-        &worktree_path,
-        &project_root,
-        &session_name,
-        wt_type,
-    );
-    let _ = run_hook(&hooks_dir, "post-setup", &env, &metadata)?;
+        // 6. Seed Claude memory
+        seed_memory(&project_root, &worktree_path)?;
+        println!("  Seeded Claude memory");
 
-    // 11. Run startup command + send prompt
-    if let Some(ref cmd) = config.startup_command {
-        let _ = std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &session_name, cmd, "Enter"])
-            .output();
-    }
+        // 7. post-copy hook
+        metadata = run_hook(&hooks_dir, "post-copy", &env, &metadata)?;
 
-    if let Some(prompt_text) = prompt {
-        // Small delay to let Claude start up
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &session_name, prompt_text, "Enter"])
-            .output();
+        // 8. Check metadata for session name override, create tmux session
+        if let Some(name_override) = metadata.get("session_name").and_then(|v| v.as_str()) {
+            session_name = name_override.to_string();
+            env.insert("HIVE_SESSION_NAME".to_string(), session_name.clone());
+        }
+
+        let tmux_output = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-c",
+                &worktree_path.to_string_lossy(),
+            ])
+            .output()
+            .context("Failed to run tmux new-session")?;
+
+        if !tmux_output.status.success() {
+            let stderr = String::from_utf8_lossy(&tmux_output.stderr);
+            bail!(
+                "Failed to create tmux session '{}': {}",
+                session_name,
+                stderr.trim()
+            );
+        }
+        tmux_session_created = true;
+        println!("  Created tmux session '{}'", session_name);
+
+        // 9. Register in worktrees.json (reuse state loaded at step 1)
+        state.add(WorktreeEntry {
+            project_key: project.to_string(),
+            branch: branch.to_string(),
+            worktree_type: wt_type.to_string(),
+            path: worktree_path.to_string_lossy().to_string(),
+            session_name: session_name.clone(),
+            metadata: metadata.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        state.save()?;
+
+        // 10. post-setup hook
+        run_hook(&hooks_dir, "post-setup", &env, &metadata)?;
+
+        // 11. Run startup command + send prompt
+        if let Some(ref cmd) = config.startup_command {
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &session_name, cmd, "Enter"])
+                .output();
+        }
+
+        if let Some(prompt_text) = prompt {
+            // Small delay to let Claude start up
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &session_name, prompt_text, "Enter"])
+                .output();
+        }
+
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        eprintln!("  Error during worktree setup, cleaning up...");
+        if tmux_session_created {
+            use crate::common::tmux::kill_tmux_session;
+            kill_tmux_session(&session_name);
+        }
+        let _ = delete_git_worktree(&project_root, &worktree_path, branch, true, true);
+        return Err(e);
     }
 
     // 12. Switch to session
@@ -1794,6 +1810,7 @@ fn run_wt_delete(project: &str, branch: &str, keep_branch: bool, force: bool) ->
         &project_root,
         &entry.session_name,
         &entry.worktree_type,
+        &hooks_dir,
     );
 
     // 3. pre-delete hook (receives full metadata)
@@ -1804,16 +1821,16 @@ fn run_wt_delete(project: &str, branch: &str, keep_branch: bool, force: bool) ->
         println!("  Killed tmux session '{}'", entry.session_name);
     }
 
-    // 5. Remove from worktrees.json
-    let mut state = WorktreeState::load();
-    state.remove(project, branch);
-    state.save()?;
-
-    // 6. git worktree remove + optionally delete branch
+    // 5. git worktree remove + optionally delete branch (before registry removal)
     match delete_git_worktree(&project_root, &worktree_path, branch, keep_branch, force) {
         Ok(()) => println!("  Removed git worktree"),
         Err(e) => eprintln!("  Warning: git worktree removal: {}", e),
     }
+
+    // 6. Remove from worktrees.json (after git cleanup so entry stays if git fails)
+    let mut state = WorktreeState::load();
+    state.remove(project, branch);
+    state.save()?;
 
     // 7. post-delete hook
     let _ = run_hook(&hooks_dir, "post-delete", &env, &entry.metadata)?;
@@ -1955,41 +1972,7 @@ fn main() -> Result<()> {
         Some(Command::CyclePrev) => run_cycle(false),
         Some(Command::Connect { key }) => run_connect(&key),
         Some(Command::Project { command }) => match *command {
-            ProjectCommand::Add {
-                key,
-                emoji,
-                path,
-                display_name,
-                startup,
-                worktrees_dir,
-                base_branch,
-                package_manager,
-                ports_enabled,
-                base_port,
-                port_increment,
-                db_enabled,
-                db_prefix,
-                copy_files,
-                symlink_files,
-                hooks_dir,
-            } => run_project_add(
-                key,
-                emoji,
-                path,
-                display_name,
-                startup,
-                worktrees_dir,
-                base_branch,
-                package_manager,
-                ports_enabled,
-                base_port,
-                port_increment,
-                db_enabled,
-                db_prefix,
-                copy_files,
-                symlink_files,
-                hooks_dir,
-            ),
+            cmd @ ProjectCommand::Add { .. } => run_project_add(cmd),
             ProjectCommand::Remove { key } => run_project_remove(&key),
             ProjectCommand::List => run_project_list(),
             ProjectCommand::Import => run_project_import(),
