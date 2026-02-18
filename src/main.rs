@@ -383,11 +383,13 @@ fn run_tui(
                                 {
                                     match result {
                                         SearchResult::Active(idx) => {
-                                            app.open_detail(idx);
-                                            app.input_mode = InputMode::Normal;
-                                            app.search_query.clear();
-                                            app.search_results.clear();
-                                            needs_redraw = true;
+                                            if let Some(session_info) =
+                                                app.session_infos.get(idx)
+                                            {
+                                                switch_to_session(&session_info.name);
+                                                app.save_restorable();
+                                                return Ok(());
+                                            }
                                         }
                                         SearchResult::Parked(name) => {
                                             app.showing_parked_detail = Some(name);
@@ -791,8 +793,14 @@ fn run_hook(event_type: &str) -> Result<()> {
     let mut state = HookState::load();
 
     // Check auto-approve before notifications so we can skip alerting for auto-approved requests
+    // Skip auto-approve for plans (ExitPlanMode) and questions (AskUserQuestion) — those need human input
     let mut auto_approved = false;
-    if event_type == "PermissionRequest" {
+    let tool_name_str = json
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_human_input = tool_name_str == "ExitPlanMode" || tool_name_str == "AskUserQuestion";
+    if event_type == "PermissionRequest" && !is_human_input {
         if let Some(tmux_session) = get_current_tmux_session() {
             let auto_approve = load_auto_approve_sessions();
             if auto_approve.contains(&tmux_session) {
