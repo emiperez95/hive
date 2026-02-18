@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 38 unit tests
+cargo test                # 72 unit tests
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -33,6 +33,14 @@ hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostT
 hive setup              # register hooks in ~/.claude/settings.json + tmux keybind
 hive cycle-next         # switch to next tmux session (skipping skipped)
 hive cycle-prev         # switch to previous tmux session
+hive connect <key>      # create/attach tmux session for a registered project
+hive project add <key>  # add a project to the registry (supports all config flags)
+hive project remove <key> # remove a project from the registry
+hive project list       # list all configured projects
+hive project import     # import projects from sesh.toml
+hive wt new <project> <branch>  # create worktree + tmux session (with hooks)
+hive wt delete <project> <branch>  # delete worktree + session + branch
+hive wt list [project]  # list registered worktrees with tmux status
 ```
 
 ## Project Structure
@@ -50,6 +58,8 @@ src/
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
 │   ├── jsonl.rs            JSONL parsing for Claude status from ~/.claude/projects/
 │   ├── persistence.rs      file persistence for all txt-based state (parked, todos, muted, etc.)
+│   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
+│   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
 │   └── debug.rs            debug logging to cache dir
 ├── daemon/
 │   ├── hooks.rs            handle_hook_event(): maps HookEvent → SessionState updates
@@ -69,22 +79,34 @@ src/
 - `App` (tui/app.rs) — all TUI state: sessions, selection, input mode, parked, todos, flags
 - `SessionInfo` (common/types.rs) — enriched session data for display (processes, ports, status)
 - `ClaudeStatus` (common/types.rs) — TUI-side status enum mapped from SessionStatus
+- `ProjectRegistry` (common/projects.rs) — `HashMap<name, ProjectConfig>`, loaded from projects.toml
+- `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, etc.)
+- `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
+- `WorktreeEntry` (common/worktree.rs) — worktree record (project_key, branch, type, path, session_name, metadata, created_at)
 
-## Cache Directory
+## Data Directory
 
-`~/Library/Caches/hive/` (macOS) or `~/.cache/hive/` (Linux):
+All hive data lives under `~/.hive/`:
 
-| File | Format | Purpose |
-|------|--------|---------|
-| state.json | JSON | hook state (session statuses) |
-| parked.txt | lines: `name\tnote` | parked sessions |
-| todos.txt | TOML | per-session todo lists |
-| muted.txt | lines | muted session names |
-| auto-approve.txt | lines | auto-approve session names |
-| skipped.txt | lines | skipped-from-cycling session names |
-| restore.txt | lines | sessions to restore |
-| muted-global | empty file | global mute flag |
-| debug.log | text | debug log (--debug) |
+```
+~/.hive/
+├── projects.toml              # project registry
+├── cache/                     # runtime state
+│   ├── state.json             # hook state (session statuses)
+│   ├── worktrees.json         # registered worktrees
+│   ├── parked.txt             # parked sessions (name\tnote)
+│   ├── todos.txt              # per-session todo lists
+│   ├── muted.txt              # muted session names
+│   ├── auto-approve.txt       # auto-approve session names
+│   ├── skipped.txt            # skipped-from-cycling session names
+│   ├── restore.txt            # sessions to restore
+│   ├── muted-global           # global mute flag (empty file)
+│   └── debug.log              # debug log (--debug)
+└── projects/                  # per-project config
+    └── {project_key}/
+        ├── hooks/             # lifecycle hook scripts
+        └── lib/               # shared shell libraries for hooks
+```
 
 ## Platform Guards
 
@@ -105,7 +127,7 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 7. Parked detail → unpark, back
 8. Normal list → navigate, switch (exits app), approve permissions, search, quit
 
-Switching sessions (1-9, Enter in detail, sesh connect) always exits the app.
+Switching sessions (1-9, Enter in detail, connect project) always exits the app.
 
 ## Tmux Integration
 
@@ -116,7 +138,7 @@ Switching sessions (1-9, Enter in detail, sesh connect) always exits the app.
 
 ## Testing
 
-38 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
+72 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
 
 ## Conventions
 
@@ -125,3 +147,20 @@ Switching sessions (1-9, Enter in detail, sesh connect) always exits the app.
 - `anyhow::Result` for error handling throughout
 - `sysinfo::System` is kept alive in `App` for CPU delta accuracy (needs two refresh_all calls)
 - Stale sessions cleaned up after 10 minutes of inactivity (in hook handler)
+
+## Worktree Hooks
+
+Project hooks live in `~/.hive/projects/{project_key}/hooks/` (or custom `hooks_dir`). Shell scripts named `<hook>.sh`:
+
+| Hook | When | Use case |
+|------|------|----------|
+| pre-create | Before git worktree add | Validation, pre-checks |
+| post-worktree | After git worktree add | Port allocation, resource setup |
+| post-copy | After file copy/symlink + memory seed | Database setup, env config |
+| post-setup | After tmux session + registry | Final setup steps |
+| pre-delete | Before cleanup starts | Database teardown, resource cleanup |
+| post-delete | After full cleanup | Final teardown steps |
+
+**Hook env vars**: `HIVE_PROJECT_KEY`, `HIVE_BRANCH`, `HIVE_WORKTREE_PATH`, `HIVE_PROJECT_ROOT`, `HIVE_SESSION_NAME`, `HIVE_WORKTREE_TYPE`, `HIVE_METADATA` (JSON), `HIVE_METADATA_FILE` (write path).
+
+**Metadata protocol**: Hooks write JSON to `$HIVE_METADATA_FILE`. If `session_name` key is present, it overrides the default. All keys are stored in `worktrees.json` and passed to future hooks.

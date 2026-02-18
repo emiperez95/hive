@@ -694,12 +694,21 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                         }
                     }
                 }
-                SearchResult::SeshProject(name) => {
+                SearchResult::Project(name) => {
                     lines.push(Line::from(vec![
                         prefix,
                         Span::styled(". ", style),
                         Span::styled(name.clone(), style),
-                        Span::styled(" [sesh]", Style::default().fg(Color::Cyan)),
+                        Span::styled(" [project]", Style::default().fg(Color::Cyan)),
+                    ]));
+                    lines_remaining -= 1;
+                }
+                SearchResult::Worktree(name) => {
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::styled(". ", style),
+                        Span::styled(name.clone(), style),
+                        Span::styled(" [worktree]", Style::default().fg(Color::Green)),
                     ]));
                     lines_remaining -= 1;
                 }

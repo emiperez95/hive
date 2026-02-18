@@ -5,7 +5,7 @@ mod daemon;
 mod ipc;
 mod tui;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,8 +14,12 @@ use std::time::Duration;
 
 use crate::common::debug::{debug_log, init_debug};
 use crate::common::persistence::{
-    is_globally_muted, load_muted_sessions, load_skipped_sessions, save_parked_sessions,
-    sesh_connect,
+    is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_skipped_sessions,
+    save_parked_sessions,
+};
+use crate::common::projects::{
+    connect_project, connect_session, DatabaseConfig, FilePatterns, PortConfig, ProjectConfig,
+    ProjectRegistry,
 };
 use crate::common::tmux::{
     get_current_tmux_session, get_current_tmux_session_names, switch_to_session,
@@ -66,6 +70,131 @@ enum Command {
     CycleNext,
     /// Cycle to previous tmux session (skipping skipped sessions)
     CyclePrev,
+    /// Create/attach to a tmux session for a registered project
+    Connect {
+        /// Project key from the registry
+        key: String,
+    },
+    /// Manage the project registry
+    Project {
+        #[command(subcommand)]
+        command: Box<ProjectCommand>,
+    },
+    /// Manage git worktrees for registered projects
+    Wt {
+        #[command(subcommand)]
+        command: WtCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+enum ProjectCommand {
+    /// Add a project to the registry
+    Add {
+        /// Project key (used as identifier)
+        key: String,
+        /// Emoji identifier for session names
+        #[arg(short, long)]
+        emoji: String,
+        /// Project root path (defaults to current directory)
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Display name override (defaults to key)
+        #[arg(short = 'd', long)]
+        display_name: Option<String>,
+        /// Command to run on session startup
+        #[arg(short = 's', long)]
+        startup: Option<String>,
+        /// Directory for worktrees
+        #[arg(long)]
+        worktrees_dir: Option<String>,
+        /// Default git base branch for worktrees
+        #[arg(long)]
+        base_branch: Option<String>,
+        /// Package manager (npm, pnpm, yarn, etc.)
+        #[arg(long)]
+        package_manager: Option<String>,
+        /// Enable port management
+        #[arg(long)]
+        ports_enabled: bool,
+        /// Base port number
+        #[arg(long)]
+        base_port: Option<u16>,
+        /// Port increment between worktrees
+        #[arg(long)]
+        port_increment: Option<u16>,
+        /// Enable database management
+        #[arg(long)]
+        db_enabled: bool,
+        /// Database name prefix
+        #[arg(long)]
+        db_prefix: Option<String>,
+        /// Files to copy into worktrees (repeatable)
+        #[arg(long = "copy")]
+        copy_files: Vec<String>,
+        /// Files to symlink into worktrees (repeatable)
+        #[arg(long = "symlink")]
+        symlink_files: Vec<String>,
+        /// Custom hooks directory (defaults to ~/.hive/projects/{key}/hooks/)
+        #[arg(long)]
+        hooks_dir: Option<String>,
+    },
+    /// Remove a project from the registry
+    Remove {
+        /// Project key to remove
+        key: String,
+    },
+    /// List all configured projects
+    List,
+    /// Import projects from sesh.toml
+    Import,
+}
+
+#[derive(Subcommand, Debug)]
+enum WtCommand {
+    /// Create a new worktree for a registered project
+    New {
+        /// Project key from the registry
+        project: String,
+        /// Branch name for the worktree
+        branch: String,
+        /// Base branch to create from (defaults to project's default_base_branch or "main")
+        #[arg(long)]
+        base: Option<String>,
+        /// Attach to an existing branch instead of creating a new one
+        #[arg(long)]
+        existing: bool,
+        /// Worktree type label (defaults to "worktree")
+        #[arg(long = "type", default_value = "worktree")]
+        wt_type: String,
+        /// Send a prompt to Claude after startup
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+    /// Delete a worktree and its associated resources
+    Delete {
+        /// Project key from the registry
+        project: String,
+        /// Branch name of the worktree to delete
+        branch: String,
+        /// Keep the git branch after removing the worktree
+        #[arg(long)]
+        keep_branch: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// List worktrees (all or for a specific project)
+    List {
+        /// Optional project key to filter by
+        project: Option<String>,
+    },
+    /// Import existing git worktrees into worktrees.json
+    Import {
+        /// Project key to import worktrees for
+        project: String,
+    },
 }
 
 fn run_tui(
@@ -82,7 +211,7 @@ fn run_tui(
             return Ok(());
         }
 
-        if !app.showing_parked {
+        if !app.showing_parked && app.input_mode != InputMode::Search {
             app.refresh()?;
             app.maybe_periodic_save();
         }
@@ -267,11 +396,12 @@ fn run_tui(
                                             app.search_results.clear();
                                             needs_redraw = true;
                                         }
-                                        SearchResult::SeshProject(name) => {
+                                        SearchResult::Project(name)
+                                        | SearchResult::Worktree(name) => {
                                             app.input_mode = InputMode::Normal;
                                             app.search_query.clear();
                                             app.search_results.clear();
-                                            if sesh_connect(&name) {
+                                            if connect_session(&name) {
                                                 app.save_restorable();
                                                 return Ok(());
                                             } else {
@@ -432,7 +562,7 @@ fn run_tui(
                             }
                             KeyCode::Enter => {
                                 if let Some(name) = app.showing_parked_detail.take() {
-                                    if sesh_connect(&name) {
+                                    if connect_session(&name) {
                                         app.parked_sessions.remove(&name);
                                         save_parked_sessions(&app.parked_sessions);
                                         should_refresh = true;
@@ -499,7 +629,7 @@ fn run_tui(
                                 app.input_mode = InputMode::Search;
                                 app.search_query.clear();
                                 app.search_scroll_offset = 0;
-                                app.load_sesh_projects();
+                                app.load_project_names();
                                 app.update_search_results();
                                 app.selected = 0;
                                 needs_redraw = true;
@@ -660,9 +790,31 @@ fn run_hook(event_type: &str) -> Result<()> {
     // Load state, process event, save state
     let mut state = HookState::load();
 
+    // Check auto-approve before notifications so we can skip alerting for auto-approved requests
+    let mut auto_approved = false;
+    if event_type == "PermissionRequest" {
+        if let Some(tmux_session) = get_current_tmux_session() {
+            let auto_approve = load_auto_approve_sessions();
+            if auto_approve.contains(&tmux_session) {
+                auto_approved = true;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": {
+                                "behavior": "allow"
+                            }
+                        }
+                    })
+                );
+            }
+        }
+    }
+
     if let Some(updated_session) = handle_hook_event(&mut state, hook_event) {
-        // Send notification if session needs attention and not muted
-        if updated_session.needs_attention {
+        // Send notification if session needs attention, not muted, and not auto-approved
+        if updated_session.needs_attention && !auto_approved {
             let muted = load_muted_sessions();
             let global_mute = is_globally_muted();
 
@@ -1223,6 +1375,587 @@ fn run_cycle(forward: bool) -> Result<()> {
     Ok(())
 }
 
+/// Connect to a registered project by key
+fn run_connect(key: &str) -> Result<()> {
+    let registry = ProjectRegistry::load();
+    let config = registry
+        .projects
+        .get(key)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", key))?;
+
+    let session_name = ProjectRegistry::session_name(key, config);
+    if !connect_project(&session_name) {
+        anyhow::bail!("Failed to create/connect session for '{}'", key);
+    }
+    switch_to_session(&session_name);
+    Ok(())
+}
+
+/// Add a project to the registry
+fn run_project_add(cmd: ProjectCommand) -> Result<()> {
+    let ProjectCommand::Add {
+        key,
+        emoji,
+        path,
+        display_name,
+        startup,
+        worktrees_dir,
+        base_branch,
+        package_manager,
+        ports_enabled,
+        base_port,
+        port_increment,
+        db_enabled,
+        db_prefix,
+        copy_files,
+        symlink_files,
+        hooks_dir,
+    } = cmd
+    else {
+        unreachable!()
+    };
+
+    let mut registry = ProjectRegistry::load();
+
+    if registry.projects.contains_key(&key) {
+        anyhow::bail!("Project '{}' already exists. Remove it first to re-add.", key);
+    }
+
+    let project_root = path.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+
+    let config = ProjectConfig {
+        emoji,
+        project_root,
+        display_name,
+        startup_command: startup,
+        worktrees_dir,
+        default_base_branch: base_branch,
+        worktree_types: Vec::new(),
+        package_manager,
+        ports: PortConfig {
+            enabled: ports_enabled,
+            base_port: base_port.unwrap_or(0),
+            increment: port_increment.unwrap_or(1),
+        },
+        database: DatabaseConfig {
+            enabled: db_enabled,
+            prefix: db_prefix,
+        },
+        files: FilePatterns {
+            copy: copy_files,
+            symlink: symlink_files,
+        },
+        hooks_dir,
+    };
+
+    let session_name = ProjectRegistry::session_name(&key, &config);
+    registry.add_project(key, config);
+    registry.save()?;
+    println!("Added project '{}'", session_name);
+    Ok(())
+}
+
+/// Remove a project from the registry
+fn run_project_remove(key: &str) -> Result<()> {
+    let mut registry = ProjectRegistry::load();
+    if !registry.remove_project(key) {
+        anyhow::bail!("Project '{}' not found in registry", key);
+    }
+    registry.save()?;
+    println!("Removed project '{}'", key);
+    Ok(())
+}
+
+/// List all configured projects
+fn run_project_list() -> Result<()> {
+    let registry = ProjectRegistry::load();
+
+    if registry.projects.is_empty() {
+        println!("No projects configured. Use 'hive project add' or 'hive project import'.");
+        return Ok(());
+    }
+
+    // Sort by key for consistent output
+    let mut entries: Vec<_> = registry.projects.iter().collect();
+    entries.sort_by_key(|(k, _)| k.as_str());
+
+    // Calculate column widths
+    let max_key = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let max_session = entries
+        .iter()
+        .map(|(k, c)| ProjectRegistry::session_name(k, c).len())
+        .max()
+        .unwrap_or(0);
+
+    println!(
+        "{:<width_k$}  {:<width_s$}  PATH",
+        "KEY",
+        "SESSION",
+        width_k = max_key,
+        width_s = max_session
+    );
+    println!(
+        "{:<width_k$}  {:<width_s$}  ----",
+        "-".repeat(max_key),
+        "-".repeat(max_session),
+        width_k = max_key,
+        width_s = max_session
+    );
+
+    for (key, config) in &entries {
+        let session = ProjectRegistry::session_name(key, config);
+        println!(
+            "{:<width_k$}  {:<width_s$}  {}",
+            key,
+            session,
+            config.project_root,
+            width_k = max_key,
+            width_s = max_session
+        );
+    }
+
+    println!("\n{} project(s)", entries.len());
+    Ok(())
+}
+
+/// Import projects from sesh.toml
+fn run_project_import() -> Result<()> {
+    use crate::common::projects::parse_sesh_toml;
+
+    // Check ~/.config/sesh/sesh.toml first (common on macOS), then XDG config dir
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let dot_config_path = home.join(".config").join("sesh").join("sesh.toml");
+    let xdg_path = dirs::config_dir().map(|p| p.join("sesh").join("sesh.toml"));
+
+    let sesh_path = if dot_config_path.exists() {
+        dot_config_path
+    } else if let Some(ref xdg) = xdg_path {
+        if xdg.exists() {
+            xdg.clone()
+        } else {
+            anyhow::bail!(
+                "sesh.toml not found at {:?} or {:?}",
+                dot_config_path,
+                xdg
+            );
+        }
+    } else {
+        anyhow::bail!("sesh.toml not found at {:?}", dot_config_path);
+    };
+
+    let entries = parse_sesh_toml(&sesh_path)?;
+    let mut registry = ProjectRegistry::load();
+    let mut added = 0;
+    let mut skipped = 0;
+
+    for (key, config) in entries {
+        if registry.projects.contains_key(&key) {
+            skipped += 1;
+        } else {
+            let name = ProjectRegistry::session_name(&key, &config);
+            println!("  + {}", name);
+            registry.add_project(key, config);
+            added += 1;
+        }
+    }
+
+    registry.save()?;
+    println!("\nImported {} project(s), skipped {} existing", added, skipped);
+    Ok(())
+}
+
+/// Create a new worktree: full 12-step workflow with hooks
+fn run_wt_new(
+    project: &str,
+    branch: &str,
+    base: Option<&str>,
+    existing: bool,
+    wt_type: &str,
+    prompt: Option<&str>,
+) -> Result<()> {
+    use anyhow::Context;
+    use crate::common::projects::expand_tilde;
+    use crate::common::worktree::*;
+
+    // 1. Load project config, resolve worktrees dir, build default session name
+    let registry = ProjectRegistry::load();
+    let config = registry
+        .projects
+        .get(project)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", project))?;
+
+    let worktrees_dir = registry
+        .resolve_worktrees_dir(project, config)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No worktrees directory configured for '{}'. Set 'worktrees_dir' on the project or 'worktrees_root' globally in projects.toml.",
+                project
+            )
+        })?;
+
+    let project_root = expand_tilde(&config.project_root);
+    let base_branch = base
+        .map(|s| s.to_string())
+        .or_else(|| config.default_base_branch.clone())
+        .unwrap_or_else(|| "main".to_string());
+
+    let mut session_name = build_session_name(config, wt_type, branch);
+    let hooks_dir = resolve_hooks_dir(config, project);
+    let mut metadata = serde_json::json!({});
+
+    // Check if already registered (single load, reused for insertion later)
+    let mut state = WorktreeState::load();
+    if state.get(project, branch).is_some() {
+        bail!(
+            "Worktree '{}/{}' already exists in registry. Delete it first.",
+            project,
+            branch
+        );
+    }
+
+    println!("Creating worktree {}/{}...", project, branch);
+
+    // 2. pre-create hook (uses estimated worktree path since it doesn't exist yet)
+    let pre_env = build_hook_env(
+        project,
+        branch,
+        &worktrees_dir.join(branch),
+        &project_root,
+        &session_name,
+        wt_type,
+        &hooks_dir,
+    );
+    metadata = run_hook(&hooks_dir, "pre-create", &pre_env, &metadata)?;
+
+    // 3. git worktree add
+    let worktree_path = create_git_worktree(
+        &project_root,
+        &worktrees_dir,
+        branch,
+        &base_branch,
+        existing,
+    )?;
+    println!("  Created worktree at {}", worktree_path.display());
+
+    // Steps 4-12: any failure triggers cleanup of everything created so far.
+    // Track what was created so cleanup knows what to tear down.
+    let mut tmux_session_created = false;
+
+    let result = (|| -> Result<()> {
+        // Build hook env once (reused for post-worktree, post-copy, post-setup)
+        let mut env = build_hook_env(
+            project,
+            branch,
+            &worktree_path,
+            &project_root,
+            &session_name,
+            wt_type,
+            &hooks_dir,
+        );
+
+        // 4. post-worktree hook
+        metadata = run_hook(&hooks_dir, "post-worktree", &env, &metadata)?;
+
+        // 5. Copy/symlink file patterns
+        if !config.files.copy.is_empty() {
+            copy_file_patterns(&project_root, &worktree_path, &config.files.copy)?;
+            println!("  Copied {} file pattern(s)", config.files.copy.len());
+        }
+        if !config.files.symlink.is_empty() {
+            symlink_file_patterns(&project_root, &worktree_path, &config.files.symlink)?;
+            println!("  Symlinked {} file pattern(s)", config.files.symlink.len());
+        }
+
+        // 6. Seed Claude memory
+        seed_memory(&project_root, &worktree_path)?;
+        println!("  Seeded Claude memory");
+
+        // 7. post-copy hook
+        metadata = run_hook(&hooks_dir, "post-copy", &env, &metadata)?;
+
+        // 8. Check metadata for session name override, create tmux session
+        if let Some(name_override) = metadata.get("session_name").and_then(|v| v.as_str()) {
+            session_name = name_override.to_string();
+            env.insert("HIVE_SESSION_NAME".to_string(), session_name.clone());
+        }
+
+        let tmux_output = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-c",
+                &worktree_path.to_string_lossy(),
+            ])
+            .output()
+            .context("Failed to run tmux new-session")?;
+
+        if !tmux_output.status.success() {
+            let stderr = String::from_utf8_lossy(&tmux_output.stderr);
+            bail!(
+                "Failed to create tmux session '{}': {}",
+                session_name,
+                stderr.trim()
+            );
+        }
+        tmux_session_created = true;
+        println!("  Created tmux session '{}'", session_name);
+
+        // 9. Register in worktrees.json (reuse state loaded at step 1)
+        state.add(WorktreeEntry {
+            project_key: project.to_string(),
+            branch: branch.to_string(),
+            worktree_type: wt_type.to_string(),
+            path: worktree_path.to_string_lossy().to_string(),
+            session_name: session_name.clone(),
+            metadata: metadata.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        state.save()?;
+
+        // 10. post-setup hook
+        run_hook(&hooks_dir, "post-setup", &env, &metadata)?;
+
+        // 11. Run startup command (append prompt as argument if provided)
+        if let Some(ref cmd) = config.startup_command {
+            let full_cmd = match prompt {
+                Some(p) => format!("{} {:?}", cmd, p),
+                None => cmd.clone(),
+            };
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &session_name, &full_cmd, "Enter"])
+                .output();
+        }
+
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        eprintln!("  Error during worktree setup, cleaning up...");
+        if tmux_session_created {
+            use crate::common::tmux::kill_tmux_session;
+            kill_tmux_session(&session_name);
+        }
+        let _ = delete_git_worktree(&project_root, &worktree_path, branch, true, true);
+        return Err(e);
+    }
+
+    // 12. Switch to session
+    switch_to_session(&session_name);
+    println!("Switched to session '{}'", session_name);
+
+    Ok(())
+}
+
+/// Delete a worktree: full 7-step workflow with hooks
+fn run_wt_delete(project: &str, branch: &str, keep_branch: bool, force: bool) -> Result<()> {
+    use crate::common::projects::expand_tilde;
+    use crate::common::tmux::kill_tmux_session;
+    use crate::common::worktree::*;
+
+    // 1. Look up entry in worktrees.json
+    let state = WorktreeState::load();
+    let entry = state
+        .get(project, branch)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Worktree '{}/{}' not found in registry. Use 'hive wt list' to see registered worktrees.",
+                project,
+                branch
+            )
+        })?
+        .clone();
+
+    let registry = ProjectRegistry::load();
+    let config = registry
+        .projects
+        .get(project)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", project))?;
+
+    let project_root = expand_tilde(&config.project_root);
+    let worktree_path = std::path::PathBuf::from(&entry.path);
+
+    // 2. Confirmation prompt
+    if !force {
+        println!(
+            "Delete worktree '{}/{}' (session: '{}', path: {})?",
+            project, branch, entry.session_name, entry.path
+        );
+        print!("[y/N] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let hooks_dir = resolve_hooks_dir(config, project);
+    let env = build_hook_env(
+        project,
+        branch,
+        &worktree_path,
+        &project_root,
+        &entry.session_name,
+        &entry.worktree_type,
+        &hooks_dir,
+    );
+
+    // 3. pre-delete hook (receives full metadata)
+    let _ = run_hook(&hooks_dir, "pre-delete", &env, &entry.metadata)?;
+
+    // 4. Kill tmux session
+    if kill_tmux_session(&entry.session_name) {
+        println!("  Killed tmux session '{}'", entry.session_name);
+    }
+
+    // 5. git worktree remove + optionally delete branch (before registry removal)
+    match delete_git_worktree(&project_root, &worktree_path, branch, keep_branch, force) {
+        Ok(()) => println!("  Removed git worktree"),
+        Err(e) => eprintln!("  Warning: git worktree removal: {}", e),
+    }
+
+    // 6. Remove from worktrees.json (after git cleanup so entry stays if git fails)
+    let mut state = WorktreeState::load();
+    state.remove(project, branch);
+    state.save()?;
+
+    // 7. post-delete hook
+    let _ = run_hook(&hooks_dir, "post-delete", &env, &entry.metadata)?;
+
+    println!("Deleted worktree '{}/{}'", project, branch);
+    Ok(())
+}
+
+/// List worktrees with tmux session status
+fn run_wt_list(project: Option<&str>) -> Result<()> {
+    let state = crate::common::worktree::WorktreeState::load();
+    let tmux_sessions = get_current_tmux_session_names();
+
+    let mut entries: Vec<_> = if let Some(proj) = project {
+        state
+            .worktrees
+            .values()
+            .filter(|e| e.project_key == proj)
+            .collect()
+    } else {
+        state.worktrees.values().collect()
+    };
+
+    if entries.is_empty() {
+        if let Some(proj) = project {
+            println!("No worktrees registered for project '{}'.", proj);
+        } else {
+            println!("No worktrees registered. Use 'hive wt new' to create one.");
+        }
+        return Ok(());
+    }
+
+    // Sort by project then branch
+    entries.sort_by(|a, b| {
+        a.project_key
+            .cmp(&b.project_key)
+            .then(a.branch.cmp(&b.branch))
+    });
+
+    // Calculate column widths
+    let max_key = entries
+        .iter()
+        .map(|e| WorktreeState::make_key(&e.project_key, &e.branch).len())
+        .max()
+        .unwrap_or(0);
+    let max_session = entries
+        .iter()
+        .map(|e| e.session_name.len())
+        .max()
+        .unwrap_or(0);
+
+    use crate::common::worktree::WorktreeState;
+
+    println!(
+        "{:<width_k$}  {:<width_s$}  STATUS  PATH",
+        "WORKTREE",
+        "SESSION",
+        width_k = max_key,
+        width_s = max_session
+    );
+    println!(
+        "{:<width_k$}  {:<width_s$}  ------  ----",
+        "-".repeat(max_key),
+        "-".repeat(max_session),
+        width_k = max_key,
+        width_s = max_session
+    );
+
+    for entry in &entries {
+        let wt_key = WorktreeState::make_key(&entry.project_key, &entry.branch);
+        let status = if tmux_sessions.contains(&entry.session_name) {
+            "active"
+        } else {
+            "dead"
+        };
+        println!(
+            "{:<width_k$}  {:<width_s$}  {:<6}  {}",
+            wt_key,
+            entry.session_name,
+            status,
+            entry.path,
+            width_k = max_key,
+            width_s = max_session
+        );
+    }
+
+    println!("\n{} worktree(s)", entries.len());
+    Ok(())
+}
+
+/// Import existing git worktrees into worktrees.json
+fn run_wt_import(project: &str) -> Result<()> {
+    use crate::common::worktree::import_worktrees;
+
+    let registry = ProjectRegistry::load();
+    let config = registry
+        .projects
+        .get(project)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", project))?;
+
+    let worktrees_dir = registry
+        .resolve_worktrees_dir(project, config)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No worktrees directory configured for '{}'. Set 'worktrees_dir' on the project or 'worktrees_root' globally.",
+                project
+            )
+        })?;
+
+    let tmux_sessions = get_current_tmux_session_names();
+
+    println!("Scanning git worktrees for '{}'...", project);
+    let imported = import_worktrees(project, config, &worktrees_dir, &tmux_sessions)?;
+
+    if imported.is_empty() {
+        println!("No new worktrees found to import.");
+    } else {
+        for entry in &imported {
+            println!(
+                "  + {}/{} → session '{}'",
+                entry.project_key, entry.branch, entry.session_name
+            );
+        }
+        println!("\nImported {} worktree(s)", imported.len());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     init_debug(args.debug);
@@ -1233,6 +1966,38 @@ fn main() -> Result<()> {
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::CycleNext) => run_cycle(true),
         Some(Command::CyclePrev) => run_cycle(false),
+        Some(Command::Connect { key }) => run_connect(&key),
+        Some(Command::Project { command }) => match *command {
+            cmd @ ProjectCommand::Add { .. } => run_project_add(cmd),
+            ProjectCommand::Remove { key } => run_project_remove(&key),
+            ProjectCommand::List => run_project_list(),
+            ProjectCommand::Import => run_project_import(),
+        },
+        Some(Command::Wt { command }) => match command {
+            WtCommand::New {
+                project,
+                branch,
+                base,
+                existing,
+                wt_type,
+                prompt,
+            } => run_wt_new(
+                &project,
+                &branch,
+                base.as_deref(),
+                existing,
+                &wt_type,
+                prompt.as_deref(),
+            ),
+            WtCommand::Delete {
+                project,
+                branch,
+                keep_branch,
+                force,
+            } => run_wt_delete(&project, &branch, keep_branch, force),
+            WtCommand::List { project } => run_wt_list(project.as_deref()),
+            WtCommand::Import { project } => run_wt_import(&project),
+        },
         Some(Command::Tui) | None => {
             // Set up signal handler for graceful shutdown
             let running = Arc::new(AtomicBool::new(true));

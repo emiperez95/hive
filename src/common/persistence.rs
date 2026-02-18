@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::Command;
+
 
 /// Escape newlines for single-line file storage
 fn escape_newlines(s: &str) -> String {
@@ -33,9 +33,14 @@ fn unescape_newlines(s: &str) -> String {
     result
 }
 
-/// Get the cache directory for hive
-fn cache_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|p| p.join("hive"))
+/// Get the hive home directory: ~/.hive/
+pub(crate) fn hive_home() -> Option<PathBuf> {
+    dirs::home_dir().map(|p| p.join(".hive"))
+}
+
+/// Get the cache directory for hive: ~/.hive/cache/
+pub(crate) fn cache_dir() -> Option<PathBuf> {
+    hive_home().map(|p| p.join("cache"))
 }
 
 /// Get the path to the parked sessions file
@@ -145,42 +150,6 @@ pub fn save_restorable_sessions(session_names: &[String]) {
             let _ = writeln!(file, "{}", name);
         }
     }
-}
-
-/// Check if a session name has a matching sesh config
-pub fn has_sesh_config(name: &str) -> bool {
-    Command::new("sesh")
-        .args(["list"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|line| line == name)
-        })
-        .unwrap_or(false)
-}
-
-/// Unpark a session via sesh connect
-pub fn sesh_connect(name: &str) -> bool {
-    Command::new("sesh")
-        .args(["connect", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// List configured sesh project names (from sesh.toml only, not zoxide history)
-pub fn list_sesh_projects() -> Vec<String> {
-    Command::new("sesh")
-        .args(["list", "--config"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Get the path to the auto-approve sessions file

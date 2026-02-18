@@ -2,12 +2,12 @@
 
 use crate::common::debug::debug_log;
 use crate::common::persistence::{
-    has_sesh_config, is_globally_muted, list_sesh_projects, load_auto_approve_sessions,
-    load_muted_sessions, load_parked_sessions, load_session_todos, load_skipped_sessions,
-    save_auto_approve_sessions, save_muted_sessions, save_parked_sessions,
-    save_restorable_sessions, save_session_todos, save_skipped_sessions, sesh_connect,
+    is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_parked_sessions,
+    load_session_todos, load_skipped_sessions, save_auto_approve_sessions, save_muted_sessions,
+    save_parked_sessions, save_restorable_sessions, save_session_todos, save_skipped_sessions,
     set_global_mute,
 };
+use crate::common::projects::{connect_session, has_project_config, ProjectRegistry};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
@@ -30,12 +30,13 @@ pub enum InputMode {
     Search,   // Interactive session search
 }
 
-/// Search result item - active session, parked one, or inactive sesh project
+/// Search result item - active session, parked one, inactive project, or worktree
 #[derive(Clone)]
 pub enum SearchResult {
     Active(usize),       // Index into session_infos
     Parked(String),      // Session name from parked_sessions
-    SeshProject(String), // Sesh project name (not active, not parked)
+    Project(String),     // Project name from registry (not active, not parked)
+    Worktree(String),    // Worktree session name from worktrees.json (not active, not parked)
 }
 
 /// TUI application state
@@ -72,7 +73,9 @@ pub struct App {
     pub search_query: String,
     pub search_results: Vec<SearchResult>,
     pub search_scroll_offset: usize, // Scroll offset for search results
-    pub sesh_projects: Vec<String>,  // Cached list of all sesh projects
+    pub project_names: Vec<String>,   // Cached list of all project session names
+    pub worktree_names: Vec<String>,                       // Flat list of all worktree session names
+    pub worktrees_by_project: HashMap<String, Vec<String>>, // project_key → worktree session names
     // Parked session detail view
     pub showing_parked_detail: Option<String>, // parked session name being viewed
     // Per-session auto-approve toggle
@@ -122,7 +125,9 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_scroll_offset: 0,
-            sesh_projects: Vec::new(),
+            project_names: Vec::new(),
+            worktree_names: Vec::new(),
+            worktrees_by_project: HashMap::new(),
             showing_parked_detail: None,
             auto_approve_sessions: load_auto_approve_sessions(),
             muted_sessions: load_muted_sessions(),
@@ -134,7 +139,10 @@ impl App {
         }
     }
 
-    /// Update search results based on current query
+    /// Update search results based on current query.
+    /// Projects and their worktrees are grouped together: project first, then its worktrees.
+    /// Searching for a project name also shows its worktrees.
+    /// Uses cached project_names and worktrees_by_project (loaded in load_project_names).
     pub fn update_search_results(&mut self) {
         self.search_results.clear();
         let query = self.search_query.to_lowercase();
@@ -142,6 +150,12 @@ impl App {
         // Collect active session names for deduplication
         let active_names: HashSet<String> =
             self.session_infos.iter().map(|s| s.name.clone()).collect();
+
+        let worktree_names_set: HashSet<String> =
+            self.worktree_names.iter().cloned().collect();
+
+        // Track which worktrees were already added (to avoid duplicates)
+        let mut added_worktrees: HashSet<String> = HashSet::new();
 
         // Add matching active sessions
         for (i, info) in self.session_infos.iter().enumerate() {
@@ -157,14 +171,75 @@ impl App {
             }
         }
 
-        // Add matching sesh projects that are not active and not parked
-        for name in &self.sesh_projects {
-            if active_names.contains(name) || self.parked_sessions.contains_key(name) {
+        // Add projects with their worktrees grouped underneath.
+        // Uses cached project_names (loaded once when entering search mode).
+        for session_name in &self.project_names {
+            // Skip if this is a worktree name
+            if worktree_names_set.contains(session_name) {
+                continue;
+            }
+
+            let project_matches = query.is_empty()
+                || session_name.to_lowercase().contains(&query);
+
+            // Find worktrees for this project by checking worktrees_by_project keys
+            // The key in worktrees_by_project is the project_key, not session_name.
+            // We need to check all project keys whose worktrees might match.
+            let mut matching_worktrees: Vec<&String> = Vec::new();
+            let mut any_worktree_matches = false;
+            for (proj_key, wt_names) in &self.worktrees_by_project {
+                // Check if this project key is associated with this session_name
+                // by checking if the session_name contains the project key
+                if !session_name.to_lowercase().contains(&proj_key.to_lowercase()) {
+                    continue;
+                }
+                for wt in wt_names {
+                    if wt.to_lowercase().contains(&query) {
+                        any_worktree_matches = true;
+                    }
+                    matching_worktrees.push(wt);
+                }
+            }
+
+            let show_project = project_matches || any_worktree_matches;
+
+            if show_project {
+                if !active_names.contains(session_name)
+                    && !self.parked_sessions.contains_key(session_name)
+                {
+                    self.search_results
+                        .push(SearchResult::Project(session_name.clone()));
+                }
+
+                for wt_name in &matching_worktrees {
+                    if added_worktrees.contains(*wt_name) {
+                        continue;
+                    }
+                    if active_names.contains(*wt_name)
+                        || self.parked_sessions.contains_key(*wt_name)
+                    {
+                        continue;
+                    }
+                    if project_matches || wt_name.to_lowercase().contains(&query) {
+                        self.search_results
+                            .push(SearchResult::Worktree((*wt_name).clone()));
+                        added_worktrees.insert((*wt_name).clone());
+                    }
+                }
+            }
+        }
+
+        // Add any orphan worktrees (no matching project in registry)
+        for name in &self.worktree_names {
+            if added_worktrees.contains(name)
+                || active_names.contains(name)
+                || self.parked_sessions.contains_key(name)
+            {
                 continue;
             }
             if query.is_empty() || name.to_lowercase().contains(&query) {
                 self.search_results
-                    .push(SearchResult::SeshProject(name.clone()));
+                    .push(SearchResult::Worktree(name.clone()));
             }
         }
 
@@ -174,9 +249,23 @@ impl App {
         }
     }
 
-    /// Load sesh projects list (called when entering search mode)
-    pub fn load_sesh_projects(&mut self) {
-        self.sesh_projects = list_sesh_projects();
+    /// Load project and worktree names lists (called when entering search mode)
+    pub fn load_project_names(&mut self) {
+        self.project_names = ProjectRegistry::load().list_session_names();
+        let wt_state = crate::common::worktree::WorktreeState::load();
+        self.worktree_names = wt_state
+            .worktrees
+            .values()
+            .map(|e| e.session_name.clone())
+            .collect();
+        let mut by_project: HashMap<String, Vec<String>> = HashMap::new();
+        for entry in wt_state.worktrees.values() {
+            by_project
+                .entry(entry.project_key.clone())
+                .or_default()
+                .push(entry.session_name.clone());
+        }
+        self.worktrees_by_project = by_project;
     }
 
     /// Calculate lines needed to display a search result
@@ -191,7 +280,8 @@ impl App {
                 }
                 1
             }
-            SearchResult::SeshProject(_) => 1,
+            SearchResult::Project(_) => 1,
+            SearchResult::Worktree(_) => 1,
         }
     }
 
@@ -437,10 +527,7 @@ impl App {
             ));
         }
 
-        // Update search results if in search mode
-        if self.input_mode == InputMode::Search {
-            self.update_search_results();
-        } else if !self.session_infos.is_empty() {
+        if !self.session_infos.is_empty() {
             if self.selected >= self.session_infos.len() {
                 self.selected = self.session_infos.len() - 1;
             }
@@ -492,9 +579,9 @@ impl App {
     pub fn start_park_session(&mut self, idx: usize) {
         if let Some(session_info) = self.session_infos.get(idx) {
             let name = session_info.name.clone();
-            if !has_sesh_config(&name) {
+            if !has_project_config(&name) {
                 self.error_message = Some((
-                    format!("Cannot park '{}': no sesh config", name),
+                    format!("Cannot park '{}': no project config", name),
                     Instant::now(),
                 ));
                 return;
@@ -537,7 +624,7 @@ impl App {
         let list = self.parked_list();
         if let Some((name, _note)) = list.get(self.parked_selected) {
             let name = name.clone();
-            if sesh_connect(&name) {
+            if connect_session(&name) {
                 self.parked_sessions.remove(&name);
                 save_parked_sessions(&self.parked_sessions);
                 self.showing_parked = false;
@@ -656,7 +743,7 @@ impl App {
         let restorable: Vec<String> = self
             .session_infos
             .iter()
-            .filter(|s| has_sesh_config(&s.name))
+            .filter(|s| has_project_config(&s.name))
             .map(|s| s.name.clone())
             .collect();
         save_restorable_sessions(&restorable);
