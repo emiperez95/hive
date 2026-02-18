@@ -89,7 +89,7 @@ pub struct SessionInfo {
     pub listening_ports: Vec<ListeningPort>,
 }
 
-/// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'u' for unparked, 'p' for park)
+/// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'f' for favorite)
 pub const PERMISSION_KEYS: [char; 6] = ['y', 'z', 'x', 'w', 'v', 't'];
 
 /// Truncate a command string for display

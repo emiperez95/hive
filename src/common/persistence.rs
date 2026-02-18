@@ -1,4 +1,4 @@
-//! File persistence for parked sessions, todos, and session restore.
+//! File persistence for favorites, todos, and session restore.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -43,45 +43,37 @@ pub(crate) fn cache_dir() -> Option<PathBuf> {
     hive_home().map(|p| p.join("cache"))
 }
 
-/// Get the path to the parked sessions file
-pub fn get_parked_file_path() -> Option<PathBuf> {
-    cache_dir().map(|p| p.join("parked.txt"))
+/// Get the path to the favorites file
+pub fn get_favorites_file_path() -> Option<PathBuf> {
+    cache_dir().map(|p| p.join("favorites.txt"))
 }
 
-/// Load parked sessions from disk (name -> note)
-pub fn load_parked_sessions() -> HashMap<String, String> {
-    let Some(path) = get_parked_file_path() else {
-        return HashMap::new();
+/// Load favorite session names from disk
+pub fn load_favorite_sessions() -> HashSet<String> {
+    let Some(path) = get_favorites_file_path() else {
+        return HashSet::new();
     };
     let Ok(file) = fs::File::open(&path) else {
-        return HashMap::new();
+        return HashSet::new();
     };
     BufReader::new(file)
         .lines()
         .map_while(Result::ok)
         .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            // Format: "session-name\tnote" or just "session-name" (for backwards compat)
-            if let Some((name, note)) = line.split_once('\t') {
-                (name.to_string(), unescape_newlines(note))
-            } else {
-                (line, String::new())
-            }
-        })
         .collect()
 }
 
-/// Save parked sessions to disk (tab-separated: name\tnote)
-pub fn save_parked_sessions(parked: &HashMap<String, String>) {
-    let Some(path) = get_parked_file_path() else {
+/// Save favorite session names to disk
+pub fn save_favorite_sessions(sessions: &HashSet<String>) {
+    let Some(path) = get_favorites_file_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(mut file) = fs::File::create(&path) {
-        for (name, note) in parked {
-            let _ = writeln!(file, "{}\t{}", name, escape_newlines(note));
+        for name in sessions {
+            let _ = writeln!(file, "{}", name);
         }
     }
 }

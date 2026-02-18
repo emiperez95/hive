@@ -57,7 +57,7 @@ src/
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
 │   ├── jsonl.rs            JSONL parsing for Claude status from ~/.claude/projects/
-│   ├── persistence.rs      file persistence for all txt-based state (parked, todos, muted, etc.)
+│   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
 │   └── debug.rs            debug logging to cache dir
@@ -67,8 +67,8 @@ src/
 ├── ipc/
 │   └── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
 └── tui/
-    ├── app.rs              App struct, refresh(), session management, search, parking, todos
-    └── ui.rs               ratatui rendering (list, detail, parked, search, help, input modals)
+    ├── app.rs              App struct, refresh(), session management, search, favorites, todos
+    └── ui.rs               ratatui rendering (list, detail, search, help, input modals)
 ```
 
 ## Key Types
@@ -76,7 +76,7 @@ src/
 - `HookState` (ipc/messages.rs) — `HashMap<session_id, SessionState>`, serialized to state.json
 - `SessionState` — session_id, cwd, status, needs_attention, last_activity
 - `SessionStatus` — Working, Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked
-- `App` (tui/app.rs) — all TUI state: sessions, selection, input mode, parked, todos, flags
+- `App` (tui/app.rs) — all TUI state: sessions, selection, input mode, favorites, todos, flags
 - `SessionInfo` (common/types.rs) — enriched session data for display (processes, ports, status)
 - `ClaudeStatus` (common/types.rs) — TUI-side status enum mapped from SessionStatus
 - `ProjectRegistry` (common/projects.rs) — `HashMap<name, ProjectConfig>`, loaded from projects.toml
@@ -94,7 +94,7 @@ All hive data lives under `~/.hive/`:
 ├── cache/                     # runtime state
 │   ├── state.json             # hook state (session statuses)
 │   ├── worktrees.json         # registered worktrees
-│   ├── parked.txt             # parked sessions (name\tnote)
+│   ├── favorites.txt           # favorite session names
 │   ├── todos.txt              # per-session todo lists
 │   ├── muted.txt              # muted session names
 │   ├── auto-approve.txt       # auto-approve session names
@@ -119,13 +119,10 @@ macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other
 All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::Press` only (crossterm 0.28 sends release events that break Esc in tmux popups). The if/else chain priority:
 
 1. Help screen → `?`/Esc dismiss, `Q` quit
-2. Parked view → navigate, unpark, back
-3. ParkNote input → text entry modal
-4. AddTodo input → text entry modal
-5. Search mode → filter, navigate, select
-6. Detail view → todos, ports, switch, park, flags
-7. Parked detail → unpark, back
-8. Normal list → navigate, switch (exits app), approve permissions, search, quit
+2. AddTodo input → text entry modal
+3. Search mode → filter, navigate, select
+4. Detail view → todos, ports, switch, favorite, flags
+5. Normal list → navigate, switch (exits app), approve permissions, search, quit
 
 Switching sessions (1-9, Enter in detail, connect project) always exits the app.
 

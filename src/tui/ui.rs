@@ -38,10 +38,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         } else {
             "hive [DETAIL]".to_string()
         }
-    } else if let Some(ref name) = app.showing_parked_detail {
-        format!("hive [{}]", name)
-    } else if app.showing_parked {
-        "hive [PARKED]".to_string()
     } else {
         "hive".to_string()
     };
@@ -77,15 +73,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         render_search_view(frame, app, chunks[1]);
     } else if app.showing_detail.is_some() {
         render_detail_view(frame, app, chunks[1]);
-        if app.input_mode == InputMode::ParkNote {
-            render_input_modal(frame, app, chunks[1], "Park", "park", Color::Yellow);
-        } else if app.input_mode == InputMode::AddTodo {
+        if app.input_mode == InputMode::AddTodo {
             render_input_modal(frame, app, chunks[1], "Add Todo", "add", Color::Cyan);
         }
-    } else if app.showing_parked_detail.is_some() {
-        render_parked_detail_view(frame, app, chunks[1]);
-    } else if app.showing_parked {
-        render_parked_view(frame, app, chunks[1]);
     } else {
         render_session_list(frame, app, chunks[1]);
     }
@@ -124,8 +114,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("elete "),
             Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("switch "),
-            Span::styled("[P]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("ark "),
+            Span::styled("[F]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("av "),
             Span::styled("[!]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("auto "),
             Span::styled("[M]", Style::default().add_modifier(Modifier::BOLD)),
@@ -139,73 +129,25 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("uit"),
         ])
-    } else if app.showing_parked_detail.is_some() {
-        Line::from(vec![
-            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("unpark "),
-            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("back "),
-            Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("uit"),
-        ])
-    } else if app.showing_parked {
-        Line::from(vec![
-            Span::styled("[a-z]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("select "),
-            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("unpark "),
-            Span::styled("[U/Esc]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("back "),
-            Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("uit"),
-        ])
     } else {
-        let parked_count = app.parked_sessions.len();
-        let mut spans = vec![
+        Line::from(vec![
             Span::styled("[↑↓]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("select "),
             Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("detail "),
             Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("switch "),
-        ];
-        if parked_count > 0 {
-            spans.push(Span::styled(
-                "[U]",
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(format!("parked({}) ", parked_count)));
-        } else {
-            spans.push(Span::styled(
-                "[U]",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            spans.push(Span::styled(
-                "parked ",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        spans.push(Span::styled(
-            "[R]",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw("efresh "));
-        spans.push(Span::styled(
-            "[M]",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw("ute "));
-        spans.push(Span::styled(
-            "[?]",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw("help "));
-        spans.push(Span::styled(
-            "[Q]",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw("uit"));
-        Line::from(spans)
+            Span::styled("[/]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("search "),
+            Span::styled("[R]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("efresh "),
+            Span::styled("[M]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("ute "),
+            Span::styled("[?]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("help "),
+            Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("uit"),
+        ])
     };
     frame.render_widget(Paragraph::new(footer), chunks[3]);
 }
@@ -224,7 +166,6 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    y/z/x/w/v  Approve permission (once)"),
         Line::raw("    Y/Z/X/W/V  Approve permission (always)"),
         Line::raw("    /           Search sessions"),
-        Line::raw("    U           View parked sessions"),
         Line::raw("    M           Toggle global mute"),
         Line::raw("    R           Force refresh"),
         Line::raw(""),
@@ -236,7 +177,7 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    Enter       Switch to session / open port in Chrome"),
         Line::raw("    A           Add todo"),
         Line::raw("    D           Delete selected todo"),
-        Line::raw("    P           Park session (requires sesh)"),
+        Line::raw("    F           Toggle favorite"),
         Line::raw("    !           Toggle auto-approve"),
         Line::raw("    M           Toggle notifications mute"),
         Line::raw("    S           Toggle skip from cycling"),
@@ -355,6 +296,8 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" ")
         };
 
+        let is_fav = app.is_favorite(&session_info.name);
+
         if is_claude {
             let header_style = if is_selected {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -364,9 +307,15 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
             };
 
+            let sep = if is_fav {
+                Span::styled("★", Style::default().fg(Color::Yellow))
+            } else {
+                Span::styled(".", header_style)
+            };
+
             let mut header_spans = vec![
                 prefix_span,
-                Span::styled(".", header_style),
+                sep,
                 Span::styled(" ", header_style),
                 Span::styled(
                     session_info.name.clone(),
@@ -513,9 +462,15 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().add_modifier(Modifier::DIM)
             };
 
+            let sep = if is_fav {
+                Span::styled("★", Style::default().fg(Color::Yellow))
+            } else {
+                Span::styled(".", header_style)
+            };
+
             let mut header_spans = vec![
                 prefix_span,
-                Span::styled(".", header_style),
+                sep,
                 Span::styled(" ", header_style),
                 Span::styled(session_info.name.clone(), header_style),
                 Span::styled(" [", header_style),
@@ -549,59 +504,6 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
         lines_remaining -= needed;
         idx += 1;
-    }
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// Render the parked sessions view
-pub fn render_parked_view(frame: &mut Frame, app: &mut App, area: Rect) {
-    let parked_list = app.parked_list();
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::raw(""));
-
-    if parked_list.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No parked sessions",
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-    } else {
-        for (i, (name, note)) in parked_list.iter().enumerate() {
-            let letter = (b'a' + i as u8) as char;
-            let is_selected = i == app.parked_selected;
-
-            let prefix = if is_selected {
-                Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
-            } else {
-                Span::styled(
-                    format!("{}", letter),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )
-            };
-
-            let style = if is_selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-
-            lines.push(Line::from(vec![
-                prefix,
-                Span::styled(". ", style),
-                Span::styled(name.clone(), style),
-            ]));
-
-            if !note.is_empty() {
-                let note_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
-                for (j, note_line) in note.split('\n').enumerate() {
-                    let prefix = if j == 0 { "   → " } else { "     " };
-                    lines.push(Line::from(Span::styled(
-                        format!("{}{}", prefix, note_line),
-                        note_style,
-                    )));
-                }
-            }
-        }
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -659,40 +561,6 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                         Span::styled(status_text, Style::default().fg(Color::Cyan)),
                     ]));
                     lines_remaining -= 1;
-                }
-                SearchResult::Parked(name) => {
-                    let has_note = app
-                        .parked_sessions
-                        .get(name)
-                        .map(|n| !n.is_empty())
-                        .unwrap_or(false);
-                    let needed = if has_note { 2 } else { 1 };
-                    if lines_remaining < needed {
-                        break;
-                    }
-
-                    lines.push(Line::from(vec![
-                        prefix,
-                        Span::styled(". ", style),
-                        Span::styled(name.clone(), style),
-                        Span::styled(" [parked]", Style::default().fg(Color::DarkGray)),
-                    ]));
-                    lines_remaining -= 1;
-
-                    if has_note {
-                        if let Some(note) = app.parked_sessions.get(name) {
-                            let note_style =
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
-                            for (j, note_line) in note.split('\n').enumerate() {
-                                let prefix = if j == 0 { "   → " } else { "     " };
-                                lines.push(Line::from(Span::styled(
-                                    format!("{}{}", prefix, note_line),
-                                    note_style,
-                                )));
-                                lines_remaining -= 1;
-                            }
-                        }
-                    }
                 }
                 SearchResult::Project(name) => {
                     lines.push(Line::from(vec![
@@ -783,6 +651,12 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let mut flag_spans: Vec<Span> = Vec::new();
+    if app.is_favorite(&session_info.name) {
+        flag_spans.push(Span::styled(
+            "[★ fav] ",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     if app.is_auto_approved(&session_info.name) {
         flag_spans.push(Span::styled(
             "[auto-approve] ",
@@ -1082,45 +956,3 @@ fn render_input_modal(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Render the parked session detail view
-pub fn render_parked_detail_view(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::raw(""));
-
-    let Some(ref name) = app.showing_parked_detail else {
-        return;
-    };
-    let note = app.parked_sessions.get(name).cloned().unwrap_or_default();
-
-    lines.push(Line::from(vec![
-        Span::styled("Session: ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-    ]));
-
-    lines.push(Line::raw(""));
-
-    lines.push(Line::from(Span::styled(
-        "Note:",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    if note.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no note)",
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", note),
-            Style::default().fg(Color::Cyan),
-        )));
-    }
-
-    lines.push(Line::raw(""));
-
-    lines.push(Line::from(vec![
-        Span::styled("Status: ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("[parked]", Style::default().fg(Color::DarkGray)),
-    ]));
-
-    frame.render_widget(Paragraph::new(lines), area);
-}

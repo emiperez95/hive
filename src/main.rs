@@ -15,7 +15,6 @@ use std::time::Duration;
 use crate::common::debug::{debug_log, init_debug};
 use crate::common::persistence::{
     is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_skipped_sessions,
-    save_parked_sessions,
 };
 use crate::common::projects::{
     connect_project, connect_session, DatabaseConfig, FilePatterns, PortConfig, ProjectConfig,
@@ -211,7 +210,7 @@ fn run_tui(
             return Ok(());
         }
 
-        if !app.showing_parked && app.input_mode != InputMode::Search {
+        if app.input_mode != InputMode::Search {
             app.refresh()?;
             app.maybe_periodic_save();
         }
@@ -258,10 +257,9 @@ fn run_tui(
                 }) = read()?
                 {
                     debug_log(&format!(
-                        "KEY: {:?} (mode={:?}, showing_parked={}, showing_detail={:?}, showing_help={})",
+                        "KEY: {:?} (mode={:?}, showing_detail={:?}, showing_help={})",
                         code,
                         app.input_mode,
-                        app.showing_parked,
                         app.showing_detail.is_some(),
                         app.showing_help,
                     ));
@@ -276,73 +274,6 @@ fn run_tui(
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 app.save_restorable();
                                 return Ok(());
-                            }
-                            _ => {}
-                        }
-                    } else if app.showing_parked {
-                        match code {
-                            KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Esc => {
-                                app.showing_parked = false;
-                                app.parked_selected = 0;
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                app.save_restorable();
-                                return Ok(());
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if app.parked_selected > 0 {
-                                    app.parked_selected -= 1;
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                let count = app.parked_list().len();
-                                if count > 0 && app.parked_selected < count - 1 {
-                                    app.parked_selected += 1;
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter => {
-                                app.unpark_selected();
-                                if !app.showing_parked {
-                                    return Ok(());
-                                }
-                                should_refresh = true;
-                                break;
-                            }
-                            KeyCode::Char(c) if c.is_ascii_lowercase() => {
-                                let idx = (c as u8 - b'a') as usize;
-                                let count = app.parked_list().len();
-                                if idx < count {
-                                    app.parked_selected = idx;
-                                    needs_redraw = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::ParkNote {
-                        match code {
-                            KeyCode::Esc => {
-                                app.cancel_park_input();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => {
-                                app.input_buffer.push('\n');
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter => {
-                                app.complete_park_session();
-                                should_refresh = true;
-                                break;
-                            }
-                            KeyCode::Backspace => {
-                                app.input_buffer.pop();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                app.input_buffer.push(c);
-                                needs_redraw = true;
                             }
                             _ => {}
                         }
@@ -390,13 +321,6 @@ fn run_tui(
                                                 app.save_restorable();
                                                 return Ok(());
                                             }
-                                        }
-                                        SearchResult::Parked(name) => {
-                                            app.showing_parked_detail = Some(name);
-                                            app.input_mode = InputMode::Normal;
-                                            app.search_query.clear();
-                                            app.search_results.clear();
-                                            needs_redraw = true;
                                         }
                                         SearchResult::Project(name)
                                         | SearchResult::Worktree(name) => {
@@ -526,9 +450,9 @@ fn run_tui(
                                     return Ok(());
                                 }
                             }
-                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                            KeyCode::Char('f') | KeyCode::Char('F') => {
                                 if let Some(idx) = app.showing_detail {
-                                    app.start_park_session(idx);
+                                    app.toggle_favorite(idx);
                                     needs_redraw = true;
                                 }
                             }
@@ -548,35 +472,6 @@ fn run_tui(
                                 if let Some(idx) = app.showing_detail {
                                     app.toggle_skip(idx);
                                     needs_redraw = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else if app.showing_parked_detail.is_some() {
-                        match code {
-                            KeyCode::Esc => {
-                                app.showing_parked_detail = None;
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                app.save_restorable();
-                                return Ok(());
-                            }
-                            KeyCode::Enter => {
-                                if let Some(name) = app.showing_parked_detail.take() {
-                                    if connect_session(&name) {
-                                        app.parked_sessions.remove(&name);
-                                        save_parked_sessions(&app.parked_sessions);
-                                        should_refresh = true;
-                                        break;
-                                    } else {
-                                        app.error_message = Some((
-                                            format!("Failed to unpark '{}'", name),
-                                            std::time::Instant::now(),
-                                        ));
-                                        app.showing_parked_detail = Some(name);
-                                        needs_redraw = true;
-                                    }
                                 }
                             }
                             _ => {}
@@ -601,11 +496,6 @@ fn run_tui(
                                     app.open_detail(app.selected);
                                     needs_redraw = true;
                                 }
-                            }
-                            KeyCode::Char('u') | KeyCode::Char('U') => {
-                                app.showing_parked = true;
-                                app.parked_selected = 0;
-                                needs_redraw = true;
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 should_refresh = true;

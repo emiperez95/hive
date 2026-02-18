@@ -2,15 +2,15 @@
 
 use crate::common::debug::debug_log;
 use crate::common::persistence::{
-    is_globally_muted, load_auto_approve_sessions, load_muted_sessions, load_parked_sessions,
-    load_session_todos, load_skipped_sessions, save_auto_approve_sessions, save_muted_sessions,
-    save_parked_sessions, save_restorable_sessions, save_session_todos, save_skipped_sessions,
+    is_globally_muted, load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions,
+    load_session_todos, load_skipped_sessions, save_auto_approve_sessions, save_favorite_sessions,
+    save_muted_sessions, save_restorable_sessions, save_session_todos, save_skipped_sessions,
     set_global_mute,
 };
-use crate::common::projects::{connect_session, has_project_config, ProjectRegistry};
+use crate::common::projects::{has_project_config, ProjectRegistry};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
-use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
+use crate::common::tmux::get_tmux_sessions;
 use crate::common::types::{
     lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
 };
@@ -25,18 +25,16 @@ use sysinfo::System;
 #[derive(Debug, PartialEq)]
 pub enum InputMode {
     Normal,
-    ParkNote, // Entering note for parking
-    AddTodo,  // Adding a todo in detail view
-    Search,   // Interactive session search
+    AddTodo, // Adding a todo in detail view
+    Search,  // Interactive session search
 }
 
-/// Search result item - active session, parked one, inactive project, or worktree
+/// Search result item - active session, inactive project, or worktree
 #[derive(Clone)]
 pub enum SearchResult {
-    Active(usize),       // Index into session_infos
-    Parked(String),      // Session name from parked_sessions
-    Project(String),     // Project name from registry (not active, not parked)
-    Worktree(String),    // Worktree session name from worktrees.json (not active, not parked)
+    Active(usize),    // Index into session_infos
+    Project(String),  // Project name from registry (not active)
+    Worktree(String), // Worktree session name from worktrees.json (not active)
 }
 
 /// TUI application state
@@ -48,15 +46,12 @@ pub struct App {
     pub selected: usize,
     pub scroll_offset: usize,
     pub show_selection: bool,
-    // Parking feature
-    pub parked_sessions: HashMap<String, String>, // name -> note
-    pub showing_parked: bool,
-    pub parked_selected: usize,
+    // Favorites
+    pub favorite_sessions: HashSet<String>,
     pub error_message: Option<(String, Instant)>,
-    // Text input (park note or add todo)
+    // Text input
     pub input_mode: InputMode,
     pub input_buffer: String,
-    pub pending_park_session: Option<usize>, // session index to park after note entry
     // Session todos
     pub session_todos: HashMap<String, Vec<String>>, // name -> list of todos
     // Detail view
@@ -76,8 +71,6 @@ pub struct App {
     pub project_names: Vec<String>,   // Cached list of all project session names
     pub worktree_names: Vec<String>,                       // Flat list of all worktree session names
     pub worktrees_by_project: HashMap<String, Vec<String>>, // project_key → worktree session names
-    // Parked session detail view
-    pub showing_parked_detail: Option<String>, // parked session name being viewed
     // Per-session auto-approve toggle
     pub auto_approve_sessions: HashSet<String>,
     // Per-session notification mute
@@ -108,13 +101,10 @@ impl App {
             selected: 0,
             scroll_offset: 0,
             show_selection: false,
-            parked_sessions: load_parked_sessions(),
-            showing_parked: false,
-            parked_selected: 0,
+            favorite_sessions: load_favorite_sessions(),
             error_message: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
-            pending_park_session: None,
             session_todos: load_session_todos(),
             showing_detail: None,
             detail_selected: 0,
@@ -128,7 +118,6 @@ impl App {
             project_names: Vec::new(),
             worktree_names: Vec::new(),
             worktrees_by_project: HashMap::new(),
-            showing_parked_detail: None,
             auto_approve_sessions: load_auto_approve_sessions(),
             muted_sessions: load_muted_sessions(),
             global_mute: is_globally_muted(),
@@ -161,13 +150,6 @@ impl App {
         for (i, info) in self.session_infos.iter().enumerate() {
             if query.is_empty() || info.name.to_lowercase().contains(&query) {
                 self.search_results.push(SearchResult::Active(i));
-            }
-        }
-
-        // Add matching parked sessions
-        for name in self.parked_sessions.keys() {
-            if query.is_empty() || name.to_lowercase().contains(&query) {
-                self.search_results.push(SearchResult::Parked(name.clone()));
             }
         }
 
@@ -204,9 +186,7 @@ impl App {
             let show_project = project_matches || any_worktree_matches;
 
             if show_project {
-                if !active_names.contains(session_name)
-                    && !self.parked_sessions.contains_key(session_name)
-                {
+                if !active_names.contains(session_name) {
                     self.search_results
                         .push(SearchResult::Project(session_name.clone()));
                 }
@@ -215,9 +195,7 @@ impl App {
                     if added_worktrees.contains(*wt_name) {
                         continue;
                     }
-                    if active_names.contains(*wt_name)
-                        || self.parked_sessions.contains_key(*wt_name)
-                    {
+                    if active_names.contains(*wt_name) {
                         continue;
                     }
                     if project_matches || wt_name.to_lowercase().contains(&query) {
@@ -231,10 +209,7 @@ impl App {
 
         // Add any orphan worktrees (no matching project in registry)
         for name in &self.worktree_names {
-            if added_worktrees.contains(name)
-                || active_names.contains(name)
-                || self.parked_sessions.contains_key(name)
-            {
+            if added_worktrees.contains(name) || active_names.contains(name) {
                 continue;
             }
             if query.is_empty() || name.to_lowercase().contains(&query) {
@@ -271,17 +246,7 @@ impl App {
     /// Calculate lines needed to display a search result
     fn lines_for_search_result(&self, result: &SearchResult) -> usize {
         match result {
-            SearchResult::Active(_) => 1,
-            SearchResult::Parked(name) => {
-                if let Some(note) = self.parked_sessions.get(name) {
-                    if !note.is_empty() {
-                        return 2;
-                    }
-                }
-                1
-            }
-            SearchResult::Project(_) => 1,
-            SearchResult::Worktree(_) => 1,
+            SearchResult::Active(_) | SearchResult::Project(_) | SearchResult::Worktree(_) => 1,
         }
     }
 
@@ -435,10 +400,11 @@ impl App {
             });
         }
 
-        // Sort: Claude (non-skipped) -> non-Claude (non-skipped) -> skipped
+        // Sort: favorites first, then Claude (non-skipped) -> non-Claude (non-skipped) -> skipped
         session_infos.sort_by_key(|s| {
+            let is_favorite = self.favorite_sessions.contains(&s.name);
             let is_skipped = self.skipped_sessions.contains(&s.name);
-            (is_skipped, s.claude_status.is_none())
+            (!is_favorite, is_skipped, s.claude_status.is_none())
         });
 
         // Stable permission key assignment
@@ -564,75 +530,25 @@ impl App {
         }
     }
 
-    /// Get sorted list of parked sessions (name, note)
-    pub fn parked_list(&self) -> Vec<(String, String)> {
-        let mut list: Vec<_> = self
-            .parked_sessions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        list.sort_by(|a, b| a.0.cmp(&b.0));
-        list
-    }
-
-    /// Start parking a session
-    pub fn start_park_session(&mut self, idx: usize) {
-        if let Some(session_info) = self.session_infos.get(idx) {
-            let name = session_info.name.clone();
-            if !has_project_config(&name) {
-                self.error_message = Some((
-                    format!("Cannot park '{}': no project config", name),
-                    Instant::now(),
-                ));
-                return;
-            }
-            self.input_mode = InputMode::ParkNote;
-            self.input_buffer.clear();
-            self.pending_park_session = Some(idx);
+    /// Toggle favorite for a session by index
+    pub fn toggle_favorite(&mut self, idx: usize) {
+        let Some(session_info) = self.session_infos.get(idx) else {
+            return;
+        };
+        let name = session_info.name.clone();
+        if self.favorite_sessions.contains(&name) {
+            self.favorite_sessions.remove(&name);
+            self.error_message = Some((format!("Unfavorited '{}'", name), Instant::now()));
+        } else {
+            self.favorite_sessions.insert(name.clone());
+            self.error_message = Some((format!("Favorited '{}'", name), Instant::now()));
         }
+        save_favorite_sessions(&self.favorite_sessions);
     }
 
-    /// Complete parking a session with the given note
-    pub fn complete_park_session(&mut self) {
-        if let Some(idx) = self.pending_park_session.take() {
-            if let Some(session_info) = self.session_infos.get(idx) {
-                let name = session_info.name.clone();
-                let note = self.input_buffer.trim().to_string();
-                if kill_tmux_session(&name) {
-                    self.parked_sessions.insert(name.clone(), note);
-                    save_parked_sessions(&self.parked_sessions);
-                    self.showing_detail = None;
-                } else {
-                    self.error_message =
-                        Some((format!("Failed to kill session '{}'", name), Instant::now()));
-                }
-            }
-        }
-        self.input_mode = InputMode::Normal;
-        self.input_buffer.clear();
-    }
-
-    /// Cancel note input
-    pub fn cancel_park_input(&mut self) {
-        self.input_mode = InputMode::Normal;
-        self.input_buffer.clear();
-        self.pending_park_session = None;
-    }
-
-    /// Unpark the selected parked session
-    pub fn unpark_selected(&mut self) {
-        let list = self.parked_list();
-        if let Some((name, _note)) = list.get(self.parked_selected) {
-            let name = name.clone();
-            if connect_session(&name) {
-                self.parked_sessions.remove(&name);
-                save_parked_sessions(&self.parked_sessions);
-                self.showing_parked = false;
-                self.parked_selected = 0;
-            } else {
-                self.error_message = Some((format!("Failed to unpark '{}'", name), Instant::now()));
-            }
-        }
+    /// Check if a session is favorited
+    pub fn is_favorite(&self, name: &str) -> bool {
+        self.favorite_sessions.contains(name)
     }
 
     /// Clear error message if it's older than 3 seconds
