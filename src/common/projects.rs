@@ -205,9 +205,19 @@ impl ProjectRegistry {
     }
 }
 
-/// Check if a session name has a matching project config (replaces has_sesh_config)
+/// Check if a session name has a matching project config or worktree entry
 pub fn has_project_config(session_name: &str) -> bool {
     ProjectRegistry::load().has_project(session_name)
+        || crate::common::worktree::find_worktree_by_session_name(session_name).is_some()
+}
+
+/// Connect/create a tmux session for a project or worktree.
+/// Tries project registry first, then worktrees.json.
+pub fn connect_session(session_name: &str) -> bool {
+    if connect_project(session_name) {
+        return true;
+    }
+    crate::common::worktree::connect_worktree(session_name)
 }
 
 /// Connect/create a tmux session for a project (replaces sesh_connect)
@@ -257,9 +267,11 @@ pub fn connect_project(session_name: &str) -> bool {
     true
 }
 
-/// List all project session names (replaces list_sesh_projects)
+/// List all project and worktree session names
 pub fn list_project_names() -> Vec<String> {
-    ProjectRegistry::load().list_session_names()
+    let mut names = ProjectRegistry::load().list_session_names();
+    names.extend(crate::common::worktree::list_worktree_session_names());
+    names
 }
 
 /// Sesh session entry for parsing sesh.toml

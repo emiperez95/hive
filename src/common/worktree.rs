@@ -102,6 +102,92 @@ pub fn build_session_name(config: &ProjectConfig, wt_type: &str, branch: &str) -
     format!("{} {}-{}", config.emoji, wt_type, branch)
 }
 
+// ─── Worktree lookup helpers ─────────────────────────────────────────────────
+
+/// List all worktree session names from worktrees.json
+pub fn list_worktree_session_names() -> Vec<String> {
+    WorktreeState::load()
+        .worktrees
+        .values()
+        .map(|e| e.session_name.clone())
+        .collect()
+}
+
+/// List worktree session names grouped by project key.
+/// Returns a map of project_key → Vec<session_name>.
+pub fn worktree_names_by_project() -> HashMap<String, Vec<String>> {
+    let state = WorktreeState::load();
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in state.worktrees.values() {
+        map.entry(entry.project_key.clone())
+            .or_default()
+            .push(entry.session_name.clone());
+    }
+    map
+}
+
+/// Find a worktree entry by its session name. Returns None if not found.
+pub fn find_worktree_by_session_name(session_name: &str) -> Option<WorktreeEntry> {
+    WorktreeState::load()
+        .worktrees
+        .values()
+        .find(|e| e.session_name == session_name)
+        .cloned()
+}
+
+/// Connect/create a tmux session for a worktree (similar to connect_project).
+/// Creates the session at the worktree path if it doesn't exist.
+pub fn connect_worktree(session_name: &str) -> bool {
+    let Some(entry) = find_worktree_by_session_name(session_name) else {
+        return false;
+    };
+
+    let path = &entry.path;
+
+    // Check if session already exists
+    let exists = Command::new("tmux")
+        .args(["has-session", "-t", &entry.session_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !exists {
+        // Create new detached session at worktree path
+        let success = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &entry.session_name,
+                "-c",
+                path,
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !success {
+            return false;
+        }
+
+        // Run startup command from the parent project config if available
+        let registry = crate::common::projects::ProjectRegistry::load();
+        if let Some((_, config)) = registry
+            .projects
+            .iter()
+            .find(|(k, _)| **k == entry.project_key)
+        {
+            if let Some(ref cmd) = config.startup_command {
+                let _ = Command::new("tmux")
+                    .args(["send-keys", "-t", &entry.session_name, cmd, "Enter"])
+                    .output();
+            }
+        }
+    }
+
+    true
+}
+
 // ─── Import ─────────────────────────────────────────────────────────────────
 
 /// Import existing git worktrees into worktrees.json.

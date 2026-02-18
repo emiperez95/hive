@@ -703,6 +703,15 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                     ]));
                     lines_remaining -= 1;
                 }
+                SearchResult::Worktree(name) => {
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::styled(". ", style),
+                        Span::styled(name.clone(), style),
+                        Span::styled(" [worktree]", Style::default().fg(Color::Green)),
+                    ]));
+                    lines_remaining -= 1;
+                }
             }
             idx += 1;
         }

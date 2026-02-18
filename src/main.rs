@@ -18,7 +18,8 @@ use crate::common::persistence::{
     save_parked_sessions,
 };
 use crate::common::projects::{
-    connect_project, DatabaseConfig, FilePatterns, PortConfig, ProjectConfig, ProjectRegistry,
+    connect_project, connect_session, DatabaseConfig, FilePatterns, PortConfig, ProjectConfig,
+    ProjectRegistry,
 };
 use crate::common::tmux::{
     get_current_tmux_session, get_current_tmux_session_names, switch_to_session,
@@ -210,7 +211,7 @@ fn run_tui(
             return Ok(());
         }
 
-        if !app.showing_parked {
+        if !app.showing_parked && app.input_mode != InputMode::Search {
             app.refresh()?;
             app.maybe_periodic_save();
         }
@@ -395,11 +396,12 @@ fn run_tui(
                                             app.search_results.clear();
                                             needs_redraw = true;
                                         }
-                                        SearchResult::Project(name) => {
+                                        SearchResult::Project(name)
+                                        | SearchResult::Worktree(name) => {
                                             app.input_mode = InputMode::Normal;
                                             app.search_query.clear();
                                             app.search_results.clear();
-                                            if connect_project(&name) {
+                                            if connect_session(&name) {
                                                 app.save_restorable();
                                                 return Ok(());
                                             } else {
@@ -560,7 +562,7 @@ fn run_tui(
                             }
                             KeyCode::Enter => {
                                 if let Some(name) = app.showing_parked_detail.take() {
-                                    if connect_project(&name) {
+                                    if connect_session(&name) {
                                         app.parked_sessions.remove(&name);
                                         save_parked_sessions(&app.parked_sessions);
                                         should_refresh = true;
