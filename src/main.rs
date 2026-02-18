@@ -1721,18 +1721,14 @@ fn run_wt_new(
         // 10. post-setup hook
         run_hook(&hooks_dir, "post-setup", &env, &metadata)?;
 
-        // 11. Run startup command + send prompt
+        // 11. Run startup command (append prompt as argument if provided)
         if let Some(ref cmd) = config.startup_command {
+            let full_cmd = match prompt {
+                Some(p) => format!("{} {:?}", cmd, p),
+                None => cmd.clone(),
+            };
             let _ = std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &session_name, cmd, "Enter"])
-                .output();
-        }
-
-        if let Some(prompt_text) = prompt {
-            // Small delay to let Claude start up
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &session_name, prompt_text, "Enter"])
+                .args(["send-keys", "-t", &session_name, &full_cmd, "Enter"])
                 .output();
         }
 
