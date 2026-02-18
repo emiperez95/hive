@@ -27,6 +27,9 @@ use crate::common::types::PERMISSION_KEYS;
 use crate::tui::app::{find_session_by_permission_key, App, InputMode, SearchResult};
 use crate::tui::ui::ui;
 
+/// Bundled janus-wt-portal agent definition, embedded at compile time.
+const JANUS_AGENT_CONTENT: &str = include_str!("../.claude/agents/janus-wt-portal.md");
+
 #[derive(Parser, Debug)]
 #[command(name = "hive")]
 #[command(about = "Interactive Claude Code session dashboard for tmux")]
@@ -897,10 +900,30 @@ fn run_setup() -> Result<()> {
         println!("  [missing] tmux Ctrl+p keybinding (cycle prev)");
     }
 
+    // Check janus-wt-portal agent
+    let agent_dest = home.join(".claude").join("agents").join("janus-wt-portal.md");
+    let agent_status = if agent_dest.exists() {
+        let existing = fs::read_to_string(&agent_dest).unwrap_or_default();
+        if existing == JANUS_AGENT_CONTENT {
+            "ok"
+        } else {
+            "update"
+        }
+    } else {
+        "missing"
+    };
+
+    match agent_status {
+        "ok" => println!("  [ok]      janus-wt-portal agent"),
+        "update" => println!("  [update]  janus-wt-portal agent (content differs)"),
+        _ => println!("  [missing] janus-wt-portal agent"),
+    }
+
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();
     let all_tmux_bound = tmux_s_bound && tmux_d_bound && tmux_cn_bound && tmux_cp_bound;
+    let agent_needs_install = agent_status != "ok";
 
-    if !needs_hook_changes && all_tmux_bound {
+    if !needs_hook_changes && all_tmux_bound && !agent_needs_install {
         println!();
         println!("Everything is already set up!");
         return Ok(());
@@ -1099,6 +1122,27 @@ fn run_setup() -> Result<()> {
         }
     }
 
+    // Install janus-wt-portal agent
+    if agent_needs_install {
+        println!();
+        println!("Install janus-wt-portal agent to ~/.claude/agents/?");
+        print!("[Y/n] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if input.is_empty() || input == "y" || input == "yes" {
+            if let Some(parent) = agent_dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&agent_dest, JANUS_AGENT_CONTENT)?;
+            println!("Agent installed to {:?}", agent_dest);
+        } else {
+            println!("Skipped agent installation.");
+        }
+    }
+
     Ok(())
 }
 
@@ -1230,6 +1274,24 @@ fn run_uninstall() -> Result<()> {
         println!("Remove from ~/.tmux.conf manually if present.");
     } else {
         println!("Skipped tmux keybinding removal.");
+    }
+
+    // Remove janus-wt-portal agent
+    let agent_path = home.join(".claude").join("agents").join("janus-wt-portal.md");
+    if agent_path.exists() {
+        println!();
+        print!("Remove janus-wt-portal agent? [Y/n] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        let mut input3 = String::new();
+        std::io::stdin().read_line(&mut input3)?;
+        let input3 = input3.trim().to_lowercase();
+        if input3.is_empty() || input3 == "y" || input3 == "yes" {
+            fs::remove_file(&agent_path)?;
+            println!("Removed {:?}", agent_path);
+        } else {
+            println!("Skipped agent removal.");
+        }
     }
 
     Ok(())

@@ -43,6 +43,12 @@ hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
 ```
 
+## Janus WT Portal
+
+The **janus-wt-portal** agent (`.claude/agents/janus-wt-portal.md`) ships with hive and is installed by `hive setup`. It's the primary way to manage worktrees interactively — detects ticket mentions, extracts branch names, resolves the project from git remote, and runs `hive wt` commands.
+
+Installed to `~/.claude/agents/janus-wt-portal.md` globally so it's available in all projects.
+
 ## Project Structure
 
 ```
@@ -86,7 +92,7 @@ src/
 
 ## Data Directory
 
-All hive data lives under `~/.hive/`:
+All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to `~/.claude/agents/`.
 
 ```
 ~/.hive/
