@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Auto-increment version in Cargo.toml on each commit.
+# Default: bump patch. Override with BUMP=minor or BUMP=major.
+
+set -euo pipefail
+
+CARGO_TOML="Cargo.toml"
+
+# Only bump if there are staged changes (skip empty commits)
+if ! git diff --cached --quiet --exit-code 2>/dev/null; then
+    :
+else
+    exit 0
+fi
+
+# Read current version
+current=$(grep -m1 '^version' "$CARGO_TOML" | sed 's/.*"\(.*\)".*/\1/')
+IFS='.' read -r major minor patch <<< "$current"
+
+bump="${BUMP:-patch}"
+case "$bump" in
+    major) major=$((major + 1)); minor=0; patch=0 ;;
+    minor) minor=$((minor + 1)); patch=0 ;;
+    patch) patch=$((patch + 1)) ;;
+    *) echo "Unknown BUMP value: $bump (use major, minor, or patch)" >&2; exit 1 ;;
+esac
+
+new_version="$major.$minor.$patch"
+
+# Update Cargo.toml (first version = line only)
+sed -i '' "0,/^version = \".*\"/s//version = \"$new_version\"/" "$CARGO_TOML"
+
+# Update Cargo.lock if it exists and is tracked
+if [ -f Cargo.lock ] && git ls-files --error-unmatch Cargo.lock &>/dev/null; then
+    cargo generate-lockfile --quiet 2>/dev/null || true
+    git add Cargo.lock
+fi
+
+git add "$CARGO_TOML"
+
+echo "Version bumped: $current → $new_version"

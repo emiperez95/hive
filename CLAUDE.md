@@ -30,7 +30,9 @@ hive                    # open TUI (default)
 hive --detail           # open TUI with detail view for current session
 hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
-hive setup              # register hooks in ~/.claude/settings.json + tmux keybind
+hive setup              # register hooks, agent, and tmux keybindings
+hive update             # update to latest version from GitHub + re-run setup
+hive --version          # print current version
 hive cycle-next         # switch to next tmux session (skipping skipped)
 hive cycle-prev         # switch to previous tmux session
 hive connect <key>      # create/attach tmux session for a registered project

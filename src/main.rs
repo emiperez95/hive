@@ -32,6 +32,7 @@ const JANUS_AGENT_CONTENT: &str = include_str!("../.claude/agents/janus-wt-porta
 
 #[derive(Parser, Debug)]
 #[command(name = "hive")]
+#[command(version)]
 #[command(about = "Interactive Claude Code session dashboard for tmux")]
 struct Args {
     /// Subcommand to run
@@ -82,6 +83,8 @@ enum Command {
         #[command(subcommand)]
         command: Box<ProjectCommand>,
     },
+    /// Update hive to the latest version from GitHub
+    Update,
     /// Manage git worktrees for registered projects
     Wt {
         #[command(subcommand)]
@@ -1916,6 +1919,47 @@ fn run_wt_import(project: &str) -> Result<()> {
     Ok(())
 }
 
+/// Update hive to the latest version from GitHub, then re-run setup
+fn run_update() -> Result<()> {
+    const REPO_URL: &str = "https://github.com/emiperez95/hive";
+
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+    let install_root = home.join(".local");
+
+    println!("Current version: {}", env!("CARGO_PKG_VERSION"));
+    println!("Installing latest from {}...", REPO_URL);
+    println!();
+
+    let status = std::process::Command::new("cargo")
+        .args([
+            "install",
+            "--git",
+            REPO_URL,
+            "--root",
+            &install_root.to_string_lossy(),
+        ])
+        .status()?;
+
+    if !status.success() {
+        bail!("cargo install failed");
+    }
+
+    println!();
+    println!("Running setup with new binary...");
+    println!();
+
+    let new_binary = install_root.join("bin").join("hive");
+    let setup_status = std::process::Command::new(&new_binary)
+        .arg("setup")
+        .status()?;
+
+    if !setup_status.success() {
+        bail!("hive setup failed");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     init_debug(args.debug);
@@ -1923,6 +1967,7 @@ fn main() -> Result<()> {
     match args.command {
         Some(Command::Hook { event }) => run_hook(&event),
         Some(Command::Setup) => run_setup(),
+        Some(Command::Update) => run_update(),
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::CycleNext) => run_cycle(true),
         Some(Command::CyclePrev) => run_cycle(false),
