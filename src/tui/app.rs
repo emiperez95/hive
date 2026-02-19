@@ -56,7 +56,7 @@ pub struct App {
     pub session_todos: HashMap<String, Vec<String>>, // name -> list of todos
     // Detail view
     pub showing_detail: Option<usize>, // session index being viewed
-    pub detail_selected: usize,        // selected todo index in detail view
+    pub detail_selected: Option<usize>, // selected todo/port index in detail view (None = no selection)
     pub detail_scroll_offset: usize,   // scroll offset for detail view content
     // Session restore
     pub last_save: Instant, // Track last save time for periodic saves
@@ -109,7 +109,7 @@ impl App {
             input_buffer: String::new(),
             session_todos: load_session_todos(),
             showing_detail: None,
-            detail_selected: 0,
+            detail_selected: None,
             detail_scroll_offset: 0,
             last_save: Instant::now(),
             permission_key_map: HashMap::new(),
@@ -614,7 +614,7 @@ impl App {
     pub fn open_detail(&mut self, idx: usize) {
         if idx < self.session_infos.len() {
             self.showing_detail = Some(idx);
-            self.detail_selected = 0;
+            self.detail_selected = None;
             self.detail_scroll_offset = 0;
         }
     }
@@ -655,15 +655,20 @@ impl App {
     }
 
     pub fn delete_selected_todo(&mut self) {
+        let Some(sel) = self.detail_selected else {
+            return;
+        };
         let Some(name) = self.detail_session_name() else {
             return;
         };
 
         let should_save = if let Some(todos) = self.session_todos.get_mut(&name) {
-            if self.detail_selected < todos.len() {
-                todos.remove(self.detail_selected);
-                if self.detail_selected >= todos.len() && self.detail_selected > 0 {
-                    self.detail_selected -= 1;
+            if sel < todos.len() {
+                todos.remove(sel);
+                if todos.is_empty() {
+                    self.detail_selected = None;
+                } else if sel >= todos.len() {
+                    self.detail_selected = Some(sel - 1);
                 }
                 true
             } else {

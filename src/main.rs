@@ -439,7 +439,16 @@ fn run_tui(
                         }
                     } else if app.showing_detail.is_some() {
                         match code {
-                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            KeyCode::Esc => {
+                                if app.detail_selected.is_some() {
+                                    app.detail_selected = None;
+                                    needs_redraw = true;
+                                } else {
+                                    app.save_restorable();
+                                    return Ok(());
+                                }
+                            }
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 app.save_restorable();
                                 return Ok(());
                             }
@@ -452,17 +461,33 @@ fn run_tui(
                                 needs_redraw = true;
                             }
                             KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Backspace => {
-                                let todo_count = app.detail_todos().len();
-                                if app.detail_selected < todo_count {
+                                if app.detail_selected.is_some() {
                                     app.delete_selected_todo();
                                 }
                                 needs_redraw = true;
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
-                                if app.detail_selected > 0 {
-                                    app.detail_selected -= 1;
-                                } else if app.detail_scroll_offset > 0 {
-                                    app.detail_scroll_offset -= 1;
+                                let todo_count = app.detail_todos().len();
+                                let port_count = app
+                                    .showing_detail
+                                    .and_then(|idx| app.session_infos.get(idx))
+                                    .map(|s| s.listening_ports.len())
+                                    .unwrap_or(0);
+                                let total = todo_count + port_count;
+                                match app.detail_selected {
+                                    None => {
+                                        if total > 0 {
+                                            app.detail_selected = Some(total - 1);
+                                        } else if app.detail_scroll_offset > 0 {
+                                            app.detail_scroll_offset -= 1;
+                                        }
+                                    }
+                                    Some(0) => {
+                                        app.detail_selected = None;
+                                    }
+                                    Some(sel) => {
+                                        app.detail_selected = Some(sel - 1);
+                                    }
                                 }
                                 needs_redraw = true;
                             }
@@ -474,43 +499,61 @@ fn run_tui(
                                     .map(|s| s.listening_ports.len())
                                     .unwrap_or(0);
                                 let total = todo_count + port_count;
-                                if total > 0 && app.detail_selected < total - 1 {
-                                    app.detail_selected += 1;
-                                } else {
-                                    app.detail_scroll_offset += 1;
+                                match app.detail_selected {
+                                    None => {
+                                        if total > 0 {
+                                            app.detail_selected = Some(0);
+                                        } else {
+                                            app.detail_scroll_offset += 1;
+                                        }
+                                    }
+                                    Some(sel) if total > 0 && sel < total - 1 => {
+                                        app.detail_selected = Some(sel + 1);
+                                    }
+                                    _ => {
+                                        app.detail_scroll_offset += 1;
+                                    }
                                 }
                                 needs_redraw = true;
                             }
                             KeyCode::Enter => {
-                                let todo_count = app.detail_todos().len();
-                                let port_count = app
-                                    .showing_detail
-                                    .and_then(|idx| app.session_infos.get(idx))
-                                    .map(|s| s.listening_ports.len())
-                                    .unwrap_or(0);
-                                if app.detail_selected >= todo_count && port_count > 0 {
-                                    let port_idx = app.detail_selected - todo_count;
-                                    if let Some(session) = app
+                                if let Some(sel) = app.detail_selected {
+                                    let todo_count = app.detail_todos().len();
+                                    let port_count = app
                                         .showing_detail
                                         .and_then(|idx| app.session_infos.get(idx))
-                                    {
-                                        if let Some(port_info) =
-                                            session.listening_ports.get(port_idx)
+                                        .map(|s| s.listening_ports.len())
+                                        .unwrap_or(0);
+                                    if sel >= todo_count && port_count > 0 {
+                                        let port_idx = sel - todo_count;
+                                        if let Some(session) = app
+                                            .showing_detail
+                                            .and_then(|idx| app.session_infos.get(idx))
                                         {
-                                            let matched_tab = app
-                                                .detail_chrome_tabs
-                                                .iter()
-                                                .find(|(_, p)| *p == port_info.port);
-                                            if let Some((tab, _)) = matched_tab {
-                                                crate::common::chrome::focus_chrome_tab(tab);
-                                            } else {
-                                                let url =
-                                                    format!("http://localhost:{}", port_info.port);
-                                                crate::common::chrome::open_chrome_tab(&url);
+                                            if let Some(port_info) =
+                                                session.listening_ports.get(port_idx)
+                                            {
+                                                let matched_tab = app
+                                                    .detail_chrome_tabs
+                                                    .iter()
+                                                    .find(|(_, p)| *p == port_info.port);
+                                                if let Some((tab, _)) = matched_tab {
+                                                    crate::common::chrome::focus_chrome_tab(tab);
+                                                } else {
+                                                    let url = format!(
+                                                        "http://localhost:{}",
+                                                        port_info.port
+                                                    );
+                                                    crate::common::chrome::open_chrome_tab(&url);
+                                                }
                                             }
                                         }
+                                        needs_redraw = true;
+                                    } else if let Some(name) = app.detail_session_name() {
+                                        switch_to_session(&name);
+                                        app.save_restorable();
+                                        return Ok(());
                                     }
-                                    needs_redraw = true;
                                 } else if let Some(name) = app.detail_session_name() {
                                     switch_to_session(&name);
                                     app.save_restorable();

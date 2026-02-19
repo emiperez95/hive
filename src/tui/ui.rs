@@ -718,7 +718,7 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
 
         for (i, todo) in todos.iter().enumerate() {
             let letter = (b'a' + i as u8) as char;
-            let is_selected = i == app.detail_selected;
+            let is_selected = app.detail_selected == Some(i);
 
             let prefix = if is_selected {
                 Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
@@ -764,7 +764,7 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
 
         for (i, port_info) in listening_ports.iter().enumerate() {
             let sel_idx = port_selection_offset + i;
-            let is_selected = sel_idx == app.detail_selected;
+            let is_selected = app.detail_selected == Some(sel_idx);
 
             let port_label = format!(":{:<5}  ({})", port_info.port, port_info.process_name);
 
