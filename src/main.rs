@@ -176,6 +176,9 @@ enum WtCommand {
         /// Send a prompt to Claude after startup
         #[arg(long)]
         prompt: Option<String>,
+        /// Enable auto-approve for the new session
+        #[arg(long)]
+        auto_approve: bool,
     },
     /// Delete a worktree and its associated resources
     Delete {
@@ -1539,8 +1542,10 @@ fn run_wt_new(
     existing: bool,
     wt_type: &str,
     prompt: Option<&str>,
+    auto_approve: bool,
 ) -> Result<()> {
     use anyhow::Context;
+    use crate::common::persistence::{load_auto_approve_sessions, save_auto_approve_sessions};
     use crate::common::projects::expand_tilde;
     use crate::common::worktree::*;
 
@@ -1681,10 +1686,18 @@ fn run_wt_new(
         });
         state.save()?;
 
-        // 10. post-setup hook
+        // 10. Enable auto-approve if requested
+        if auto_approve {
+            let mut sessions = load_auto_approve_sessions();
+            sessions.insert(session_name.clone());
+            save_auto_approve_sessions(&sessions);
+            println!("  Enabled auto-approve for '{}'", session_name);
+        }
+
+        // 11. post-setup hook
         run_hook(&hooks_dir, "post-setup", &env, &metadata)?;
 
-        // 11. Run startup command (append prompt as argument if provided)
+        // 12. Run startup command (append prompt as argument if provided)
         if let Some(ref cmd) = config.startup_command {
             let full_cmd = match prompt {
                 Some(p) => format!("{} {:?}", cmd, p),
@@ -1708,7 +1721,7 @@ fn run_wt_new(
         return Err(e);
     }
 
-    // 12. Switch to session
+    // 13. Switch to session
     switch_to_session(&session_name);
     println!("Switched to session '{}'", session_name);
 
@@ -1986,6 +1999,7 @@ fn main() -> Result<()> {
                 existing,
                 wt_type,
                 prompt,
+                auto_approve,
             } => run_wt_new(
                 &project,
                 &branch,
@@ -1993,6 +2007,7 @@ fn main() -> Result<()> {
                 existing,
                 &wt_type,
                 prompt.as_deref(),
+                auto_approve,
             ),
             WtCommand::Delete {
                 project,

@@ -40,7 +40,7 @@ You are Janus WT Portal, a worktree management agent. You run `hive wt` commands
 
 **Commands:**
 ```bash
-hive wt new <project> <branch> [--base BASE] [--existing] [--type TYPE] [--prompt PROMPT]
+hive wt new <project> <branch> [--base BASE] [--existing] [--type TYPE] [--prompt PROMPT] [--auto-approve]
 hive wt delete <project> <branch> [--keep-branch] [--force]
 hive wt list [project]
 hive wt import <project>
