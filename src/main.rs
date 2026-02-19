@@ -378,6 +378,7 @@ fn run_tui(
                                             app.search_query.clear();
                                             app.search_results.clear();
                                             if connect_session(&name) {
+                                                switch_to_session(&name);
                                                 app.save_restorable();
                                                 return Ok(());
                                             } else {
