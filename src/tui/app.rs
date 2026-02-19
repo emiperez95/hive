@@ -218,6 +218,31 @@ impl App {
             }
         }
 
+        // Sort non-active results: favorites first, preserving relative order
+        let active_count = self
+            .search_results
+            .iter()
+            .take_while(|r| matches!(r, SearchResult::Active(_)))
+            .count();
+        if active_count < self.search_results.len() {
+            let non_active = self.search_results.split_off(active_count);
+            let mut fav_results = Vec::new();
+            let mut rest_results = Vec::new();
+            for r in non_active {
+                let name = match &r {
+                    SearchResult::Project(n) | SearchResult::Worktree(n) => n,
+                    SearchResult::Active(_) => unreachable!(),
+                };
+                if self.favorite_sessions.contains(name) {
+                    fav_results.push(r);
+                } else {
+                    rest_results.push(r);
+                }
+            }
+            self.search_results.append(&mut fav_results);
+            self.search_results.append(&mut rest_results);
+        }
+
         // Reset selection if out of bounds
         if self.selected >= self.search_results.len() {
             self.selected = 0;

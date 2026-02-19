@@ -545,6 +545,11 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
             match result {
                 SearchResult::Active(session_idx) => {
                     let info = &app.session_infos[*session_idx];
+                    let star = if app.is_favorite(&info.name) {
+                        Span::styled("★ ", Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::styled(". ", style)
+                    };
                     let status_text = match &info.claude_status {
                         Some(ClaudeStatus::NeedsPermission(_, _)) => " [permission]",
                         Some(ClaudeStatus::EditApproval(_)) => " [edit]",
@@ -556,25 +561,35 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                     };
                     lines.push(Line::from(vec![
                         prefix,
-                        Span::styled(". ", style),
+                        star,
                         Span::styled(info.name.clone(), style.add_modifier(Modifier::BOLD)),
                         Span::styled(status_text, Style::default().fg(Color::Cyan)),
                     ]));
                     lines_remaining -= 1;
                 }
                 SearchResult::Project(name) => {
+                    let star = if app.is_favorite(name) {
+                        Span::styled("★ ", Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::styled(". ", style)
+                    };
                     lines.push(Line::from(vec![
                         prefix,
-                        Span::styled(". ", style),
+                        star,
                         Span::styled(name.clone(), style),
                         Span::styled(" [project]", Style::default().fg(Color::Cyan)),
                     ]));
                     lines_remaining -= 1;
                 }
                 SearchResult::Worktree(name) => {
+                    let star = if app.is_favorite(name) {
+                        Span::styled("★ ", Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::styled(". ", style)
+                    };
                     lines.push(Line::from(vec![
                         prefix,
-                        Span::styled(". ", style),
+                        star,
                         Span::styled(name.clone(), style),
                         Span::styled(" [worktree]", Style::default().fg(Color::Green)),
                     ]));
