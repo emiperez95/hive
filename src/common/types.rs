@@ -87,6 +87,8 @@ pub struct SessionInfo {
     pub cwd: Option<String>,
     /// Listening TCP ports in this session's process tree
     pub listening_ports: Vec<ListeningPort>,
+    /// Session is attached to another tmux client (not the caller's)
+    pub attached_other_client: bool,
 }
 
 /// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'f' for favorite)

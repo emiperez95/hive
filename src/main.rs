@@ -22,7 +22,8 @@ use crate::common::projects::{
     ProjectRegistry,
 };
 use crate::common::tmux::{
-    get_current_tmux_session, get_current_tmux_session_names, switch_to_session,
+    get_current_tmux_session, get_current_tmux_session_names, get_other_client_sessions,
+    switch_to_session,
 };
 use crate::common::types::PERMISSION_KEYS;
 use crate::tui::app::{find_session_by_permission_key, App, InputMode, SearchResult};
@@ -1363,11 +1364,12 @@ fn run_uninstall() -> Result<()> {
 /// Cycle to next/prev tmux session, skipping skipped sessions
 fn run_cycle(forward: bool) -> Result<()> {
     let skipped = load_skipped_sessions();
+    let other_clients = get_other_client_sessions();
     let all_sessions = get_current_tmux_session_names();
 
     let filtered: Vec<&String> = all_sessions
         .iter()
-        .filter(|name| !skipped.contains(*name))
+        .filter(|name| !skipped.contains(*name) && !other_clients.contains(*name))
         .collect();
 
     if filtered.is_empty() {

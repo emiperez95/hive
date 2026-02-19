@@ -10,7 +10,7 @@ use crate::common::persistence::{
 use crate::common::projects::{has_project_config, ProjectRegistry};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
-use crate::common::tmux::get_tmux_sessions;
+use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
     lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
 };
@@ -334,6 +334,7 @@ impl App {
         }
 
         let sessions = get_tmux_sessions()?;
+        let other_client_sessions = get_other_client_sessions();
         let mut session_infos = Vec::new();
 
         for session in sessions {
@@ -425,6 +426,7 @@ impl App {
                 processes,
                 cwd: session_cwd,
                 listening_ports,
+                attached_other_client: other_client_sessions.contains(&session.name),
             });
         }
 

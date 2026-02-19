@@ -2,6 +2,7 @@
 
 use crate::common::types::{TmuxPane, TmuxSession, TmuxWindow};
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::process::Command;
 
 /// Get all tmux sessions with their windows and panes
@@ -144,6 +145,33 @@ pub fn get_current_tmux_session() -> Option<String> {
                 Some(name)
             }
         })
+}
+
+/// Get session names attached to tmux clients other than the caller's.
+pub fn get_other_client_sessions() -> HashSet<String> {
+    let my_tty = Command::new("tmux")
+        .args(["display-message", "-p", "#{client_tty}"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let clients_output = Command::new("tmux")
+        .args(["list-clients", "-F", "#{client_tty} #{client_session}"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    let mut other_sessions = HashSet::new();
+    for line in clients_output.lines() {
+        if let Some((tty, session)) = line.split_once(' ') {
+            if !my_tty.is_empty() && tty != my_tty {
+                other_sessions.insert(session.to_string());
+            }
+        }
+    }
+    other_sessions
 }
 
 /// Kill a tmux session

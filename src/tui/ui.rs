@@ -313,14 +313,17 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(".", header_style)
             };
 
+            let name_style = if session_info.attached_other_client {
+                header_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                header_style.add_modifier(Modifier::BOLD)
+            };
+
             let mut header_spans = vec![
                 prefix_span,
                 sep,
                 Span::styled(" ", header_style),
-                Span::styled(
-                    session_info.name.clone(),
-                    header_style.add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(session_info.name.clone(), name_style),
                 Span::styled(" [", header_style),
                 Span::styled(cpu_text, header_style.fg(cpu_color)),
                 Span::styled("/", header_style),
@@ -468,11 +471,17 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(".", header_style)
             };
 
+            let name_style = if session_info.attached_other_client {
+                header_style.add_modifier(Modifier::UNDERLINED)
+            } else {
+                header_style
+            };
+
             let mut header_spans = vec![
                 prefix_span,
                 sep,
                 Span::styled(" ", header_style),
-                Span::styled(session_info.name.clone(), header_style),
+                Span::styled(session_info.name.clone(), name_style),
                 Span::styled(" [", header_style),
                 Span::styled(cpu_text, header_style.fg(cpu_color)),
                 Span::styled("/", header_style),
