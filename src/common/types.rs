@@ -89,6 +89,8 @@ pub struct SessionInfo {
     pub listening_ports: Vec<ListeningPort>,
     /// Session is attached to another tmux client (not the caller's)
     pub attached_other_client: bool,
+    /// This is the session the caller's tmux client is attached to
+    pub is_current_session: bool,
 }
 
 /// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'f' for favorite)

@@ -313,16 +313,23 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(".", header_style)
             };
 
-            let name_style = if session_info.attached_other_client {
+            let name_style = if session_info.is_current_session || session_info.attached_other_client
+            {
                 header_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
                 header_style.add_modifier(Modifier::BOLD)
             };
 
+            let current_marker = if session_info.is_current_session {
+                Span::styled("›", header_style.add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(" ", header_style)
+            };
+
             let mut header_spans = vec![
                 prefix_span,
                 sep,
-                Span::styled(" ", header_style),
+                current_marker,
                 Span::styled(session_info.name.clone(), name_style),
                 Span::styled(" [", header_style),
                 Span::styled(cpu_text, header_style.fg(cpu_color)),
@@ -471,16 +478,23 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(".", header_style)
             };
 
-            let name_style = if session_info.attached_other_client {
+            let name_style = if session_info.is_current_session || session_info.attached_other_client
+            {
                 header_style.add_modifier(Modifier::UNDERLINED)
             } else {
                 header_style
             };
 
+            let current_marker = if session_info.is_current_session {
+                Span::styled("›", header_style.add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(" ", header_style)
+            };
+
             let mut header_spans = vec![
                 prefix_span,
                 sep,
-                Span::styled(" ", header_style),
+                current_marker,
                 Span::styled(session_info.name.clone(), name_style),
                 Span::styled(" [", header_style),
                 Span::styled(cpu_text, header_style.fg(cpu_color)),

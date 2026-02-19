@@ -147,6 +147,16 @@ pub fn get_current_tmux_session() -> Option<String> {
         })
 }
 
+/// Get the session name attached to the caller's tmux client.
+pub fn get_current_session() -> Option<String> {
+    Command::new("tmux")
+        .args(["display-message", "-p", "#{client_session}"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Get session names attached to tmux clients other than the caller's.
 pub fn get_other_client_sessions() -> HashSet<String> {
     let my_tty = Command::new("tmux")
