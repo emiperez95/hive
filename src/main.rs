@@ -55,6 +55,10 @@ struct Args {
     /// Enable debug logging to ~/.cache/hive/debug.log
     #[arg(long, global = true)]
     debug: bool,
+
+    /// Open directly in picker/search mode
+    #[arg(long, global = true)]
+    picker: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -254,6 +258,13 @@ fn run_tui(
     let mut app = App::new(args.filter.clone(), args.watch);
     app.auto_detail = args.detail;
 
+    if args.picker {
+        app.auto_picker = true;
+        app.input_mode = InputMode::Search;
+        app.load_project_names();
+        app.update_search_results();
+    }
+
     loop {
         if !running.load(Ordering::SeqCst) {
             app.save_restorable();
@@ -354,6 +365,10 @@ fn run_tui(
                     } else if app.input_mode == InputMode::Search {
                         match code {
                             KeyCode::Esc => {
+                                if app.auto_picker {
+                                    app.save_restorable();
+                                    return Ok(());
+                                }
                                 app.input_mode = InputMode::Normal;
                                 app.search_query.clear();
                                 app.search_results.clear();

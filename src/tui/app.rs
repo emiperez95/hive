@@ -84,6 +84,8 @@ pub struct App {
     pub detail_chrome_tabs: Vec<(crate::common::chrome::ChromeTab, u16)>,
     // Help screen visible
     pub showing_help: bool,
+    // Auto-picker mode: started with --picker, Esc exits app
+    pub auto_picker: bool,
 }
 
 impl App {
@@ -125,6 +127,7 @@ impl App {
             auto_detail: false,
             detail_chrome_tabs: Vec::new(),
             showing_help: false,
+            auto_picker: false,
         }
     }
 
