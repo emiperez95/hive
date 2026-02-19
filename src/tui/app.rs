@@ -428,11 +428,11 @@ impl App {
             });
         }
 
-        // Sort: favorites first, then Claude (non-skipped) -> non-Claude (non-skipped) -> skipped
+        // Sort: skipped always last, favorites first within each group, then Claude before non-Claude
         session_infos.sort_by_key(|s| {
             let is_favorite = self.favorite_sessions.contains(&s.name);
             let is_skipped = self.skipped_sessions.contains(&s.name);
-            (!is_favorite, is_skipped, s.claude_status.is_none())
+            (is_skipped, !is_favorite, s.claude_status.is_none())
         });
 
         // Stable permission key assignment
