@@ -259,6 +259,51 @@ pub fn is_globally_muted() -> bool {
     get_global_mute_path().map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Get the path to the completed todos file
+pub fn get_completed_todos_file_path() -> Option<PathBuf> {
+    cache_dir().map(|p| p.join("todos-done.txt"))
+}
+
+/// Load completed todos from disk (name -> list of completed todos)
+pub fn load_completed_todos() -> HashMap<String, Vec<String>> {
+    let Some(path) = get_completed_todos_file_path() else {
+        return HashMap::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return HashMap::new();
+    };
+    let mut todos: HashMap<String, Vec<String>> = HashMap::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some((name, todo)) = line.split_once('\t') {
+            todos
+                .entry(name.to_string())
+                .or_default()
+                .push(unescape_newlines(todo));
+        }
+    }
+    todos
+}
+
+/// Save completed todos to disk (tab-separated: name\ttodo, one per line)
+pub fn save_completed_todos(todos: &HashMap<String, Vec<String>>) {
+    let Some(path) = get_completed_todos_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for (name, items) in todos {
+            for item in items {
+                let _ = writeln!(file, "{}\t{}", name, escape_newlines(item));
+            }
+        }
+    }
+}
+
 /// Set global mute state (creates or removes the flag file)
 pub fn set_global_mute(enabled: bool) {
     let Some(path) = get_global_mute_path() else {

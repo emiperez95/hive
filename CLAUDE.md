@@ -43,6 +43,11 @@ hive project import     # import projects from sesh.toml
 hive wt new <project> <branch>  # create worktree + tmux session (with hooks)
 hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
+hive todo list [--session <name>] [--done]  # list active (or completed) todos
+hive todo next [--session <name>]           # print first active todo (exit 1 if none)
+hive todo add <text> [--session <name>]     # add a todo
+hive todo done [index] [--session <name>]   # mark todo as done (default: 1)
+hive todo clear [--session <name>]          # clear completed todos
 ```
 
 ## Janus WT Portal
@@ -103,7 +108,8 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 │   ├── state.json             # hook state (session statuses)
 │   ├── worktrees.json         # registered worktrees
 │   ├── favorites.txt           # favorite session names
-│   ├── todos.txt              # per-session todo lists
+│   ├── todos.txt              # per-session todo lists (active)
+│   ├── todos-done.txt         # per-session completed todos
 │   ├── muted.txt              # muted session names
 │   ├── auto-approve.txt       # auto-approve session names
 │   ├── skipped.txt            # skipped-from-cycling session names
