@@ -458,6 +458,47 @@ fn path_to_claude_dir_name(path: &Path) -> String {
     path_str.replace('/', "-")
 }
 
+// ─── Trust ───────────────────────────────────────────────────────────────────
+
+/// Pre-trust a worktree directory in Claude's ~/.claude.json so the trust
+/// dialog is skipped when Claude starts in the new session.
+pub fn pretrust_claude_project(worktree_path: &Path) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+    let claude_json = home.join(".claude.json");
+
+    let mut config: serde_json::Value = if claude_json.exists() {
+        let content = std::fs::read_to_string(&claude_json)?;
+        serde_json::from_str(&content)?
+    } else {
+        serde_json::json!({})
+    };
+
+    let path_key = worktree_path.to_string_lossy().to_string();
+    let projects = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("~/.claude.json is not a JSON object"))?
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let project = projects
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("projects is not a JSON object"))?
+        .entry(&path_key)
+        .or_insert_with(|| serde_json::json!({}));
+
+    if let Some(obj) = project.as_object_mut() {
+        obj.insert(
+            "hasTrustDialogAccepted".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+
+    let content = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&claude_json, content)?;
+
+    Ok(())
+}
+
 // ─── Hooks ──────────────────────────────────────────────────────────────────
 
 /// Resolve the hooks directory for a project config.
@@ -522,10 +563,19 @@ pub fn run_hook(
 
     let output = cmd.output().with_context(|| format!("Failed to run hook: {}", name))?;
 
+    // Print hook output so log messages are visible
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        eprint!("{}", stdout);
+    }
+    if !stderr.trim().is_empty() {
+        eprint!("{}", stderr);
+    }
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_file(&metadata_file);
-        bail!("Hook '{}' failed: {}", name, stderr.trim());
+        bail!("Hook '{}' failed (exit {})", name, output.status);
     }
 
     // Read metadata file if the hook wrote one

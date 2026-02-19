@@ -1638,9 +1638,10 @@ fn run_wt_new(
             println!("  Symlinked {} file pattern(s)", config.files.symlink.len());
         }
 
-        // 6. Seed Claude memory
+        // 6. Seed Claude memory + pre-trust
         seed_memory(&project_root, &worktree_path)?;
-        println!("  Seeded Claude memory");
+        pretrust_claude_project(&worktree_path)?;
+        println!("  Seeded Claude memory (trusted)");
 
         // 7. post-copy hook
         metadata = run_hook(&hooks_dir, "post-copy", &env, &metadata)?;
@@ -1697,7 +1698,7 @@ fn run_wt_new(
         // 11. post-setup hook
         run_hook(&hooks_dir, "post-setup", &env, &metadata)?;
 
-        // 12. Run startup command (append prompt as argument if provided)
+        // 12. Run startup command (append prompt as CLI argument if provided)
         if let Some(ref cmd) = config.startup_command {
             let full_cmd = match prompt {
                 Some(p) => format!("{} {:?}", cmd, p),
@@ -1721,9 +1722,7 @@ fn run_wt_new(
         return Err(e);
     }
 
-    // 13. Switch to session
-    switch_to_session(&session_name);
-    println!("Switched to session '{}'", session_name);
+    println!("Ready: session '{}'", session_name);
 
     Ok(())
 }
