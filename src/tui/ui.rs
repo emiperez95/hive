@@ -342,7 +342,7 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             if todo_count > 0 {
                 header_spans.push(Span::styled(
                     format!(" [{}]", todo_count),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(Color::Magenta),
                 ));
             }
 
@@ -507,7 +507,7 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             if todo_count > 0 {
                 header_spans.push(Span::styled(
                     format!(" [{}]", todo_count),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(Color::Magenta),
                 ));
             }
 
@@ -582,12 +582,20 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                         Some(ClaudeStatus::Unknown) => " [working]",
                         None => "",
                     };
-                    lines.push(Line::from(vec![
+                    let mut spans = vec![
                         prefix,
                         star,
                         Span::styled(info.name.clone(), style.add_modifier(Modifier::BOLD)),
                         Span::styled(status_text, Style::default().fg(Color::Cyan)),
-                    ]));
+                    ];
+                    let todo_count = app.todo_count(&info.name);
+                    if todo_count > 0 {
+                        spans.push(Span::styled(
+                            format!(" [{}]", todo_count),
+                            Style::default().fg(Color::Magenta),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
                     lines_remaining -= 1;
                 }
                 SearchResult::Project(name) => {
