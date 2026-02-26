@@ -379,14 +379,10 @@ fn run_tui(
                                 if let Some(result) = app.search_results.get(app.selected).cloned()
                                 {
                                     match result {
-                                        SearchResult::Active(idx) => {
-                                            if let Some(session_info) =
-                                                app.session_infos.get(idx)
-                                            {
-                                                switch_to_session(&session_info.name);
-                                                app.save_restorable();
-                                                return Ok(());
-                                            }
+                                        SearchResult::Active(name) => {
+                                            switch_to_session(&name);
+                                            app.save_restorable();
+                                            return Ok(());
                                         }
                                         SearchResult::Project(name)
                                         | SearchResult::Worktree(name) => {
@@ -469,8 +465,7 @@ fn run_tui(
                             KeyCode::Up | KeyCode::Char('k') => {
                                 let todo_count = app.detail_todos().len();
                                 let port_count = app
-                                    .showing_detail
-                                    .and_then(|idx| app.session_infos.get(idx))
+                                    .detail_session_info()
                                     .map(|s| s.listening_ports.len())
                                     .unwrap_or(0);
                                 let total = todo_count + port_count;
@@ -494,8 +489,7 @@ fn run_tui(
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let todo_count = app.detail_todos().len();
                                 let port_count = app
-                                    .showing_detail
-                                    .and_then(|idx| app.session_infos.get(idx))
+                                    .detail_session_info()
                                     .map(|s| s.listening_ports.len())
                                     .unwrap_or(0);
                                 let total = todo_count + port_count;
@@ -520,16 +514,12 @@ fn run_tui(
                                 if let Some(sel) = app.detail_selected {
                                     let todo_count = app.detail_todos().len();
                                     let port_count = app
-                                        .showing_detail
-                                        .and_then(|idx| app.session_infos.get(idx))
+                                        .detail_session_info()
                                         .map(|s| s.listening_ports.len())
                                         .unwrap_or(0);
                                     if sel >= todo_count && port_count > 0 {
                                         let port_idx = sel - todo_count;
-                                        if let Some(session) = app
-                                            .showing_detail
-                                            .and_then(|idx| app.session_infos.get(idx))
-                                        {
+                                        if let Some(session) = app.detail_session_info() {
                                             if let Some(port_info) =
                                                 session.listening_ports.get(port_idx)
                                             {
@@ -561,26 +551,26 @@ fn run_tui(
                                 }
                             }
                             KeyCode::Char('f') | KeyCode::Char('F') => {
-                                if let Some(idx) = app.showing_detail {
-                                    app.toggle_favorite(idx);
+                                if let Some(name) = app.detail_session_name() {
+                                    app.toggle_favorite(&name);
                                     needs_redraw = true;
                                 }
                             }
                             KeyCode::Char('!') => {
-                                if let Some(idx) = app.showing_detail {
-                                    app.toggle_auto_approve(idx);
+                                if let Some(name) = app.detail_session_name() {
+                                    app.toggle_auto_approve(&name);
                                     needs_redraw = true;
                                 }
                             }
                             KeyCode::Char('m') | KeyCode::Char('M') => {
-                                if let Some(idx) = app.showing_detail {
-                                    app.toggle_mute(idx);
+                                if let Some(name) = app.detail_session_name() {
+                                    app.toggle_mute(&name);
                                     needs_redraw = true;
                                 }
                             }
                             KeyCode::Char('s') | KeyCode::Char('S') => {
-                                if let Some(idx) = app.showing_detail {
-                                    app.toggle_skip(idx);
+                                if let Some(name) = app.detail_session_name() {
+                                    app.toggle_skip(&name);
                                     needs_redraw = true;
                                 }
                             }

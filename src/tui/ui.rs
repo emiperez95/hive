@@ -566,8 +566,11 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
             };
 
             match result {
-                SearchResult::Active(session_idx) => {
-                    let info = &app.session_infos[*session_idx];
+                SearchResult::Active(name) => {
+                    let Some(info) = app.session_infos.iter().find(|s| &s.name == name) else {
+                        idx += 1;
+                        continue;
+                    };
                     let star = if app.is_favorite(&info.name) {
                         Span::styled("★ ", Style::default().fg(Color::Yellow))
                     } else {
@@ -639,10 +642,7 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
 
-    let Some(idx) = app.showing_detail else {
-        return;
-    };
-    let Some(session_info) = app.session_infos.get(idx) else {
+    let Some(session_info) = app.detail_session_info() else {
         return;
     };
 

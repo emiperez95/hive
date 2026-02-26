@@ -32,7 +32,7 @@ pub enum InputMode {
 /// Search result item - active session, inactive project, or worktree
 #[derive(Clone)]
 pub enum SearchResult {
-    Active(usize),    // Index into session_infos
+    Active(String),   // Session name
     Project(String),  // Project name from registry (not active)
     Worktree(String), // Worktree session name from worktrees.json (not active)
 }
@@ -55,7 +55,7 @@ pub struct App {
     // Session todos
     pub session_todos: HashMap<String, Vec<String>>, // name -> list of todos
     // Detail view
-    pub showing_detail: Option<usize>, // session index being viewed
+    pub showing_detail: Option<String>, // session name being viewed
     pub detail_selected: Option<usize>, // selected todo/port index in detail view (None = no selection)
     pub detail_scroll_offset: usize,   // scroll offset for detail view content
     // Session restore
@@ -150,9 +150,9 @@ impl App {
         let mut added_worktrees: HashSet<String> = HashSet::new();
 
         // Add matching active sessions
-        for (i, info) in self.session_infos.iter().enumerate() {
+        for info in self.session_infos.iter() {
             if query.is_empty() || info.name.to_lowercase().contains(&query) {
-                self.search_results.push(SearchResult::Active(i));
+                self.search_results.push(SearchResult::Active(info.name.clone()));
             }
         }
 
@@ -486,20 +486,30 @@ impl App {
             }
         }
 
+        // Stabilize selected index across re-sort
+        let selected_name = self
+            .session_infos
+            .get(self.selected)
+            .map(|s| s.name.clone());
+
         self.session_infos = session_infos;
 
+        // Restore selected index by name
+        if let Some(ref name) = selected_name {
+            if let Some(new_idx) = self.session_infos.iter().position(|s| &s.name == name) {
+                self.selected = new_idx;
+            }
+        }
+
         // Fetch Chrome tabs for detail view
-        if let Some(idx) = self.showing_detail {
-            if let Some(session) = self.session_infos.get(idx) {
-                if !session.listening_ports.is_empty() {
-                    let all_tabs = crate::common::chrome::get_chrome_tabs();
-                    self.detail_chrome_tabs = crate::common::chrome::match_tabs_to_ports(
-                        &all_tabs,
-                        &session.listening_ports,
-                    );
-                } else {
-                    self.detail_chrome_tabs.clear();
-                }
+        if let Some(session) = self.detail_session_info() {
+            if !session.listening_ports.is_empty() {
+                let ports = session.listening_ports.clone();
+                let all_tabs = crate::common::chrome::get_chrome_tabs();
+                self.detail_chrome_tabs =
+                    crate::common::chrome::match_tabs_to_ports(&all_tabs, &ports);
+            } else {
+                self.detail_chrome_tabs.clear();
             }
         } else {
             self.detail_chrome_tabs.clear();
@@ -562,17 +572,13 @@ impl App {
         }
     }
 
-    /// Toggle favorite for a session by index
-    pub fn toggle_favorite(&mut self, idx: usize) {
-        let Some(session_info) = self.session_infos.get(idx) else {
-            return;
-        };
-        let name = session_info.name.clone();
-        if self.favorite_sessions.contains(&name) {
-            self.favorite_sessions.remove(&name);
+    /// Toggle favorite for a session by name
+    pub fn toggle_favorite(&mut self, name: &str) {
+        if self.favorite_sessions.contains(name) {
+            self.favorite_sessions.remove(name);
             self.error_message = Some((format!("Unfavorited '{}'", name), Instant::now()));
         } else {
-            self.favorite_sessions.insert(name.clone());
+            self.favorite_sessions.insert(name.to_string());
             self.error_message = Some((format!("Favorited '{}'", name), Instant::now()));
         }
         save_favorite_sessions(&self.favorite_sessions);
@@ -614,17 +620,21 @@ impl App {
     // --- Detail view methods ---
 
     pub fn open_detail(&mut self, idx: usize) {
-        if idx < self.session_infos.len() {
-            self.showing_detail = Some(idx);
+        if let Some(info) = self.session_infos.get(idx) {
+            self.showing_detail = Some(info.name.clone());
             self.detail_selected = None;
             self.detail_scroll_offset = 0;
         }
     }
 
     pub fn detail_session_name(&self) -> Option<String> {
+        self.showing_detail.clone()
+    }
+
+    pub fn detail_session_info(&self) -> Option<&SessionInfo> {
         self.showing_detail
-            .and_then(|idx| self.session_infos.get(idx))
-            .map(|s| s.name.clone())
+            .as_ref()
+            .and_then(|name| self.session_infos.iter().find(|s| &s.name == name))
     }
 
     pub fn detail_todos(&self) -> Vec<String> {
@@ -709,16 +719,12 @@ impl App {
         }
     }
 
-    pub fn toggle_auto_approve(&mut self, idx: usize) {
-        let Some(session_info) = self.session_infos.get(idx) else {
-            return;
-        };
-        let name = session_info.name.clone();
-        if self.auto_approve_sessions.contains(&name) {
-            self.auto_approve_sessions.remove(&name);
+    pub fn toggle_auto_approve(&mut self, name: &str) {
+        if self.auto_approve_sessions.contains(name) {
+            self.auto_approve_sessions.remove(name);
             self.error_message = Some((format!("Auto-approve OFF for '{}'", name), Instant::now()));
         } else {
-            self.auto_approve_sessions.insert(name.clone());
+            self.auto_approve_sessions.insert(name.to_string());
             self.error_message = Some((format!("Auto-approve ON for '{}'", name), Instant::now()));
         }
         save_auto_approve_sessions(&self.auto_approve_sessions);
@@ -728,16 +734,12 @@ impl App {
         self.auto_approve_sessions.contains(name)
     }
 
-    pub fn toggle_mute(&mut self, idx: usize) {
-        let Some(session_info) = self.session_infos.get(idx) else {
-            return;
-        };
-        let name = session_info.name.clone();
-        if self.muted_sessions.contains(&name) {
-            self.muted_sessions.remove(&name);
+    pub fn toggle_mute(&mut self, name: &str) {
+        if self.muted_sessions.contains(name) {
+            self.muted_sessions.remove(name);
             self.error_message = Some((format!("Notifications ON for '{}'", name), Instant::now()));
         } else {
-            self.muted_sessions.insert(name.clone());
+            self.muted_sessions.insert(name.to_string());
             self.error_message =
                 Some((format!("Notifications OFF for '{}'", name), Instant::now()));
         }
@@ -758,16 +760,12 @@ impl App {
         }
     }
 
-    pub fn toggle_skip(&mut self, idx: usize) {
-        let Some(session_info) = self.session_infos.get(idx) else {
-            return;
-        };
-        let name = session_info.name.clone();
-        if self.skipped_sessions.contains(&name) {
-            self.skipped_sessions.remove(&name);
+    pub fn toggle_skip(&mut self, name: &str) {
+        if self.skipped_sessions.contains(name) {
+            self.skipped_sessions.remove(name);
             self.error_message = Some((format!("Cycling ON for '{}'", name), Instant::now()));
         } else {
-            self.skipped_sessions.insert(name.clone());
+            self.skipped_sessions.insert(name.to_string());
             self.error_message = Some((format!("Cycling OFF for '{}'", name), Instant::now()));
         }
         save_skipped_sessions(&self.skipped_sessions);
