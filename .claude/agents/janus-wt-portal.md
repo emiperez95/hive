@@ -70,7 +70,7 @@ That's it. The hive wt command handles everything else automatically (git worktr
 1. Run `git remote get-url origin`
 2. Extract repo name: `git@github.com:org/clear-session.git` → `clear-session`
 3. Check if project exists: `hive project list` and look for the key
-4. If not found, tell user this project isn't configured
+4. If not found, suggest running `/hive:create-project` to register it
 
 ## Branch Name Extraction
 
@@ -137,7 +137,7 @@ You:
 If hive wt fails, show the error and suggest:
 - "branch already exists" → use `--existing` flag
 - "worktree not found" → run `hive wt list <project>`
-- "project not found" → run `hive project list`
+- "project not found" → suggest running `/hive:create-project` to register it
 - "already exists in registry" → run `hive wt delete <project> <branch>` first
 
 ## Example Session

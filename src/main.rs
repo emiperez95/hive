@@ -32,6 +32,9 @@ use crate::tui::ui::ui;
 /// Bundled janus-wt-portal agent definition, embedded at compile time.
 const JANUS_AGENT_CONTENT: &str = include_str!("../.claude/agents/janus-wt-portal.md");
 
+/// Bundled create-project command, embedded at compile time.
+const CREATE_PROJECT_CMD_CONTENT: &str = include_str!("../.claude/commands/hive/create-project.md");
+
 #[derive(Parser, Debug)]
 #[command(name = "hive")]
 #[command(version)]
@@ -1016,11 +1019,35 @@ fn run_setup() -> Result<()> {
         _ => println!("  [missing] janus-wt-portal agent"),
     }
 
+    // Check create-project command
+    let cmd_dest = home
+        .join(".claude")
+        .join("commands")
+        .join("hive")
+        .join("create-project.md");
+    let cmd_status = if cmd_dest.exists() {
+        let existing = fs::read_to_string(&cmd_dest).unwrap_or_default();
+        if existing == CREATE_PROJECT_CMD_CONTENT {
+            "ok"
+        } else {
+            "update"
+        }
+    } else {
+        "missing"
+    };
+
+    match cmd_status {
+        "ok" => println!("  [ok]      create-project command"),
+        "update" => println!("  [update]  create-project command (content differs)"),
+        _ => println!("  [missing] create-project command"),
+    }
+
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();
     let all_tmux_bound = tmux_s_bound && tmux_d_bound && tmux_cn_bound && tmux_cp_bound;
     let agent_needs_install = agent_status != "ok";
+    let cmd_needs_install = cmd_status != "ok";
 
-    if !needs_hook_changes && all_tmux_bound && !agent_needs_install {
+    if !needs_hook_changes && all_tmux_bound && !agent_needs_install && !cmd_needs_install {
         println!();
         println!("Everything is already set up!");
         return Ok(());
@@ -1237,6 +1264,27 @@ fn run_setup() -> Result<()> {
             println!("Agent installed to {:?}", agent_dest);
         } else {
             println!("Skipped agent installation.");
+        }
+    }
+
+    // Install create-project command
+    if cmd_needs_install {
+        println!();
+        println!("Install create-project command to ~/.claude/commands/hive/?");
+        print!("[Y/n] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if input.is_empty() || input == "y" || input == "yes" {
+            if let Some(parent) = cmd_dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&cmd_dest, CREATE_PROJECT_CMD_CONTENT)?;
+            println!("Command installed to {:?}", cmd_dest);
+        } else {
+            println!("Skipped command installation.");
         }
     }
 
