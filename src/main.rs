@@ -1932,21 +1932,37 @@ fn run_wt_delete(project: &str, branch: &str, keep_branch: bool, force: bool) ->
         println!("  Killed tmux session '{}'", entry.session_name);
     }
 
-    // 5. git worktree remove + optionally delete branch (before registry removal)
-    match delete_git_worktree(&project_root, &worktree_path, branch, keep_branch, force) {
-        Ok(()) => println!("  Removed git worktree"),
-        Err(e) => eprintln!("  Warning: git worktree removal: {}", e),
+    // 5. git worktree remove + optionally delete branch
+    let git_removed = match delete_git_worktree(&project_root, &worktree_path, branch, keep_branch, force) {
+        Ok(()) => {
+            println!("  Removed git worktree");
+            true
+        }
+        Err(e) => {
+            eprintln!("  Warning: git worktree removal failed: {}", e);
+            false
+        }
+    };
+
+    // 6. Remove from worktrees.json only if git worktree was actually removed
+    if git_removed {
+        let mut state = WorktreeState::load();
+        state.remove(project, branch);
+        state.save()?;
+    } else {
+        eprintln!("  Keeping registry entry (git worktree still exists on disk)");
     }
 
-    // 6. Remove from worktrees.json (after git cleanup so entry stays if git fails)
-    let mut state = WorktreeState::load();
-    state.remove(project, branch);
-    state.save()?;
-
     // 7. post-delete hook
-    let _ = run_hook(&hooks_dir, "post-delete", &env, &entry.metadata)?;
-
-    println!("Deleted worktree '{}/{}'", project, branch);
+    if git_removed {
+        let _ = run_hook(&hooks_dir, "post-delete", &env, &entry.metadata)?;
+        println!("Deleted worktree '{}/{}'", project, branch);
+    } else {
+        eprintln!(
+            "Partial delete: hooks ran and tmux killed, but worktree remains at {}",
+            entry.path
+        );
+    }
     Ok(())
 }
 
