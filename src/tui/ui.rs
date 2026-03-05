@@ -731,6 +731,8 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
 
     lines.push(Line::raw(""));
 
+    let mut item_lines: Vec<usize> = Vec::new();
+
     let todos = app.detail_todos();
     if !todos.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -739,6 +741,7 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
         )));
 
         for (i, todo) in todos.iter().enumerate() {
+            item_lines.push(lines.len());
             let letter = (b'a' + i as u8) as char;
             let is_selected = app.detail_selected == Some(i);
 
@@ -785,6 +788,7 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
         )));
 
         for (i, port_info) in listening_ports.iter().enumerate() {
+            item_lines.push(lines.len());
             let sel_idx = port_selection_offset + i;
             let is_selected = app.detail_selected == Some(sel_idx);
 
@@ -836,6 +840,24 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         }
 
+        lines.push(Line::raw(""));
+    }
+
+    // Branch commits section (worktree sessions only)
+    if !app.detail_commits.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Commits ({}):", app.detail_commits.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for commit in &app.detail_commits {
+            let (hash, msg) = commit.split_once(' ').unwrap_or(("", commit));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(hash.to_string(), Style::default().fg(Color::Yellow)),
+                Span::raw(" "),
+                Span::styled(msg.to_string(), Style::default().add_modifier(Modifier::DIM)),
+            ]));
+        }
         lines.push(Line::raw(""));
     }
 
@@ -907,18 +929,11 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    // Apply scroll offset
+    // Apply scroll offset with auto-scroll for selected items
     let available_height = area.height as usize;
-    let total_lines = lines.len();
-
-    if total_lines > available_height {
-        let max_scroll = total_lines.saturating_sub(available_height);
-        if app.detail_scroll_offset > max_scroll {
-            app.detail_scroll_offset = max_scroll;
-        }
-    } else {
-        app.detail_scroll_offset = 0;
-    }
+    app.detail_item_lines = item_lines;
+    app.detail_total_lines = lines.len();
+    app.ensure_detail_visible(available_height);
 
     let visible_lines: Vec<Line> = lines
         .into_iter()

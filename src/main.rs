@@ -474,13 +474,16 @@ fn run_tui(
                                 let total = todo_count + port_count;
                                 match app.detail_selected {
                                     None => {
-                                        if total > 0 {
-                                            app.detail_selected = Some(total - 1);
-                                        } else if app.detail_scroll_offset > 0 {
+                                        if app.detail_scroll_offset > 0 {
                                             app.detail_scroll_offset -= 1;
+                                        } else if total > 0 {
+                                            app.detail_selected = Some(total - 1);
                                         }
                                     }
                                     Some(0) => {
+                                        if app.detail_scroll_offset > 0 {
+                                            app.detail_scroll_offset -= 1;
+                                        }
                                         app.detail_selected = None;
                                     }
                                     Some(sel) => {

@@ -82,10 +82,15 @@ pub struct App {
     pub auto_detail: bool,
     // Chrome tabs matched to the currently viewed detail session's ports
     pub detail_chrome_tabs: Vec<(crate::common::chrome::ChromeTab, u16)>,
+    // Branch commits ahead of base (for worktree sessions)
+    pub detail_commits: Vec<String>,
     // Help screen visible
     pub showing_help: bool,
     // Auto-picker mode: started with --picker, Esc exits app
     pub auto_picker: bool,
+    // Detail view: line index of each selectable item, total rendered lines
+    pub detail_item_lines: Vec<usize>,
+    pub detail_total_lines: usize,
 }
 
 impl App {
@@ -126,8 +131,11 @@ impl App {
             skipped_sessions: load_skipped_sessions(),
             auto_detail: false,
             detail_chrome_tabs: Vec::new(),
+            detail_commits: Vec::new(),
             showing_help: false,
             auto_picker: false,
+            detail_item_lines: Vec::new(),
+            detail_total_lines: 0,
         }
     }
 
@@ -515,6 +523,22 @@ impl App {
             self.detail_chrome_tabs.clear();
         }
 
+        // Fetch branch commits for worktree sessions in detail view
+        if let Some(name) = self.detail_session_name() {
+            if let Some(entry) = crate::common::worktree::find_worktree_by_session_name(&name) {
+                let registry = ProjectRegistry::load();
+                let base = registry
+                    .projects.get(&entry.project_key)
+                    .and_then(|c| c.default_base_branch.clone())
+                    .unwrap_or_else(|| "main".to_string());
+                self.detail_commits = get_commits_ahead(&entry.path, &base);
+            } else {
+                self.detail_commits.clear();
+            }
+        } else {
+            self.detail_commits.clear();
+        }
+
         // Debug log refresh summary
         if crate::common::debug::is_debug_enabled() {
             let summary: Vec<String> = self
@@ -617,6 +641,34 @@ impl App {
         }
     }
 
+    /// Auto-scroll detail view to keep the selected item visible
+    pub fn ensure_detail_visible(&mut self, available_height: usize) {
+        if available_height == 0 || self.detail_total_lines <= available_height {
+            self.detail_scroll_offset = 0;
+            return;
+        }
+
+        let max_scroll = self.detail_total_lines.saturating_sub(available_height);
+
+        if let Some(sel) = self.detail_selected {
+            if let Some(&item_line) = self.detail_item_lines.get(sel) {
+                // Scroll up if item is above visible window
+                if item_line < self.detail_scroll_offset {
+                    self.detail_scroll_offset = item_line.saturating_sub(1);
+                }
+                // Scroll down if item is below visible window
+                let visible_end = self.detail_scroll_offset + available_height;
+                if item_line >= visible_end {
+                    self.detail_scroll_offset = (item_line + 2).saturating_sub(available_height);
+                }
+            }
+        }
+
+        if self.detail_scroll_offset > max_scroll {
+            self.detail_scroll_offset = max_scroll;
+        }
+    }
+
     // --- Detail view methods ---
 
     pub fn open_detail(&mut self, idx: usize) {
@@ -624,6 +676,8 @@ impl App {
             self.showing_detail = Some(info.name.clone());
             self.detail_selected = None;
             self.detail_scroll_offset = 0;
+            self.detail_item_lines.clear();
+            self.detail_total_lines = 0;
         }
     }
 
@@ -804,4 +858,22 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Get commits ahead of base branch in a git repo.
+/// Returns commit summary lines (from `git log base..HEAD --oneline`).
+fn get_commits_ahead(repo_path: &str, base_branch: &str) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .args(["log", &format!("{}..HEAD", base_branch), "--oneline", "-20"])
+        .current_dir(repo_path)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .map(|l| l.to_string())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
