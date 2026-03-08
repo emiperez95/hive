@@ -195,7 +195,11 @@ pub fn resolve_tmux_path() -> String {
             }
         }
     }
-    for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+    for p in [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+    ] {
         if std::path::Path::new(p).exists() {
             return p.to_string();
         }

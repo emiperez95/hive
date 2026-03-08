@@ -650,8 +650,7 @@ fn run_tui(
                                 needs_redraw = true;
                             }
                             KeyCode::Char('l') | KeyCode::Char('L') => {
-                                let pane_count =
-                                    crate::common::iterm::get_iterm_pane_count();
+                                let pane_count = crate::common::iterm::get_iterm_pane_count();
                                 if pane_count > 1 {
                                     app.save_restorable();
                                     return Ok(PostAction::Collapse);
@@ -840,10 +839,7 @@ fn run_hook(event_type: &str) -> Result<()> {
     // Check auto-approve before notifications so we can skip alerting for auto-approved requests
     // Skip auto-approve for plans (ExitPlanMode) and questions (AskUserQuestion) — those need human input
     let mut auto_approved = false;
-    let tool_name_str = json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let tool_name_str = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let is_human_input = tool_name_str == "ExitPlanMode" || tool_name_str == "AskUserQuestion";
     if event_type == "PermissionRequest" && !is_human_input {
         if let Some(tmux_session) = get_current_tmux_session() {
@@ -1053,7 +1049,10 @@ fn run_setup() -> Result<()> {
     }
 
     // Check janus-wt-portal agent
-    let agent_dest = home.join(".claude").join("agents").join("janus-wt-portal.md");
+    let agent_dest = home
+        .join(".claude")
+        .join("agents")
+        .join("janus-wt-portal.md");
     let agent_status = if agent_dest.exists() {
         let existing = fs::read_to_string(&agent_dest).unwrap_or_default();
         if existing == JANUS_AGENT_CONTENT {
@@ -1474,7 +1473,10 @@ fn run_uninstall() -> Result<()> {
     }
 
     // Remove janus-wt-portal agent
-    let agent_path = home.join(".claude").join("agents").join("janus-wt-portal.md");
+    let agent_path = home
+        .join(".claude")
+        .join("agents")
+        .join("janus-wt-portal.md");
     if agent_path.exists() {
         println!();
         print!("Remove janus-wt-portal agent? [Y/n] ");
@@ -1591,7 +1593,10 @@ fn run_project_add(cmd: ProjectCommand) -> Result<()> {
     let mut registry = ProjectRegistry::load();
 
     if registry.projects.contains_key(&key) {
-        anyhow::bail!("Project '{}' already exists. Remove it first to re-add.", key);
+        anyhow::bail!(
+            "Project '{}' already exists. Remove it first to re-add.",
+            key
+        );
     }
 
     let project_root = path.unwrap_or_else(|| {
@@ -1700,7 +1705,8 @@ fn run_project_import() -> Result<()> {
     use crate::common::projects::parse_sesh_toml;
 
     // Check ~/.config/sesh/sesh.toml first (common on macOS), then XDG config dir
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let dot_config_path = home.join(".config").join("sesh").join("sesh.toml");
     let xdg_path = dirs::config_dir().map(|p| p.join("sesh").join("sesh.toml"));
 
@@ -1710,11 +1716,7 @@ fn run_project_import() -> Result<()> {
         if xdg.exists() {
             xdg.clone()
         } else {
-            anyhow::bail!(
-                "sesh.toml not found at {:?} or {:?}",
-                dot_config_path,
-                xdg
-            );
+            anyhow::bail!("sesh.toml not found at {:?} or {:?}", dot_config_path, xdg);
         }
     } else {
         anyhow::bail!("sesh.toml not found at {:?}", dot_config_path);
@@ -1737,7 +1739,10 @@ fn run_project_import() -> Result<()> {
     }
 
     registry.save()?;
-    println!("\nImported {} project(s), skipped {} existing", added, skipped);
+    println!(
+        "\nImported {} project(s), skipped {} existing",
+        added, skipped
+    );
     Ok(())
 }
 
@@ -1751,10 +1756,10 @@ fn run_wt_new(
     prompt: Option<&str>,
     auto_approve: bool,
 ) -> Result<()> {
-    use anyhow::Context;
     use crate::common::persistence::{load_auto_approve_sessions, save_auto_approve_sessions};
     use crate::common::projects::expand_tilde;
     use crate::common::worktree::*;
+    use anyhow::Context;
 
     // 1. Load project config, resolve worktrees dir, build default session name
     let registry = ProjectRegistry::load();
@@ -2000,16 +2005,17 @@ fn run_wt_delete(project: &str, branch: &str, keep_branch: bool, force: bool) ->
     }
 
     // 5. git worktree remove + optionally delete branch
-    let git_removed = match delete_git_worktree(&project_root, &worktree_path, branch, keep_branch, force) {
-        Ok(()) => {
-            println!("  Removed git worktree");
-            true
-        }
-        Err(e) => {
-            eprintln!("  Warning: git worktree removal failed: {}", e);
-            false
-        }
-    };
+    let git_removed =
+        match delete_git_worktree(&project_root, &worktree_path, branch, keep_branch, force) {
+            Ok(()) => {
+                println!("  Removed git worktree");
+                true
+            }
+            Err(e) => {
+                eprintln!("  Warning: git worktree removal failed: {}", e);
+                false
+            }
+        };
 
     // 6. Remove from worktrees.json only if git worktree was actually removed
     if git_removed {

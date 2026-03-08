@@ -54,8 +54,8 @@ impl WorktreeState {
 
     /// Save worktree state to disk atomically (write .tmp, rename).
     pub fn save(&self) -> Result<()> {
-        let path = Self::file_path()
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine cache directory"))?;
+        let path =
+            Self::file_path().ok_or_else(|| anyhow::anyhow!("Cannot determine cache directory"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -130,11 +130,7 @@ pub fn connect_worktree(session_name: &str) -> bool {
         .get(&entry.project_key)
         .and_then(|c| c.startup_command.as_deref());
 
-    crate::common::projects::ensure_tmux_session(
-        &entry.session_name,
-        &entry.path,
-        startup_cmd,
-    )
+    crate::common::projects::ensure_tmux_session(&entry.session_name, &entry.path, startup_cmd)
 }
 
 // ─── Import ─────────────────────────────────────────────────────────────────
@@ -244,13 +240,14 @@ pub fn create_git_worktree(
     }
 
     // Ensure worktrees_dir exists
-    std::fs::create_dir_all(worktrees_dir)
-        .with_context(|| format!("Failed to create worktrees directory: {}", worktrees_dir.display()))?;
+    std::fs::create_dir_all(worktrees_dir).with_context(|| {
+        format!(
+            "Failed to create worktrees directory: {}",
+            worktrees_dir.display()
+        )
+    })?;
 
-    let mut args = vec![
-        "worktree".to_string(),
-        "add".to_string(),
-    ];
+    let mut args = vec!["worktree".to_string(), "add".to_string()];
 
     if existing {
         args.push(worktree_path.to_string_lossy().to_string());
@@ -315,7 +312,11 @@ pub fn delete_git_worktree(
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Don't fail hard — branch might be checked out elsewhere or already deleted
-            eprintln!("Warning: could not delete branch '{}': {}", branch, stderr.trim());
+            eprintln!(
+                "Warning: could not delete branch '{}': {}",
+                branch,
+                stderr.trim()
+            );
         }
     }
 
@@ -387,7 +388,10 @@ pub fn symlink_file_patterns(
         }
 
         if dst.exists() || dst.symlink_metadata().is_ok() {
-            eprintln!("Warning: symlink target '{}' already exists, skipping", pattern);
+            eprintln!(
+                "Warning: symlink target '{}' already exists, skipping",
+                pattern
+            );
             continue;
         }
 
@@ -396,9 +400,8 @@ pub fn symlink_file_patterns(
         }
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&src, &dst).with_context(|| {
-            format!("Failed to symlink {} -> {}", src.display(), dst.display())
-        })?;
+        std::os::unix::fs::symlink(&src, &dst)
+            .with_context(|| format!("Failed to symlink {} -> {}", src.display(), dst.display()))?;
 
         #[cfg(not(unix))]
         {
@@ -508,8 +511,17 @@ pub fn resolve_hooks_dir(config: &ProjectConfig, project_key: &str) -> PathBuf {
         expand_tilde(dir)
     } else {
         dirs::home_dir()
-            .map(|p| p.join(".hive").join("projects").join(project_key).join("hooks"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/.hive/projects").join(project_key).join("hooks"))
+            .map(|p| {
+                p.join(".hive")
+                    .join("projects")
+                    .join(project_key)
+                    .join("hooks")
+            })
+            .unwrap_or_else(|| {
+                PathBuf::from("/tmp/.hive/projects")
+                    .join(project_key)
+                    .join("hooks")
+            })
     }
 }
 
@@ -561,7 +573,9 @@ pub fn run_hook(
     cmd.env("HIVE_METADATA", serde_json::to_string(metadata)?);
     cmd.env("HIVE_METADATA_FILE", &metadata_file);
 
-    let output = cmd.output().with_context(|| format!("Failed to run hook: {}", name))?;
+    let output = cmd
+        .output()
+        .with_context(|| format!("Failed to run hook: {}", name))?;
 
     // Print hook output so log messages are visible
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -849,7 +863,10 @@ mod tests {
         assert_eq!(env["HIVE_PROJECT_ROOT"], "/home/user/projects/my-proj");
         assert_eq!(env["HIVE_SESSION_NAME"], "📦 worktree-feat-1");
         assert_eq!(env["HIVE_WORKTREE_TYPE"], "worktree");
-        assert_eq!(env["HIVE_HOOKS_DIR"], "/home/user/.hive/projects/my-proj/hooks");
+        assert_eq!(
+            env["HIVE_HOOKS_DIR"],
+            "/home/user/.hive/projects/my-proj/hooks"
+        );
     }
 
     #[test]

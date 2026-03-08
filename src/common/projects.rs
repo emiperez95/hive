@@ -221,11 +221,7 @@ pub fn connect_session(session_name: &str) -> bool {
 /// Ensure a tmux session exists, creating it at the given path if needed.
 /// Optionally runs a startup command in the new session.
 /// Returns true on success, false on failure.
-pub fn ensure_tmux_session(
-    session_name: &str,
-    cwd: &str,
-    startup_cmd: Option<&str>,
-) -> bool {
+pub fn ensure_tmux_session(session_name: &str, cwd: &str, startup_cmd: Option<&str>) -> bool {
     let exists = Command::new("tmux")
         .args(["has-session", "-t", session_name])
         .output()
@@ -627,7 +623,10 @@ base_port = 3000
     fn test_derive_key_from_name() {
         assert_eq!(derive_key_from_name("🐝 hive"), "hive");
         assert_eq!(derive_key_from_name("🌐 My App"), "my-app");
-        assert_eq!(derive_key_from_name("📁 teleport-server"), "teleport-server");
+        assert_eq!(
+            derive_key_from_name("📁 teleport-server"),
+            "teleport-server"
+        );
         assert_eq!(derive_key_from_name("⚖️ Legal Advisor"), "legal-advisor");
         assert_eq!(derive_key_from_name("00-Dashboard"), "00-dashboard");
         assert_eq!(derive_key_from_name("🛠️ Nvim config"), "nvim-config");

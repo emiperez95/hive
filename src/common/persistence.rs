@@ -5,7 +5,6 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-
 /// Escape newlines for single-line file storage
 fn escape_newlines(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")

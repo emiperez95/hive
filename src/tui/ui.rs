@@ -317,12 +317,12 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(".", header_style)
             };
 
-            let name_style = if session_info.is_current_session || session_info.attached_other_client
-            {
-                header_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                header_style.add_modifier(Modifier::BOLD)
-            };
+            let name_style =
+                if session_info.is_current_session || session_info.attached_other_client {
+                    header_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    header_style.add_modifier(Modifier::BOLD)
+                };
 
             let current_marker = if session_info.is_current_session {
                 Span::styled("›", header_style.add_modifier(Modifier::BOLD))
@@ -482,12 +482,12 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(".", header_style)
             };
 
-            let name_style = if session_info.is_current_session || session_info.attached_other_client
-            {
-                header_style.add_modifier(Modifier::UNDERLINED)
-            } else {
-                header_style
-            };
+            let name_style =
+                if session_info.is_current_session || session_info.attached_other_client {
+                    header_style.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    header_style
+                };
 
             let current_marker = if session_info.is_current_session {
                 Span::styled("›", header_style.add_modifier(Modifier::BOLD))
@@ -702,10 +702,7 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let mut flag_spans: Vec<Span> = Vec::new();
     if app.is_favorite(&session_info.name) {
-        flag_spans.push(Span::styled(
-            "[★ fav] ",
-            Style::default().fg(Color::Yellow),
-        ));
+        flag_spans.push(Span::styled("[★ fav] ", Style::default().fg(Color::Yellow)));
     }
     if app.is_auto_approved(&session_info.name) {
         flag_spans.push(Span::styled(
@@ -859,7 +856,10 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw("  "),
                 Span::styled(hash.to_string(), Style::default().fg(Color::Yellow)),
                 Span::raw(" "),
-                Span::styled(msg.to_string(), Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    msg.to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
             ]));
         }
         lines.push(Line::raw(""));
@@ -1048,4 +1048,3 @@ fn render_spread_prompt(frame: &mut Frame, area: Rect) {
     ));
     frame.render_widget(Paragraph::new(line), inner);
 }
-

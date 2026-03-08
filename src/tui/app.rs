@@ -7,9 +7,9 @@ use crate::common::persistence::{
     save_muted_sessions, save_restorable_sessions, save_session_todos, save_skipped_sessions,
     set_global_mute,
 };
-use crate::common::projects::{has_project_config, ProjectRegistry};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
+use crate::common::projects::{has_project_config, ProjectRegistry};
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
     lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
@@ -58,7 +58,7 @@ pub struct App {
     // Detail view
     pub showing_detail: Option<String>, // session name being viewed
     pub detail_selected: Option<usize>, // selected todo/port index in detail view (None = no selection)
-    pub detail_scroll_offset: usize,   // scroll offset for detail view content
+    pub detail_scroll_offset: usize,    // scroll offset for detail view content
     // Session restore
     pub last_save: Instant, // Track last save time for periodic saves
     // Stable permission key assignments (session name -> key)
@@ -69,8 +69,8 @@ pub struct App {
     pub search_query: String,
     pub search_results: Vec<SearchResult>,
     pub search_scroll_offset: usize, // Scroll offset for search results
-    pub project_names: Vec<String>,   // Cached list of all project session names
-    pub worktree_names: Vec<String>,                       // Flat list of all worktree session names
+    pub project_names: Vec<String>,  // Cached list of all project session names
+    pub worktree_names: Vec<String>, // Flat list of all worktree session names
     pub worktrees_by_project: HashMap<String, Vec<String>>, // project_key → worktree session names
     // Per-session auto-approve toggle
     pub auto_approve_sessions: HashSet<String>,
@@ -152,8 +152,7 @@ impl App {
         let active_names: HashSet<String> =
             self.session_infos.iter().map(|s| s.name.clone()).collect();
 
-        let worktree_names_set: HashSet<String> =
-            self.worktree_names.iter().cloned().collect();
+        let worktree_names_set: HashSet<String> = self.worktree_names.iter().cloned().collect();
 
         // Track which worktrees were already added (to avoid duplicates)
         let mut added_worktrees: HashSet<String> = HashSet::new();
@@ -161,7 +160,8 @@ impl App {
         // Add matching active sessions
         for info in self.session_infos.iter() {
             if query.is_empty() || info.name.to_lowercase().contains(&query) {
-                self.search_results.push(SearchResult::Active(info.name.clone()));
+                self.search_results
+                    .push(SearchResult::Active(info.name.clone()));
             }
         }
 
@@ -173,8 +173,7 @@ impl App {
                 continue;
             }
 
-            let project_matches = query.is_empty()
-                || session_name.to_lowercase().contains(&query);
+            let project_matches = query.is_empty() || session_name.to_lowercase().contains(&query);
 
             // Find worktrees for this project by checking worktrees_by_project keys
             // The key in worktrees_by_project is the project_key, not session_name.
@@ -184,7 +183,10 @@ impl App {
             for (proj_key, wt_names) in &self.worktrees_by_project {
                 // Check if this project key is associated with this session_name
                 // by checking if the session_name contains the project key
-                if !session_name.to_lowercase().contains(&proj_key.to_lowercase()) {
+                if !session_name
+                    .to_lowercase()
+                    .contains(&proj_key.to_lowercase())
+                {
                     continue;
                 }
                 for wt in wt_names {
@@ -529,7 +531,8 @@ impl App {
             if let Some(entry) = crate::common::worktree::find_worktree_by_session_name(&name) {
                 let registry = ProjectRegistry::load();
                 let base = registry
-                    .projects.get(&entry.project_key)
+                    .projects
+                    .get(&entry.project_key)
                     .and_then(|c| c.default_base_branch.clone())
                     .unwrap_or_else(|| "main".to_string());
                 self.detail_commits = get_commits_ahead(&entry.path, &base);
@@ -871,9 +874,7 @@ fn get_commits_ahead(repo_path: &str, base_branch: &str) -> Vec<String> {
     match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            text.lines()
-                .map(|l| l.to_string())
-                .collect()
+            text.lines().map(|l| l.to_string()).collect()
         }
         _ => Vec::new(),
     }
