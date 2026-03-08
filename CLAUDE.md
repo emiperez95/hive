@@ -68,7 +68,7 @@ src/
 ├── bin/bench.rs            benchmark tool
 ├── common/
 │   ├── types.rs            TmuxSession, SessionInfo, ClaudeStatus, ProcessInfo, PERMISSION_KEYS
-│   ├── tmux.rs             tmux command helpers (list-sessions, switch, send-keys, kill)
+│   ├── tmux.rs             tmux command helpers (list-sessions, switch, send-keys, kill, resolve_tmux_path)
 │   ├── process.rs          Claude process detection, process tree traversal (sysinfo)
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
@@ -131,7 +131,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other platforms:
 - `ports.rs`: `get_listening_ports_for_pids()` — uses `libproc`
 - `chrome.rs`: `get_chrome_tabs()`, `open_chrome_tab()`, `focus_chrome_tab()` — uses AppleScript
-- `iterm.rs`: `get_iterm_pane_count()`, `spread_sessions()`, `collapse_panes()` — uses AppleScript
+- `iterm.rs`: `get_iterm_pane_count()`, `spread_panes()`, `collapse_panes()` — uses AppleScript
 
 ## Key Handling
 
@@ -139,11 +139,30 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 
 1. Help screen → `?`/Esc dismiss, `Q` quit
 2. AddTodo input → text entry modal
-3. Search mode → filter, navigate, select
-4. Detail view → todos, ports, switch, favorite, flags
-5. Normal list → navigate, switch (exits app), approve permissions, search, quit
+3. SpreadPrompt → digit 1-9 triggers spread, Esc cancels
+4. Search mode → filter, navigate, select
+5. Detail view → todos, ports, switch, favorite, flags
+6. Normal list → navigate, switch (exits app), approve permissions, search, `L` spread/collapse, quit
 
 Switching sessions (1-9, Enter in detail, connect project) always exits the app.
+
+## `hive start`
+
+Auto-attach to a tmux session. Designed as iTerm2's startup command for new tabs/panes.
+
+1. Find the first non-skipped session **not attached** to another client → `exec tmux attach`
+2. If all non-skipped sessions are attached, attach to **any** non-skipped session (duplicates are fine)
+3. If no sessions exist at all → fall through to TUI picker (search mode)
+
+When the picker is used (case 3), selecting a session returns `PostAction::Attach(name)` which `exec`s into tmux after the TUI is cleaned up.
+
+## `hive spread/collapse`
+
+`hive spread N` opens N-1 new vertical iTerm2 panes via AppleScript (`split vertically`). Each new pane runs `env PATH='...' /path/to/hive start` — PATH is captured from the current process since iTerm split panes have minimal environment. Each `hive start` independently picks a session.
+
+`hive collapse` closes all iTerm2 panes except the current one. Tmux sessions stay alive (just detached).
+
+In the TUI, `L` toggles: if multiple panes exist → collapse, otherwise → show SpreadPrompt for digit input.
 
 ## Tmux Integration
 

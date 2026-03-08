@@ -9,8 +9,10 @@ Monitor and manage multiple parallel Claude Code sessions from a single TUI. See
 - **Session overview** — all tmux sessions with Claude activity, CPU/memory usage
 - **Permission approval** — approve Bash, Write, Edit permissions with single keypresses
 - **Detail view** — per-session todos, listening ports, Chrome tab matching, process tree
-- **Search** — fuzzy search across active, parked, and sesh-configured sessions
-- **Session parking** — temporarily park sessions (kill tmux, remember via sesh)
+- **Search** — fuzzy search across active sessions and registered projects
+- **Project registry** — manage projects with emoji identifiers, startup commands, and config
+- **Worktree management** — create/delete git worktrees with tmux sessions and lifecycle hooks
+- **iTerm2 pane spread** — split into N panes, each auto-attaching to a session
 - **Notifications** — native macOS/Linux notifications when sessions need attention
 - **Hook-based status** — real-time Claude status via Claude Code hooks
 - **Port detection** — discovers listening TCP ports per session (macOS via libproc)
@@ -46,15 +48,68 @@ To remove everything:
 hive uninstall
 ```
 
-## Usage
+## Commands
+
+### Core
 
 ```bash
-hive                   # Launch the dashboard
-hive --detail          # Open detail view for current session
-hive -w 5             # Custom refresh interval (seconds)
-hive -f pattern       # Filter sessions by name
-hive cycle-next       # Cycle to next tmux session
-hive cycle-prev       # Cycle to previous tmux session
+hive                    # open TUI dashboard (default)
+hive start              # auto-attach to first available tmux session
+hive --detail           # open TUI with detail view for current session
+hive --picker           # open TUI in search/picker mode
+hive -w 5               # custom refresh interval (seconds)
+hive -f pattern         # filter sessions by name
+```
+
+### Session Navigation
+
+```bash
+hive cycle-next         # switch to next tmux session (skips skipped sessions)
+hive cycle-prev         # switch to previous tmux session
+hive connect <key>      # create/attach tmux session for a registered project
+```
+
+### iTerm2 Panes
+
+```bash
+hive spread <N>         # split into N vertical iTerm2 panes (each runs hive start)
+hive collapse           # close all panes except the current one
+```
+
+### Project Registry
+
+```bash
+hive project add <key>  # add a project (supports --emoji, --path, --startup, etc.)
+hive project remove <key>
+hive project list
+hive project import     # import from sesh.toml
+```
+
+### Worktrees
+
+```bash
+hive wt new <project> <branch>    # create worktree + tmux session (with hooks)
+hive wt delete <project> <branch> # delete worktree + session + branch
+hive wt list [project]            # list registered worktrees with status
+```
+
+### Todos
+
+```bash
+hive todo list [--session <name>] [--done]
+hive todo next [--session <name>]
+hive todo add <text> [--session <name>]
+hive todo done [index] [--session <name>]
+hive todo clear [--session <name>]
+```
+
+### System
+
+```bash
+hive setup              # register hooks, agent, and tmux keybindings
+hive update             # update to latest version from GitHub + re-run setup
+hive uninstall          # remove hooks and keybindings
+hive hook <event>       # process hook event from stdin (used by Claude Code hooks)
 ```
 
 ### Tmux Keybindings
@@ -78,7 +133,7 @@ hive cycle-prev       # Cycle to previous tmux session
 | `y/z/x/w/v` | Approve permission (once) |
 | `Y/Z/X/W/V` | Approve permission (always) |
 | `/` | Search sessions |
-| `U` | View parked sessions |
+| `L` | Spread/collapse iTerm2 panes |
 | `M` | Toggle global mute |
 | `R` | Force refresh |
 | `?` | Help screen |
@@ -92,7 +147,7 @@ hive cycle-prev       # Cycle to previous tmux session
 | `Enter` | Switch to session / open port |
 | `A` | Add todo |
 | `D` | Delete selected todo |
-| `P` | Park session |
+| `F` | Toggle favorite |
 | `!` | Toggle auto-approve |
 | `M` | Toggle mute |
 | `S` | Toggle skip from cycling |
@@ -123,6 +178,28 @@ No background daemon. No async runtime. No Unix sockets. Just a state file.
 | Notifications | osascript/terminal-notifier | notify-send |
 | Port detection | libproc | stub (empty) |
 | Chrome tabs | AppleScript | stub (empty) |
+| iTerm2 panes | AppleScript | stub (empty) |
+
+## Adding Terminal Support
+
+The iTerm2 pane spread/collapse feature lives in `src/common/iterm.rs` and is guarded behind `#[cfg(target_os = "macos")]`. To add support for another terminal emulator:
+
+1. **Create a new module** (e.g., `src/common/wezterm.rs` or `src/common/kitty.rs`) implementing:
+   - `get_pane_count() -> usize` — return the number of panes/splits in the current tab/window
+   - `spread_panes(n: usize) -> bool` — open `n` new panes, each running `hive start` with the current PATH
+   - `collapse_panes() -> bool` — close all panes except the current one
+
+2. **Register the module** in `src/common/mod.rs`.
+
+3. **Wire it up** in `src/main.rs`: `run_spread()` and `run_collapse()` currently call `crate::common::iterm::*`. Add detection logic or a config flag to select the right backend. The TUI key handler for `L` in `run_tui()` uses `get_iterm_pane_count()` to decide between spread and collapse.
+
+Each terminal has different automation APIs:
+- **iTerm2**: AppleScript (`tell application "iTerm2"`)
+- **WezTerm**: CLI (`wezterm cli split-pane`) or Lua scripting
+- **Kitty**: Remote control protocol (`kitten @ launch`, `kitten @ close-window`)
+- **Alacritty/tmux-only**: No terminal splits — could fall back to tmux splits instead
+
+Key consideration: new panes need the full PATH to find tmux. iTerm2 panes get minimal environment, so hive passes `env PATH='...'` explicitly. Other terminals may or may not have this issue.
 
 ## License
 
