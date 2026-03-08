@@ -2,6 +2,7 @@
 
 pub mod chrome;
 pub mod debug;
+pub mod iterm;
 #[allow(dead_code)]
 pub mod jsonl;
 pub mod persistence;

@@ -78,6 +78,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         }
     } else {
         render_session_list(frame, app, chunks[1]);
+        if app.input_mode == InputMode::SpreadPrompt {
+            render_spread_prompt(frame, chunks[1]);
+        }
     }
 
     // --- Error message ---
@@ -166,6 +169,7 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    y/z/x/w/v  Approve permission (once)"),
         Line::raw("    Y/Z/X/W/V  Approve permission (always)"),
         Line::raw("    /           Search sessions"),
+        Line::raw("    L           Spread/collapse iTerm2 panes"),
         Line::raw("    M           Toggle global mute"),
         Line::raw("    R           Force refresh"),
         Line::raw(""),
@@ -1015,5 +1019,33 @@ fn render_input_modal(
     ]));
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render a spread prompt overlay in the center of the area
+fn render_spread_prompt(frame: &mut Frame, area: Rect) {
+    let text = " Spread: press 1-9 (Esc to cancel) ";
+    let width = (text.len() as u16 + 2).min(area.width);
+    let height = 3u16;
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let line = Line::from(Span::styled(
+        text.trim(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(line), inner);
 }
 

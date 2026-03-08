@@ -23,7 +23,7 @@ use crate::common::projects::{
 };
 use crate::common::tmux::{
     get_current_tmux_session, get_current_tmux_session_names, get_other_client_sessions,
-    switch_to_session,
+    resolve_tmux_path, switch_to_session,
 };
 use crate::common::types::PERMISSION_KEYS;
 use crate::tui::app::{find_session_by_permission_key, App, InputMode, SearchResult};
@@ -104,6 +104,15 @@ enum Command {
         #[command(subcommand)]
         command: TodoCommand,
     },
+    /// Spread tmux sessions into N vertical iTerm2 panes
+    Spread {
+        /// Number of panes (1-9)
+        count: usize,
+    },
+    /// Collapse iTerm2 panes back to a single pane
+    Collapse,
+    /// Auto-attach to the first available tmux session
+    Start,
 }
 
 #[derive(Subcommand, Debug)]
@@ -254,11 +263,20 @@ enum TodoCommand {
     },
 }
 
+/// Action to perform after TUI exits (post terminal restore)
+enum PostAction {
+    None,
+    Spread(usize),
+    Collapse,
+    /// Attach to a tmux session via exec (used by `hive start` outside tmux)
+    Attach(String),
+}
+
 fn run_tui(
     terminal: &mut ratatui::DefaultTerminal,
     args: &Args,
     running: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<PostAction> {
     let mut app = App::new(args.filter.clone(), args.watch);
     app.auto_detail = args.detail;
 
@@ -272,7 +290,7 @@ fn run_tui(
     loop {
         if !running.load(Ordering::SeqCst) {
             app.save_restorable();
-            return Ok(());
+            return Ok(PostAction::None);
         }
 
         if app.input_mode != InputMode::Search {
@@ -310,7 +328,7 @@ fn run_tui(
         for _ in 0..iterations {
             if !running.load(Ordering::SeqCst) {
                 app.save_restorable();
-                return Ok(());
+                return Ok(PostAction::None);
             }
 
             if poll(Duration::from_millis(sleep_ms))? {
@@ -338,7 +356,7 @@ fn run_tui(
                             }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 app.save_restorable();
-                                return Ok(());
+                                return Ok(PostAction::None);
                             }
                             _ => {}
                         }
@@ -366,12 +384,26 @@ fn run_tui(
                             }
                             _ => {}
                         }
+                    } else if app.input_mode == InputMode::SpreadPrompt {
+                        match code {
+                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                let n = c.to_digit(10).unwrap() as usize;
+                                app.save_restorable();
+                                // Return spread count to run after TUI cleanup
+                                return Ok(PostAction::Spread(n));
+                            }
+                            KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
                     } else if app.input_mode == InputMode::Search {
                         match code {
                             KeyCode::Esc => {
                                 if app.auto_picker {
                                     app.save_restorable();
-                                    return Ok(());
+                                    return Ok(PostAction::None);
                                 }
                                 app.input_mode = InputMode::Normal;
                                 app.search_query.clear();
@@ -383,9 +415,12 @@ fn run_tui(
                                 {
                                     match result {
                                         SearchResult::Active(name) => {
-                                            switch_to_session(&name);
                                             app.save_restorable();
-                                            return Ok(());
+                                            if app.auto_picker {
+                                                return Ok(PostAction::Attach(name));
+                                            }
+                                            switch_to_session(&name);
+                                            return Ok(PostAction::None);
                                         }
                                         SearchResult::Project(name)
                                         | SearchResult::Worktree(name) => {
@@ -393,9 +428,12 @@ fn run_tui(
                                             app.search_query.clear();
                                             app.search_results.clear();
                                             if connect_session(&name) {
-                                                switch_to_session(&name);
                                                 app.save_restorable();
-                                                return Ok(());
+                                                if app.auto_picker {
+                                                    return Ok(PostAction::Attach(name));
+                                                }
+                                                switch_to_session(&name);
+                                                return Ok(PostAction::None);
                                             } else {
                                                 app.error_message = Some((
                                                     format!("Failed to connect to '{}'", name),
@@ -444,12 +482,12 @@ fn run_tui(
                                     needs_redraw = true;
                                 } else {
                                     app.save_restorable();
-                                    return Ok(());
+                                    return Ok(PostAction::None);
                                 }
                             }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 app.save_restorable();
-                                return Ok(());
+                                return Ok(PostAction::None);
                             }
                             KeyCode::Char('?') => {
                                 app.showing_help = true;
@@ -548,12 +586,12 @@ fn run_tui(
                                     } else if let Some(name) = app.detail_session_name() {
                                         switch_to_session(&name);
                                         app.save_restorable();
-                                        return Ok(());
+                                        return Ok(PostAction::None);
                                     }
                                 } else if let Some(name) = app.detail_session_name() {
                                     switch_to_session(&name);
                                     app.save_restorable();
-                                    return Ok(());
+                                    return Ok(PostAction::None);
                                 }
                             }
                             KeyCode::Char('f') | KeyCode::Char('F') => {
@@ -611,17 +649,28 @@ fn run_tui(
                                 app.toggle_global_mute();
                                 needs_redraw = true;
                             }
+                            KeyCode::Char('l') | KeyCode::Char('L') => {
+                                let pane_count =
+                                    crate::common::iterm::get_iterm_pane_count();
+                                if pane_count > 1 {
+                                    app.save_restorable();
+                                    return Ok(PostAction::Collapse);
+                                } else {
+                                    app.input_mode = InputMode::SpreadPrompt;
+                                    needs_redraw = true;
+                                }
+                            }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 app.save_restorable();
-                                return Ok(());
+                                return Ok(PostAction::None);
                             }
                             KeyCode::Esc => {
                                 app.save_restorable();
-                                return Ok(());
+                                return Ok(PostAction::None);
                             }
                             KeyCode::Char('c') if cfg!(unix) => {
                                 app.save_restorable();
-                                return Ok(());
+                                return Ok(PostAction::None);
                             }
                             KeyCode::Char('/') => {
                                 app.input_mode = InputMode::Search;
@@ -637,7 +686,7 @@ fn run_tui(
                                 if let Some(session_info) = app.session_infos.get(idx) {
                                     switch_to_session(&session_info.name);
                                     app.save_restorable();
-                                    return Ok(());
+                                    return Ok(PostAction::None);
                                 }
                             }
                             KeyCode::Char(c)
@@ -1484,6 +1533,49 @@ fn run_cycle(forward: bool) -> Result<()> {
     Ok(())
 }
 
+/// Spread tmux sessions into N vertical iTerm2 panes
+fn run_spread(count: usize) -> Result<()> {
+    use crate::common::iterm::spread_sessions;
+
+    let skipped = load_skipped_sessions();
+    let other_clients = get_other_client_sessions();
+    let all_sessions = get_current_tmux_session_names();
+    let current = get_current_tmux_session();
+
+    // Filter: remove skipped and other-client-attached sessions
+    let mut filtered: Vec<String> = all_sessions
+        .into_iter()
+        .filter(|name| !skipped.contains(name) && !other_clients.contains(name))
+        .collect();
+
+    // Put current session first, keep rest in order
+    if let Some(ref cur) = current {
+        if let Some(pos) = filtered.iter().position(|n| n == cur) {
+            let c = filtered.remove(pos);
+            filtered.insert(0, c);
+        }
+    }
+
+    // Build list for new panes: cycle through sessions (excluding current) to fill count-1 slots
+    let others: Vec<String> = filtered.into_iter().skip(1).collect();
+    if others.is_empty() {
+        return Ok(());
+    }
+    let to_spread: Vec<String> = (0..count - 1)
+        .map(|i| others[i % others.len()].clone())
+        .collect();
+
+    spread_sessions(&to_spread);
+
+    Ok(())
+}
+
+/// Collapse iTerm2 panes back to a single pane
+fn run_collapse() -> Result<()> {
+    crate::common::iterm::collapse_panes();
+    Ok(())
+}
+
 /// Connect to a registered project by key
 fn run_connect(key: &str) -> Result<()> {
     let registry = ProjectRegistry::load();
@@ -2221,8 +2313,35 @@ fn run_todo_clear(session: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Handle post-TUI actions (spread, collapse, attach)
+fn handle_post_action(action: PostAction) -> Result<()> {
+    match action {
+        PostAction::Spread(n) => run_spread(n),
+        PostAction::Collapse => run_collapse(),
+        PostAction::Attach(name) => {
+            use std::os::unix::process::CommandExt;
+            let tmux = resolve_tmux_path();
+            let err = std::process::Command::new(&tmux)
+                .args(["attach-session", "-t", &name])
+                .exec();
+            bail!("exec failed: {}", err);
+        }
+        PostAction::None => Ok(()),
+    }
+}
+
+/// Find the first tmux session not skipped and not attached to another client.
+fn run_start() -> Result<Option<String>> {
+    let skipped = load_skipped_sessions();
+    let other_clients = get_other_client_sessions();
+
+    Ok(get_current_tmux_session_names()
+        .into_iter()
+        .find(|name| !skipped.contains(name) && !other_clients.contains(name)))
+}
+
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     init_debug(args.debug);
 
     match args.command {
@@ -2240,6 +2359,33 @@ fn main() -> Result<()> {
             ProjectCommand::Import => run_project_import(),
         },
         Some(Command::Todo { command }) => run_todo(command),
+        Some(Command::Spread { count }) => run_spread(count),
+        Some(Command::Collapse) => run_collapse(),
+        Some(Command::Start) => {
+            if let Some(target) = run_start()? {
+                use std::os::unix::process::CommandExt;
+                let tmux = resolve_tmux_path();
+                let err = std::process::Command::new(&tmux)
+                    .args(["attach-session", "-t", &target])
+                    .exec();
+                bail!("exec failed: {}", err);
+            }
+            // No available session — fall through to TUI picker
+            args.picker = true;
+            args.command = None;
+            // fall through below
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+            ctrlc::set_handler(move || {
+                r.store(false, Ordering::SeqCst);
+            })
+            .expect("Error setting Ctrl-C handler");
+
+            let mut terminal = ratatui::init();
+            let action = run_tui(&mut terminal, &args, running);
+            ratatui::restore();
+            handle_post_action(action?)
+        }
         Some(Command::Wt { command }) => match command {
             WtCommand::New {
                 project,
@@ -2277,9 +2423,10 @@ fn main() -> Result<()> {
             .expect("Error setting Ctrl-C handler");
 
             let mut terminal = ratatui::init();
-            let result = run_tui(&mut terminal, &args, running);
+            let action = run_tui(&mut terminal, &args, running);
             ratatui::restore();
-            result
+            // Run spread/collapse after terminal is restored (popup closed)
+            handle_post_action(action?)
         }
     }
 }

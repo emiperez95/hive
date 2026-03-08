@@ -184,6 +184,25 @@ pub fn get_other_client_sessions() -> HashSet<String> {
     other_sessions
 }
 
+/// Resolve the absolute path to tmux by searching PATH.
+/// Needed for exec() and iTerm split panes which may have minimal PATH.
+pub fn resolve_tmux_path() -> String {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let candidate = std::path::PathBuf::from(dir).join("tmux");
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "tmux".to_string()
+}
+
 /// Kill a tmux session
 pub fn kill_tmux_session(name: &str) -> bool {
     Command::new("tmux")

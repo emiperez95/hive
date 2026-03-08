@@ -27,6 +27,7 @@ TUI (1s refresh)  → reads state.json   + tmux sessions + sysinfo + libproc + C
 
 ```
 hive                    # open TUI (default)
+hive start              # auto-attach to first available session (or fall through to picker)
 hive --detail           # open TUI with detail view for current session
 hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
@@ -48,6 +49,8 @@ hive todo next [--session <name>]           # print first active todo (exit 1 if
 hive todo add <text> [--session <name>]     # add a todo
 hive todo done [index] [--session <name>]   # mark todo as done (default: 1)
 hive todo clear [--session <name>]          # clear completed todos
+hive spread <N>                             # spread N sessions into vertical iTerm2 panes
+hive collapse                               # collapse iTerm2 panes back to one
 ```
 
 ## Janus WT Portal
@@ -69,6 +72,7 @@ src/
 │   ├── process.rs          Claude process detection, process tree traversal (sysinfo)
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
+│   ├── iterm.rs            iTerm2 pane spread/collapse via AppleScript (macOS only, #[cfg] guarded)
 │   ├── jsonl.rs            JSONL parsing for Claude status from ~/.claude/projects/
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
@@ -127,6 +131,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other platforms:
 - `ports.rs`: `get_listening_ports_for_pids()` — uses `libproc`
 - `chrome.rs`: `get_chrome_tabs()`, `open_chrome_tab()`, `focus_chrome_tab()` — uses AppleScript
+- `iterm.rs`: `get_iterm_pane_count()`, `spread_sessions()`, `collapse_panes()` — uses AppleScript
 
 ## Key Handling
 

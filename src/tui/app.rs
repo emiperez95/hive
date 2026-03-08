@@ -25,8 +25,9 @@ use sysinfo::System;
 #[derive(Debug, PartialEq)]
 pub enum InputMode {
     Normal,
-    AddTodo, // Adding a todo in detail view
-    Search,  // Interactive session search
+    AddTodo,      // Adding a todo in detail view
+    Search,       // Interactive session search
+    SpreadPrompt, // Waiting for digit 1-9 to spread iTerm2 panes
 }
 
 /// Search result item - active session, inactive project, or worktree
