@@ -1535,38 +1535,10 @@ fn run_cycle(forward: bool) -> Result<()> {
 
 /// Spread tmux sessions into N vertical iTerm2 panes
 fn run_spread(count: usize) -> Result<()> {
-    use crate::common::iterm::spread_sessions;
-
-    let skipped = load_skipped_sessions();
-    let other_clients = get_other_client_sessions();
-    let all_sessions = get_current_tmux_session_names();
-    let current = get_current_tmux_session();
-
-    // Filter: remove skipped and other-client-attached sessions
-    let mut filtered: Vec<String> = all_sessions
-        .into_iter()
-        .filter(|name| !skipped.contains(name) && !other_clients.contains(name))
-        .collect();
-
-    // Put current session first, keep rest in order
-    if let Some(ref cur) = current {
-        if let Some(pos) = filtered.iter().position(|n| n == cur) {
-            let c = filtered.remove(pos);
-            filtered.insert(0, c);
-        }
-    }
-
-    // Build list for new panes: cycle through sessions (excluding current) to fill count-1 slots
-    let others: Vec<String> = filtered.into_iter().skip(1).collect();
-    if others.is_empty() {
+    if count <= 1 {
         return Ok(());
     }
-    let to_spread: Vec<String> = (0..count - 1)
-        .map(|i| others[i % others.len()].clone())
-        .collect();
-
-    spread_sessions(&to_spread);
-
+    crate::common::iterm::spread_panes(count - 1);
     Ok(())
 }
 
@@ -2334,10 +2306,18 @@ fn handle_post_action(action: PostAction) -> Result<()> {
 fn run_start() -> Result<Option<String>> {
     let skipped = load_skipped_sessions();
     let other_clients = get_other_client_sessions();
-
-    Ok(get_current_tmux_session_names()
+    let sessions: Vec<String> = get_current_tmux_session_names()
         .into_iter()
-        .find(|name| !skipped.contains(name) && !other_clients.contains(name)))
+        .filter(|name| !skipped.contains(name))
+        .collect();
+
+    // Prefer a session not attached elsewhere, fall back to any non-skipped session
+    let target = sessions
+        .iter()
+        .find(|name| !other_clients.contains(*name))
+        .or_else(|| sessions.first());
+
+    Ok(target.cloned())
 }
 
 fn main() -> Result<()> {

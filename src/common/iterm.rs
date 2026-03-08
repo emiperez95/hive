@@ -42,32 +42,33 @@ pub fn get_iterm_pane_count() -> usize {
     0
 }
 
-/// Spread tmux sessions into new vertical iTerm2 panes.
+/// Open N new vertical iTerm2 panes, each running `hive start`.
 ///
-/// Takes session names for NEW panes only (the current session stays in the existing pane).
-/// Each new pane runs `tmux attach-session -t <name>`.
-/// Returns true on success.
+/// The current pane is untouched. Each new pane runs hive start which
+/// auto-attaches to the first available tmux session.
 #[cfg(target_os = "macos")]
-pub fn spread_sessions(sessions: &[String]) -> bool {
-    if sessions.is_empty() {
+pub fn spread_panes(n: usize) -> bool {
+    if n == 0 {
         return true;
     }
 
     use std::process::Command;
 
-    // Resolve tmux absolute path — iTerm split panes have minimal PATH
-    let tmux = super::tmux::resolve_tmux_path();
+    let hive = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "hive".to_string());
+    let path = std::env::var("PATH").unwrap_or_default();
 
     let mut splits = String::new();
-    for name in sessions {
+    for _ in 0..n {
         splits.push_str(&format!(
             r#"
             tell lastSess
-                set newSess to (split vertically with default profile command "{} attach-session -t \"{}\"")
+                set newSess to (split vertically with default profile command "env PATH='{}' {} start")
             end tell
             set lastSess to newSess
 "#,
-            tmux, name
+            path, hive
         ));
     }
 
@@ -94,7 +95,7 @@ end tell
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn spread_sessions(_sessions: &[String]) -> bool {
+pub fn spread_panes(_n: usize) -> bool {
     false
 }
 
