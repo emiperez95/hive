@@ -443,11 +443,11 @@ impl App {
             });
         }
 
-        // Sort: skipped always last, favorites first within each group, then Claude before non-Claude
+        // Sort: skipped last, Claude before non-Claude, favorites first within each group
         session_infos.sort_by_key(|s| {
             let is_favorite = self.favorite_sessions.contains(&s.name);
             let is_skipped = self.skipped_sessions.contains(&s.name);
-            (is_skipped, !is_favorite, s.claude_status.is_none())
+            (is_skipped, s.claude_status.is_none(), !is_favorite)
         });
 
         // Stable permission key assignment
