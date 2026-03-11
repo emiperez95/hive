@@ -18,7 +18,7 @@ File-based state, no daemon, no async runtime:
 
 ```
 Claude hook fires → hive hook <event>  → reads stdin JSON, updates state.json, sends notification
-TUI (1s refresh)  → reads state.json   + tmux sessions + sysinfo + libproc + Chrome AppleScript
+TUI (1s refresh)  → reads state.json   + tmux sessions + sysinfo + libproc + Chrome JXA (on-demand)
 ```
 
 **Data flow**: `hive hook` writes `state.json` atomically (write .tmp, rename). TUI reads it each refresh cycle. No locking needed.
@@ -130,7 +130,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 
 macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other platforms:
 - `ports.rs`: `get_listening_ports_for_pids()` — uses `libproc`
-- `chrome.rs`: `get_chrome_tabs()`, `open_chrome_tab()`, `focus_chrome_tab()` — uses AppleScript
+- `chrome.rs`: `get_chrome_tabs()`, `open_chrome_tab()`, `focus_chrome_tab()`, `focus_all_matched_tabs()` — uses JXA (sees all Chrome profiles)
 - `iterm.rs`: `get_iterm_pane_count()`, `spread_panes()`, `collapse_panes()` — uses AppleScript
 
 ## Key Handling
@@ -141,8 +141,8 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 2. AddTodo input → text entry modal
 3. SpreadPrompt → digit 1-9 triggers spread, Esc cancels
 4. Search mode → filter, navigate, select
-5. Detail view → todos, ports, switch, favorite, flags
-6. Normal list → navigate, switch (exits app), approve permissions, search, `L` spread/collapse, quit
+5. Detail view → todos, ports, switch, favorite, flags, `O` open Chrome tabs
+6. Normal list → navigate, switch (exits app), approve permissions, search, `O` open Chrome tabs, `L` spread/collapse, quit
 
 Switching sessions (1-9, Enter in detail, connect project) always exits the app.
 
@@ -163,6 +163,17 @@ When the picker is used (case 3), selecting a session returns `PostAction::Attac
 `hive collapse` closes all iTerm2 panes except the current one. Tmux sessions stay alive (just detached).
 
 In the TUI, `L` toggles: if multiple panes exist → collapse, otherwise → show SpreadPrompt for digit input.
+
+## Chrome Integration
+
+Hive detects Chrome tabs matching a session's listening ports (`localhost:PORT`, `127.0.0.1:PORT`, `[::1]:PORT`).
+
+Uses **JXA (JavaScript for Automation)** instead of AppleScript because Chrome's AppleScript dictionary only exposes windows from the main profile. JXA sees all windows across all profiles and incognito.
+
+- **Detail view**: Chrome tab titles shown next to matching ports (fetched once on entering detail view)
+- **`O` key** (list or detail view): Focus all Chrome windows/tabs matching the session's ports. Uses `AXRaise` via System Events to bring only matched windows to front (other Chrome windows may still appear behind due to macOS limitations)
+- **`Enter` on a port** (detail view): Focus the matching Chrome tab, or open `localhost:PORT` if no tab exists
+- Chrome tabs are fetched **on-demand** (not every refresh cycle) to avoid spawning `osascript` every second
 
 ## Tmux Integration
 

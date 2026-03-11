@@ -512,19 +512,7 @@ impl App {
             }
         }
 
-        // Fetch Chrome tabs for detail view
-        if let Some(session) = self.detail_session_info() {
-            if !session.listening_ports.is_empty() {
-                let ports = session.listening_ports.clone();
-                let all_tabs = crate::common::chrome::get_chrome_tabs();
-                self.detail_chrome_tabs =
-                    crate::common::chrome::match_tabs_to_ports(&all_tabs, &ports);
-            } else {
-                self.detail_chrome_tabs.clear();
-            }
-        } else {
-            self.detail_chrome_tabs.clear();
-        }
+        // Chrome tabs are fetched on-demand (refresh_chrome_tabs), not every cycle
 
         // Fetch branch commits for worktree sessions in detail view
         if let Some(name) = self.detail_session_name() {
@@ -682,6 +670,7 @@ impl App {
             self.detail_scroll_offset = 0;
             self.detail_item_lines.clear();
             self.detail_total_lines = 0;
+            self.refresh_chrome_tabs();
         }
     }
 
@@ -693,6 +682,22 @@ impl App {
         self.showing_detail
             .as_ref()
             .and_then(|name| self.session_infos.iter().find(|s| &s.name == name))
+    }
+
+    /// Fetch Chrome tabs matching the current detail session's ports (on-demand).
+    pub fn refresh_chrome_tabs(&mut self) {
+        if let Some(session) = self.detail_session_info() {
+            if !session.listening_ports.is_empty() {
+                let ports = session.listening_ports.clone();
+                let all_tabs = crate::common::chrome::get_chrome_tabs();
+                self.detail_chrome_tabs =
+                    crate::common::chrome::match_tabs_to_ports(&all_tabs, &ports);
+            } else {
+                self.detail_chrome_tabs.clear();
+            }
+        } else {
+            self.detail_chrome_tabs.clear();
+        }
     }
 
     pub fn detail_todos(&self) -> Vec<String> {

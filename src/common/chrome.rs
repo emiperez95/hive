@@ -20,29 +20,36 @@ pub struct ChromeTab {
 pub fn get_chrome_tabs() -> Vec<ChromeTab> {
     use std::process::Command;
 
+    // Use JXA (JavaScript for Automation) instead of AppleScript because
+    // Chrome's AppleScript dictionary only exposes windows from the main profile,
+    // while JXA sees all windows across all profiles and incognito.
     let script = r#"
-tell application "System Events"
-    if not (exists process "Google Chrome") then return ""
-end tell
-tell application "Google Chrome"
-    set output to ""
-    set allWindows to every window
-    set winCount to count of allWindows
-    set allURLLists to URL of every tab of every window
-    repeat with w from 1 to winCount
-        set urls to item w of allURLLists
-        repeat with t from 1 to count of urls
-            set tabURL to item t of urls
-            if tabURL contains "localhost" or tabURL contains "127.0.0.1" or tabURL contains "[::1]" then
-                set output to output & w & "\t" & t & "\t" & (title of tab t of window w) & "\t" & tabURL & "\n"
-            end if
-        end repeat
-    end repeat
-    return output
-end tell
+var app = Application('System Events');
+if (!app.processes.whose({name: 'Google Chrome'}).length) { ''; }
+else {
+    var chrome = Application('Google Chrome');
+    var wins = chrome.windows();
+    var lines = [];
+    for (var w = 0; w < wins.length; w++) {
+        var tabs = wins[w].tabs();
+        for (var t = 0; t < tabs.length; t++) {
+            var url = tabs[t].url();
+            if (url.indexOf('localhost') !== -1 || url.indexOf('127.0.0.1') !== -1 || url.indexOf('[::1]') !== -1) {
+                lines.push((w+1) + '\t' + (t+1) + '\t' + tabs[t].title() + '\t' + url);
+            }
+        }
+    }
+    lines.join('\n');
+}
 "#;
 
-    let output = match Command::new("osascript").arg("-e").arg(script).output() {
+    let output = match Command::new("osascript")
+        .arg("-l")
+        .arg("JavaScript")
+        .arg("-e")
+        .arg(script)
+        .output()
+    {
         Ok(out) => out,
         Err(_) => return Vec::new(),
     };
@@ -140,16 +147,21 @@ pub fn focus_chrome_tab(tab: &ChromeTab) -> bool {
 
     let script = format!(
         r#"
-tell application "Google Chrome"
-    set active tab index of window {} to {}
-    set index of window {} to 1
-    activate
-end tell
+var chrome = Application('Google Chrome');
+var se = Application('System Events');
+var proc = se.processes.byName('Google Chrome');
+chrome.windows[{}].activeTabIndex = {};
+proc.windows[{}].actions.byName('AXRaise').perform();
+proc.frontmost = true;
 "#,
-        tab.window_index, tab.tab_index, tab.window_index
+        tab.window_index - 1,
+        tab.tab_index,
+        tab.window_index - 1
     );
 
     Command::new("osascript")
+        .arg("-l")
+        .arg("JavaScript")
         .arg("-e")
         .arg(&script)
         .output()
@@ -159,6 +171,62 @@ end tell
 
 #[cfg(not(target_os = "macos"))]
 pub fn focus_chrome_tab(_tab: &ChromeTab) -> bool {
+    false
+}
+
+/// Focus all Chrome tabs matching a session's ports.
+///
+/// If any port has at least one matching tab, activates every matched tab across all windows
+/// (including duplicates — two windows with the same port both get focused).
+/// Does nothing if no ports have matching tabs.
+#[cfg(target_os = "macos")]
+pub fn focus_all_matched_tabs(matched: &[(ChromeTab, u16)]) -> bool {
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    if matched.is_empty() {
+        return false;
+    }
+
+    // Group tabs by window — we need to pick one tab per window to set as active.
+    // If a window has multiple matching tabs, pick the first one.
+    let mut best_per_window: HashMap<usize, &ChromeTab> = HashMap::new();
+    for (tab, _) in matched {
+        best_per_window.entry(tab.window_index).or_insert(tab);
+    }
+
+    // Set active tabs via Chrome JXA, then raise only matched windows via System Events.
+    // Using AXRaise + frontmost instead of chrome.activate() avoids bringing ALL windows forward.
+    let mut script = String::from(
+        "var chrome = Application('Google Chrome');\n\
+         var se = Application('System Events');\n\
+         var proc = se.processes.byName('Google Chrome');\n",
+    );
+    for (win_idx, tab) in &best_per_window {
+        // JXA uses 0-based window index, 1-based activeTabIndex
+        script.push_str(&format!(
+            "chrome.windows[{}].activeTabIndex = {};\n\
+             proc.windows[{}].actions.byName('AXRaise').perform();\n",
+            win_idx - 1,
+            tab.tab_index,
+            win_idx - 1
+        ));
+    }
+    // Make Chrome the frontmost app (matched windows are already raised to top)
+    script.push_str("proc.frontmost = true;\n");
+
+    Command::new("osascript")
+        .arg("-l")
+        .arg("JavaScript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn focus_all_matched_tabs(_matched: &[(ChromeTab, u16)]) -> bool {
     false
 }
 

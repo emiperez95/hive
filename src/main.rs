@@ -563,6 +563,7 @@ fn run_tui(
                                         .unwrap_or(0);
                                     if sel >= todo_count && port_count > 0 {
                                         let port_idx = sel - todo_count;
+                                        app.refresh_chrome_tabs();
                                         if let Some(session) = app.detail_session_info() {
                                             if let Some(port_info) =
                                                 session.listening_ports.get(port_idx)
@@ -618,6 +619,13 @@ fn run_tui(
                                     needs_redraw = true;
                                 }
                             }
+                            KeyCode::Char('o') | KeyCode::Char('O') => {
+                                app.refresh_chrome_tabs();
+                                crate::common::chrome::focus_all_matched_tabs(
+                                    &app.detail_chrome_tabs,
+                                );
+                                needs_redraw = true;
+                            }
                             _ => {}
                         }
                     } else {
@@ -647,6 +655,25 @@ fn run_tui(
                             }
                             KeyCode::Char('m') | KeyCode::Char('M') => {
                                 app.toggle_global_mute();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('o') | KeyCode::Char('O') => {
+                                if let Some(session) =
+                                    app.session_infos.get(app.selected)
+                                {
+                                    if !session.listening_ports.is_empty() {
+                                        let ports = session.listening_ports.clone();
+                                        let all_tabs =
+                                            crate::common::chrome::get_chrome_tabs();
+                                        let matched =
+                                            crate::common::chrome::match_tabs_to_ports(
+                                                &all_tabs, &ports,
+                                            );
+                                        crate::common::chrome::focus_all_matched_tabs(
+                                            &matched,
+                                        );
+                                    }
+                                }
                                 needs_redraw = true;
                             }
                             KeyCode::Char('l') | KeyCode::Char('L') => {
