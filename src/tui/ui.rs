@@ -169,7 +169,6 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    y/z/x/w/v  Approve permission (once)"),
         Line::raw("    Y/Z/X/W/V  Approve permission (always)"),
         Line::raw("    /           Search sessions"),
-        Line::raw("    O           Open all Chrome tabs for session"),
         Line::raw("    L           Spread/collapse iTerm2 panes"),
         Line::raw("    M           Toggle global mute"),
         Line::raw("    R           Force refresh"),

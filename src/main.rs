@@ -657,25 +657,6 @@ fn run_tui(
                                 app.toggle_global_mute();
                                 needs_redraw = true;
                             }
-                            KeyCode::Char('o') | KeyCode::Char('O') => {
-                                if let Some(session) =
-                                    app.session_infos.get(app.selected)
-                                {
-                                    if !session.listening_ports.is_empty() {
-                                        let ports = session.listening_ports.clone();
-                                        let all_tabs =
-                                            crate::common::chrome::get_chrome_tabs();
-                                        let matched =
-                                            crate::common::chrome::match_tabs_to_ports(
-                                                &all_tabs, &ports,
-                                            );
-                                        crate::common::chrome::focus_all_matched_tabs(
-                                            &matched,
-                                        );
-                                    }
-                                }
-                                needs_redraw = true;
-                            }
                             KeyCode::Char('l') | KeyCode::Char('L') => {
                                 let pane_count = crate::common::iterm::get_iterm_pane_count();
                                 if pane_count > 1 {
