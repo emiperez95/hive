@@ -10,6 +10,7 @@ use crate::common::persistence::{
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::projects::{has_project_config, ProjectRegistry};
+use crate::common::worktree::sanitize_branch_name;
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
     lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
@@ -900,7 +901,7 @@ impl App {
 
     /// Transition from branch name input to base branch picker.
     pub fn enter_base_picker(&mut self) {
-        let branch = self.input_buffer.trim().to_string();
+        let branch = sanitize_branch_name(self.input_buffer.trim());
         if branch.is_empty() {
             self.cancel_worktree_wizard();
             return;

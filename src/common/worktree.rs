@@ -98,6 +98,26 @@ impl WorktreeState {
     }
 }
 
+// ─── Branch name sanitization ────────────────────────────────────────────────
+
+/// Sanitize user input into a valid git branch name by replacing spaces with hyphens
+/// and collapsing consecutive hyphens.
+pub fn sanitize_branch_name(input: &str) -> String {
+    let sanitized: String = input
+        .chars()
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect();
+    // Collapse consecutive hyphens
+    let mut result = String::with_capacity(sanitized.len());
+    for c in sanitized.chars() {
+        if c == '-' && result.ends_with('-') {
+            continue;
+        }
+        result.push(c);
+    }
+    result.trim_matches('-').to_string()
+}
+
 // ─── Session name builder ────────────────────────────────────────────────────
 
 /// Build a default session name: "{emoji} {type}-{branch}"
@@ -694,6 +714,26 @@ mod tests {
             build_session_name(&config, "feature", "my-branch"),
             "🐝 feature-my-branch"
         );
+    }
+
+    #[test]
+    fn test_sanitize_branch_name_spaces() {
+        assert_eq!(sanitize_branch_name("my new branch"), "my-new-branch");
+    }
+
+    #[test]
+    fn test_sanitize_branch_name_multiple_spaces() {
+        assert_eq!(sanitize_branch_name("a  b   c"), "a-b-c");
+    }
+
+    #[test]
+    fn test_sanitize_branch_name_leading_trailing_spaces() {
+        assert_eq!(sanitize_branch_name("  branch  "), "branch");
+    }
+
+    #[test]
+    fn test_sanitize_branch_name_no_spaces() {
+        assert_eq!(sanitize_branch_name("already-valid"), "already-valid");
     }
 
     #[test]
