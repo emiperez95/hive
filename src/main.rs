@@ -276,6 +276,11 @@ enum PostAction {
         branch: String,
         base: String,
     },
+    /// Delete a worktree (confirmed in TUI)
+    DeleteWorktree {
+        project: String,
+        branch: String,
+    },
 }
 
 fn run_tui(
@@ -299,7 +304,10 @@ fn run_tui(
             return Ok(PostAction::None);
         }
 
-        if app.input_mode != InputMode::Search {
+        if app.input_mode != InputMode::Search
+            && app.input_mode != InputMode::WorktreeBase
+            && app.input_mode != InputMode::WorktreeConfirmDelete
+        {
             app.refresh()?;
             app.maybe_periodic_save();
         }
@@ -407,19 +415,7 @@ fn run_tui(
                     } else if app.input_mode == InputMode::WorktreeBranch {
                         match code {
                             KeyCode::Enter => {
-                                let branch = app.input_buffer.trim().to_string();
-                                if branch.is_empty() {
-                                    app.cancel_worktree_wizard();
-                                } else if let Some(project) = app.wt_project_key.take() {
-                                    app.input_mode = InputMode::Normal;
-                                    app.input_buffer.clear();
-                                    app.save_restorable();
-                                    return Ok(PostAction::CreateWorktree {
-                                        project,
-                                        branch,
-                                        base: "staging".to_string(),
-                                    });
-                                }
+                                app.enter_base_picker();
                                 needs_redraw = true;
                             }
                             KeyCode::Esc => {
@@ -432,6 +428,61 @@ fn run_tui(
                             }
                             KeyCode::Char(c) => {
                                 app.input_buffer.push(c);
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.input_mode == InputMode::WorktreeBase {
+                        match code {
+                            KeyCode::Enter => {
+                                if let (Some(project), Some(branch)) =
+                                    (app.wt_project_key.take(), app.wt_branch_name.take())
+                                {
+                                    let base = app
+                                        .wt_base_choices
+                                        .get(app.wt_base_selected)
+                                        .cloned()
+                                        .unwrap_or_else(|| "main".to_string());
+                                    app.cancel_worktree_wizard();
+                                    app.save_restorable();
+                                    return Ok(PostAction::CreateWorktree {
+                                        project,
+                                        branch,
+                                        base,
+                                    });
+                                }
+                            }
+                            KeyCode::Esc => {
+                                app.cancel_worktree_wizard();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.wt_base_selected > 0 {
+                                    app.wt_base_selected -= 1;
+                                }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.wt_base_selected + 1 < app.wt_base_choices.len() {
+                                    app.wt_base_selected += 1;
+                                }
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.input_mode == InputMode::WorktreeConfirmDelete {
+                        match code {
+                            KeyCode::Enter => {
+                                if let (Some(project), Some(branch)) =
+                                    (app.wt_delete_project.take(), app.wt_delete_branch.take())
+                                {
+                                    app.cancel_worktree_delete();
+                                    app.save_restorable();
+                                    return Ok(PostAction::DeleteWorktree { project, branch });
+                                }
+                            }
+                            KeyCode::Esc => {
+                                app.cancel_worktree_delete();
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -666,6 +717,10 @@ fn run_tui(
                             }
                             KeyCode::Char('w') | KeyCode::Char('W') => {
                                 app.start_worktree_wizard();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('x') | KeyCode::Char('X') => {
+                                app.start_worktree_delete();
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -1961,10 +2016,12 @@ fn run_wt_new(
         run_hook(&hooks_dir, "post-setup", &env, &metadata)?;
 
         // 12. Run startup command (append prompt as CLI argument if provided)
+        //     New worktrees have no conversation to continue, so strip `-c` from claude commands.
         if let Some(ref cmd) = config.startup_command {
+            let base_cmd = cmd.replace("claude -c", "claude");
             let full_cmd = match prompt {
-                Some(p) => format!("{} {:?}", cmd, p),
-                None => cmd.clone(),
+                Some(p) => format!("{} {:?}", base_cmd, p),
+                None => base_cmd,
             };
             let _ = std::process::Command::new("tmux")
                 .args(["send-keys", "-t", &session_name, &full_cmd, "Enter"])
@@ -2368,6 +2425,11 @@ fn handle_post_action(action: PostAction) -> Result<()> {
                 .map(|e| e.session_name.clone())
                 .unwrap_or_else(|| format!("{}/{}", project, branch));
             switch_to_session(&session_name);
+            Ok(())
+        }
+        PostAction::DeleteWorktree { project, branch } => {
+            eprintln!("Deleting worktree {}/{}...", project, branch);
+            run_wt_delete(&project, &branch, false, true)?;
             Ok(())
         }
         PostAction::None => Ok(()),

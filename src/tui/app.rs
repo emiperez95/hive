@@ -28,7 +28,9 @@ pub enum InputMode {
     AddTodo,         // Adding a todo in detail view
     Search,          // Interactive session search
     SpreadPrompt,    // Waiting for digit 1-9 to spread iTerm2 panes
-    WorktreeBranch,  // Typing branch name for new worktree
+    WorktreeBranch,        // Typing branch name for new worktree
+    WorktreeBase,          // Picking base branch for new worktree
+    WorktreeConfirmDelete, // Confirming worktree deletion
 }
 
 /// Search result item - active session, inactive project, or worktree
@@ -95,6 +97,15 @@ pub struct App {
     pub detail_total_lines: usize,
     // Worktree wizard: resolved project key
     pub wt_project_key: Option<String>,
+    // Worktree wizard: branch name from step 1
+    pub wt_branch_name: Option<String>,
+    // Worktree wizard: base branch choices for picker
+    pub wt_base_choices: Vec<String>,
+    // Worktree wizard: selected index in base picker
+    pub wt_base_selected: usize,
+    // Worktree delete: project key and branch for pending deletion
+    pub wt_delete_project: Option<String>,
+    pub wt_delete_branch: Option<String>,
 }
 
 impl App {
@@ -141,6 +152,11 @@ impl App {
             detail_item_lines: Vec::new(),
             detail_total_lines: 0,
             wt_project_key: None,
+            wt_branch_name: None,
+            wt_base_choices: Vec::new(),
+            wt_base_selected: 0,
+            wt_delete_project: None,
+            wt_delete_branch: None,
         }
     }
 
@@ -882,12 +898,131 @@ impl App {
         false
     }
 
+    /// Transition from branch name input to base branch picker.
+    pub fn enter_base_picker(&mut self) {
+        let branch = self.input_buffer.trim().to_string();
+        if branch.is_empty() {
+            self.cancel_worktree_wizard();
+            return;
+        }
+        self.wt_branch_name = Some(branch);
+        self.input_buffer.clear();
+
+        // Resolve project_root from registry
+        let registry = ProjectRegistry::load();
+        let project_root = self
+            .wt_project_key
+            .as_ref()
+            .and_then(|key| registry.projects.get(key))
+            .map(|config| {
+                crate::common::projects::expand_tilde(&config.project_root)
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+        let repo_path = project_root.as_deref().unwrap_or(".");
+
+        // Build choices: check existence of staging/main/master, then current branch
+        let candidates = ["staging", "main", "master"];
+        let mut choices: Vec<String> = Vec::new();
+        for &name in &candidates {
+            if branch_exists(repo_path, name) {
+                choices.push(name.to_string());
+            }
+        }
+        if let Some(current) = get_current_branch(repo_path) {
+            if !choices.contains(&current) {
+                choices.push(current);
+            }
+        }
+
+        if choices.is_empty() {
+            choices.push("main".to_string());
+        }
+
+        // Pre-select default_base_branch from config if it's in the list
+        let default_base = self
+            .wt_project_key
+            .as_ref()
+            .and_then(|key| registry.projects.get(key))
+            .and_then(|config| config.default_base_branch.clone());
+
+        self.wt_base_selected = default_base
+            .and_then(|db| choices.iter().position(|c| c == &db))
+            .unwrap_or(0);
+
+        self.wt_base_choices = choices;
+        self.input_mode = InputMode::WorktreeBase;
+    }
+
+    /// Start worktree deletion flow for the current detail session.
+    /// Returns true if the confirmation modal was shown, false with an error if not a worktree.
+    pub fn start_worktree_delete(&mut self) -> bool {
+        let Some(name) = self.detail_session_name() else {
+            return false;
+        };
+
+        if let Some(entry) = crate::common::worktree::find_worktree_by_session_name(&name) {
+            self.wt_delete_project = Some(entry.project_key);
+            self.wt_delete_branch = Some(entry.branch);
+            self.input_mode = InputMode::WorktreeConfirmDelete;
+            true
+        } else {
+            self.error_message = Some((
+                "Not a worktree session".to_string(),
+                std::time::Instant::now(),
+            ));
+            false
+        }
+    }
+
+    /// Cancel worktree deletion, resetting state.
+    pub fn cancel_worktree_delete(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.wt_delete_project = None;
+        self.wt_delete_branch = None;
+    }
+
     /// Cancel the worktree wizard, resetting state.
     pub fn cancel_worktree_wizard(&mut self) {
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.wt_project_key = None;
+        self.wt_branch_name = None;
+        self.wt_base_choices.clear();
+        self.wt_base_selected = 0;
     }
+}
+
+/// Get the current branch of a git repo.
+fn get_current_branch(repo_path: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch.is_empty() || branch == "HEAD" {
+            None
+        } else {
+            Some(branch)
+        }
+    } else {
+        None
+    }
+}
+
+/// Check if a branch exists in a git repo.
+fn branch_exists(repo_path: &str, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", branch])
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Find session by permission key
