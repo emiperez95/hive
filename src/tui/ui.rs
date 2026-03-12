@@ -75,6 +75,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         render_detail_view(frame, app, chunks[1]);
         if app.input_mode == InputMode::AddTodo {
             render_input_modal(frame, app, chunks[1], "Add Todo", "add", Color::Cyan);
+        } else if app.input_mode == InputMode::WorktreeBranch {
+            render_input_modal(frame, app, chunks[1], "New Worktree", "create", Color::Green);
         }
     } else {
         render_session_list(frame, app, chunks[1]);
@@ -125,6 +127,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("ute "),
             Span::styled("[S]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("kip "),
+            Span::styled("[W]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("t "),
             Span::styled("[?]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("help "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
@@ -186,6 +190,7 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    !           Toggle auto-approve"),
         Line::raw("    M           Toggle notifications mute"),
         Line::raw("    S           Toggle skip from cycling"),
+        Line::raw("    W           New worktree from session"),
         Line::raw(""),
         Line::from(Span::styled(
             "  Search",

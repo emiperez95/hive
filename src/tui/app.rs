@@ -25,9 +25,10 @@ use sysinfo::System;
 #[derive(Debug, PartialEq)]
 pub enum InputMode {
     Normal,
-    AddTodo,      // Adding a todo in detail view
-    Search,       // Interactive session search
-    SpreadPrompt, // Waiting for digit 1-9 to spread iTerm2 panes
+    AddTodo,         // Adding a todo in detail view
+    Search,          // Interactive session search
+    SpreadPrompt,    // Waiting for digit 1-9 to spread iTerm2 panes
+    WorktreeBranch,  // Typing branch name for new worktree
 }
 
 /// Search result item - active session, inactive project, or worktree
@@ -92,6 +93,8 @@ pub struct App {
     // Detail view: line index of each selectable item, total rendered lines
     pub detail_item_lines: Vec<usize>,
     pub detail_total_lines: usize,
+    // Worktree wizard: resolved project key
+    pub wt_project_key: Option<String>,
 }
 
 impl App {
@@ -137,6 +140,7 @@ impl App {
             auto_picker: false,
             detail_item_lines: Vec::new(),
             detail_total_lines: 0,
+            wt_project_key: None,
         }
     }
 
@@ -836,6 +840,53 @@ impl App {
 
     pub fn is_skipped(&self, name: &str) -> bool {
         self.skipped_sessions.contains(name)
+    }
+
+    /// Start the worktree creation wizard from the current detail view session.
+    /// Resolves the project key from the session (worktree entry or project registry).
+    /// Returns true if the wizard was started, false with an error message if not.
+    pub fn start_worktree_wizard(&mut self) -> bool {
+        let Some(name) = self.detail_session_name() else {
+            return false;
+        };
+
+        // Try worktree entry first (session is already a worktree → use its project)
+        if let Some(entry) = crate::common::worktree::find_worktree_by_session_name(&name) {
+            let registry = ProjectRegistry::load();
+            if registry
+                .resolve_worktrees_dir(&entry.project_key, registry.projects.get(&entry.project_key).unwrap())
+                .is_some()
+            {
+                self.wt_project_key = Some(entry.project_key);
+                self.input_mode = InputMode::WorktreeBranch;
+                self.input_buffer.clear();
+                return true;
+            }
+        }
+
+        // Try project registry (session is the main project session)
+        let registry = ProjectRegistry::load();
+        if let Some((key, config)) = registry.find_by_session_name(&name) {
+            if registry.resolve_worktrees_dir(key, config).is_some() {
+                self.wt_project_key = Some(key.to_string());
+                self.input_mode = InputMode::WorktreeBranch;
+                self.input_buffer.clear();
+                return true;
+            }
+        }
+
+        self.error_message = Some((
+            format!("No worktree config for '{}'", name),
+            std::time::Instant::now(),
+        ));
+        false
+    }
+
+    /// Cancel the worktree wizard, resetting state.
+    pub fn cancel_worktree_wizard(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.wt_project_key = None;
     }
 }
 

@@ -270,6 +270,12 @@ enum PostAction {
     Collapse,
     /// Attach to a tmux session via exec (used by `hive start` outside tmux)
     Attach(String),
+    /// Create a worktree and switch to its session
+    CreateWorktree {
+        project: String,
+        branch: String,
+        base: String,
+    },
 }
 
 fn run_tui(
@@ -394,6 +400,38 @@ fn run_tui(
                             }
                             KeyCode::Esc => {
                                 app.input_mode = InputMode::Normal;
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.input_mode == InputMode::WorktreeBranch {
+                        match code {
+                            KeyCode::Enter => {
+                                let branch = app.input_buffer.trim().to_string();
+                                if branch.is_empty() {
+                                    app.cancel_worktree_wizard();
+                                } else if let Some(project) = app.wt_project_key.take() {
+                                    app.input_mode = InputMode::Normal;
+                                    app.input_buffer.clear();
+                                    app.save_restorable();
+                                    return Ok(PostAction::CreateWorktree {
+                                        project,
+                                        branch,
+                                        base: "staging".to_string(),
+                                    });
+                                }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Esc => {
+                                app.cancel_worktree_wizard();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.input_buffer.pop();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                app.input_buffer.push(c);
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -624,6 +662,10 @@ fn run_tui(
                                 crate::common::chrome::focus_all_matched_tabs(
                                     &app.detail_chrome_tabs,
                                 );
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('w') | KeyCode::Char('W') => {
+                                app.start_worktree_wizard();
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -2299,7 +2341,7 @@ fn run_todo_clear(session: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Handle post-TUI actions (spread, collapse, attach)
+/// Handle post-TUI actions (spread, collapse, attach, create worktree)
 fn handle_post_action(action: PostAction) -> Result<()> {
     match action {
         PostAction::Spread(n) => run_spread(n),
@@ -2311,6 +2353,22 @@ fn handle_post_action(action: PostAction) -> Result<()> {
                 .args(["attach-session", "-t", &name])
                 .exec();
             bail!("exec failed: {}", err);
+        }
+        PostAction::CreateWorktree {
+            project,
+            branch,
+            base,
+        } => {
+            eprintln!("Creating worktree {}/{}...", project, branch);
+            run_wt_new(&project, &branch, Some(&base), false, "worktree", None, false)?;
+            // Look up final session name from WorktreeState (hooks may override)
+            let state = crate::common::worktree::WorktreeState::load();
+            let session_name = state
+                .get(&project, &branch)
+                .map(|e| e.session_name.clone())
+                .unwrap_or_else(|| format!("{}/{}", project, branch));
+            switch_to_session(&session_name);
+            Ok(())
         }
         PostAction::None => Ok(()),
     }
