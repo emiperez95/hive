@@ -1050,6 +1050,9 @@ impl App {
             }
         };
         let project_root = format!("~/Projects/00-Personal/{}", key);
+        // Ensure the project directory exists before creating the tmux session
+        let expanded = crate::common::projects::expand_tilde(&project_root);
+        let _ = std::fs::create_dir_all(&expanded);
         let config = ProjectConfig {
             emoji: emoji.clone(),
             project_root,
