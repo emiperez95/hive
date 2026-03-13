@@ -74,8 +74,19 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     } else if app.showing_detail.is_some() {
         render_detail_view(frame, app, chunks[1]);
         if app.input_mode == InputMode::AddTodo {
-            let ctx = app.detail_session_name().unwrap_or_else(|| "session".to_string());
-            render_input_modal(frame, app, chunks[1], "Add Todo", &ctx, None, "add", Color::Cyan);
+            let ctx = app
+                .detail_session_name()
+                .unwrap_or_else(|| "session".to_string());
+            render_input_modal(
+                frame,
+                app,
+                chunks[1],
+                "Add Todo",
+                &ctx,
+                None,
+                "add",
+                Color::Cyan,
+            );
         } else if app.input_mode == InputMode::WorktreeBranch {
             let ctx = app
                 .detail_session_name()
@@ -100,10 +111,28 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         if app.input_mode == InputMode::SpreadPrompt {
             render_spread_prompt(frame, chunks[1]);
         } else if app.input_mode == InputMode::NewProjectKey {
-            render_input_modal(frame, app, chunks[1], "New Project", "key", None, "next", Color::Yellow);
+            render_input_modal(
+                frame,
+                app,
+                chunks[1],
+                "New Project",
+                "key",
+                None,
+                "next",
+                Color::Yellow,
+            );
         } else if app.input_mode == InputMode::NewProjectEmoji {
             let key = app.np_key.clone().unwrap_or_default();
-            render_input_modal(frame, app, chunks[1], "New Project", &key, Some("emoji (default 📁)"), "create", Color::Yellow);
+            render_input_modal(
+                frame,
+                app,
+                chunks[1],
+                "New Project",
+                &key,
+                Some("emoji (default 📁)"),
+                "create",
+                Color::Yellow,
+            );
         }
     }
 
@@ -1019,7 +1048,8 @@ fn render_input_modal(
     let prompt_lines = if prompt.is_some() { 1 } else { 0 };
 
     let modal_width = (area.width.saturating_sub(4)).clamp(40, 60);
-    let modal_height = (num_input_lines as u16 + 4 + prompt_lines).min(area.height.saturating_sub(2));
+    let modal_height =
+        (num_input_lines as u16 + 4 + prompt_lines).min(area.height.saturating_sub(2));
 
     let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
     let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
