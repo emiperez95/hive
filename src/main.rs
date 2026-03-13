@@ -307,6 +307,8 @@ fn run_tui(
         if app.input_mode != InputMode::Search
             && app.input_mode != InputMode::WorktreeBase
             && app.input_mode != InputMode::WorktreeConfirmDelete
+            && app.input_mode != InputMode::NewProjectKey
+            && app.input_mode != InputMode::NewProjectEmoji
         {
             app.refresh()?;
             app.maybe_periodic_save();
@@ -483,6 +485,57 @@ fn run_tui(
                             }
                             KeyCode::Esc => {
                                 app.cancel_worktree_delete();
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.input_mode == InputMode::NewProjectKey {
+                        match code {
+                            KeyCode::Enter => {
+                                app.np_enter_emoji_step();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Esc => {
+                                app.cancel_new_project_wizard();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.input_buffer.pop();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                app.input_buffer.push(c);
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.input_mode == InputMode::NewProjectEmoji {
+                        match code {
+                            KeyCode::Enter => {
+                                if let Some(session_name) = app.np_complete() {
+                                    if connect_session(&session_name) {
+                                        switch_to_session(&session_name);
+                                        app.save_restorable();
+                                        return Ok(PostAction::None);
+                                    } else {
+                                        app.error_message = Some((
+                                            format!("Failed to connect to '{}'", session_name),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Esc => {
+                                app.cancel_new_project_wizard();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.input_buffer.pop();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                app.input_buffer.push(c);
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -775,6 +828,10 @@ fn run_tui(
                             KeyCode::Char('c') if cfg!(unix) => {
                                 app.save_restorable();
                                 return Ok(PostAction::None);
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                app.start_new_project_wizard();
+                                needs_redraw = true;
                             }
                             KeyCode::Char('/') => {
                                 app.input_mode = InputMode::Search;

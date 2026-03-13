@@ -9,7 +9,7 @@ use crate::common::persistence::{
 };
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
-use crate::common::projects::{has_project_config, ProjectRegistry};
+use crate::common::projects::{has_project_config, ProjectConfig, ProjectRegistry};
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
     lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
@@ -32,6 +32,8 @@ pub enum InputMode {
     WorktreeBranch,        // Typing branch name for new worktree
     WorktreeBase,          // Picking base branch for new worktree
     WorktreeConfirmDelete, // Confirming worktree deletion
+    NewProjectKey,         // Typing project key in new project wizard
+    NewProjectEmoji,       // Typing emoji in new project wizard
 }
 
 /// Search result item - active session, inactive project, or worktree
@@ -107,6 +109,8 @@ pub struct App {
     // Worktree delete: project key and branch for pending deletion
     pub wt_delete_project: Option<String>,
     pub wt_delete_branch: Option<String>,
+    // New project wizard: stored key from step 1
+    pub np_key: Option<String>,
 }
 
 impl App {
@@ -158,6 +162,7 @@ impl App {
             wt_base_selected: 0,
             wt_delete_project: None,
             wt_delete_branch: None,
+            np_key: None,
         }
     }
 
@@ -995,6 +1000,93 @@ impl App {
         self.wt_branch_name = None;
         self.wt_base_choices.clear();
         self.wt_base_selected = 0;
+    }
+
+    // --- New project wizard methods ---
+
+    /// Start the new project wizard (step 1: key input)
+    pub fn start_new_project_wizard(&mut self) {
+        self.input_mode = InputMode::NewProjectKey;
+        self.input_buffer.clear();
+        self.np_key = None;
+    }
+
+    /// Validate key and advance to emoji step. Sets error_message on failure.
+    pub fn np_enter_emoji_step(&mut self) {
+        let key = self.input_buffer.trim().to_string();
+        if key.is_empty() {
+            self.cancel_new_project_wizard();
+            return;
+        }
+        if key.contains(' ') || key.contains('/') {
+            self.error_message = Some((
+                "Key cannot contain spaces or slashes".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        let registry = ProjectRegistry::load();
+        if registry.projects.contains_key(&key) {
+            self.error_message = Some((
+                format!("Project '{}' already exists", key),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        self.np_key = Some(key);
+        self.input_buffer.clear();
+        self.input_mode = InputMode::NewProjectEmoji;
+    }
+
+    /// Complete the wizard: create project, return session name for connect+switch.
+    pub fn np_complete(&mut self) -> Option<String> {
+        let key = self.np_key.take()?;
+        let emoji = {
+            let e = self.input_buffer.trim().to_string();
+            if e.is_empty() {
+                "📁".to_string()
+            } else {
+                e
+            }
+        };
+        let project_root = format!("~/Projects/00-Personal/{}", key);
+        // Ensure the project directory exists before creating the tmux session
+        let expanded = crate::common::projects::expand_tilde(&project_root);
+        let _ = std::fs::create_dir_all(&expanded);
+        let config = ProjectConfig {
+            emoji: emoji.clone(),
+            project_root,
+            display_name: None,
+            startup_command: Some("claude -c".to_string()),
+            worktrees_dir: None,
+            default_base_branch: None,
+            worktree_types: Vec::new(),
+            package_manager: None,
+            ports: crate::common::projects::PortConfig::default(),
+            database: crate::common::projects::DatabaseConfig::default(),
+            files: crate::common::projects::FilePatterns::default(),
+            hooks_dir: None,
+        };
+        let session_name = ProjectRegistry::session_name(&key, &config);
+        let mut registry = ProjectRegistry::load();
+        registry.add_project(key, config);
+        if let Err(e) = registry.save() {
+            self.error_message = Some((
+                format!("Failed to save project: {}", e),
+                std::time::Instant::now(),
+            ));
+            self.cancel_new_project_wizard();
+            return None;
+        }
+        self.cancel_new_project_wizard();
+        Some(session_name)
+    }
+
+    /// Cancel the new project wizard, resetting state.
+    pub fn cancel_new_project_wizard(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.np_key = None;
     }
 }
 
