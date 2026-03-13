@@ -2417,7 +2417,15 @@ fn handle_post_action(action: PostAction) -> Result<()> {
             base,
         } => {
             eprintln!("Creating worktree {}/{}...", project, branch);
-            run_wt_new(&project, &branch, Some(&base), false, "worktree", None, false)?;
+            run_wt_new(
+                &project,
+                &branch,
+                Some(&base),
+                false,
+                "worktree",
+                None,
+                false,
+            )?;
             // Look up final session name from WorktreeState (hooks may override)
             let state = crate::common::worktree::WorktreeState::load();
             let session_name = state

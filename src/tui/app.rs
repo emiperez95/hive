@@ -10,11 +10,11 @@ use crate::common::persistence::{
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::projects::{has_project_config, ProjectRegistry};
-use crate::common::worktree::sanitize_branch_name;
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
     lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
 };
+use crate::common::worktree::sanitize_branch_name;
 use crate::ipc::messages::{HookState, SessionState, SessionStatus};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -26,9 +26,9 @@ use sysinfo::System;
 #[derive(Debug, PartialEq)]
 pub enum InputMode {
     Normal,
-    AddTodo,         // Adding a todo in detail view
-    Search,          // Interactive session search
-    SpreadPrompt,    // Waiting for digit 1-9 to spread iTerm2 panes
+    AddTodo,               // Adding a todo in detail view
+    Search,                // Interactive session search
+    SpreadPrompt,          // Waiting for digit 1-9 to spread iTerm2 panes
     WorktreeBranch,        // Typing branch name for new worktree
     WorktreeBase,          // Picking base branch for new worktree
     WorktreeConfirmDelete, // Confirming worktree deletion
@@ -871,7 +871,10 @@ impl App {
         if let Some(entry) = crate::common::worktree::find_worktree_by_session_name(&name) {
             let registry = ProjectRegistry::load();
             if registry
-                .resolve_worktrees_dir(&entry.project_key, registry.projects.get(&entry.project_key).unwrap())
+                .resolve_worktrees_dir(
+                    &entry.project_key,
+                    registry.projects.get(&entry.project_key).unwrap(),
+                )
                 .is_some()
             {
                 self.wt_project_key = Some(entry.project_key);

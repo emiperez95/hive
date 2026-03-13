@@ -76,7 +76,14 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         if app.input_mode == InputMode::AddTodo {
             render_input_modal(frame, app, chunks[1], "Add Todo", "add", Color::Cyan);
         } else if app.input_mode == InputMode::WorktreeBranch {
-            render_input_modal(frame, app, chunks[1], "New Worktree", "create", Color::Green);
+            render_input_modal(
+                frame,
+                app,
+                chunks[1],
+                "New Worktree",
+                "create",
+                Color::Green,
+            );
         } else if app.input_mode == InputMode::WorktreeBase {
             render_base_picker_modal(frame, app, chunks[1]);
         } else if app.input_mode == InputMode::WorktreeConfirmDelete {
@@ -1095,10 +1102,7 @@ fn render_base_picker_modal(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]));
         } else {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::raw(choice.clone()),
-            ]));
+            lines.push(Line::from(vec![Span::raw("  "), Span::raw(choice.clone())]));
         }
     }
 
@@ -1156,9 +1160,7 @@ fn render_delete_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("Delete "),
         Span::styled(
             label,
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         Span::raw("?"),
     ]));
