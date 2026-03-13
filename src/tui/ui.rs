@@ -74,13 +74,19 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     } else if app.showing_detail.is_some() {
         render_detail_view(frame, app, chunks[1]);
         if app.input_mode == InputMode::AddTodo {
-            render_input_modal(frame, app, chunks[1], "Add Todo", "add", Color::Cyan);
+            let ctx = app.detail_session_name().unwrap_or_else(|| "session".to_string());
+            render_input_modal(frame, app, chunks[1], "Add Todo", &ctx, None, "add", Color::Cyan);
         } else if app.input_mode == InputMode::WorktreeBranch {
+            let ctx = app
+                .detail_session_name()
+                .unwrap_or_else(|| "session".to_string());
             render_input_modal(
                 frame,
                 app,
                 chunks[1],
                 "New Worktree",
+                &ctx,
+                None,
                 "create",
                 Color::Green,
             );
@@ -93,6 +99,11 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         render_session_list(frame, app, chunks[1]);
         if app.input_mode == InputMode::SpreadPrompt {
             render_spread_prompt(frame, chunks[1]);
+        } else if app.input_mode == InputMode::NewProjectKey {
+            render_input_modal(frame, app, chunks[1], "New Project", "key", None, "next", Color::Yellow);
+        } else if app.input_mode == InputMode::NewProjectEmoji {
+            let key = app.np_key.clone().unwrap_or_default();
+            render_input_modal(frame, app, chunks[1], "New Project", &key, Some("emoji (default 📁)"), "create", Color::Yellow);
         }
     }
 
@@ -121,6 +132,24 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("select "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("cancel"),
+        ])
+    } else if app.input_mode == InputMode::NewProjectKey {
+        Line::from(vec![
+            Span::styled("Step 1/2 ", Style::default().fg(Color::Yellow)),
+            Span::styled("key ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" next "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ])
+    } else if app.input_mode == InputMode::NewProjectEmoji {
+        Line::from(vec![
+            Span::styled("Step 2/2 ", Style::default().fg(Color::Yellow)),
+            Span::styled("emoji ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" create "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
         ])
     } else if app.showing_detail.is_some() {
         Line::from(vec![
@@ -159,6 +188,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("switch "),
             Span::styled("[/]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("search "),
+            Span::styled("[N]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("ew "),
             Span::styled("[R]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("efresh "),
             Span::styled("[M]", Style::default().add_modifier(Modifier::BOLD)),
@@ -186,6 +217,7 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    y/z/x/w/v  Approve permission (once)"),
         Line::raw("    Y/Z/X/W/V  Approve permission (always)"),
         Line::raw("    /           Search sessions"),
+        Line::raw("    N           New project"),
         Line::raw("    L           Spread/collapse iTerm2 panes"),
         Line::raw("    M           Toggle global mute"),
         Line::raw("    R           Force refresh"),
@@ -969,23 +1001,25 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Render a multiline input modal overlay
+#[allow(clippy::too_many_arguments)]
 fn render_input_modal(
     frame: &mut Frame,
     app: &App,
     area: Rect,
     title: &str,
+    context: &str,
+    prompt: Option<&str>,
     submit_label: &str,
     border_color: Color,
 ) {
-    let session_name = app
-        .detail_session_name()
-        .unwrap_or_else(|| "session".to_string());
+    let session_name = context;
 
     let input_lines: Vec<&str> = app.input_buffer.split('\n').collect();
     let num_input_lines = input_lines.len().max(1);
+    let prompt_lines = if prompt.is_some() { 1 } else { 0 };
 
     let modal_width = (area.width.saturating_sub(4)).clamp(40, 60);
-    let modal_height = (num_input_lines as u16 + 4).min(area.height.saturating_sub(2));
+    let modal_height = (num_input_lines as u16 + 4 + prompt_lines).min(area.height.saturating_sub(2));
 
     let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
     let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
@@ -1003,6 +1037,13 @@ fn render_input_modal(
 
     let inner_width = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(p) = prompt {
+        lines.push(Line::from(Span::styled(
+            p,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
 
     for (i, line_text) in input_lines.iter().enumerate() {
         let is_last = i == input_lines.len() - 1;
