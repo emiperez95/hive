@@ -75,6 +75,19 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         render_detail_view(frame, app, chunks[1]);
         if app.input_mode == InputMode::AddTodo {
             render_input_modal(frame, app, chunks[1], "Add Todo", "add", Color::Cyan);
+        } else if app.input_mode == InputMode::WorktreeBranch {
+            render_input_modal(
+                frame,
+                app,
+                chunks[1],
+                "New Worktree",
+                "create",
+                Color::Green,
+            );
+        } else if app.input_mode == InputMode::WorktreeBase {
+            render_base_picker_modal(frame, app, chunks[1]);
+        } else if app.input_mode == InputMode::WorktreeConfirmDelete {
+            render_delete_confirm_modal(frame, app, chunks[1]);
         }
     } else {
         render_session_list(frame, app, chunks[1]);
@@ -125,6 +138,10 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("ute "),
             Span::styled("[S]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("kip "),
+            Span::styled("[W]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("t "),
+            Span::styled("[X]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("del "),
             Span::styled("[?]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("help "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
@@ -186,6 +203,8 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    !           Toggle auto-approve"),
         Line::raw("    M           Toggle notifications mute"),
         Line::raw("    S           Toggle skip from cycling"),
+        Line::raw("    W           New worktree from session"),
+        Line::raw("    X           Delete worktree"),
         Line::raw(""),
         Line::from(Span::styled(
             "  Search",
@@ -1048,4 +1067,124 @@ fn render_spread_prompt(frame: &mut Frame, area: Rect) {
             .add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(Paragraph::new(line), inner);
+}
+
+/// Render the base branch picker modal
+fn render_base_picker_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let item_count = app.wt_base_choices.len();
+    // 2 border + items + 1 blank + 1 footer
+    let modal_height = (item_count as u16 + 4).min(area.height.saturating_sub(2));
+    let modal_width = 40u16.min(area.width.saturating_sub(4));
+
+    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(x, y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" Base Branch ");
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, choice) in app.wt_base_choices.iter().enumerate() {
+        let is_selected = i == app.wt_base_selected;
+        if is_selected {
+            lines.push(Line::from(vec![
+                Span::styled("> ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    choice.clone(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![Span::raw("  "), Span::raw(choice.clone())]));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" select  ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[↑↓]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" navigate  ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" cancel", Style::default().add_modifier(Modifier::DIM)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the worktree delete confirmation modal
+fn render_delete_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let project = app.wt_delete_project.as_deref().unwrap_or("?");
+    let branch = app.wt_delete_branch.as_deref().unwrap_or("?");
+
+    let label = format!("{}/{}", project, branch);
+
+    // Look up session name and path from worktree state
+    let wt_state = crate::common::worktree::WorktreeState::load();
+    let entry = wt_state.get(project, branch);
+    let session_line = entry
+        .map(|e| format!("Session: {}", e.session_name))
+        .unwrap_or_default();
+    let path_line = entry
+        .map(|e| format!("Path: {}", e.path))
+        .unwrap_or_default();
+
+    let content_lines =
+        3 + usize::from(!session_line.is_empty()) + usize::from(!path_line.is_empty());
+    let modal_height = (content_lines as u16 + 4).min(area.height.saturating_sub(2));
+    let modal_width = 50u16.min(area.width.saturating_sub(4));
+
+    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(x, y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete Worktree ");
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::raw("Delete "),
+        Span::styled(
+            label,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("?"),
+    ]));
+
+    if !session_line.is_empty() {
+        lines.push(Line::from(Span::styled(
+            session_line,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    if !path_line.is_empty() {
+        lines.push(Line::from(Span::styled(
+            path_line,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" delete  ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" cancel", Style::default().add_modifier(Modifier::DIM)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
