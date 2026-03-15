@@ -1702,6 +1702,7 @@ fn run_spread(count: usize) -> Result<()> {
     if count <= 1 {
         return Ok(());
     }
+    crate::common::tmux::set_all_sessions_layout("spread");
     crate::common::iterm::spread_panes(count - 1);
     Ok(())
 }
@@ -1709,6 +1710,7 @@ fn run_spread(count: usize) -> Result<()> {
 /// Collapse iTerm2 panes back to a single pane
 fn run_collapse() -> Result<()> {
     crate::common::iterm::collapse_panes();
+    crate::common::tmux::set_all_sessions_layout("collapse");
     Ok(())
 }
 

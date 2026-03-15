@@ -207,6 +207,82 @@ pub fn resolve_tmux_path() -> String {
     "tmux".to_string()
 }
 
+/// Rearrange panes in every tmux session's windows for spread/collapse.
+///
+/// `mode` is either "spread" or "collapse":
+/// - **spread**: stack panes vertically (top-bottom), pane 0 gets 70% height
+/// - **collapse**: arrange panes horizontally (side-by-side), pane 0 gets 70% width
+///
+/// Only handles windows with 2 or 3 panes. Windows with 1 or 4+ panes are left untouched.
+/// For 3 panes: pane 0 is the main pane (70%), panes 1-2 split the remaining 30%.
+pub fn set_all_sessions_layout(mode: &str) {
+    let sessions = get_current_tmux_session_names();
+
+    for session in &sessions {
+        if let Ok(output) = Command::new("tmux")
+            .args([
+                "list-windows",
+                "-t",
+                session,
+                "-F",
+                "#{window_index}:#{window_panes}",
+            ])
+            .output()
+        {
+            let window_list = String::from_utf8_lossy(&output.stdout);
+            for line in window_list.lines() {
+                if let Some((idx, count_str)) = line.split_once(':') {
+                    let pane_count: usize = count_str.parse().unwrap_or(0);
+                    let target = format!("{}:{}", session, idx);
+                    match pane_count {
+                        2 => layout_2_panes(&target, mode),
+                        3 => layout_3_panes(&target, mode),
+                        _ => {} // 0-1 or 4+: leave untouched
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 2 panes: main pane (70%) + secondary pane (30%).
+/// spread: top/bottom, collapse: left/right.
+fn layout_2_panes(target: &str, mode: &str) {
+    let (layout, flag) = if mode == "spread" {
+        ("even-vertical", "-y")
+    } else {
+        ("even-horizontal", "-x")
+    };
+    let _ = Command::new("tmux")
+        .args(["select-layout", "-t", target, layout])
+        .output();
+    let pane0 = format!("{}.0", target);
+    let _ = Command::new("tmux")
+        .args(["resize-pane", "-t", &pane0, flag, "70%"])
+        .output();
+}
+
+/// 3 panes: main pane 0 (70%) + panes 1-2 split in the remaining 30%.
+/// spread: pane 0 on top (70% height), panes 1-2 side-by-side below.
+/// collapse: pane 0 on left (70% width), panes 1-2 stacked on right.
+fn layout_3_panes(target: &str, mode: &str) {
+    let layout = if mode == "spread" {
+        "main-horizontal"
+    } else {
+        "main-vertical"
+    };
+    let _ = Command::new("tmux")
+        .args(["select-layout", "-t", target, layout])
+        .output();
+    // main-horizontal/main-vertical use pane 0 as the main pane by default.
+    // Resize it to 70%.
+    let pane0 = format!("{}.0", target);
+    let flag = if mode == "spread" { "-y" } else { "-x" };
+    let _ = Command::new("tmux")
+        .args(["resize-pane", "-t", &pane0, flag, "70%"])
+        .output();
+}
+
 /// Kill a tmux session
 pub fn kill_tmux_session(name: &str) -> bool {
     Command::new("tmux")

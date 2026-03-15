@@ -68,7 +68,7 @@ src/
 ├── bin/bench.rs            benchmark tool
 ├── common/
 │   ├── types.rs            TmuxSession, SessionInfo, ClaudeStatus, ProcessInfo, PERMISSION_KEYS
-│   ├── tmux.rs             tmux command helpers (list-sessions, switch, send-keys, kill, resolve_tmux_path)
+│   ├── tmux.rs             tmux command helpers (list-sessions, switch, send-keys, kill, resolve_tmux_path, set_all_sessions_layout)
 │   ├── process.rs          Claude process detection, process tree traversal (sysinfo)
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
@@ -163,6 +163,15 @@ When the picker is used (case 3), selecting a session returns `PostAction::Attac
 `hive collapse` closes all iTerm2 panes except the current one. Tmux sessions stay alive (just detached).
 
 In the TUI, `L` toggles: if multiple panes exist → collapse, otherwise → show SpreadPrompt for digit input.
+
+**Tmux pane layout adjustment**: Spread and collapse also rearrange tmux panes within each session to optimize for the available space. Only windows with 2 or 3 panes are affected (1 or 4+ are left untouched):
+
+| Panes | Spread (narrow iTerm columns) | Collapse (full width) |
+|-------|-------------------------------|----------------------|
+| 2 | top 70% / bottom 30% | left 70% / right 30% |
+| 3 | top 70% / bottom two side-by-side in 30% | left 70% / right two stacked in 30% |
+
+Layout logic lives in `tmux.rs::set_all_sessions_layout()`.
 
 ## Chrome Integration
 
