@@ -96,6 +96,46 @@ impl WorktreeState {
     fn file_path() -> Option<PathBuf> {
         cache_dir().map(|p| p.join("worktrees.json"))
     }
+
+    /// Migrate old-format session names to the new `[project_key]` tag format.
+    /// Renames live tmux sessions, updates persistence files, and saves the updated state.
+    /// Idempotent: entries already containing `[` are skipped.
+    pub fn migrate_session_names(
+        &mut self,
+        registry: &crate::common::projects::ProjectRegistry,
+    ) -> bool {
+        let mut renames: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for entry in self.worktrees.values_mut() {
+            // Already migrated
+            if entry.session_name.contains('[') {
+                continue;
+            }
+
+            let Some(config) = registry.projects.get(&entry.project_key) else {
+                continue;
+            };
+
+            let new_name =
+                build_session_name(config, &entry.project_key, &entry.worktree_type, &entry.branch);
+
+            // Rename tmux session if it exists
+            let _ = std::process::Command::new("tmux")
+                .args(["rename-session", "-t", &entry.session_name, &new_name])
+                .output();
+
+            renames.insert(entry.session_name.clone(), new_name.clone());
+            entry.session_name = new_name;
+        }
+
+        if !renames.is_empty() {
+            let _ = self.save();
+            crate::common::persistence::migrate_session_names(&renames);
+        }
+
+        !renames.is_empty()
+    }
 }
 
 // ─── Branch name sanitization ────────────────────────────────────────────────
@@ -120,9 +160,19 @@ pub fn sanitize_branch_name(input: &str) -> String {
 
 // ─── Session name builder ────────────────────────────────────────────────────
 
-/// Build a default session name: "{emoji} {type}-{branch}"
-pub fn build_session_name(config: &ProjectConfig, wt_type: &str, branch: &str) -> String {
-    format!("{} {}-{}", config.emoji, wt_type, branch)
+/// Build a default session name: "{emoji} [{project_key}] {branch}" (default type omitted)
+/// or "{emoji} [{project_key}] {type}-{branch}" (non-default type shown)
+pub fn build_session_name(
+    config: &ProjectConfig,
+    project_key: &str,
+    wt_type: &str,
+    branch: &str,
+) -> String {
+    if wt_type == "worktree" {
+        format!("{} [{}] {}", config.emoji, project_key, branch)
+    } else {
+        format!("{} [{}] {}-{}", config.emoji, project_key, wt_type, branch)
+    }
 }
 
 // ─── Worktree lookup helpers ─────────────────────────────────────────────────
@@ -204,7 +254,7 @@ pub fn import_worktrees(
                         .iter()
                         .find(|s| s.contains(branch))
                         .cloned()
-                        .unwrap_or_else(|| build_session_name(config, "worktree", branch));
+                        .unwrap_or_else(|| build_session_name(config, project_key, "worktree", branch));
 
                     let entry = WorktreeEntry {
                         project_key: project_key.to_string(),
@@ -699,20 +749,29 @@ mod tests {
     }
 
     #[test]
-    fn test_build_session_name() {
+    fn test_build_session_name_default_type() {
         let config = test_config("🌳");
         assert_eq!(
-            build_session_name(&config, "worktree", "CSD-2527"),
-            "🌳 worktree-CSD-2527"
+            build_session_name(&config, "clear-session", "worktree", "CSD-2527"),
+            "🌳 [clear-session] CSD-2527"
         );
     }
 
     #[test]
-    fn test_build_session_name_feature() {
+    fn test_build_session_name_non_default_type() {
         let config = test_config("🐝");
         assert_eq!(
-            build_session_name(&config, "feature", "my-branch"),
-            "🐝 feature-my-branch"
+            build_session_name(&config, "hive", "feature", "my-branch"),
+            "🐝 [hive] feature-my-branch"
+        );
+    }
+
+    #[test]
+    fn test_build_session_name_spike_type() {
+        let config = test_config("🌳");
+        assert_eq!(
+            build_session_name(&config, "clear-session", "spike", "CSD-2597"),
+            "🌳 [clear-session] spike-CSD-2597"
         );
     }
 
@@ -752,7 +811,7 @@ mod tests {
             branch: "test-branch".to_string(),
             worktree_type: "worktree".to_string(),
             path: "/tmp/worktrees/hive/test-branch".to_string(),
-            session_name: "🐝 worktree-test-branch".to_string(),
+            session_name: "🐝 [hive] test-branch".to_string(),
             metadata: serde_json::json!({}),
             created_at: "2026-02-17T10:00:00Z".to_string(),
         };
@@ -760,7 +819,7 @@ mod tests {
 
         let got = state.get("hive", "test-branch");
         assert!(got.is_some());
-        assert_eq!(got.unwrap().session_name, "🐝 worktree-test-branch");
+        assert_eq!(got.unwrap().session_name, "🐝 [hive] test-branch");
     }
 
     #[test]
@@ -771,7 +830,7 @@ mod tests {
             branch: "test-branch".to_string(),
             worktree_type: "worktree".to_string(),
             path: "/tmp/worktrees/hive/test-branch".to_string(),
-            session_name: "🐝 worktree-test-branch".to_string(),
+            session_name: "🐝 [hive] test-branch".to_string(),
             metadata: serde_json::json!({}),
             created_at: "2026-02-17T10:00:00Z".to_string(),
         };
@@ -797,7 +856,7 @@ mod tests {
                 branch: branch.to_string(),
                 worktree_type: "worktree".to_string(),
                 path: format!("/tmp/{}", branch),
-                session_name: format!("📦 worktree-{}", branch),
+                session_name: format!("📦 [proj-a] {}", branch),
                 metadata: serde_json::json!({}),
                 created_at: "2026-02-17T10:00:00Z".to_string(),
             });
@@ -807,7 +866,7 @@ mod tests {
             branch: "other".to_string(),
             worktree_type: "worktree".to_string(),
             path: "/tmp/other".to_string(),
-            session_name: "🔧 worktree-other".to_string(),
+            session_name: "🔧 [proj-b] other".to_string(),
             metadata: serde_json::json!({}),
             created_at: "2026-02-17T10:00:00Z".to_string(),
         });
@@ -826,7 +885,7 @@ mod tests {
             branch: "CSD-2527".to_string(),
             worktree_type: "worktree".to_string(),
             path: "/Users/test/02-features/CSD-2527".to_string(),
-            session_name: "🌳 worktree-CSD-2527-3027".to_string(),
+            session_name: "🌳 [clear-session] CSD-2527-3027".to_string(),
             metadata: serde_json::json!({
                 "frontend_port": 3027,
                 "backend_port": 3028,

@@ -159,7 +159,7 @@ Janus:
 5. Reports:
    ✓ Worktree created
    - Path: /Users/emilianoperez/Projects/01-wyeworks/02-features/CSD-2345-auth-flow
-   - Session: 🌳 worktree-CSD-2345-auth-flow
+   - Session: 🌳 [clear-session] CSD-2345-auth-flow
 
    Ready to work!
 ```

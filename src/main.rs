@@ -291,6 +291,13 @@ fn run_tui(
     let mut app = App::new(args.filter.clone(), args.watch);
     app.auto_detail = args.detail;
 
+    // Migrate old worktree session names to new [project_key] format
+    {
+        let registry = ProjectRegistry::load();
+        let mut wt_state = crate::common::worktree::WorktreeState::load();
+        wt_state.migrate_session_names(&registry);
+    }
+
     if args.picker {
         app.auto_picker = true;
         app.input_mode = InputMode::Search;
@@ -1947,7 +1954,7 @@ fn run_wt_new(
         .or_else(|| config.default_base_branch.clone())
         .unwrap_or_else(|| "main".to_string());
 
-    let mut session_name = build_session_name(config, wt_type, branch);
+    let mut session_name = build_session_name(config, project, wt_type, branch);
     let hooks_dir = resolve_hooks_dir(config, project);
     let mut metadata = serde_json::json!({});
 

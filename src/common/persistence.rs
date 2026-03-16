@@ -303,6 +303,64 @@ pub fn save_completed_todos(todos: &HashMap<String, Vec<String>>) {
     }
 }
 
+/// Rename session names across all persistence files (favorites, skipped, muted, auto-approve,
+/// restore, todos, completed todos). Takes a map of old_name → new_name.
+pub fn migrate_session_names(renames: &HashMap<String, String>) {
+    if renames.is_empty() {
+        return;
+    }
+
+    // Helper: rename entries in a HashSet-based file
+    let migrate_set = |load: fn() -> HashSet<String>, save: fn(&HashSet<String>)| {
+        let old = load();
+        let new: HashSet<String> = old
+            .into_iter()
+            .map(|name| renames.get(&name).cloned().unwrap_or(name))
+            .collect();
+        save(&new);
+    };
+
+    migrate_set(load_favorite_sessions, save_favorite_sessions);
+    migrate_set(load_skipped_sessions, save_skipped_sessions);
+    migrate_set(load_muted_sessions, save_muted_sessions);
+    migrate_set(load_auto_approve_sessions, save_auto_approve_sessions);
+
+    // Restore file (Vec-based, one name per line)
+    {
+        if let Some(path) = get_restore_file_path() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let lines: Vec<String> = content
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| renames.get(l).map(|s| s.as_str()).unwrap_or(l).to_string())
+                    .collect();
+                if let Ok(mut file) = fs::File::create(&path) {
+                    for name in &lines {
+                        let _ = writeln!(file, "{}", name);
+                    }
+                }
+            }
+        }
+    }
+
+    // Todos (tab-separated: name\ttodo)
+    let migrate_todos =
+        |load: fn() -> HashMap<String, Vec<String>>, save: fn(&HashMap<String, Vec<String>>)| {
+            let old = load();
+            let new: HashMap<String, Vec<String>> = old
+                .into_iter()
+                .map(|(name, items)| {
+                    let new_name = renames.get(&name).cloned().unwrap_or(name);
+                    (new_name, items)
+                })
+                .collect();
+            save(&new);
+        };
+
+    migrate_todos(load_session_todos, save_session_todos);
+    migrate_todos(load_completed_todos, save_completed_todos);
+}
+
 /// Set global mute state (creates or removes the flag file)
 pub fn set_global_mute(enabled: bool) {
     let Some(path) = get_global_mute_path() else {

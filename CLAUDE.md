@@ -203,6 +203,16 @@ Uses **JXA (JavaScript for Automation)** instead of AppleScript because Chrome's
 - `sysinfo::System` is kept alive in `App` for CPU delta accuracy (needs two refresh_all calls)
 - Stale sessions cleaned up after 10 minutes of inactivity (in hook handler)
 
+## Session Naming
+
+- **Projects**: `{emoji} {display_name|key}` — e.g. `🌳 Clear Session`, `🐝 hive`
+- **Worktrees (default type)**: `{emoji} [{project_key}] {branch}` — e.g. `🌳 [clear-session] CSD-2527`
+- **Worktrees (non-default type)**: `{emoji} [{project_key}] {type}-{branch}` — e.g. `🌳 [clear-session] spike-CSD-2597`
+
+The `[project_key]` tag identifies which project a worktree belongs to. The `worktree` type prefix is omitted since it's the default; other types (spike, feature, etc.) are shown.
+
+On first TUI launch after upgrade, old-format names (`{emoji} {type}-{branch}`) are automatically migrated: worktrees.json entries are updated, live tmux sessions are renamed, and all persistence files (favorites, skipped, auto-approve, restore, todos) are updated.
+
 ## Worktree Hooks
 
 Project hooks live in `~/.hive/projects/{project_key}/hooks/` (or custom `hooks_dir`). Shell scripts named `<hook>.sh`:
