@@ -436,14 +436,15 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 lines.push(Line::from(header_spans));
 
-                // Line 2: resource stats + tags
+                // Line 2: resource stats + tags (no selection highlight)
+                let dim = Style::default().add_modifier(Modifier::DIM);
                 let mut stats_spans = vec![
-                    Span::styled("   ", header_style),
-                    Span::styled("[", header_style),
-                    Span::styled(cpu_text, header_style.fg(cpu_color)),
-                    Span::styled("/", header_style),
-                    Span::styled(mem_text, header_style.fg(mem_color)),
-                    Span::styled("]", header_style),
+                    Span::styled("   ", dim),
+                    Span::styled("[", dim),
+                    Span::styled(cpu_text, Style::default().fg(cpu_color)),
+                    Span::styled("/", dim),
+                    Span::styled(mem_text, Style::default().fg(mem_color)),
+                    Span::styled("]", dim),
                     Span::styled(" [auto]", Style::default().fg(Color::Green)),
                 ];
 
