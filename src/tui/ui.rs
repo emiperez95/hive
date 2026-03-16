@@ -384,6 +384,8 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let is_fav = app.is_favorite(&session_info.name);
 
         if is_claude {
+            let is_auto = app.is_auto_approved(&session_info.name);
+
             let header_style = if is_selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else if is_skipped {
@@ -411,142 +413,204 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(" ", header_style)
             };
 
-            let mut header_spans = vec![
-                prefix_span,
-                sep,
-                current_marker,
-                Span::styled(session_info.name.clone(), name_style),
-                Span::styled(" [", header_style),
-                Span::styled(cpu_text, header_style.fg(cpu_color)),
-                Span::styled("/", header_style),
-                Span::styled(mem_text, header_style.fg(mem_color)),
-                Span::styled("]", header_style),
-            ];
-
             let todo_count = app.todo_count(&session_info.name);
-            if todo_count > 0 {
-                header_spans.push(Span::styled(
-                    format!(" [{}]", todo_count),
-                    Style::default().fg(Color::Magenta),
-                ));
-            }
 
-            if app.is_auto_approved(&session_info.name) {
-                header_spans.push(Span::styled(" [auto]", Style::default().fg(Color::Green)));
-            }
+            if is_auto {
+                // Auto-approved layout:
+                // Line 1: name only (+ fav star, todo count)
+                // Line 2: [cpu/mem] [auto] [muted]
+                // Line 3: simplified status
+                let mut header_spans = vec![
+                    prefix_span,
+                    sep,
+                    current_marker,
+                    Span::styled(session_info.name.clone(), name_style),
+                ];
 
-            if app.is_muted(&session_info.name) {
-                header_spans.push(Span::styled(
-                    " [muted]",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
+                if todo_count > 0 {
+                    header_spans.push(Span::styled(
+                        format!(" [{}]", todo_count),
+                        Style::default().fg(Color::Magenta),
+                    ));
+                }
 
-            lines.push(Line::from(header_spans));
+                lines.push(Line::from(header_spans));
 
-            if let Some(ref status) = session_info.claude_status {
-                let ago_text = session_info
-                    .last_activity
-                    .as_ref()
-                    .map(|ts| format!(" ({})", format_duration_ago(ts)))
-                    .unwrap_or_default();
+                // Line 2: resource stats + tags
+                let mut stats_spans = vec![
+                    Span::styled("   ", header_style),
+                    Span::styled("[", header_style),
+                    Span::styled(cpu_text, header_style.fg(cpu_color)),
+                    Span::styled("/", header_style),
+                    Span::styled(mem_text, header_style.fg(mem_color)),
+                    Span::styled("]", header_style),
+                    Span::styled(" [auto]", Style::default().fg(Color::Green)),
+                ];
 
-                match status {
-                    ClaudeStatus::NeedsPermission(cmd, desc) => {
-                        let text = if let Some(key) = session_info.permission_key {
-                            format!(
-                                "   → [{}/{}] needs permission: {}",
-                                key,
-                                key.to_ascii_uppercase(),
-                                cmd
-                            )
-                        } else {
-                            format!("   → needs permission: {}", cmd)
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(text, Style::default().fg(Color::Yellow)),
-                            Span::styled(
-                                ago_text.clone(),
+                if app.is_muted(&session_info.name) {
+                    stats_spans.push(Span::styled(
+                        " [muted]",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+
+                lines.push(Line::from(stats_spans));
+
+                // Line 3: simplified claude status
+                if let Some(ref status) = session_info.claude_status {
+                    let ago_text = session_info
+                        .last_activity
+                        .as_ref()
+                        .map(|ts| format!(" ({})", format_duration_ago(ts)))
+                        .unwrap_or_default();
+
+                    let (label, color) = match status {
+                        ClaudeStatus::Waiting => ("waiting for input", Color::Cyan),
+                        ClaudeStatus::PlanReview => ("plan ready", Color::Magenta),
+                        ClaudeStatus::QuestionAsked => ("question asked", Color::Magenta),
+                        // NeedsPermission/EditApproval auto-resolve → show as working
+                        _ => ("working", Color::DarkGray),
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("   → {}", label), Style::default().fg(color)),
+                        Span::styled(ago_text, Style::default().add_modifier(Modifier::DIM)),
+                    ]));
+                }
+            } else {
+                // Standard layout: name + stats on line 1, detailed status on line 2-3
+                let mut header_spans = vec![
+                    prefix_span,
+                    sep,
+                    current_marker,
+                    Span::styled(session_info.name.clone(), name_style),
+                    Span::styled(" [", header_style),
+                    Span::styled(cpu_text, header_style.fg(cpu_color)),
+                    Span::styled("/", header_style),
+                    Span::styled(mem_text, header_style.fg(mem_color)),
+                    Span::styled("]", header_style),
+                ];
+
+                if todo_count > 0 {
+                    header_spans.push(Span::styled(
+                        format!(" [{}]", todo_count),
+                        Style::default().fg(Color::Magenta),
+                    ));
+                }
+
+                if app.is_muted(&session_info.name) {
+                    header_spans.push(Span::styled(
+                        " [muted]",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+
+                lines.push(Line::from(header_spans));
+
+                if let Some(ref status) = session_info.claude_status {
+                    let ago_text = session_info
+                        .last_activity
+                        .as_ref()
+                        .map(|ts| format!(" ({})", format_duration_ago(ts)))
+                        .unwrap_or_default();
+
+                    match status {
+                        ClaudeStatus::NeedsPermission(cmd, desc) => {
+                            let text = if let Some(key) = session_info.permission_key {
+                                format!(
+                                    "   → [{}/{}] needs permission: {}",
+                                    key,
+                                    key.to_ascii_uppercase(),
+                                    cmd
+                                )
+                            } else {
+                                format!("   → needs permission: {}", cmd)
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(text, Style::default().fg(Color::Yellow)),
+                                Span::styled(
+                                    ago_text.clone(),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                            let desc_text = desc.as_deref().unwrap_or("");
+                            lines.push(Line::from(Span::styled(
+                                format!("     {}", desc_text),
                                 Style::default().add_modifier(Modifier::DIM),
-                            ),
-                        ]));
-                        let desc_text = desc.as_deref().unwrap_or("");
-                        lines.push(Line::from(Span::styled(
-                            format!("     {}", desc_text),
-                            Style::default().add_modifier(Modifier::DIM),
-                        )));
-                    }
-                    ClaudeStatus::EditApproval(filename) => {
-                        let text = if let Some(key) = session_info.permission_key {
-                            format!(
-                                "   → [{}/{}] edit: {}",
-                                key,
-                                key.to_ascii_uppercase(),
-                                filename
-                            )
-                        } else {
-                            format!("   → edit: {}", filename)
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(text, Style::default().fg(Color::Yellow)),
-                            Span::styled(
-                                ago_text.clone(),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ),
-                        ]));
-                        lines.push(Line::raw(""));
-                    }
-                    ClaudeStatus::PlanReview => {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("   → {}", status),
-                                Style::default().fg(Color::Magenta),
-                            ),
-                            Span::styled(
-                                ago_text.clone(),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ),
-                        ]));
-                        lines.push(Line::raw(""));
-                    }
-                    ClaudeStatus::QuestionAsked => {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("   → {}", status),
-                                Style::default().fg(Color::Magenta),
-                            ),
-                            Span::styled(
-                                ago_text.clone(),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ),
-                        ]));
-                        lines.push(Line::raw(""));
-                    }
-                    ClaudeStatus::Waiting => {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("   → {}", status),
-                                Style::default().fg(Color::Cyan),
-                            ),
-                            Span::styled(
-                                ago_text.clone(),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ),
-                        ]));
-                        lines.push(Line::raw(""));
-                    }
-                    _ => {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("   → {}", status),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ),
-                            Span::styled(
-                                ago_text.clone(),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ),
-                        ]));
-                        lines.push(Line::raw(""));
+                            )));
+                        }
+                        ClaudeStatus::EditApproval(filename) => {
+                            let text = if let Some(key) = session_info.permission_key {
+                                format!(
+                                    "   → [{}/{}] edit: {}",
+                                    key,
+                                    key.to_ascii_uppercase(),
+                                    filename
+                                )
+                            } else {
+                                format!("   → edit: {}", filename)
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(text, Style::default().fg(Color::Yellow)),
+                                Span::styled(
+                                    ago_text.clone(),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                            lines.push(Line::raw(""));
+                        }
+                        ClaudeStatus::PlanReview => {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("   → {}", status),
+                                    Style::default().fg(Color::Magenta),
+                                ),
+                                Span::styled(
+                                    ago_text.clone(),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                            lines.push(Line::raw(""));
+                        }
+                        ClaudeStatus::QuestionAsked => {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("   → {}", status),
+                                    Style::default().fg(Color::Magenta),
+                                ),
+                                Span::styled(
+                                    ago_text.clone(),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                            lines.push(Line::raw(""));
+                        }
+                        ClaudeStatus::Waiting => {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("   → {}", status),
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(
+                                    ago_text.clone(),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                            lines.push(Line::raw(""));
+                        }
+                        _ => {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("   → {}", status),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                                Span::styled(
+                                    ago_text.clone(),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                            lines.push(Line::raw(""));
+                        }
                     }
                 }
             }
