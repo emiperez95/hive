@@ -469,6 +469,7 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
 
                 lines.push(Line::from(line2_spans));
+                lines.push(Line::raw(""));
             } else {
                 // Standard layout: name + stats on line 1, detailed status on line 2-3
                 let mut header_spans = vec![
