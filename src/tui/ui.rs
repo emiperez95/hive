@@ -344,7 +344,7 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             lines_remaining -= 2;
         }
 
-        let needed = lines_for_session(session_info);
+        let needed = lines_for_session(session_info, app.is_auto_approved(&session_info.name));
         if lines_remaining < needed {
             break;
         }
@@ -436,28 +436,11 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 lines.push(Line::from(header_spans));
 
-                // Line 2: resource stats + tags (no selection highlight)
+                // Line 2: status + resource stats + tags (merged, no selection highlight)
                 let dim = Style::default().add_modifier(Modifier::DIM);
-                let mut stats_spans = vec![
-                    Span::styled("   ", dim),
-                    Span::styled("[", dim),
-                    Span::styled(cpu_text, Style::default().fg(cpu_color)),
-                    Span::styled("/", dim),
-                    Span::styled(mem_text, Style::default().fg(mem_color)),
-                    Span::styled("]", dim),
-                    Span::styled(" [auto]", Style::default().fg(Color::Green)),
-                ];
 
-                if app.is_muted(&session_info.name) {
-                    stats_spans.push(Span::styled(
-                        " [muted]",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
+                let mut line2_spans = Vec::new();
 
-                lines.push(Line::from(stats_spans));
-
-                // Line 3: simplified claude status
                 if let Some(ref status) = session_info.claude_status {
                     let ago_text = session_info
                         .last_activity
@@ -469,15 +452,30 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         ClaudeStatus::Waiting => ("waiting for input", Color::Cyan),
                         ClaudeStatus::PlanReview => ("plan ready", Color::Magenta),
                         ClaudeStatus::QuestionAsked => ("question asked", Color::Magenta),
-                        // NeedsPermission/EditApproval auto-resolve → show as working
                         _ => ("working", Color::DarkGray),
                     };
 
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("   → {}", label), Style::default().fg(color)),
-                        Span::styled(ago_text, Style::default().add_modifier(Modifier::DIM)),
-                    ]));
+                    line2_spans.push(Span::styled(
+                        format!("   → {}", label),
+                        Style::default().fg(color),
+                    ));
+                    line2_spans.push(Span::styled(ago_text, dim));
                 }
+
+                line2_spans.push(Span::styled(" [", dim));
+                line2_spans.push(Span::styled(cpu_text, Style::default().fg(cpu_color)));
+                line2_spans.push(Span::styled("/", dim));
+                line2_spans.push(Span::styled(mem_text, Style::default().fg(mem_color)));
+                line2_spans.push(Span::styled("]", dim));
+
+                if app.is_muted(&session_info.name) {
+                    line2_spans.push(Span::styled(
+                        " [muted]",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+
+                lines.push(Line::from(line2_spans));
             } else {
                 // Standard layout: name + stats on line 1, detailed status on line 2-3
                 let mut header_spans = vec![

@@ -157,10 +157,12 @@ pub fn matches_filter(session_name: &str, filter: &Option<String>) -> bool {
 }
 
 /// Returns the number of display lines a session occupies:
-/// Claude sessions get 3 lines (header + status + blank), non-Claude get 1 line.
-pub fn lines_for_session(session: &SessionInfo) -> usize {
+/// Auto-approved Claude sessions get 2 lines (header + stats/status).
+/// Other Claude sessions get 3 lines (header + status + blank).
+/// Non-Claude sessions get 1 line.
+pub fn lines_for_session(session: &SessionInfo, is_auto_approved: bool) -> usize {
     if session.claude_status.is_some() {
-        3
+        if is_auto_approved { 2 } else { 3 }
     } else {
         1
     }

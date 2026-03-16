@@ -650,7 +650,7 @@ impl App {
         loop {
             let mut used = 0;
             for i in self.scroll_offset..=self.selected {
-                used += lines_for_session(&self.session_infos[i]);
+                used += lines_for_session(&self.session_infos[i], self.is_auto_approved(&self.session_infos[i].name));
             }
             if used <= available_height {
                 break;
