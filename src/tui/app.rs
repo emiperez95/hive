@@ -444,7 +444,15 @@ impl App {
                                 .as_ref()
                                 .and_then(|s| parse_timestamp(s));
                         } else {
-                            claude_status = Some(ClaudeStatus::Unknown);
+                            // No hook state (stale cleanup removed it) — fall back to JSONL
+                            if let Some(jsonl_status) =
+                                crate::common::jsonl::get_claude_status_from_jsonl(&p.cwd)
+                            {
+                                claude_status = Some(jsonl_status.status);
+                                last_activity = jsonl_status.timestamp;
+                            } else {
+                                claude_status = Some(ClaudeStatus::Unknown);
+                            }
                         }
                         claude_pane =
                             Some((session.name.clone(), window.index.clone(), p.index.clone()));
