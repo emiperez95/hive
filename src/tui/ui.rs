@@ -442,24 +442,17 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 let mut line2_spans = Vec::new();
 
                 if let Some(ref status) = session_info.claude_status {
-                    let ago_text = session_info
-                        .last_activity
-                        .as_ref()
-                        .map(|ts| format!(" ({})", format_duration_ago(ts)))
-                        .unwrap_or_default();
-
                     let (label, color) = match status {
-                        ClaudeStatus::Waiting => ("waiting for input", Color::Cyan),
-                        ClaudeStatus::PlanReview => ("plan ready", Color::Magenta),
-                        ClaudeStatus::QuestionAsked => ("question asked", Color::Magenta),
-                        _ => ("working", Color::DarkGray),
+                        ClaudeStatus::Waiting => ("idle", Color::Cyan),
+                        ClaudeStatus::PlanReview => ("plan", Color::Magenta),
+                        ClaudeStatus::QuestionAsked => ("ask?", Color::Magenta),
+                        _ => ("work", Color::DarkGray),
                     };
 
                     line2_spans.push(Span::styled(
                         format!("   → {}", label),
                         Style::default().fg(color),
                     ));
-                    line2_spans.push(Span::styled(ago_text, dim));
                 }
 
                 line2_spans.push(Span::styled(" [", dim));
