@@ -16,6 +16,7 @@ use crate::common::debug::{debug_log, init_debug};
 use crate::common::persistence::{
     is_globally_muted, load_auto_approve_sessions, load_completed_todos, load_muted_sessions,
     load_session_todos, load_skipped_sessions, save_completed_todos, save_session_todos,
+    save_skipped_sessions,
 };
 use crate::common::projects::{
     connect_project, connect_session, DatabaseConfig, FilePatterns, PortConfig, ProjectConfig,
@@ -521,6 +522,7 @@ fn run_tui(
                             KeyCode::Enter => {
                                 if let Some(session_name) = app.np_complete() {
                                     if connect_session(&session_name) {
+                                        app.unskip(&session_name);
                                         switch_to_session(&session_name);
                                         app.save_restorable();
                                         return Ok(PostAction::None);
@@ -564,6 +566,7 @@ fn run_tui(
                                 {
                                     match result {
                                         SearchResult::Active(name) => {
+                                            app.unskip(&name);
                                             app.save_restorable();
                                             if app.auto_picker {
                                                 return Ok(PostAction::Attach(name));
@@ -577,6 +580,7 @@ fn run_tui(
                                             app.search_query.clear();
                                             app.search_results.clear();
                                             if connect_session(&name) {
+                                                app.unskip(&name);
                                                 app.save_restorable();
                                                 if app.auto_picker {
                                                     return Ok(PostAction::Attach(name));
@@ -734,11 +738,13 @@ fn run_tui(
                                         }
                                         needs_redraw = true;
                                     } else if let Some(name) = app.detail_session_name() {
+                                        app.unskip(&name);
                                         switch_to_session(&name);
                                         app.save_restorable();
                                         return Ok(PostAction::None);
                                     }
                                 } else if let Some(name) = app.detail_session_name() {
+                                    app.unskip(&name);
                                     switch_to_session(&name);
                                     app.save_restorable();
                                     return Ok(PostAction::None);
@@ -852,7 +858,9 @@ fn run_tui(
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                                 let idx = c.to_digit(10).unwrap() as usize - 1;
                                 if let Some(session_info) = app.session_infos.get(idx) {
-                                    switch_to_session(&session_info.name);
+                                    let name = session_info.name.clone();
+                                    app.unskip(&name);
+                                    switch_to_session(&name);
                                     app.save_restorable();
                                     return Ok(PostAction::None);
                                 }
@@ -1732,6 +1740,11 @@ fn run_connect(key: &str) -> Result<()> {
     let session_name = ProjectRegistry::session_name(key, config);
     if !connect_project(&session_name) {
         anyhow::bail!("Failed to create/connect session for '{}'", key);
+    }
+    // Unskip if it was skipped — user explicitly chose to connect
+    let mut skipped = load_skipped_sessions();
+    if skipped.remove(&session_name) {
+        save_skipped_sessions(&skipped);
     }
     switch_to_session(&session_name);
     Ok(())

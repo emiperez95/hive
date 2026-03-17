@@ -868,6 +868,13 @@ impl App {
         save_skipped_sessions(&self.skipped_sessions);
     }
 
+    /// Remove a session from the skipped set if it's there (no-op otherwise).
+    pub fn unskip(&mut self, name: &str) {
+        if self.skipped_sessions.remove(name) {
+            save_skipped_sessions(&self.skipped_sessions);
+        }
+    }
+
     pub fn is_skipped(&self, name: &str) -> bool {
         self.skipped_sessions.contains(name)
     }
