@@ -9,6 +9,8 @@ pub mod persistence;
 pub mod ports;
 pub mod process;
 pub mod projects;
+pub mod remote_client;
+pub mod remotes;
 pub mod tmux;
 pub mod types;
 pub mod worktree;

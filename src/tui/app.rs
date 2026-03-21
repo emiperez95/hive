@@ -10,9 +10,11 @@ use crate::common::persistence::{
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::projects::{has_project_config, ProjectConfig, ProjectRegistry};
+use crate::common::remotes::RemoteRegistry;
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
-    lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
+    lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, SessionSource,
+    PERMISSION_KEYS,
 };
 use crate::common::worktree::sanitize_branch_name;
 use crate::ipc::messages::{HookState, SessionState, SessionStatus};
@@ -463,6 +465,7 @@ impl App {
 
             session_infos.push(SessionInfo {
                 name: session.name.clone(),
+                source: SessionSource::Local,
                 claude_status,
                 claude_pane,
                 permission_key: None,
@@ -477,11 +480,102 @@ impl App {
             });
         }
 
-        // Sort: skipped last, Claude before non-Claude, favorites first within each group
+        // Enrich local wrapper sessions with remote Claude status.
+        // Wrapper sessions are named "{emoji} {label} | {remote_session}" and contain
+        // just an SSH process locally — overlay the remote's status so they sort/render correctly.
+        let remote_registry = RemoteRegistry::load();
+        for (_key, config) in &remote_registry.remotes {
+            let cached = crate::common::remote_client::load_cache_pub(_key);
+            let wrapper_prefix = format!("{} {} | ", config.emoji, config.label);
+            for rs in &cached {
+                let wrapper_name = format!("{}{}", wrapper_prefix, rs.name);
+                if let Some(local) = session_infos.iter_mut().find(|s| s.name == wrapper_name) {
+                    if local.claude_status.is_none() {
+                        local.claude_status = rs.status.as_ref().map(convert_hook_status);
+                        local.claude_pane = rs.pane.clone();
+                        local.last_activity = rs
+                            .last_activity
+                            .as_ref()
+                            .and_then(|s| parse_timestamp(s));
+                        local.source = SessionSource::Remote {
+                            remote_key: _key.clone(),
+                            remote_label: config.label.clone(),
+                            remote_emoji: config.emoji.clone(),
+                        };
+                    }
+                }
+            }
+        }
+
+        // Merge remote sessions from cache files (written by `hive remote sync`)
+        let local_names: HashSet<String> = session_infos.iter().map(|s| s.name.clone()).collect();
+        let remote_registry = RemoteRegistry::load();
+        for (key, config) in &remote_registry.remotes {
+            let cached = crate::common::remote_client::load_cache_pub(key);
+            // Build wrapper prefix to detect open remote sessions: "{emoji} {label} | "
+            let wrapper_prefix = format!("{} {} | ", config.emoji, config.label);
+            for rs in &cached {
+                if !matches_filter(&rs.name, &self.filter) {
+                    continue;
+                }
+                // Skip if a local wrapper session exists for this remote session
+                let wrapper_name = format!("{}{}", wrapper_prefix, rs.name);
+                if local_names.contains(&wrapper_name) {
+                    continue;
+                }
+                let claude_status = rs.status.as_ref().map(convert_hook_status);
+                let last_activity = rs
+                    .last_activity
+                    .as_ref()
+                    .and_then(|s| parse_timestamp(s));
+                let processes = rs
+                    .processes
+                    .iter()
+                    .map(|p| ProcessInfo {
+                        pid: p.pid,
+                        name: p.name.clone(),
+                        cpu_percent: p.cpu_percent,
+                        memory_kb: p.memory_kb,
+                        command: p.command.clone(),
+                    })
+                    .collect();
+                let listening_ports = rs
+                    .ports
+                    .iter()
+                    .map(|&port| crate::common::ports::ListeningPort {
+                        port,
+                        pid: 0,
+                        process_name: String::new(),
+                    })
+                    .collect();
+                session_infos.push(SessionInfo {
+                    name: rs.name.clone(),
+                    source: SessionSource::Remote {
+                        remote_key: key.clone(),
+                        remote_label: config.label.clone(),
+                        remote_emoji: config.emoji.clone(),
+                    },
+                    claude_status,
+                    claude_pane: rs.pane.clone(),
+                    permission_key: None,
+                    total_cpu: rs.cpu,
+                    total_mem_kb: rs.mem_kb,
+                    last_activity,
+                    processes,
+                    cwd: rs.cwd.clone(),
+                    listening_ports,
+                    attached_other_client: rs.attached,
+                    is_current_session: false,
+                });
+            }
+        }
+
+        // Sort: remote after local, skipped last, Claude before non-Claude, favorites first
         session_infos.sort_by_key(|s| {
-            let is_favorite = self.favorite_sessions.contains(&s.name);
-            let is_skipped = self.skipped_sessions.contains(&s.name);
-            (is_skipped, s.claude_status.is_none(), !is_favorite)
+            let is_remote = s.source.is_remote();
+            let is_favorite = self.favorite_sessions.contains(&s.persistence_key());
+            let is_skipped = self.skipped_sessions.contains(&s.persistence_key());
+            (is_remote, is_skipped, s.claude_status.is_none(), !is_favorite)
         });
 
         // Stable permission key assignment
@@ -803,7 +897,7 @@ impl App {
         let restorable: Vec<String> = self
             .session_infos
             .iter()
-            .filter(|s| has_project_config(&s.name))
+            .filter(|s| !s.source.is_remote() && has_project_config(&s.name))
             .map(|s| s.name.clone())
             .collect();
         save_restorable_sessions(&restorable);

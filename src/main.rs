@@ -3,6 +3,7 @@
 mod common;
 mod daemon;
 mod ipc;
+mod serve;
 mod tui;
 
 use anyhow::{bail, Result};
@@ -114,6 +115,17 @@ enum Command {
     Collapse,
     /// Auto-attach to the first available tmux session
     Start,
+    /// Run as a remote session server (stdio transport for SSH)
+    Serve {
+        /// Use stdio transport (JSON lines on stdin/stdout)
+        #[arg(long)]
+        stdio: bool,
+    },
+    /// Manage remote machine connections
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -264,6 +276,33 @@ enum TodoCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum RemoteCommand {
+    /// Add a remote machine
+    Add {
+        /// Remote name (identifier)
+        name: String,
+        /// SSH host (from ~/.ssh/config)
+        #[arg(long)]
+        host: String,
+        /// Display label (defaults to name)
+        #[arg(long)]
+        label: Option<String>,
+        /// Emoji for remote sessions
+        #[arg(long, default_value = "🖥️")]
+        emoji: String,
+    },
+    /// Remove a remote machine
+    Remove {
+        /// Remote name to remove
+        name: String,
+    },
+    /// List configured remotes
+    List,
+    /// Keep SSH connections alive and cache remote sessions in the background
+    Sync,
+}
+
 /// Action to perform after TUI exits (post terminal restore)
 enum PostAction {
     None,
@@ -282,6 +321,45 @@ enum PostAction {
         project: String,
         branch: String,
     },
+    /// Connect to a remote session by creating a local wrapper tmux session
+    ConnectRemote {
+        ssh_host: String,
+        label: String,
+        emoji: String,
+        session_name: String,
+    },
+}
+
+/// Switch to a session or return a ConnectRemote post-action for remote sessions.
+/// For local sessions, performs the switch immediately and returns None.
+/// For remote sessions, returns Some(PostAction::ConnectRemote).
+fn switch_or_connect(session_info: &crate::common::types::SessionInfo, app: &mut App) -> Option<PostAction> {
+    use crate::common::types::SessionSource;
+    match &session_info.source {
+        SessionSource::Local => {
+            app.unskip(&session_info.name);
+            switch_to_session(&session_info.name);
+            app.save_restorable();
+            None
+        }
+        SessionSource::Remote {
+            remote_key,
+            remote_label,
+            remote_emoji,
+        } => {
+            let ssh_host = crate::common::remotes::RemoteRegistry::load()
+                .remotes
+                .get(remote_key)
+                .map(|c| c.ssh_host.clone())
+                .unwrap_or_else(|| remote_key.clone());
+            Some(PostAction::ConnectRemote {
+                ssh_host,
+                label: remote_label.clone(),
+                emoji: remote_emoji.clone(),
+                session_name: session_info.name.clone(),
+            })
+        }
+    }
 }
 
 fn run_tui(
@@ -289,6 +367,9 @@ fn run_tui(
     args: &Args,
     running: Arc<AtomicBool>,
 ) -> Result<PostAction> {
+    // Auto-start remote sync if remotes are configured and sync isn't running
+    ensure_remote_sync();
+
     let mut app = App::new(args.filter.clone(), args.watch);
     app.auto_detail = args.detail;
 
@@ -737,16 +818,16 @@ fn run_tui(
                                             }
                                         }
                                         needs_redraw = true;
-                                    } else if let Some(name) = app.detail_session_name() {
-                                        app.unskip(&name);
-                                        switch_to_session(&name);
-                                        app.save_restorable();
+                                    } else if let Some(info) = app.detail_session_info().cloned() {
+                                        if let Some(action) = switch_or_connect(&info, &mut app) {
+                                            return Ok(action);
+                                        }
                                         return Ok(PostAction::None);
                                     }
-                                } else if let Some(name) = app.detail_session_name() {
-                                    app.unskip(&name);
-                                    switch_to_session(&name);
-                                    app.save_restorable();
+                                } else if let Some(info) = app.detail_session_info().cloned() {
+                                    if let Some(action) = switch_or_connect(&info, &mut app) {
+                                        return Ok(action);
+                                    }
                                     return Ok(PostAction::None);
                                 }
                             }
@@ -857,11 +938,10 @@ fn run_tui(
                             }
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                                 let idx = c.to_digit(10).unwrap() as usize - 1;
-                                if let Some(session_info) = app.session_infos.get(idx) {
-                                    let name = session_info.name.clone();
-                                    app.unskip(&name);
-                                    switch_to_session(&name);
-                                    app.save_restorable();
+                                if let Some(session_info) = app.session_infos.get(idx).cloned() {
+                                    if let Some(action) = switch_or_connect(&session_info, &mut app) {
+                                        return Ok(action);
+                                    }
                                     return Ok(PostAction::None);
                                 }
                             }
@@ -875,19 +955,39 @@ fn run_tui(
                                     if let Some((ref sess, ref win, ref pane)) =
                                         session_info.claude_pane
                                     {
-                                        use crate::common::tmux::send_key_to_pane;
                                         use crate::common::types::ClaudeStatus;
                                         let has_approve_always = matches!(
                                             session_info.claude_status,
                                             Some(ClaudeStatus::NeedsPermission(_, _))
                                         );
-                                        if is_uppercase && has_approve_always {
-                                            send_key_to_pane(sess, win, pane, "2");
-                                            send_key_to_pane(sess, win, pane, "Enter");
+                                        let keys = if is_uppercase && has_approve_always {
+                                            vec!["2".to_string(), "Enter".to_string()]
                                         } else {
-                                            send_key_to_pane(sess, win, pane, "1");
-                                            send_key_to_pane(sess, win, pane, "Enter");
+                                            vec!["1".to_string(), "Enter".to_string()]
+                                        };
+
+                                        match &session_info.source {
+                                            crate::common::types::SessionSource::Local => {
+                                                use crate::common::tmux::send_key_to_pane;
+                                                for key in &keys {
+                                                    send_key_to_pane(sess, win, pane, key);
+                                                }
+                                            }
+                                            crate::common::types::SessionSource::Remote {
+                                                remote_key,
+                                                ..
+                                            } => {
+                                                let registry = crate::common::remotes::RemoteRegistry::load();
+                                                if let Some(config) = registry.remotes.get(remote_key) {
+                                                    send_keys_to_remote(
+                                                        &config.ssh_host,
+                                                        sess, win, pane,
+                                                        &keys,
+                                                    );
+                                                }
+                                            }
                                         }
+
                                         app.pending_approvals.insert(session_info.name.clone());
                                         app.hide_selection();
                                         should_refresh = true;
@@ -2478,6 +2578,180 @@ fn run_todo_clear(session: Option<String>) -> Result<()> {
 }
 
 /// Handle post-TUI actions (spread, collapse, attach, create worktree)
+/// Send keys to a remote tmux pane via SSH.
+/// Uses `-o RemoteCommand=none` to bypass any RemoteCommand in SSH config.
+/// Uses `bash -lc` to get a login shell with full PATH on the remote.
+fn send_keys_to_remote(ssh_host: &str, session: &str, window: &str, pane: &str, keys: &[String]) {
+    let target = format!("{}:{}.{}", session, window, pane);
+    for key in keys {
+        let cmd = format!("tmux send-keys -t '{}' '{}'", target, key);
+        let _ = std::process::Command::new("ssh")
+            .args([
+                "-T",
+                "-o", "RemoteCommand=none",
+                ssh_host,
+                "bash", "-lc", &cmd,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+    }
+}
+
+/// Start `hive remote sync` in the background if remotes are configured and it's not already running.
+fn ensure_remote_sync() {
+    use crate::common::remotes::RemoteRegistry;
+
+    let registry = RemoteRegistry::load();
+    if registry.remotes.is_empty() {
+        return;
+    }
+
+    let pid_path = crate::common::persistence::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.hive/cache"))
+        .join("remote-sync.pid");
+
+    // Check if already running
+    if pid_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = content.trim().parse::<i32>() {
+                unsafe {
+                    if libc::kill(pid, 0) == 0 {
+                        return; // already running
+                    }
+                }
+            }
+        }
+    }
+
+    // Find hive binary
+    let binary = dirs::home_dir()
+        .map(|h| h.join(".local/bin/hive"))
+        .filter(|p| p.exists())
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("hive"));
+
+    // Spawn detached: stdin/stdout/stderr all null so it doesn't block
+    let _ = std::process::Command::new(binary)
+        .args(["remote", "sync"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+fn run_remote(command: RemoteCommand) -> Result<()> {
+    use crate::common::remotes::{RemoteConfig, RemoteRegistry};
+    match command {
+        RemoteCommand::Add {
+            name,
+            host,
+            label,
+            emoji,
+        } => {
+            let mut registry = RemoteRegistry::load();
+            let config = RemoteConfig {
+                ssh_host: host,
+                label: label.unwrap_or_else(|| name.clone()),
+                emoji,
+            };
+            registry.remotes.insert(name.clone(), config);
+            registry.save()?;
+            println!("Added remote '{}'", name);
+            Ok(())
+        }
+        RemoteCommand::Remove { name } => {
+            let mut registry = RemoteRegistry::load();
+            if registry.remotes.remove(&name).is_some() {
+                registry.save()?;
+                println!("Removed remote '{}'", name);
+            } else {
+                println!("Remote '{}' not found", name);
+            }
+            Ok(())
+        }
+        RemoteCommand::List => {
+            let registry = RemoteRegistry::load();
+            if registry.remotes.is_empty() {
+                println!("No remotes configured. Add one with: hive remote add <name> --host <ssh-host>");
+            } else {
+                for (name, config) in &registry.remotes {
+                    println!(
+                        "  {} {} ({}) → ssh {}",
+                        config.emoji, name, config.label, config.ssh_host
+                    );
+                }
+            }
+            Ok(())
+        }
+        RemoteCommand::Sync => {
+            use crate::common::remote_client::RemoteHandle;
+
+            // PID file lock — prevent multiple sync instances
+            let pid_path = crate::common::persistence::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.hive/cache"))
+                .join("remote-sync.pid");
+
+            // Check if another sync is already running
+            if pid_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = content.trim().parse::<i32>() {
+                        // Check if process is still alive (signal 0 = existence check)
+                        unsafe {
+                            if libc::kill(pid, 0) == 0 {
+                                println!("Remote sync already running (pid {})", pid);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Write our PID
+            if let Some(parent) = pid_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&pid_path, format!("{}", std::process::id()));
+
+            let registry = RemoteRegistry::load();
+            if registry.remotes.is_empty() {
+                let _ = std::fs::remove_file(&pid_path);
+                println!("No remotes configured.");
+                return Ok(());
+            }
+
+            let handles: Vec<RemoteHandle> = registry
+                .remotes
+                .into_iter()
+                .map(|(key, config)| {
+                    println!("Connecting to {} (ssh {})...", key, config.ssh_host);
+                    RemoteHandle::spawn(key, config)
+                })
+                .collect();
+
+            println!("Syncing {} remote(s). Press Ctrl-C to stop.", handles.len());
+
+            // Block until Ctrl-C
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+            ctrlc::set_handler(move || {
+                r.store(false, Ordering::SeqCst);
+            })
+            .ok();
+
+            while running.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+
+            drop(handles); // triggers shutdown + join
+            let _ = std::fs::remove_file(&pid_path);
+            println!("\nStopped.");
+            Ok(())
+        }
+    }
+}
+
 fn handle_post_action(action: PostAction) -> Result<()> {
     match action {
         PostAction::Spread(n) => run_spread(n),
@@ -2517,6 +2791,37 @@ fn handle_post_action(action: PostAction) -> Result<()> {
         PostAction::DeleteWorktree { project, branch } => {
             eprintln!("Deleting worktree {}/{}...", project, branch);
             run_wt_delete(&project, &branch, false, true)?;
+            Ok(())
+        }
+        PostAction::ConnectRemote {
+            ssh_host,
+            label,
+            emoji,
+            session_name,
+        } => {
+            let wrapper = format!("{} {} | {}", emoji, label, session_name);
+
+            // Check if wrapper session already exists
+            let exists = std::process::Command::new("tmux")
+                .args(["has-session", "-t", &wrapper])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if !exists {
+                // Create a local tmux session that SSHs into the remote tmux session.
+                // -o RemoteCommand=none bypasses the hive serve RemoteCommand in SSH config.
+                // Explicit PATH ensures tmux is found on the remote (non-login SSH has minimal PATH).
+                let ssh_cmd = format!(
+                    "ssh -t -o RemoteCommand=none {} 'export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; exec tmux attach -t \"{}\"'",
+                    ssh_host, session_name
+                );
+                std::process::Command::new("tmux")
+                    .args(["new-session", "-d", "-s", &wrapper, &ssh_cmd])
+                    .output()?;
+            }
+
+            switch_to_session(&wrapper);
             Ok(())
         }
         PostAction::None => Ok(()),
@@ -2562,6 +2867,14 @@ fn main() -> Result<()> {
         Some(Command::Todo { command }) => run_todo(command),
         Some(Command::Spread { count }) => run_spread(count),
         Some(Command::Collapse) => run_collapse(),
+        Some(Command::Serve { stdio }) => {
+            if stdio {
+                crate::serve::server::run_stdio_server()
+            } else {
+                bail!("hive serve requires --stdio flag");
+            }
+        }
+        Some(Command::Remote { command }) => run_remote(command),
         Some(Command::Start) => {
             if let Some(target) = run_start()? {
                 use std::os::unix::process::CommandExt;

@@ -68,10 +68,30 @@ impl std::fmt::Display for ClaudeStatus {
     }
 }
 
+/// Whether a session is local or from a remote machine
+#[derive(Debug, Clone, Default)]
+pub enum SessionSource {
+    #[default]
+    Local,
+    Remote {
+        remote_key: String,
+        remote_label: String,
+        remote_emoji: String,
+    },
+}
+
+impl SessionSource {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, SessionSource::Remote { .. })
+    }
+}
+
 /// Info about a displayed session for interactive mode
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub name: String,
+    /// Whether this session is local or from a remote machine
+    pub source: SessionSource,
     pub claude_status: Option<ClaudeStatus>,
     /// (session, window, pane) for sending keys
     pub claude_pane: Option<(String, String, String)>,
@@ -91,6 +111,20 @@ pub struct SessionInfo {
     pub attached_other_client: bool,
     /// This is the session the caller's tmux client is attached to
     pub is_current_session: bool,
+}
+
+impl SessionInfo {
+    /// Returns a key suitable for persistence lookups (favorites, muted, etc.).
+    /// For local sessions, returns the session name.
+    /// For remote sessions, returns `remote:{key}:{name}` to avoid collisions.
+    pub fn persistence_key(&self) -> String {
+        match &self.source {
+            SessionSource::Local => self.name.clone(),
+            SessionSource::Remote { remote_key, .. } => {
+                format!("remote:{}:{}", remote_key, self.name)
+            }
+        }
+    }
 }
 
 /// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'f' for favorite)
