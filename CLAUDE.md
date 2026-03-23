@@ -232,25 +232,36 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 | GET | `/api/sessions` | Session list with status, CPU, ports, skipped flag (polled every 1.5s) |
 | GET | `/api/messages?session=X` | Full conversation for a session (user + assistant + tool uses) |
 | GET | `/api/config` | Feature flags (`{"tts": true/false}`) |
+| GET | `/api/projects` | All registered projects with exists flag |
+| GET | `/api/session-info?session=X` | Enriched session data: CWD, ports, processes, flags, todos |
 | POST | `/api/send` | Send text to session: `{"session": "...", "text": "..."}` |
 | POST | `/api/tts` | Proxy to TTS service, returns audio/wav (only when `--tts-host` set) |
+| POST | `/api/toggle-skip` | Toggle skip status: `{"session": "..."}` |
+| POST | `/api/toggle-flag` | Toggle favorite/auto_approve/skip: `{"session": "...", "flag": "..."}` |
+| POST | `/api/todos` | Manage todos: `{"session": "...", "action": "add|done|delete", ...}` |
+| POST | `/api/connect` | Create/attach session: `{"session_name": "..."}` |
+| POST | `/api/kill-session` | Kill tmux session (with frontend confirmation): `{"session": "..."}` |
 
 **Frontend features (web.html):**
 
-- Session list with color-coded status badges (green=waiting, blue=working, red=needs attention)
-- Skipped sessions separated into their own section
+- Light theme based on Google Stitch designs (Inter font, Material Symbols icons, glass blur effects)
+- Session list: emoji in rounded squares, status labels (Idle=green, Busy=red), CPU/mem, todo count badges
+- Swipe left on session items to skip/unskip
+- Floating + button opens session picker (search projects, connect/create)
+- Skipped sessions in separate section with solid gray background
 - Full conversation view with markdown rendering (headers, bold, italic, code blocks, lists, links, tables)
-- Syntax highlighting via Prism.js CDN (JS, TS, Rust, Python, Bash, YAML, JSON, TOML) with dark theme
+- Syntax highlighting via Prism.js CDN (JS, TS, Rust, Python, Bash, YAML, JSON, TOML)
 - Tool use cards (Bash, Write, Edit, Read, Grep, Glob, Agent) with expandable detail modals
-- Styled tool modals: dark terminal block for Bash (with copy button), unified LCS diff for Edit, file viewer for Write/Read
+- Styled tool modals: dark terminal block for Bash (copy button), unified LCS diff for Edit, file viewer for Write/Read
+- Tappable session header opens info modal: CWD, ports, processes, flag toggles (favorite, auto-approve, skip), todo management (add/done/delete), kill session button
 - Quick action buttons (Approve/Reject/yes) — only shown when session needs attention
 - Text input with Send button for typing messages to sessions
 - TTS "Read Last Message" button (only when `--tts-host` configured)
 - iOS keyboard handling via `visualViewport` API (body is `position: fixed`, height set by JS)
-- Browser back gesture navigation via History API
+- Browser back gesture navigation via History API (all modals use pushState)
 - Auto-scroll to bottom, preserves scroll position when reading older messages
 - Jump-to-bottom button appears when scrolled up, bottom bar auto-hides on scroll
-- Consecutive same-role messages collapse the role label (no repeated "Claude")
+- Consecutive same-role messages collapse the role label
 - Smart re-rendering: session list and messages only update on actual data changes (JSON comparison)
 
 **JSONL conversation extraction (`jsonl.rs`):**
@@ -260,10 +271,16 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 - Extracts tool_use blocks with per-tool summaries (command, filename, pattern, etc.)
 - UTF-8 safe string truncation for tool details
 
+**Process tree traversal:**
+
+- Uses `ps -eo pid,ppid` instead of `sysinfo` for accurate parent-child relationships
+- `sysinfo` caches stale/dead processes on macOS, inflating CPU/memory counts by 10-50x
+- Resources counted only from the Claude pane's process tree (not all session panes)
+
 **TTS integration:**
 
 - Proxied through hive server via `curl` subprocess to avoid CORS issues
-- Default config: Michael Caine voice (`voice: "michael_caine"`), English, 1.3x speed, `summarize: true`
+- Default config: Michael Caine voice (`voice: "michael_caine"`), English, 1.0x speed, `summarize: true`
 - Logs latency, audio duration, and input size to stderr
 - iOS audio playback: uses silent WAV unlock trick to work around iOS autoplay restrictions
 - 60s timeout on curl to prevent hanging

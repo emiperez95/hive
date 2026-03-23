@@ -10,7 +10,7 @@ use crate::common::persistence::{
     save_completed_todos, save_favorite_sessions, save_session_todos, save_skipped_sessions,
 };
 use crate::common::projects::{connect_project, ProjectRegistry};
-use crate::common::tmux::{get_current_tmux_session_names, send_text_to_pane};
+use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
 use crate::ipc::messages::HookState;
 use crate::serve::protocol::{ConversationMessage, ToolSummary};
 use crate::serve::server::gather_session_data;
@@ -529,6 +529,20 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            (Method::Post, "/api/kill-session") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let session = req.get("session")?.as_str()?;
+                    let ok = kill_tmux_session(session);
+                    Some(format!(r#"{{"ok":{}}}"#, ok))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
             _ => {
                 let response = Response::from_string("Not Found").with_status_code(404);
                 let _ = request.respond(response);
@@ -539,15 +553,36 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     Ok(())
 }
 
-/// Parse audio duration from a WAV header.
-/// WAV format: bytes 28..32 = byte rate, bytes 40..44 = data chunk size.
+/// Parse audio duration from a WAV file by scanning for the data chunk.
+/// Byte rate is always at offset 28. The data chunk may not be at offset 40
+/// if extra chunks exist between fmt and data.
 fn wav_duration_secs(data: &[u8]) -> f64 {
     if data.len() < 44 {
         return 0.0;
     }
     let byte_rate = u32::from_le_bytes([data[28], data[29], data[30], data[31]]) as f64;
-    let data_size = u32::from_le_bytes([data[40], data[41], data[42], data[43]]) as f64;
-    if byte_rate > 0.0 { data_size / byte_rate } else { 0.0 }
+    if byte_rate <= 0.0 {
+        return 0.0;
+    }
+
+    // Scan for "data" chunk ID (0x64617461)
+    let mut i = 12; // skip RIFF header (12 bytes)
+    while i + 8 <= data.len() {
+        let chunk_id = &data[i..i + 4];
+        let chunk_size =
+            u32::from_le_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]) as f64;
+        if chunk_id == b"data" {
+            return chunk_size / byte_rate;
+        }
+        i += 8 + chunk_size as usize;
+        // Align to even boundary
+        if i % 2 != 0 {
+            i += 1;
+        }
+    }
+
+    // Fallback: estimate from total file size minus header
+    (data.len() as f64 - 44.0) / byte_rate
 }
 
 /// Percent-decoding for URL query parameters (handles multi-byte UTF-8).

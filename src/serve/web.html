@@ -1544,6 +1544,29 @@
 
   .todo-add-btn .material-symbols-outlined { font-size: 20px; }
 
+  .kill-session-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    padding: 10px;
+    background: none;
+    border: 1px solid var(--error);
+    border-radius: 0.5rem;
+    color: var(--error);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .kill-session-btn:active {
+    background: var(--error-container);
+  }
+
+  .kill-session-btn .material-symbols-outlined { font-size: 18px; }
+
   .detail-status.tappable {
     cursor: pointer;
     transition: background 0.15s;
@@ -2399,7 +2422,7 @@ async function speakLastMessage() {
         text: lastAssistant.text,
         voice: 'michael_caine',
         language: 'English',
-        speed: 1.3,
+        speed: 1.0,
         summarize: true
       })
     });
@@ -2670,7 +2693,29 @@ function renderInfoModal(data) {
     html += '</div>';
   }
 
+  // Section 5: Danger zone
+  html += '<div class="info-section" style="padding-top:8px">';
+  html += '<button class="kill-session-btn" onclick="confirmKillSession()"><span class="material-symbols-outlined">power_settings_new</span>Kill Session</button>';
+  html += '</div>';
+
   document.getElementById('infoModalContent').innerHTML = html;
+}
+
+async function confirmKillSession() {
+  if (!currentInfoSession) return;
+  const name = currentInfoSession;
+  if (!confirm('Kill session "' + name + '"? This will terminate all processes in the tmux session.')) return;
+  try {
+    await fetch('/api/kill-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: name })
+    });
+    closeInfoModal();
+    history.back(); // go back to session list
+    lastSessionsJson = '';
+    fetchSessions();
+  } catch (e) { /* ignore */ }
 }
 
 function renderToggleRow(icon, label, flag, isActive) {
