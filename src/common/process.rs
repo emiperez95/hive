@@ -42,14 +42,35 @@ pub fn is_claude_process(proc: &ProcessInfo) -> bool {
     false
 }
 
-/// Get all descendant PIDs of a parent process
-pub fn get_all_descendants(sys: &System, parent_pid: u32, descendants: &mut Vec<u32>) {
-    for (pid, process) in sys.processes() {
-        if let Some(ppid) = process.parent() {
-            if ppid.as_u32() == parent_pid {
-                let child_pid = pid.as_u32();
-                descendants.push(child_pid);
-                get_all_descendants(sys, child_pid, descendants);
+/// Get all descendant PIDs of a parent process.
+/// Uses `ps` on macOS for accurate parent-child data (sysinfo can report phantom relationships).
+pub fn get_all_descendants(_sys: &System, parent_pid: u32, descendants: &mut Vec<u32>) {
+    // Build parent→children map from ps (authoritative on macOS)
+    let output = match std::process::Command::new("ps")
+        .args(["-eo", "pid,ppid"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            if let (Ok(pid), Ok(ppid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+
+    // BFS to collect all descendants
+    let mut queue = vec![parent_pid];
+    while let Some(pid) = queue.pop() {
+        if let Some(kids) = children.get(&pid) {
+            for &kid in kids {
+                descendants.push(kid);
+                queue.push(kid);
             }
         }
     }

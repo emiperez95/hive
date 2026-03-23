@@ -3,7 +3,7 @@
 //! Runs a loop that gathers local session data and writes JSON lines to stdout.
 //! Reads client commands from stdin and dispatches them (e.g., send-keys).
 
-use crate::common::persistence::load_skipped_sessions;
+use crate::common::persistence::{load_session_todos, load_skipped_sessions};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions, send_key_to_pane};
@@ -44,6 +44,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
     };
 
     let skipped_sessions = load_skipped_sessions();
+    let session_todos = load_session_todos();
     let mut results = Vec::new();
 
     for session in &sessions {
@@ -53,49 +54,12 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
             .and_then(|w| w.panes.first())
             .map(|p| p.cwd.clone());
 
-        // Collect all PIDs in this session
-        let mut all_pids = Vec::new();
-        for window in &session.windows {
-            for pane in &window.panes {
-                all_pids.push(pane.pid);
-                get_all_descendants(sys, pane.pid, &mut all_pids);
-            }
-        }
-
-        let mut total_cpu = 0.0f32;
-        let mut total_mem_kb = 0u64;
-        let mut processes = Vec::new();
-
-        for &pid in &all_pids {
-            if let Some(info) = get_process_info(sys, pid) {
-                total_cpu += info.cpu_percent;
-                total_mem_kb += info.memory_kb;
-                if info.cpu_percent > 0.0 || info.memory_kb >= 1024 {
-                    processes.push(RemoteProcessInfo {
-                        pid: info.pid,
-                        name: info.name.clone(),
-                        cpu_percent: info.cpu_percent,
-                        memory_kb: info.memory_kb,
-                        command: info.command.clone(),
-                    });
-                }
-            }
-        }
-
-        processes.sort_by(|a, b| {
-            b.cpu_percent
-                .partial_cmp(&a.cpu_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Detect listening ports
-        let listening_ports = get_listening_ports_for_pids(&all_pids, sys);
-        let ports: Vec<u16> = listening_ports.iter().map(|lp| lp.port).collect();
-
-        // Find Claude pane and status
+        // Find Claude pane first, then only count resources from that pane's tree.
+        // This avoids counting hive web (which may run in another pane) and its descendants.
         let mut status: Option<SessionStatus> = None;
         let mut claude_pane: Option<(String, String, String)> = None;
         let mut last_activity: Option<String> = None;
+        let mut claude_pids: Vec<u32> = Vec::new();
         'outer: for window in &session.windows {
             for p in &window.panes {
                 let mut pane_pids = vec![p.pid];
@@ -108,6 +72,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
                 });
 
                 if has_claude {
+                    claude_pids = pane_pids;
                     if let Some(hook_session) = hook_sessions.get(&p.cwd) {
                         status = Some(hook_session.status.clone());
                         last_activity = hook_session.last_activity.clone();
@@ -131,6 +96,35 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
             }
         }
 
+        // Count resources only from the Claude pane's process tree
+        let mut total_cpu = 0.0f32;
+        let mut total_mem_kb = 0u64;
+        let mut processes = Vec::new();
+
+        for &pid in &claude_pids {
+            if let Some(info) = get_process_info(sys, pid) {
+                total_cpu += info.cpu_percent;
+                total_mem_kb += info.memory_kb;
+                processes.push(RemoteProcessInfo {
+                    pid: info.pid,
+                    name: info.name.clone(),
+                    cpu_percent: info.cpu_percent,
+                    memory_kb: info.memory_kb,
+                    command: info.command.clone(),
+                });
+            }
+        }
+
+        processes.sort_by(|a, b| {
+            b.cpu_percent
+                .partial_cmp(&a.cpu_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Detect listening ports from Claude pane processes
+        let listening_ports = get_listening_ports_for_pids(&claude_pids, sys);
+        let ports: Vec<u16> = listening_ports.iter().map(|lp| lp.port).collect();
+
         results.push(RemoteSessionData {
             name: session.name.clone(),
             status,
@@ -143,6 +137,10 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
             attached: other_client_sessions.contains(&session.name),
             pane: claude_pane,
             skipped: skipped_sessions.contains(&session.name),
+            todo_count: session_todos
+                .get(&session.name)
+                .map(|t| t.len() as u32)
+                .unwrap_or(0),
             messages: Vec::new(),
         });
     }

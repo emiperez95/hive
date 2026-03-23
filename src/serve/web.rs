@@ -4,7 +4,13 @@
 //! and interacting with Claude sessions from a mobile browser.
 
 use crate::common::jsonl::get_conversation_messages;
-use crate::common::tmux::send_text_to_pane;
+use crate::common::persistence::{
+    load_auto_approve_sessions, load_completed_todos, load_favorite_sessions,
+    load_session_todos, load_skipped_sessions, save_auto_approve_sessions,
+    save_completed_todos, save_favorite_sessions, save_session_todos, save_skipped_sessions,
+};
+use crate::common::projects::{connect_project, ProjectRegistry};
+use crate::common::tmux::{get_current_tmux_session_names, send_text_to_pane};
 use crate::ipc::messages::HookState;
 use crate::serve::protocol::{ConversationMessage, ToolSummary};
 use crate::serve::server::gather_session_data;
@@ -304,6 +310,223 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     .with_header(header)
                     .with_status_code(status);
                 let _ = request.respond(response);
+            }
+
+            (Method::Post, "/api/toggle-skip") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let session = req.get("session")?.as_str()?;
+                    let mut skipped = load_skipped_sessions();
+                    let is_skipped = if skipped.contains(session) {
+                        skipped.remove(session);
+                        false
+                    } else {
+                        skipped.insert(session.to_string());
+                        true
+                    };
+                    save_skipped_sessions(&skipped);
+                    Some(format!(r#"{{"ok":true,"skipped":{}}}"#, is_skipped))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/toggle-flag") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let session = req.get("session")?.as_str()?;
+                    let flag = req.get("flag")?.as_str()?;
+                    let value = match flag {
+                        "favorite" => {
+                            let mut set = load_favorite_sessions();
+                            let v = if set.contains(session) { set.remove(session); false } else { set.insert(session.to_string()); true };
+                            save_favorite_sessions(&set);
+                            v
+                        }
+                        "auto_approve" => {
+                            let mut set = load_auto_approve_sessions();
+                            let v = if set.contains(session) { set.remove(session); false } else { set.insert(session.to_string()); true };
+                            save_auto_approve_sessions(&set);
+                            v
+                        }
+                        "skip" => {
+                            let mut set = load_skipped_sessions();
+                            let v = if set.contains(session) { set.remove(session); false } else { set.insert(session.to_string()); true };
+                            save_skipped_sessions(&set);
+                            v
+                        }
+                        _ => return Some(r#"{"error":"unknown flag"}"#.to_string()),
+                    };
+                    Some(format!(r#"{{"ok":true,"value":{}}}"#, value))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Get, "/api/projects") => {
+                let registry = ProjectRegistry::load();
+                let existing = get_current_tmux_session_names();
+                let mut projects: Vec<serde_json::Value> = registry
+                    .projects
+                    .iter()
+                    .map(|(key, config)| {
+                        let session_name = ProjectRegistry::session_name(key, config);
+                        serde_json::json!({
+                            "key": key,
+                            "emoji": config.emoji,
+                            "display_name": config.display_name.as_deref().unwrap_or(key),
+                            "session_name": session_name,
+                            "exists": existing.contains(&session_name),
+                        })
+                    })
+                    .collect();
+                projects.sort_by(|a, b| {
+                    let a_exists = a["exists"].as_bool().unwrap_or(false);
+                    let b_exists = b["exists"].as_bool().unwrap_or(false);
+                    b_exists.cmp(&a_exists)
+                        .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
+                });
+                let json = serde_json::to_string(&projects).unwrap_or_else(|_| "[]".to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/connect") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let session_name = req.get("session_name")?.as_str()?;
+                    let ok = connect_project(session_name);
+                    Some(format!(r#"{{"ok":{}}}"#, ok))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Get, url) if url.starts_with("/api/session-info?") => {
+                let session_name = url
+                    .split('?')
+                    .nth(1)
+                    .and_then(|qs| {
+                        qs.split('&').find_map(|param| {
+                            let (k, v) = param.split_once('=')?;
+                            if k == "session" { Some(urldecode(v)) } else { None }
+                        })
+                    });
+
+                let json = if let Some(name) = session_name {
+                    let session_data = shared_data.lock().ok().and_then(|data| {
+                        data.iter().find(|s| s.name == name).cloned()
+                    });
+
+                    if let Some(s) = session_data {
+                        let favorites = load_favorite_sessions();
+                        let auto_approve = load_auto_approve_sessions();
+                        let skipped = load_skipped_sessions();
+                        let todos = load_session_todos();
+                        let todos_done = load_completed_todos();
+
+                        let active_todos: Vec<&str> = todos
+                            .get(&name)
+                            .map(|v| v.iter().map(|s| s.as_str()).collect())
+                            .unwrap_or_default();
+                        let done_todos: Vec<&str> = todos_done
+                            .get(&name)
+                            .map(|v| v.iter().map(|s| s.as_str()).collect())
+                            .unwrap_or_default();
+
+                        let processes: Vec<serde_json::Value> = s
+                            .processes
+                            .iter()
+                            .map(|p| {
+                                serde_json::json!({
+                                    "name": p.name,
+                                    "cpu_percent": p.cpu_percent,
+                                    "memory_kb": p.memory_kb,
+                                    "command": p.command,
+                                })
+                            })
+                            .collect();
+
+                        serde_json::json!({
+                            "name": s.name,
+                            "cwd": s.cwd,
+                            "ports": s.ports,
+                            "processes": processes,
+                            "cpu": s.cpu,
+                            "mem_kb": s.mem_kb,
+                            "favorite": favorites.contains(&name),
+                            "auto_approve": auto_approve.contains(&name),
+                            "skipped": skipped.contains(&name),
+                            "todos": active_todos,
+                            "todos_done": done_todos,
+                        })
+                        .to_string()
+                    } else {
+                        r#"{"error":"session not found"}"#.to_string()
+                    }
+                } else {
+                    r#"{"error":"missing session param"}"#.to_string()
+                };
+
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/todos") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let session = req.get("session")?.as_str()?.to_string();
+                    let action = req.get("action")?.as_str()?;
+                    let mut todos = load_session_todos();
+                    let mut todos_done = load_completed_todos();
+
+                    match action {
+                        "add" => {
+                            let text = req.get("text")?.as_str()?.to_string();
+                            todos.entry(session.clone()).or_default().push(text);
+                            save_session_todos(&todos);
+                        }
+                        "done" => {
+                            let index = req.get("index")?.as_u64()? as usize;
+                            let list = todos.get_mut(&session)?;
+                            if index < list.len() {
+                                let item = list.remove(index);
+                                todos_done.entry(session.clone()).or_default().push(item);
+                                save_session_todos(&todos);
+                                save_completed_todos(&todos_done);
+                            }
+                        }
+                        "delete" => {
+                            let index = req.get("index")?.as_u64()? as usize;
+                            let list = todos.get_mut(&session)?;
+                            if index < list.len() {
+                                list.remove(index);
+                                save_session_todos(&todos);
+                            }
+                        }
+                        _ => return Some(r#"{"error":"unknown action"}"#.to_string()),
+                    }
+
+                    let current: Vec<&str> = todos
+                        .get(&session)
+                        .map(|v| v.iter().map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    Some(serde_json::json!({"ok": true, "todos": current}).to_string())
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
             _ => {

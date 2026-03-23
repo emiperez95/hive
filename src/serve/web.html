@@ -163,6 +163,7 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+    position: relative;
   }
 
   .session-list-view.hidden { display: none; }
@@ -271,9 +272,8 @@
 
   /* Skipped session styling */
   .session-item.skipped {
-    background: var(--surface-container-low);
-    opacity: 0.6;
-    filter: grayscale(1);
+    background: var(--surface-container-high);
+    color: var(--on-surface-variant);
   }
 
   .session-item.skipped .emoji-box {
@@ -333,17 +333,17 @@
     border-radius: 50%;
   }
 
-  .badge.waiting {
+  .badge.idle {
     background: var(--secondary-container);
     color: var(--on-secondary-container);
   }
-  .badge.waiting .badge-dot { background: var(--secondary); }
+  .badge.idle .badge-dot { background: var(--secondary); }
 
-  .badge.working {
-    background: var(--secondary-container);
-    color: var(--on-secondary-container);
+  .badge.busy {
+    background: var(--error-container);
+    color: var(--on-error-container);
   }
-  .badge.working .badge-dot { background: var(--secondary); }
+  .badge.busy .badge-dot { background: var(--error); }
 
   .badge.attention {
     background: var(--tertiary-fixed);
@@ -1053,6 +1053,508 @@
   }
 
   .loading .dot-pulse { animation: pulse 1.5s ease-in-out infinite; }
+
+  /* ============================================
+     SWIPE TO SKIP
+     ============================================ */
+  .session-item-wrapper {
+    position: relative;
+    overflow: hidden;
+    border-radius: 0.5rem;
+    margin-bottom: 10px;
+  }
+
+  .swipe-action {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 24px;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: white;
+    border-radius: 0.5rem;
+  }
+
+  .swipe-action.skip-action {
+    background: var(--error);
+  }
+
+  .swipe-action.unskip-action {
+    background: var(--secondary);
+  }
+
+  .session-item-wrapper .session-item {
+    position: relative;
+    z-index: 1;
+    will-change: transform;
+    transition: none;
+    margin-bottom: 0;
+  }
+
+  .session-item-wrapper .session-item.swipe-animating {
+    transition: transform 0.25s ease;
+  }
+
+  /* ============================================
+     TODO COUNT BADGE
+     ============================================ */
+  .todo-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--on-surface-variant);
+    background: var(--surface-container-high);
+    padding: 2px 7px;
+    border-radius: 9999px;
+    letter-spacing: 0.03em;
+  }
+
+  .todo-badge .material-symbols-outlined {
+    font-size: 13px;
+  }
+
+  /* ============================================
+     FLOATING ACTION BUTTON
+     ============================================ */
+  .fab {
+    position: absolute;
+    bottom: 24px;
+    right: 24px;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--primary), var(--primary-container));
+    color: white;
+    border: none;
+    box-shadow: 0 4px 16px rgba(0, 88, 190, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 5;
+    transition: transform 0.15s;
+  }
+  .fab:active { transform: scale(0.9); }
+  .fab .material-symbols-outlined { font-size: 28px; }
+
+  /* ============================================
+     PICKER MODAL (full-screen)
+     ============================================ */
+  .picker-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--surface);
+    z-index: 200;
+    flex-direction: column;
+  }
+
+  .picker-overlay.active { display: flex; }
+
+  .picker-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    min-height: 56px;
+    flex-shrink: 0;
+  }
+
+  .picker-header .picker-title {
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--on-surface);
+  }
+
+  .picker-header .picker-close {
+    background: none;
+    border: none;
+    color: var(--on-surface-variant);
+    padding: 8px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: background 0.15s;
+  }
+
+  .picker-header .picker-close:active {
+    background: var(--surface-container-low);
+  }
+
+  .picker-search {
+    padding: 0 20px 12px;
+    flex-shrink: 0;
+  }
+
+  .picker-search input {
+    width: 100%;
+    padding: 12px 16px;
+    background: var(--surface-container-low);
+    border: none;
+    border-radius: 16px;
+    font-size: 15px;
+    font-family: 'Inter', sans-serif;
+    color: var(--on-surface);
+    outline: none;
+  }
+
+  .picker-search input::placeholder {
+    color: var(--outline);
+  }
+
+  .picker-search input:focus {
+    box-shadow: 0 0 0 2px rgba(0, 88, 190, 0.15);
+  }
+
+  .picker-list {
+    flex: 1;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 0 20px 24px;
+  }
+
+  .picker-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 16px;
+    background: var(--surface-container-lowest);
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: transform 0.15s;
+    margin-bottom: 10px;
+  }
+
+  .picker-item:active { transform: scale(0.98); }
+
+  .picker-item .picker-emoji {
+    width: 48px;
+    height: 48px;
+    border-radius: 0.5rem;
+    background: var(--surface-container-low);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+  }
+
+  .picker-item .picker-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .picker-item .picker-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--on-surface);
+  }
+
+  .picker-item .picker-status {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 3px;
+  }
+
+  .picker-item .picker-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+  }
+
+  .picker-item .picker-status-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--on-surface-variant);
+  }
+
+  /* ============================================
+     SESSION INFO MODAL (Bottom Sheet)
+     ============================================ */
+  .info-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(25, 28, 30, 0.4);
+    backdrop-filter: blur(4px);
+    z-index: 150;
+    align-items: flex-end;
+    justify-content: center;
+  }
+
+  .info-overlay.active { display: flex; }
+
+  .info-sheet {
+    background: var(--surface-container-lowest);
+    border-radius: 2rem 2rem 0 0;
+    width: 100%;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    animation: slideUp 0.25s ease-out;
+  }
+
+  .info-section {
+    padding: 0 0 16px;
+  }
+
+  .info-section-title {
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--on-surface-variant);
+    padding: 16px 0 8px;
+  }
+
+  .info-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+  }
+
+  .info-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--on-surface);
+  }
+
+  .info-value {
+    font-size: 13px;
+    color: var(--on-surface-variant);
+    text-align: right;
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .info-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+  }
+
+  .info-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border-radius: 9999px;
+    background: var(--surface-container);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--on-surface-variant);
+    font-family: 'SF Mono', 'Menlo', monospace;
+  }
+
+  .process-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--surface-container);
+    gap: 8px;
+  }
+
+  .process-item:last-child { border-bottom: none; }
+
+  .process-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--on-surface);
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .process-meta {
+    font-size: 11px;
+    color: var(--on-surface-variant);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  /* Toggle switches */
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+  }
+
+  .toggle-row-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .toggle-row-left .material-symbols-outlined {
+    font-size: 20px;
+    color: var(--on-surface-variant);
+  }
+
+  .toggle-row-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--on-surface);
+  }
+
+  .toggle-switch {
+    width: 48px;
+    height: 28px;
+    border-radius: 14px;
+    background: var(--surface-container-high);
+    border: none;
+    padding: 2px;
+    cursor: pointer;
+    position: relative;
+    transition: background 0.2s;
+  }
+
+  .toggle-switch.active {
+    background: var(--secondary);
+  }
+
+  .toggle-switch::after {
+    content: '';
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: white;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    transition: transform 0.2s;
+  }
+
+  .toggle-switch.active::after {
+    transform: translateX(20px);
+  }
+
+  /* Todos in info modal */
+  .todo-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--surface-container);
+  }
+
+  .todo-item:last-child { border-bottom: none; }
+
+  .todo-text {
+    flex: 1;
+    font-size: 13px;
+    color: var(--on-surface);
+    min-width: 0;
+    word-wrap: break-word;
+  }
+
+  .todo-actions {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .todo-action-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: none;
+    background: var(--surface-container);
+    color: var(--on-surface-variant);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.15s;
+  }
+
+  .todo-action-btn:active { transform: scale(0.9); }
+
+  .todo-action-btn.done-btn {
+    color: var(--secondary);
+  }
+
+  .todo-action-btn.delete-btn {
+    color: var(--error);
+  }
+
+  .todo-add-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    align-items: center;
+  }
+
+  .todo-add-row input {
+    flex: 1;
+    padding: 10px 14px;
+    background: var(--surface-container-low);
+    border: none;
+    border-radius: 12px;
+    font-size: 13px;
+    font-family: 'Inter', sans-serif;
+    color: var(--on-surface);
+    outline: none;
+  }
+
+  .todo-add-row input::placeholder { color: var(--outline); }
+
+  .todo-add-row input:focus {
+    box-shadow: 0 0 0 2px rgba(0, 88, 190, 0.15);
+  }
+
+  .todo-add-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: none;
+    background: var(--primary);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: transform 0.15s;
+  }
+
+  .todo-add-btn:active { transform: scale(0.9); }
+
+  .todo-add-btn .material-symbols-outlined { font-size: 20px; }
+
+  .detail-status.tappable {
+    cursor: pointer;
+    transition: background 0.15s;
+    border-radius: 0.5rem;
+    margin: 0 12px;
+    padding: 16px 8px 12px;
+  }
+
+  .detail-status.tappable:active {
+    background: var(--surface-container-low);
+  }
 </style>
 </head>
 <body>
@@ -1072,6 +1574,9 @@
     <div class="session-list" id="sessionList">
       <div class="loading"><span class="dot-pulse">Loading sessions...</span></div>
     </div>
+    <button class="fab" onclick="openPicker()">
+      <span class="material-symbols-outlined">add</span>
+    </button>
   </div>
 
   <!-- Detail View -->
@@ -1085,7 +1590,7 @@
       </div>
       <span id="detailDot" class="detail-dot"></span>
     </div>
-    <div class="detail-status">
+    <div class="detail-status tappable" onclick="openSessionInfo()">
       <div class="session-name" id="detailName"></div>
       <div class="badges" id="detailBadges"></div>
     </div>
@@ -1116,6 +1621,34 @@
         </button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- Picker modal (full screen) -->
+<div class="picker-overlay" id="pickerModal">
+  <div class="picker-header">
+    <span class="picker-title">Connect Session</span>
+    <button class="picker-close" onclick="closePicker()">
+      <span class="material-symbols-outlined">close</span>
+    </button>
+  </div>
+  <div class="picker-search">
+    <input type="text" id="pickerSearch" placeholder="Search projects..." autocomplete="off" autocorrect="off" oninput="filterPicker()">
+  </div>
+  <div class="picker-list" id="pickerList"></div>
+</div>
+
+<!-- Session info modal (bottom sheet) -->
+<div class="info-overlay" id="infoModal" onclick="closeInfoModal(event)">
+  <div class="info-sheet">
+    <div class="modal-handle"><div class="modal-handle-bar"></div></div>
+    <div class="modal-header">
+      <span class="modal-title" id="infoModalTitle">Session Info</span>
+      <button class="modal-close" onclick="closeInfoModal()">
+        <span class="material-symbols-outlined">close</span>
+      </button>
+    </div>
+    <div class="modal-body" id="infoModalContent"></div>
   </div>
 </div>
 
@@ -1516,15 +2049,15 @@ function closeModal(event) {
 function statusInfo(s) {
   if (!s || !s.status) return { label: 'No Claude', cls: 'working', color: 'var(--outline)', dotColor: 'var(--outline)', needsAction: false };
   const st = s.status;
-  if (st === 'Waiting') return { label: 'Waiting', cls: 'waiting', color: 'var(--tertiary-container)', dotColor: 'var(--tertiary-container)', needsAction: false };
-  if (st === 'Working') return { label: 'Working', cls: 'working', color: 'var(--secondary)', dotColor: 'var(--secondary)', needsAction: false };
-  if (st === 'QuestionAsked') return { label: 'Question', cls: 'attention', color: 'var(--error)', dotColor: 'var(--error)', needsAction: true };
+  if (st === 'Waiting') return { label: 'Idle', cls: 'idle', color: 'var(--secondary)', dotColor: 'var(--secondary)', needsAction: false };
+  if (st === 'Working') return { label: 'Busy', cls: 'busy', color: 'var(--error)', dotColor: 'var(--error)', needsAction: false };
+  if (st === 'QuestionAsked') return { label: 'Question', cls: 'attention', color: 'var(--tertiary-container)', dotColor: 'var(--tertiary-container)', needsAction: true };
   if (st === 'PlanReview') return { label: 'Plan Review', cls: 'attention', color: 'var(--tertiary-container)', dotColor: 'var(--tertiary-container)', needsAction: true };
   if (typeof st === 'object') {
     if (st.NeedsPermission) return { label: 'Permission', cls: 'attention', color: 'var(--tertiary-container)', dotColor: 'var(--tertiary-container)', needsAction: true };
     if (st.EditApproval) return { label: 'Edit Approval', cls: 'attention', color: 'var(--tertiary)', dotColor: 'var(--tertiary)', needsAction: true };
   }
-  return { label: 'Working', cls: 'working', color: 'var(--secondary)', dotColor: 'var(--secondary)', needsAction: false };
+  return { label: 'Busy', cls: 'busy', color: 'var(--error)', dotColor: 'var(--error)', needsAction: false };
 }
 
 function statusDetail(s) {
@@ -1560,18 +2093,27 @@ function renderSessionItem(s, isSkipped) {
   const mem = s.mem_kb > 0 ? 'MEM ' + Math.round(s.mem_kb / 1024) + 'MB' : '';
   const metaParts = [cpu, mem].filter(Boolean);
   const skippedClass = isSkipped ? ' skipped' : '';
+  const swipeLabel = isSkipped ? 'Unskip' : 'Skip';
+  const swipeClass = isSkipped ? 'unskip-action' : 'skip-action';
+  const todoBadge = (s.todo_count && s.todo_count > 0)
+    ? `<span class="todo-badge"><span class="material-symbols-outlined">checklist</span>${s.todo_count}</span>`
+    : '';
+  if (todoBadge) metaParts.push(null); // placeholder, we'll append the badge HTML directly
 
-  return `<div class="session-item${skippedClass}" onclick="selectSession('${encodeURIComponent(s.name)}')">
-    <div class="emoji-box">${displayEmoji}</div>
-    <div class="info">
-      <div class="name-row">
-        <div class="name">${esc(displayName)}</div>
-        ${!isSkipped ? `<div class="status-indicator">
-          <span class="status-dot" style="background:${si.dotColor}"></span>
-          <span class="status-label" style="color:${si.color}">${si.label}</span>
-        </div>` : '<span class="status-label" style="color:var(--on-surface-variant);font-size:10px;font-weight:700;text-transform:uppercase">INACTIVE</span>'}
+  return `<div class="session-item-wrapper" data-session-name="${esc(s.name)}">
+    <div class="swipe-action ${swipeClass}">${swipeLabel}</div>
+    <div class="session-item${skippedClass}" onclick="selectSession('${encodeURIComponent(s.name)}')">
+      <div class="emoji-box">${displayEmoji}</div>
+      <div class="info">
+        <div class="name-row">
+          <div class="name">${esc(displayName)}</div>
+          ${!isSkipped ? `<div class="status-indicator">
+            <span class="status-dot" style="background:${si.dotColor}"></span>
+            <span class="status-label" style="color:${si.color}">${si.label}</span>
+          </div>` : '<span class="status-label" style="color:var(--on-surface-variant);font-size:10px;font-weight:700;text-transform:uppercase">INACTIVE</span>'}
+        </div>
+        <div class="meta">${[cpu, mem].filter(Boolean).map(m => '<span>' + esc(m) + '</span>').join('')}${todoBadge}</div>
       </div>
-      ${metaParts.length ? `<div class="meta">${metaParts.map(m => '<span>' + esc(m) + '</span>').join('')}</div>` : ''}
     </div>
   </div>`;
 }
@@ -1717,12 +2259,26 @@ function stopMessagePolling() {
 
 // Handle browser back gesture / back button
 window.addEventListener('popstate', (e) => {
+  // Close info modal first
+  if (document.getElementById('infoModal').classList.contains('active')) {
+    document.getElementById('infoModal').classList.remove('active');
+    if (selectedSession) {
+      history.pushState({ view: 'detail', session: selectedSession }, '');
+    }
+    return;
+  }
+  // Close tool modal
   if (document.getElementById('toolModal').classList.contains('active')) {
     document.getElementById('toolModal').classList.remove('active');
     // Re-push state so detail view stays
     if (selectedSession) {
       history.pushState({ view: 'detail', session: selectedSession }, '');
     }
+    return;
+  }
+  // Close picker modal
+  if (document.getElementById('pickerModal').classList.contains('active')) {
+    document.getElementById('pickerModal').classList.remove('active');
     return;
   }
   showList();
@@ -1868,6 +2424,357 @@ async function speakLastMessage() {
 }
 
 initTts();
+
+// --- Swipe to Skip/Unskip ---
+(function() {
+  let swipeTarget = null;
+  let startX = 0, startY = 0, currentX = 0;
+  let isSwiping = false;
+  let directionLocked = false;
+
+  document.addEventListener('touchstart', (e) => {
+    const wrapper = e.target.closest('.session-item-wrapper');
+    if (!wrapper) return;
+    const item = wrapper.querySelector('.session-item');
+    if (!item) return;
+    swipeTarget = { wrapper, item };
+    const touch = e.touches[0];
+    startX = touch.clientX;
+    startY = touch.clientY;
+    currentX = 0;
+    isSwiping = false;
+    directionLocked = false;
+    item.classList.remove('swipe-animating');
+  }, { passive: true });
+
+  document.addEventListener('touchmove', (e) => {
+    if (!swipeTarget) return;
+    const touch = e.touches[0];
+    const deltaX = touch.clientX - startX;
+    const deltaY = touch.clientY - startY;
+
+    if (!directionLocked) {
+      if (Math.abs(deltaX) < 10 && Math.abs(deltaY) < 10) return;
+      directionLocked = true;
+      if (Math.abs(deltaY) > Math.abs(deltaX)) {
+        // Vertical scroll — abort swipe
+        swipeTarget = null;
+        return;
+      }
+      isSwiping = true;
+    }
+
+    if (!isSwiping) return;
+
+    // Only allow left swipe (negative deltaX)
+    currentX = Math.min(0, deltaX);
+    if (currentX < -20) {
+      swipeTarget.item.style.transform = 'translateX(' + currentX + 'px)';
+    }
+  }, { passive: true });
+
+  document.addEventListener('touchend', (e) => {
+    if (!swipeTarget || !isSwiping) {
+      swipeTarget = null;
+      return;
+    }
+    const { wrapper, item } = swipeTarget;
+    swipeTarget = null;
+
+    if (currentX < -80) {
+      // Threshold reached — trigger skip/unskip
+      item.classList.add('swipe-animating');
+      item.style.transform = 'translateX(-100%)';
+      const sessionName = wrapper.getAttribute('data-session-name');
+      toggleSkip(sessionName);
+    } else {
+      // Snap back
+      item.classList.add('swipe-animating');
+      item.style.transform = 'translateX(0)';
+    }
+    isSwiping = false;
+  }, { passive: true });
+})();
+
+async function toggleSkip(sessionName) {
+  try {
+    await fetch('/api/toggle-skip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionName })
+    });
+    lastSessionsJson = '';
+    fetchSessions();
+  } catch (e) { /* ignore */ }
+}
+
+// --- Picker Modal (FAB → Project List) ---
+let pickerProjects = [];
+
+async function openPicker() {
+  history.pushState({ view: 'picker' }, '');
+  document.getElementById('pickerModal').classList.add('active');
+  document.getElementById('pickerSearch').value = '';
+  document.getElementById('pickerList').innerHTML = '<div class="loading"><span class="dot-pulse">Loading projects...</span></div>';
+  try {
+    const res = await fetch('/api/projects');
+    pickerProjects = await res.json();
+    renderPickerList(pickerProjects);
+  } catch (e) {
+    document.getElementById('pickerList').innerHTML = '<div class="loading">Failed to load projects</div>';
+  }
+}
+
+function closePicker() {
+  if (document.getElementById('pickerModal').classList.contains('active')) {
+    document.getElementById('pickerModal').classList.remove('active');
+    history.back();
+  }
+}
+
+function filterPicker() {
+  const query = document.getElementById('pickerSearch').value.toLowerCase();
+  const filtered = pickerProjects.filter(p => {
+    const name = (p.display_name || p.key || '').toLowerCase();
+    return name.includes(query) || (p.emoji || '').includes(query);
+  });
+  renderPickerList(filtered);
+}
+
+function renderPickerList(projects) {
+  const el = document.getElementById('pickerList');
+  if (!projects.length) {
+    el.innerHTML = '<div class="loading">No projects found</div>';
+    return;
+  }
+  el.innerHTML = projects.map(p => {
+    const emoji = p.emoji || '\u{1F4E6}';
+    const name = p.display_name || p.key;
+    const exists = p.exists;
+    const dotColor = exists ? 'var(--secondary)' : 'var(--outline)';
+    const statusLabel = exists ? 'Running' : 'Not started';
+    return `<div class="picker-item" data-session-name="${esc(p.session_name)}">
+      <div class="picker-emoji">${emoji}</div>
+      <div class="picker-info">
+        <div class="picker-name">${esc(name)}</div>
+        <div class="picker-status">
+          <span class="picker-status-dot" style="background:${dotColor}"></span>
+          <span class="picker-status-label">${statusLabel}</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// Event delegation for picker item clicks
+document.getElementById('pickerList').addEventListener('click', (e) => {
+  const item = e.target.closest('.picker-item');
+  if (!item) return;
+  const sessionName = item.getAttribute('data-session-name');
+  if (sessionName) connectProject(sessionName);
+});
+
+async function connectProject(sessionName) {
+  try {
+    await fetch('/api/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_name: sessionName })
+    });
+  } catch (e) { /* ignore */ }
+  document.getElementById('pickerModal').classList.remove('active');
+  // Pop the picker state
+  history.back();
+  lastSessionsJson = '';
+  fetchSessions();
+}
+
+// --- Session Info Modal ---
+let currentInfoSession = null;
+let currentInfoData = null;
+
+async function openSessionInfo() {
+  if (!selectedSession) return;
+  currentInfoSession = selectedSession;
+  history.pushState({ view: 'info' }, '');
+  document.getElementById('infoModal').classList.add('active');
+  document.getElementById('infoModalContent').innerHTML = '<div class="loading"><span class="dot-pulse">Loading...</span></div>';
+
+  try {
+    const res = await fetch('/api/session-info?session=' + encodeURIComponent(selectedSession));
+    currentInfoData = await res.json();
+    renderInfoModal(currentInfoData);
+  } catch (e) {
+    document.getElementById('infoModalContent').innerHTML = '<div class="loading">Failed to load session info</div>';
+  }
+}
+
+function closeInfoModal(event) {
+  if (event && event.target !== document.getElementById('infoModal') && !event.target.classList.contains('modal-close') && !event.target.closest('.modal-close')) return;
+  if (document.getElementById('infoModal').classList.contains('active')) {
+    document.getElementById('infoModal').classList.remove('active');
+    history.back();
+  }
+}
+
+function renderInfoModal(data) {
+  document.getElementById('infoModalTitle').textContent = data.name || 'Session Info';
+  let html = '';
+
+  // Section 1: Directory & Ports
+  html += '<div class="info-section">';
+  html += '<div class="info-section-title">Directory</div>';
+  if (data.cwd) {
+    html += '<div style="font-size:12px;font-family:monospace;word-break:break-all;color:var(--on-surface);line-height:1.5;padding:0 2px">' + esc(data.cwd) + '</div>';
+  }
+  if (data.ports && data.ports.length > 0) {
+    html += '<div class="info-row" style="margin-top:10px"><span class="info-label">Ports</span><div class="info-pills">' +
+      data.ports.map(p => '<span class="info-pill">' + p + '</span>').join('') +
+      '</div></div>';
+  }
+  html += '</div>';
+
+  // Section 2: Todos
+  html += '<div class="info-section">';
+  html += '<div class="info-section-title">Todos</div>';
+  html += '<div id="infoTodoList">';
+  html += renderTodoList(data.todos || []);
+  html += '</div>';
+  html += '<div class="todo-add-row">';
+  html += '<input type="text" id="todoAddInput" placeholder="Add a todo..." onkeydown="if(event.key===\'Enter\'){event.preventDefault();addTodo();}">';
+  html += '<button class="todo-add-btn" onclick="addTodo()"><span class="material-symbols-outlined">add</span></button>';
+  html += '</div>';
+  html += '</div>';
+
+  // Section 3: Flags
+  html += '<div class="info-section">';
+  html += '<div class="info-section-title">Flags</div>';
+  html += renderToggleRow('star', 'Favorite', 'favorite', data.favorite);
+  html += renderToggleRow('verified', 'Auto-approve', 'auto_approve', data.auto_approve);
+  html += renderToggleRow('visibility_off', 'Skip', 'skip', data.skipped);
+  html += '</div>';
+
+  // Section 4: Processes (last, single line each, filtered to meaningful ones)
+  const procs = data.processes || [];
+  if (procs.length > 0) {
+    html += '<div class="info-section">';
+    html += '<div class="info-section-title">Processes</div>';
+    procs.forEach(p => {
+      const mem = p.memory_kb > 0 ? Math.round(p.memory_kb / 1024) + 'MB' : '';
+      const cpu = p.cpu_percent > 0 ? p.cpu_percent.toFixed(1) + '%' : '';
+      const meta = [cpu, mem].filter(Boolean).join(' · ');
+      html += '<div class="process-item"><div class="process-name">' + esc(p.name) + '</div>';
+      if (meta) html += '<div class="process-meta">' + meta + '</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+
+  document.getElementById('infoModalContent').innerHTML = html;
+}
+
+function renderToggleRow(icon, label, flag, isActive) {
+  const activeClass = isActive ? ' active' : '';
+  return `<div class="toggle-row">
+    <div class="toggle-row-left">
+      <span class="material-symbols-outlined">${icon}</span>
+      <span class="toggle-row-label">${label}</span>
+    </div>
+    <button class="toggle-switch${activeClass}" onclick="toggleFlag('${flag}', this)"></button>
+  </div>`;
+}
+
+async function toggleFlag(flag, btn) {
+  if (!currentInfoSession) return;
+  try {
+    const res = await fetch('/api/toggle-flag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: currentInfoSession, flag: flag })
+    });
+    const result = await res.json();
+    if (result.ok) {
+      if (result.value) {
+        btn.classList.add('active');
+      } else {
+        btn.classList.remove('active');
+      }
+      // Refresh session list in background
+      lastSessionsJson = '';
+      fetchSessions();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function renderTodoList(todos) {
+  if (!todos || !todos.length) {
+    return '<div style="padding:8px 0;font-size:13px;color:var(--outline)">No active todos</div>';
+  }
+  return todos.map((t, i) => {
+    return `<div class="todo-item">
+      <span class="todo-text">${esc(t)}</span>
+      <div class="todo-actions">
+        <button class="todo-action-btn done-btn" onclick="todoDone(${i + 1})"><span class="material-symbols-outlined" style="font-size:18px">check</span></button>
+        <button class="todo-action-btn delete-btn" onclick="todoDelete(${i + 1})"><span class="material-symbols-outlined" style="font-size:18px">delete</span></button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function addTodo() {
+  if (!currentInfoSession) return;
+  const input = document.getElementById('todoAddInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  try {
+    const res = await fetch('/api/todos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: currentInfoSession, action: 'add', text: text })
+    });
+    const result = await res.json();
+    if (result.ok) {
+      document.getElementById('infoTodoList').innerHTML = renderTodoList(result.todos);
+      lastSessionsJson = '';
+      fetchSessions();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function todoDone(index) {
+  if (!currentInfoSession) return;
+  try {
+    const res = await fetch('/api/todos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: currentInfoSession, action: 'done', index: index })
+    });
+    const result = await res.json();
+    if (result.ok) {
+      document.getElementById('infoTodoList').innerHTML = renderTodoList(result.todos);
+      lastSessionsJson = '';
+      fetchSessions();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function todoDelete(index) {
+  if (!currentInfoSession) return;
+  try {
+    const res = await fetch('/api/todos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: currentInfoSession, action: 'delete', index: index })
+    });
+    const result = await res.json();
+    if (result.ok) {
+      document.getElementById('infoTodoList').innerHTML = renderTodoList(result.todos);
+      lastSessionsJson = '';
+      fetchSessions();
+    }
+  } catch (e) { /* ignore */ }
+}
 
 // Enter key sends message
 document.getElementById('msgInput').addEventListener('keydown', e => {

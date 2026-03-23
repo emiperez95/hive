@@ -6,6 +6,10 @@
 use crate::ipc::messages::SessionStatus;
 use serde::{Deserialize, Serialize};
 
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
 /// Server → Client messages (written as JSON lines to stdout)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -44,6 +48,9 @@ pub struct RemoteSessionData {
     /// Session is in the skipped list
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
+    /// Active todo count for this session
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub todo_count: u32,
     /// Conversation messages for web dashboard (user + assistant)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<ConversationMessage>,
