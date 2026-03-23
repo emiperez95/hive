@@ -747,9 +747,35 @@ impl App {
         if self.selected < self.scroll_offset {
             self.scroll_offset = self.selected;
         }
+
+        // Compute divider positions (must match render_session_list logic)
+        let non_claude_start = self
+            .session_infos
+            .iter()
+            .position(|s| !self.is_skipped(&s.name) && !s.source.is_remote() && s.claude_status.is_none());
+        let skipped_start = self
+            .session_infos
+            .iter()
+            .position(|s| self.is_skipped(&s.name));
+        let remote_start = self
+            .session_infos
+            .iter()
+            .position(|s| s.source.is_remote());
+
         loop {
-            let mut used = 0;
+            // Start with 1 for the initial blank line the renderer always adds
+            let mut used: usize = 1;
             for i in self.scroll_offset..=self.selected {
+                // Dividers take 2 lines each (blank + label)
+                if Some(i) == non_claude_start {
+                    used += 2;
+                }
+                if Some(i) == skipped_start {
+                    used += 2;
+                }
+                if Some(i) == remote_start {
+                    used += 2;
+                }
                 used += lines_for_session(&self.session_infos[i], self.is_auto_approved(&self.session_infos[i].name));
             }
             if used <= available_height {
