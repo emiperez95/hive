@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 72 unit tests
+cargo test                # 90 unit tests
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -51,6 +51,10 @@ hive todo done [index] [--session <name>]   # mark todo as done (default: 1)
 hive todo clear [--session <name>]          # clear completed todos
 hive spread <N>                             # spread N sessions into vertical iTerm2 panes
 hive collapse                               # collapse iTerm2 panes back to one
+hive web                                    # start web dashboard on port 8375
+hive web --dev                              # dev mode: serve HTML from disk (live reload)
+hive web --tts-host <url>                   # enable TTS read-aloud via TTSQwen service
+hive web --port <N>                         # custom port (default: 8375)
 ```
 
 ## Janus WT Portal
@@ -73,7 +77,7 @@ src/
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
 │   ├── iterm.rs            iTerm2 pane spread/collapse via AppleScript (macOS only, #[cfg] guarded)
-│   ├── jsonl.rs            JSONL parsing for Claude status from ~/.claude/projects/
+│   ├── jsonl.rs            JSONL parsing for Claude status + conversation extraction from ~/.claude/projects/
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
@@ -82,7 +86,14 @@ src/
 │   ├── hooks.rs            handle_hook_event(): maps HookEvent → SessionState updates
 │   └── notifier.rs         platform-native notifications (terminal-notifier/osascript/notify-send)
 ├── ipc/
-│   └── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
+│   ├── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
+│   └── remote_protocol.rs  Wire protocol types (RemoteSessionData, ConversationMessage, ToolSummary)
+├── serve/
+│   ├── mod.rs              module registration (server, web, protocol)
+│   ├── protocol.rs         re-exports from ipc/remote_protocol.rs
+│   ├── server.rs           stdio server + gather_session_data() shared by TUI and web
+│   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
+│   └── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 └── tui/
     ├── app.rs              App struct, refresh(), session management, search, favorites, todos
     └── ui.rs               ratatui rendering (list, detail, search, help, input modals)
@@ -100,6 +111,9 @@ src/
 - `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, etc.)
 - `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
 - `WorktreeEntry` (common/worktree.rs) — worktree record (project_key, branch, type, path, session_name, metadata, created_at)
+- `RemoteSessionData` (ipc/remote_protocol.rs) — session data for wire protocol (name, status, cpu, ports, pane, skipped, messages)
+- `ConversationMessage` (ipc/remote_protocol.rs) — chat message with role, text, and tool summaries
+- `ToolSummary` (ipc/remote_protocol.rs) — compact tool use info (name, summary, detail for modal)
 
 ## Data Directory
 
@@ -184,6 +198,77 @@ Uses **JXA (JavaScript for Automation)** instead of AppleScript because Chrome's
 - **`Enter` on a port** (detail view): Focus the matching Chrome tab, or open `localhost:PORT` if no tab exists
 - Chrome tabs are fetched **on-demand** (not every refresh cycle) to avoid spawning `osascript` every second
 
+## Web Dashboard (`hive web`)
+
+Mobile-first web app for monitoring and interacting with Claude sessions from a phone browser. Runs a local HTTP server using `tiny_http` (sync, no async runtime).
+
+```
+hive web                                        # start on default port 8375
+hive web --dev                                  # serve web.html from disk (edit + refresh)
+hive web --tts-host http://10.18.1.2:9800       # enable TTS read-aloud
+hive web --dev --tts-host http://10.18.1.2:9800 # both
+```
+
+**Architecture:**
+
+```
+┌─────────────────┐     ┌──────────────────────────────────────┐
+│  Data Thread     │     │  HTTP Thread (main, blocking recv)   │
+│  (1s refresh)    │     │                                      │
+│  sysinfo.refresh │     │  GET /             → embedded HTML   │
+│  HookState::load │     │  GET /api/sessions → session JSON    │
+│  gather_sessions │     │  GET /api/messages → conversation    │
+│  → Arc<Mutex>    │     │  GET /api/config   → {tts: bool}    │
+│                  │     │  POST /api/send    → tmux send-keys  │
+└─────────────────┘     │  POST /api/tts     → proxy to TTS    │
+                        └──────────────────────────────────────┘
+```
+
+**API endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Serve embedded HTML (or from disk in `--dev` mode) |
+| GET | `/api/sessions` | Session list with status, CPU, ports, skipped flag (polled every 1.5s) |
+| GET | `/api/messages?session=X` | Full conversation for a session (user + assistant + tool uses) |
+| GET | `/api/config` | Feature flags (`{"tts": true/false}`) |
+| POST | `/api/send` | Send text to session: `{"session": "...", "text": "..."}` |
+| POST | `/api/tts` | Proxy to TTS service, returns audio/wav (only when `--tts-host` set) |
+
+**Frontend features (web.html):**
+
+- Session list with color-coded status badges (green=waiting, blue=working, red=needs attention)
+- Skipped sessions separated into their own section
+- Full conversation view with markdown rendering (headers, bold, italic, code blocks, lists, links)
+- Tool use cards (Bash, Write, Edit, Read, Grep, Glob, Agent) with expandable detail modals
+- Quick action buttons (Approve/Reject/yes) — only shown when session needs attention
+- Text input with Send button for typing messages to sessions
+- TTS "Read Last Message" button (only when `--tts-host` configured)
+- iOS keyboard handling via `visualViewport` API (body is `position: fixed`, height set by JS)
+- Browser back gesture navigation via History API
+- Auto-scroll to bottom, preserves scroll position when reading older messages
+
+**JSONL conversation extraction (`jsonl.rs`):**
+
+- `get_conversation_messages(cwd)` — reads the full JSONL file, extracts all user + assistant messages
+- Handles both string content (user messages) and array content blocks (assistant messages)
+- Extracts tool_use blocks with per-tool summaries (command, filename, pattern, etc.)
+- UTF-8 safe string truncation for tool details
+
+**TTS integration:**
+
+- Proxied through hive server via `curl` subprocess to avoid CORS issues
+- Default config: Michael Caine voice (`voice: "michael_caine"`), English, 1.3x speed, `summarize: true`
+- Logs latency, audio duration, and input size to stderr
+- iOS audio playback: uses silent WAV unlock trick to work around iOS autoplay restrictions
+- 60s timeout on curl to prevent hanging
+
+**Dev mode (`--dev`):**
+
+- Reads `src/serve/web.html` from disk on every `GET /` request
+- Edit HTML/CSS/JS → refresh phone browser → see changes (no recompile needed)
+- Falls back to embedded HTML if file not found
+
 ## Tmux Integration
 
 - `prefix + s` — hive popup (list view)
@@ -193,7 +278,7 @@ Uses **JXA (JavaScript for Automation)** instead of AppleScript because Chrome's
 
 ## Testing
 
-72 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
+90 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
 
 ## Conventions
 
