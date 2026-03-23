@@ -239,14 +239,19 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 - Session list with color-coded status badges (green=waiting, blue=working, red=needs attention)
 - Skipped sessions separated into their own section
-- Full conversation view with markdown rendering (headers, bold, italic, code blocks, lists, links)
+- Full conversation view with markdown rendering (headers, bold, italic, code blocks, lists, links, tables)
+- Syntax highlighting via Prism.js CDN (JS, TS, Rust, Python, Bash, YAML, JSON, TOML) with dark theme
 - Tool use cards (Bash, Write, Edit, Read, Grep, Glob, Agent) with expandable detail modals
+- Styled tool modals: dark terminal block for Bash (with copy button), unified LCS diff for Edit, file viewer for Write/Read
 - Quick action buttons (Approve/Reject/yes) — only shown when session needs attention
 - Text input with Send button for typing messages to sessions
 - TTS "Read Last Message" button (only when `--tts-host` configured)
 - iOS keyboard handling via `visualViewport` API (body is `position: fixed`, height set by JS)
 - Browser back gesture navigation via History API
 - Auto-scroll to bottom, preserves scroll position when reading older messages
+- Jump-to-bottom button appears when scrolled up, bottom bar auto-hides on scroll
+- Consecutive same-role messages collapse the role label (no repeated "Claude")
+- Smart re-rendering: session list and messages only update on actual data changes (JSON comparison)
 
 **JSONL conversation extraction (`jsonl.rs`):**
 
