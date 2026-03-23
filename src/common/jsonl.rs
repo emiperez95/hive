@@ -5,7 +5,7 @@ use crate::common::types::{truncate_command, ClaudeStatus};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 
 /// Partial structure for parsing jsonl entries - we only need specific fields
@@ -185,6 +185,327 @@ pub fn parse_status_from_entries(entries: &[JsonlEntry]) -> (ClaudeStatus, Optio
     };
 
     (status, timestamp)
+}
+
+/// Read lines from the last `max_bytes` of a file (efficient tail read).
+/// Skips the first partial line if we didn't start at offset 0.
+fn read_tail_lines(path: &PathBuf, max_bytes: u64) -> Vec<String> {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let seek_pos = len.saturating_sub(max_bytes);
+    if seek_pos > 0 && file.seek(SeekFrom::Start(seek_pos)).is_err() {
+        return Vec::new();
+    }
+
+    let reader = BufReader::new(file);
+    let mut lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+
+    // Skip the first partial line if we didn't start at the beginning
+    if seek_pos > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    lines
+}
+
+/// A message in the conversation (user or assistant).
+#[derive(Debug, Clone)]
+pub struct ConversationMessage {
+    pub role: String,
+    pub text: String,
+    pub tools: Vec<ToolSummary>,
+}
+
+/// Compact summary of a tool use.
+#[derive(Debug, Clone)]
+pub struct ToolSummary {
+    pub name: String,
+    pub summary: String,
+    pub detail: String,
+}
+
+/// Extract text content from a JSONL content field.
+/// Handles both plain strings (user messages) and arrays of content blocks (assistant messages).
+fn extract_text_from_content(content: &serde_json::Value) -> Option<String> {
+    // User messages can be plain strings
+    if let Some(s) = content.as_str() {
+        if s.is_empty() {
+            return None;
+        }
+        return Some(s.to_string());
+    }
+
+    let arr = content.as_array()?;
+    let mut text_parts = Vec::new();
+    for block in arr {
+        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                text_parts.push(text.to_string());
+            }
+        }
+    }
+    if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join("\n\n"))
+    }
+}
+
+/// Extract tool_use blocks from a JSONL content array into compact summaries.
+fn extract_tools_from_content(content: &serde_json::Value) -> Vec<ToolSummary> {
+    let arr = match content.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    let mut tools = Vec::new();
+    for block in arr {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+
+        let name = block
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        let input = block.get("input");
+
+        let (summary, detail) = match name.as_str() {
+            "Bash" => {
+                let cmd = input
+                    .and_then(|i| i.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let desc = input
+                    .and_then(|i| i.get("description"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let summary = if desc.is_empty() {
+                    truncate_str(cmd, 80)
+                } else {
+                    desc.to_string()
+                };
+                (summary, cmd.to_string())
+            }
+            "Write" => {
+                let path = input
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content_text = input
+                    .and_then(|i| i.get("content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (
+                    extract_filename(path),
+                    format!("{}\n\n{}", path, truncate_str(content_text, 2000)),
+                )
+            }
+            "Edit" => {
+                let path = input
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let old = input
+                    .and_then(|i| i.get("old_string"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new = input
+                    .and_then(|i| i.get("new_string"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (
+                    extract_filename(path),
+                    format!(
+                        "{}\n\n--- old ---\n{}\n\n+++ new +++\n{}",
+                        path,
+                        truncate_str(old, 1000),
+                        truncate_str(new, 1000)
+                    ),
+                )
+            }
+            "Read" => {
+                let path = input
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (extract_filename(path), path.to_string())
+            }
+            "Grep" => {
+                let pattern = input
+                    .and_then(|i| i.get("pattern"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let path = input
+                    .and_then(|i| i.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                (
+                    format!("/{}/", truncate_str(pattern, 40)),
+                    format!("pattern: {}\npath: {}", pattern, path),
+                )
+            }
+            "Glob" => {
+                let pattern = input
+                    .and_then(|i| i.get("pattern"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (pattern.to_string(), pattern.to_string())
+            }
+            "Agent" => {
+                let desc = input
+                    .and_then(|i| i.get("description"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let prompt = input
+                    .and_then(|i| i.get("prompt"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (
+                    desc.to_string(),
+                    truncate_str(prompt, 2000),
+                )
+            }
+            _ => {
+                // Generic: show first string field from input as summary
+                let summary = input
+                    .and_then(|i| i.as_object())
+                    .and_then(|obj| {
+                        obj.values()
+                            .find_map(|v| v.as_str().map(|s| truncate_str(s, 60)))
+                    })
+                    .unwrap_or_default();
+                let detail = input
+                    .map(|i| serde_json::to_string_pretty(i).unwrap_or_default())
+                    .unwrap_or_default();
+                (summary, detail)
+            }
+        };
+
+        tools.push(ToolSummary {
+            name,
+            summary,
+            detail,
+        });
+    }
+
+    tools
+}
+
+/// Truncate a string to approximately `max` bytes, appending "..." if truncated.
+/// Respects UTF-8 char boundaries.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Find the last char boundary at or before `max`
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = s[..end].to_string();
+    result.push_str("...");
+    result
+}
+
+/// Extract conversation messages (user + assistant) from JSONL lines.
+/// Returns messages in chronological order, limited to the last `max_messages`.
+pub fn extract_conversation_messages(lines: &[String], max_messages: usize) -> Vec<ConversationMessage> {
+    let mut messages = Vec::new();
+
+    for line in lines {
+        let entry: JsonlEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if entry.entry_type != "assistant" && entry.entry_type != "user" {
+            continue;
+        }
+
+        let content = match entry.message.and_then(|m| m.content) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let text = extract_text_from_content(&content).unwrap_or_default();
+        let tools = if entry.entry_type == "assistant" {
+            extract_tools_from_content(&content)
+        } else {
+            Vec::new()
+        };
+
+        // Skip entries with no text and no tools
+        if text.is_empty() && tools.is_empty() {
+            continue;
+        }
+
+        messages.push(ConversationMessage {
+            role: entry.entry_type,
+            text,
+            tools,
+        });
+    }
+
+    // Keep only the last N messages
+    if messages.len() > max_messages {
+        messages.drain(..messages.len() - max_messages);
+    }
+
+    messages
+}
+
+/// Extract the last assistant text message from a list of JSONL lines.
+pub fn extract_last_assistant_text(lines: &[String]) -> Option<String> {
+    for line in lines.iter().rev() {
+        let entry: JsonlEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if entry.entry_type != "assistant" {
+            continue;
+        }
+
+        let text = entry
+            .message
+            .and_then(|m| m.content)
+            .and_then(|c| extract_text_from_content(&c));
+
+        if text.is_some() {
+            return text;
+        }
+    }
+
+    None
+}
+
+/// Get conversation messages for a given project working directory.
+/// Reads the full JSONL file and returns all messages.
+pub fn get_conversation_messages(cwd: &str) -> Vec<ConversationMessage> {
+    let projects_path = cwd_to_claude_projects_path(cwd);
+    let jsonl_path = match find_latest_jsonl(&projects_path) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let file = match fs::File::open(&jsonl_path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    extract_conversation_messages(&lines, usize::MAX)
 }
 
 /// Parse Claude status from jsonl file
@@ -421,6 +742,125 @@ mod tests {
         let entries = vec![parse_entry(old_assistant), parse_entry(progress)];
         let (status, _) = parse_status_from_entries(&entries);
         assert!(matches!(status, ClaudeStatus::Unknown));
+    }
+
+    #[test]
+    fn test_extract_last_assistant_text_simple() {
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, I updated the file."}]}}"#.to_string(),
+        ];
+        let result = extract_last_assistant_text(&lines);
+        assert_eq!(result, Some("Hello, I updated the file.".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_assistant_text_multiple_blocks() {
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"First part."},{"type":"tool_use","name":"Write","input":{}},{"type":"text","text":"Second part."}]}}"#.to_string(),
+        ];
+        let result = extract_last_assistant_text(&lines);
+        assert_eq!(result, Some("First part.\n\nSecond part.".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_assistant_text_picks_last_entry() {
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Old message"}]}}"#.to_string(),
+            r#"{"type":"progress","data":{"hookEvent":"PostToolUse"}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"New message"}]}}"#.to_string(),
+        ];
+        let result = extract_last_assistant_text(&lines);
+        assert_eq!(result, Some("New message".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_assistant_text_no_text_blocks() {
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#.to_string(),
+        ];
+        let result = extract_last_assistant_text(&lines);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_last_assistant_text_empty() {
+        let lines: Vec<String> = vec![];
+        let result = extract_last_assistant_text(&lines);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_last_assistant_text_long() {
+        let long_text = "x".repeat(5000);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            long_text
+        );
+        let lines = vec![line];
+        let result = extract_last_assistant_text(&lines).unwrap();
+        assert_eq!(result.len(), 5000);
+    }
+
+    #[test]
+    fn test_extract_conversation_messages_basic() {
+        let lines = vec![
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"Hello"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi there!"}]}}"#.to_string(),
+            r#"{"type":"progress","data":{"hookEvent":"Stop"}}"#.to_string(),
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"Do something"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."},{"type":"tool_use","name":"Write","input":{"file_path":"/path/to/file.txt","content":"hello"}}]}}"#.to_string(),
+        ];
+        let msgs = extract_conversation_messages(&lines, 50);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].text, "Hello");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].text, "Hi there!");
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[3].role, "assistant");
+        assert_eq!(msgs[3].text, "Done.");
+        assert_eq!(msgs[3].tools.len(), 1);
+        assert_eq!(msgs[3].tools[0].name, "Write");
+        assert_eq!(msgs[3].tools[0].summary, "file.txt");
+    }
+
+    #[test]
+    fn test_extract_conversation_messages_max_limit() {
+        let lines = vec![
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"First"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reply 1"}]}}"#.to_string(),
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"Second"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reply 2"}]}}"#.to_string(),
+        ];
+        let msgs = extract_conversation_messages(&lines, 2);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].text, "Second");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].text, "Reply 2");
+    }
+
+    #[test]
+    fn test_extract_conversation_tool_only_assistant() {
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test","description":"Run tests"}}]}}"#.to_string(),
+        ];
+        let msgs = extract_conversation_messages(&lines, 50);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].text.is_empty());
+        assert_eq!(msgs[0].tools.len(), 1);
+        assert_eq!(msgs[0].tools[0].name, "Bash");
+        assert_eq!(msgs[0].tools[0].summary, "Run tests");
+        assert_eq!(msgs[0].tools[0].detail, "cargo test");
+    }
+
+    #[test]
+    fn test_extract_conversation_bash_no_description() {
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la /tmp"}}]}}"#.to_string(),
+        ];
+        let msgs = extract_conversation_messages(&lines, 50);
+        assert_eq!(msgs[0].tools[0].summary, "ls -la /tmp");
     }
 
     #[test]

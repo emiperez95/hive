@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Hive</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #21262d;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text2: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100%;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+    position: fixed;
+    width: 100%;
+    top: 0;
+    left: 0;
+  }
+
+  .app {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    min-height: 48px;
+    flex-shrink: 0;
+  }
+
+  .header h1 { font-size: 18px; font-weight: 600; }
+
+  .header .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  .header .back-btn {
+    background: none; border: none;
+    color: var(--accent); font-size: 16px;
+    padding: 8px; cursor: pointer; margin-left: -8px;
+  }
+
+  /* Session List */
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .session-item {
+    display: flex; align-items: center;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer; transition: background 0.15s;
+    gap: 12px; min-height: 56px;
+  }
+
+  .session-item:active { background: var(--bg3); }
+
+  .session-item .dot {
+    width: 10px; height: 10px;
+    border-radius: 50%; flex-shrink: 0;
+  }
+
+  .session-item .info { flex: 1; min-width: 0; }
+
+  .session-item .name {
+    font-size: 15px; font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .session-item .meta { font-size: 12px; color: var(--text2); margin-top: 2px; }
+  .session-item .chevron { color: var(--text2); font-size: 18px; flex-shrink: 0; }
+
+  .section-header {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text2);
+    padding: 12px 16px 6px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Detail View — NOT position:fixed, lives in normal flow */
+  .detail-view {
+    display: none;
+    flex-direction: column;
+    height: 100%;
+    background: var(--bg);
+    z-index: 10;
+    overflow: hidden;
+  }
+
+  .detail-view.active { display: flex; }
+
+  .session-list-view {
+    display: flex; flex-direction: column; height: 100%;
+  }
+
+  .session-list-view.hidden { display: none; }
+
+  .detail-status {
+    padding: 12px 16px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .detail-status .session-name { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+
+  .detail-status .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  .badge {
+    font-size: 11px; padding: 2px 8px;
+    border-radius: 12px; font-weight: 500;
+  }
+
+  .badge.waiting { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge.working { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .badge.attention { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge.cpu { background: rgba(210,153,34,0.15); color: var(--orange); }
+
+  /* Chat messages area — scrollable */
+  .chat-area {
+    flex: 1;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+  }
+
+  .chat-msg {
+    border-radius: 12px;
+    padding: 10px 14px;
+    font-size: 14px;
+    line-height: 1.55;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    max-width: 95%;
+  }
+
+  .chat-msg.assistant {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    align-self: flex-start;
+  }
+
+  .chat-msg.user {
+    background: rgba(88,166,255,0.12);
+    border: 1px solid rgba(88,166,255,0.25);
+    align-self: flex-end;
+    color: var(--accent);
+  }
+
+  .chat-msg .role-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+    color: var(--text2);
+  }
+
+  .chat-msg.user .role-label { color: rgba(88,166,255,0.7); }
+
+  .chat-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text2);
+    font-size: 14px;
+    font-style: italic;
+  }
+
+  /* Markdown styles inside messages */
+  .chat-msg h1, .chat-msg h2, .chat-msg h3 {
+    margin: 8px 0 4px 0;
+    line-height: 1.3;
+  }
+  .chat-msg h1 { font-size: 17px; }
+  .chat-msg h2 { font-size: 15px; }
+  .chat-msg h3 { font-size: 14px; }
+  .chat-msg h1:first-child, .chat-msg h2:first-child, .chat-msg h3:first-child {
+    margin-top: 0;
+  }
+
+  .chat-msg p { margin: 6px 0; }
+  .chat-msg p:first-child { margin-top: 0; }
+  .chat-msg p:last-child { margin-bottom: 0; }
+
+  .chat-msg code {
+    background: rgba(255,255,255,0.08);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    font-size: 12.5px;
+  }
+
+  .chat-msg pre {
+    background: rgba(0,0,0,0.3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 8px 0;
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  .chat-msg pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+  }
+
+  .chat-msg ul, .chat-msg ol {
+    margin: 6px 0;
+    padding-left: 20px;
+  }
+
+  .chat-msg li { margin: 2px 0; }
+
+  .chat-msg strong { font-weight: 600; }
+  .chat-msg em { font-style: italic; }
+
+  .chat-msg a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+
+  .chat-msg blockquote {
+    border-left: 3px solid var(--border);
+    padding-left: 10px;
+    margin: 6px 0;
+    color: var(--text2);
+  }
+
+  .chat-msg hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 10px 0;
+  }
+
+  /* Tool cards */
+  .tool-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin: 6px 0;
+    cursor: pointer;
+    transition: background 0.15s;
+    font-size: 13px;
+  }
+
+  .tool-card:active { background: rgba(0,0,0,0.4); }
+
+  .tool-card .tool-icon {
+    flex-shrink: 0;
+    width: 26px; height: 26px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+  }
+
+  .tool-icon.bash { background: #2ea043; }
+  .tool-icon.write { background: #8957e5; }
+  .tool-icon.edit { background: #d29922; }
+  .tool-icon.read { background: #58a6ff; }
+  .tool-icon.grep { background: #f78166; }
+  .tool-icon.agent { background: #f85149; }
+  .tool-icon.other { background: var(--text2); }
+
+  .tool-card .tool-info { flex: 1; min-width: 0; }
+
+  .tool-card .tool-name {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--text2);
+  }
+
+  .tool-card .tool-summary {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text);
+    font-family: 'SF Mono', 'Menlo', monospace;
+    font-size: 12px;
+    margin-top: 1px;
+  }
+
+  .tool-card .tool-chevron {
+    color: var(--text2);
+    flex-shrink: 0;
+    font-size: 14px;
+  }
+
+  /* Modal overlay */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    align-items: flex-end;
+    justify-content: center;
+  }
+
+  .modal-overlay.active {
+    display: flex;
+  }
+
+  .modal-sheet {
+    background: var(--bg2);
+    border-radius: 16px 16px 0 0;
+    width: 100%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    animation: slideUp 0.2s ease-out;
+  }
+
+  @keyframes slideUp {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .modal-header .modal-title {
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .modal-header .modal-close {
+    background: var(--bg3);
+    border: none;
+    color: var(--text);
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .modal-body {
+    padding: 16px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    flex: 1;
+  }
+
+  .modal-body pre {
+    background: rgba(0,0,0,0.3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: 'SF Mono', 'Menlo', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    color: var(--text);
+    overflow-x: auto;
+  }
+
+  /* TTS button */
+  .tts-bar {
+    display: none;
+    padding: 8px 16px 0 16px;
+  }
+
+  .tts-bar.visible { display: flex; }
+
+  .tts-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    color: var(--text);
+    font-size: 14px;
+    padding: 8px 16px;
+    cursor: pointer;
+    width: 100%;
+    justify-content: center;
+  }
+
+  .tts-btn:active { background: var(--border); }
+  .tts-btn:disabled { opacity: 0.5; cursor: default; }
+
+  .tts-btn .tts-icon { font-size: 16px; }
+
+  @keyframes tts-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+  }
+
+  .tts-btn.loading .tts-label {
+    animation: tts-pulse 1s ease-in-out infinite;
+  }
+
+  /* Bottom bar — fixed, never scrolls */
+  .bottom-bar {
+    flex-shrink: 0;
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+  }
+
+  .quick-actions {
+    display: flex;
+    gap: 6px;
+    padding: 8px 16px 0 16px;
+    flex-wrap: wrap;
+  }
+
+  .quick-actions.hidden { display: none; }
+
+  .quick-btn {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    color: var(--text);
+    font-size: 13px;
+    padding: 6px 14px;
+    cursor: pointer;
+  }
+
+  .quick-btn:active { background: var(--border); }
+
+  .input-bar {
+    display: flex;
+    gap: 8px;
+    padding: 8px 16px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+
+  .input-bar input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 10px 16px;
+    color: var(--text);
+    font-size: 16px;
+    outline: none;
+  }
+
+  .input-bar input:focus { border-color: var(--accent); }
+
+  .input-bar button {
+    background: var(--accent);
+    border: none; border-radius: 20px;
+    color: #fff; font-size: 15px; font-weight: 600;
+    padding: 10px 20px;
+    cursor: pointer; flex-shrink: 0;
+  }
+
+  .input-bar button:active { opacity: 0.8; }
+  .input-bar button:disabled { opacity: 0.4; }
+
+  /* Loading */
+  .loading {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--text2); font-size: 14px;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+  }
+
+  .loading .dot-pulse { animation: pulse 1.5s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Session List View -->
+  <div class="session-list-view" id="listView">
+    <div class="header">
+      <h1>Hive Sessions</h1>
+      <span id="connDot" class="status-dot" style="background:var(--green)"></span>
+    </div>
+    <div class="session-list" id="sessionList">
+      <div class="loading"><span class="dot-pulse">Loading sessions...</span></div>
+    </div>
+  </div>
+
+  <!-- Detail View -->
+  <div class="detail-view" id="detailView">
+    <div class="header">
+      <button class="back-btn" onclick="history.back()">&#8592; Back</button>
+      <span id="detailDot" class="status-dot"></span>
+    </div>
+    <div class="detail-status">
+      <div class="session-name" id="detailName"></div>
+      <div class="badges" id="detailBadges"></div>
+    </div>
+    <div class="chat-area" id="chatArea">
+      <div class="chat-empty">No messages yet</div>
+    </div>
+    <div class="bottom-bar">
+      <div class="tts-bar" id="ttsBar">
+        <button class="tts-btn" id="ttsBtn" onclick="speakLastMessage()">
+          <span class="tts-icon">&#x1f50a;</span>
+          <span class="tts-label">Read Last Message</span>
+        </button>
+      </div>
+      <div class="quick-actions hidden" id="quickActions">
+        <button class="quick-btn" onclick="sendQuick('y')">Approve (y)</button>
+        <button class="quick-btn" onclick="sendQuick('n')">Reject (n)</button>
+        <button class="quick-btn" onclick="sendQuick('yes')">yes</button>
+      </div>
+      <div class="input-bar">
+        <input type="text" id="msgInput" placeholder="Type a message..." autocomplete="off" autocorrect="off" autocapitalize="off">
+        <button id="sendBtn" onclick="sendMessage()">Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Tool detail modal -->
+<div class="modal-overlay" id="toolModal" onclick="closeModal(event)">
+  <div class="modal-sheet">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle"></span>
+      <button class="modal-close" onclick="closeModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <pre id="modalContent"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+let sessions = [];
+let selectedSession = null;
+let currentMessages = [];
+let pollTimer = null;
+let msgPollTimer = null;
+let wasAtBottom = true;
+
+// --- Markdown renderer ---
+function renderMarkdown(src) {
+  // Normalize line endings
+  src = src.replace(/\r\n/g, '\n');
+
+  // Extract fenced code blocks first to protect them
+  const codeBlocks = [];
+  src = src.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    codeBlocks.push('<pre><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>');
+    return '\x00CB' + (codeBlocks.length - 1) + '\x00';
+  });
+
+  // Process blocks
+  const lines = src.split('\n');
+  let html = '';
+  let i = 0;
+  let inList = false;
+  let listType = '';
+
+  function closePendingList() {
+    if (inList) {
+      html += listType === 'ul' ? '</ul>' : '</ol>';
+      inList = false;
+    }
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Code block placeholder
+    const cbMatch = line.match(/^\x00CB(\d+)\x00$/);
+    if (cbMatch) {
+      closePendingList();
+      html += codeBlocks[parseInt(cbMatch[1])];
+      i++; continue;
+    }
+
+    // Headings
+    const hMatch = line.match(/^(#{1,3})\s+(.+)/);
+    if (hMatch) {
+      closePendingList();
+      const level = hMatch[1].length;
+      html += `<h${level}>${inlineMarkdown(hMatch[2])}</h${level}>`;
+      i++; continue;
+    }
+
+    // Horizontal rule
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      closePendingList();
+      html += '<hr>';
+      i++; continue;
+    }
+
+    // Blockquote
+    if (line.startsWith('> ')) {
+      closePendingList();
+      let quote = '';
+      while (i < lines.length && lines[i].startsWith('> ')) {
+        quote += lines[i].slice(2) + '\n';
+        i++;
+      }
+      html += '<blockquote>' + renderMarkdown(quote.trim()) + '</blockquote>';
+      continue;
+    }
+
+    // Unordered list
+    const ulMatch = line.match(/^(\s*)[*\-+]\s+(.*)/);
+    if (ulMatch) {
+      if (!inList || listType !== 'ul') {
+        closePendingList();
+        html += '<ul>';
+        inList = true; listType = 'ul';
+      }
+      html += '<li>' + inlineMarkdown(ulMatch[2]) + '</li>';
+      i++; continue;
+    }
+
+    // Ordered list
+    const olMatch = line.match(/^(\s*)\d+\.\s+(.*)/);
+    if (olMatch) {
+      if (!inList || listType !== 'ol') {
+        closePendingList();
+        html += '<ol>';
+        inList = true; listType = 'ol';
+      }
+      html += '<li>' + inlineMarkdown(olMatch[2]) + '</li>';
+      i++; continue;
+    }
+
+    // Close list if we hit a non-list line
+    closePendingList();
+
+    // Empty line
+    if (line.trim() === '') {
+      i++; continue;
+    }
+
+    // Paragraph — collect consecutive non-empty lines
+    let para = '';
+    while (i < lines.length && lines[i].trim() !== '' &&
+           !lines[i].match(/^#{1,3}\s/) &&
+           !lines[i].match(/^[*\-+]\s/) &&
+           !lines[i].match(/^\d+\.\s/) &&
+           !lines[i].startsWith('> ') &&
+           !lines[i].match(/^\x00CB/) &&
+           !lines[i].match(/^(-{3,}|\*{3,}|_{3,})\s*$/)) {
+      if (para) para += '\n';
+      para += lines[i];
+      i++;
+    }
+    html += '<p>' + inlineMarkdown(para) + '</p>';
+  }
+
+  closePendingList();
+  return html;
+}
+
+function inlineMarkdown(text) {
+  // Inline code (must come first to protect contents)
+  const codes = [];
+  text = text.replace(/`([^`]+)`/g, (_, code) => {
+    codes.push('<code>' + esc(code) + '</code>');
+    return '\x00IC' + (codes.length - 1) + '\x00';
+  });
+
+  // Escape HTML in remaining text
+  text = esc(text);
+
+  // Bold + italic
+  text = text.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+  // Bold
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+  // Italic
+  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  text = text.replace(/_(.+?)_/g, '<em>$1</em>');
+  // Strikethrough
+  text = text.replace(/~~(.+?)~~/g, '<del>$1</del>');
+  // Links
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  // Line breaks
+  text = text.replace(/\n/g, '<br>');
+
+  // Restore inline code
+  text = text.replace(/\x00IC(\d+)\x00/g, (_, idx) => codes[parseInt(idx)]);
+
+  return text;
+}
+
+// --- Tool rendering ---
+function toolIconClass(name) {
+  const n = name.toLowerCase();
+  if (n === 'bash' || n === 'task') return 'bash';
+  if (n === 'write') return 'write';
+  if (n === 'edit') return 'edit';
+  if (n === 'read') return 'read';
+  if (n === 'grep' || n === 'glob') return 'grep';
+  if (n === 'agent') return 'agent';
+  return 'other';
+}
+
+function toolIconLabel(name) {
+  const map = { Bash: '$', Write: 'W', Edit: 'E', Read: 'R', Grep: '/', Glob: '*', Agent: 'A', Task: '$' };
+  return map[name] || name.charAt(0);
+}
+
+function renderToolCards(tools) {
+  if (!tools || !tools.length) return '';
+  return tools.map((t, i) => {
+    const id = 'tool_' + Math.random().toString(36).slice(2, 8);
+    return `<div class="tool-card" onclick="openToolModal('${esc(t.name)}', this)" data-detail="${esc(t.detail)}">
+      <div class="tool-icon ${toolIconClass(t.name)}">${toolIconLabel(t.name)}</div>
+      <div class="tool-info">
+        <div class="tool-name">${esc(t.name)}</div>
+        <div class="tool-summary">${esc(t.summary)}</div>
+      </div>
+      <span class="tool-chevron">\u203a</span>
+    </div>`;
+  }).join('');
+}
+
+function openToolModal(name, el) {
+  const detail = el.getAttribute('data-detail');
+  document.getElementById('modalTitle').textContent = name;
+  document.getElementById('modalContent').textContent = detail;
+  document.getElementById('toolModal').classList.add('active');
+  history.pushState({ view: 'modal' }, '');
+}
+
+function closeModal(event) {
+  if (event && event.target !== document.getElementById('toolModal') && !event.target.classList.contains('modal-close')) return;
+  document.getElementById('toolModal').classList.remove('active');
+}
+
+// --- Status helpers ---
+function statusInfo(s) {
+  if (!s || !s.status) return { label: 'No Claude', cls: 'working', color: 'var(--text2)', needsAction: false };
+  const st = s.status;
+  if (st === 'Waiting') return { label: 'Waiting', cls: 'waiting', color: 'var(--green)', needsAction: false };
+  if (st === 'Working') return { label: 'Working', cls: 'working', color: 'var(--blue)', needsAction: false };
+  if (st === 'QuestionAsked') return { label: 'Question', cls: 'attention', color: 'var(--red)', needsAction: true };
+  if (st === 'PlanReview') return { label: 'Plan Review', cls: 'attention', color: 'var(--orange)', needsAction: true };
+  if (typeof st === 'object') {
+    if (st.NeedsPermission) return { label: 'Permission', cls: 'attention', color: 'var(--red)', needsAction: true };
+    if (st.EditApproval) return { label: 'Edit Approval', cls: 'attention', color: 'var(--orange)', needsAction: true };
+  }
+  return { label: 'Working', cls: 'working', color: 'var(--blue)', needsAction: false };
+}
+
+function statusDetail(s) {
+  if (!s || !s.status) return '';
+  const st = s.status;
+  if (typeof st === 'object') {
+    if (st.NeedsPermission) {
+      let d = st.NeedsPermission.tool_name || '';
+      if (st.NeedsPermission.description) d += ' — ' + st.NeedsPermission.description;
+      return d;
+    }
+    if (st.EditApproval) return 'File: ' + st.EditApproval.filename;
+  }
+  return '';
+}
+
+// --- Rendering ---
+function renderSessionItem(s) {
+  const si = statusInfo(s);
+  const cpu = s.cpu > 0 ? s.cpu.toFixed(0) + '% CPU' : '';
+  const mem = s.mem_kb > 0 ? Math.round(s.mem_kb / 1024) + 'MB' : '';
+  const meta = [si.label, cpu, mem].filter(Boolean).join(' \u00b7 ');
+  return `<div class="session-item" onclick="selectSession('${encodeURIComponent(s.name)}')">
+    <span class="dot" style="background:${si.color}"></span>
+    <div class="info">
+      <div class="name">${esc(s.name)}</div>
+      <div class="meta">${esc(meta)}</div>
+    </div>
+    <span class="chevron">\u203a</span>
+  </div>`;
+}
+
+function renderList() {
+  const el = document.getElementById('sessionList');
+  if (!sessions.length) {
+    el.innerHTML = '<div class="loading">No sessions found</div>';
+    return;
+  }
+  const active = sessions.filter(s => !s.skipped);
+  const skipped = sessions.filter(s => s.skipped);
+
+  let html = active.map(renderSessionItem).join('');
+  if (skipped.length) {
+    html += `<div class="section-header">Skipped</div>`;
+    html += skipped.map(renderSessionItem).join('');
+  }
+  el.innerHTML = html;
+}
+
+function renderDetail() {
+  if (!selectedSession) return;
+  const s = sessions.find(x => x.name === selectedSession);
+  if (!s) return;
+
+  const si = statusInfo(s);
+  document.getElementById('detailName').textContent = s.name;
+  document.getElementById('detailDot').style.background = si.color;
+
+  // Badges
+  const badges = document.getElementById('detailBadges');
+  let badgeHtml = `<span class="badge ${si.cls}">${si.label}</span>`;
+  if (s.cpu > 0) badgeHtml += `<span class="badge cpu">${s.cpu.toFixed(1)}% CPU</span>`;
+  const detail = statusDetail(s);
+  if (detail) badgeHtml += `<span class="badge attention">${esc(detail)}</span>`;
+  badges.innerHTML = badgeHtml;
+
+  // Quick actions — only show when session needs attention
+  const qa = document.getElementById('quickActions');
+  if (si.needsAction) {
+    qa.classList.remove('hidden');
+  } else {
+    qa.classList.add('hidden');
+  }
+
+  // Chat messages — rendered from currentMessages (fetched separately)
+  renderMessages();
+}
+
+function renderMessages() {
+  const chatArea = document.getElementById('chatArea');
+  const isAtBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 40;
+
+  if (currentMessages.length === 0) {
+    chatArea.innerHTML = '<div class="chat-empty">No messages yet</div>';
+  } else {
+    chatArea.innerHTML = currentMessages.map(m => {
+      const roleLabel = m.role === 'assistant' ? 'Claude' : 'You';
+      const textHtml = m.text ? (m.role === 'assistant' ? renderMarkdown(m.text) : esc(m.text)) : '';
+      const toolsHtml = m.role === 'assistant' ? renderToolCards(m.tools) : '';
+      return `<div class="chat-msg ${m.role}">
+        <div class="role-label">${roleLabel}</div>
+        ${textHtml ? '<div>' + textHtml + '</div>' : ''}
+        ${toolsHtml}
+      </div>`;
+    }).join('');
+
+    if (isAtBottom || wasAtBottom) {
+      chatArea.scrollTop = chatArea.scrollHeight;
+    }
+  }
+
+  // Show/hide TTS button based on whether there's an assistant message
+  const ttsBar = document.getElementById('ttsBar');
+  const hasAssistant = currentMessages.some(m => m.role === 'assistant' && m.text);
+  if (ttsEnabled && hasAssistant) {
+    ttsBar.classList.add('visible');
+  } else {
+    ttsBar.classList.remove('visible');
+  }
+}
+
+// --- Navigation (uses History API so iOS back gesture works) ---
+function selectSession(encodedName) {
+  selectedSession = decodeURIComponent(encodedName);
+  currentMessages = [];
+  wasAtBottom = true;
+  history.pushState({ view: 'detail', session: selectedSession }, '');
+  showDetailView();
+  fetchMessages();
+  startMessagePolling();
+}
+
+function showList() {
+  selectedSession = null;
+  currentMessages = [];
+  stopMessagePolling();
+  document.getElementById('listView').classList.remove('hidden');
+  document.getElementById('detailView').classList.remove('active');
+}
+
+function showDetailView() {
+  document.getElementById('listView').classList.add('hidden');
+  document.getElementById('detailView').classList.add('active');
+  renderDetail();
+}
+
+async function fetchMessages() {
+  if (!selectedSession) return;
+  try {
+    const res = await fetch('/api/messages?session=' + encodeURIComponent(selectedSession));
+    const msgs = await res.json();
+    const chatArea = document.getElementById('chatArea');
+    wasAtBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 40;
+    currentMessages = msgs;
+    renderMessages();
+  } catch (e) { /* ignore */ }
+}
+
+function startMessagePolling() {
+  stopMessagePolling();
+  msgPollTimer = setInterval(fetchMessages, 2000);
+}
+
+function stopMessagePolling() {
+  if (msgPollTimer) { clearInterval(msgPollTimer); msgPollTimer = null; }
+}
+
+// Handle browser back gesture / back button
+window.addEventListener('popstate', (e) => {
+  if (document.getElementById('toolModal').classList.contains('active')) {
+    document.getElementById('toolModal').classList.remove('active');
+    // Re-push state so detail view stays
+    if (selectedSession) {
+      history.pushState({ view: 'detail', session: selectedSession }, '');
+    }
+    return;
+  }
+  showList();
+});
+
+// Push initial state so first back doesn't leave the page
+history.replaceState({ view: 'list' }, '');
+
+// --- Sending ---
+async function sendQuick(text) {
+  if (!selectedSession) return;
+  const s = sessions.find(x => x.name === selectedSession);
+  if (!s || !s.pane) return;
+  try {
+    await fetch('/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: s.name, text: text })
+    });
+  } catch (e) { /* ignore */ }
+}
+
+async function sendMessage() {
+  const input = document.getElementById('msgInput');
+  const text = input.value.trim();
+  if (!text || !selectedSession) return;
+  input.value = '';
+  wasAtBottom = true;
+  await sendQuick(text);
+}
+
+// --- Polling ---
+async function fetchSessions() {
+  try {
+    const res = await fetch('/api/sessions');
+    sessions = await res.json();
+    document.getElementById('connDot').style.background = 'var(--green)';
+    renderList();
+    if (selectedSession) renderDetail();
+  } catch (e) {
+    document.getElementById('connDot').style.background = 'var(--red)';
+  }
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// --- TTS ---
+let ttsEnabled = false;
+let ttsAudio = null;
+
+// Persistent audio element in the DOM — iOS needs this for reliable playback.
+// We create it once, reuse it, and "unlock" it on the first user tap.
+const ttsPlayer = document.createElement('audio');
+ttsPlayer.setAttribute('playsinline', '');
+
+async function initTts() {
+  try {
+    const res = await fetch('/api/config');
+    const cfg = await res.json();
+    ttsEnabled = cfg.tts === true;
+    if (ttsEnabled) {
+      document.getElementById('ttsBar').classList.add('visible');
+    }
+  } catch (e) { /* TTS stays disabled */ }
+}
+
+function resetTtsBtn() {
+  const btn = document.getElementById('ttsBtn');
+  btn.querySelector('.tts-label').textContent = 'Read Last Message';
+  btn.disabled = false;
+  btn.classList.remove('loading');
+}
+
+async function speakLastMessage() {
+  if (!selectedSession || !ttsEnabled) return;
+
+  const lastAssistant = [...currentMessages].reverse().find(m => m.role === 'assistant' && m.text);
+  if (!lastAssistant) return;
+
+  const btn = document.getElementById('ttsBtn');
+  btn.disabled = true;
+  btn.classList.add('loading');
+  btn.querySelector('.tts-label').textContent = 'Generating...';
+
+  // Stop any current playback
+  ttsPlayer.pause();
+  if (ttsAudio) { URL.revokeObjectURL(ttsAudio); ttsAudio = null; }
+
+  // iOS audio unlock: play a tiny silent WAV synchronously during user gesture.
+  // This "unlocks" the audio element so async playback works later.
+  ttsPlayer.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+  ttsPlayer.play().catch(() => {});
+
+  try {
+    const res = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: lastAssistant.text,
+        voice: 'michael_caine',
+        language: 'English',
+        speed: 1.3,
+        summarize: true
+      })
+    });
+
+    if (!res.ok) throw new Error('TTS request failed');
+
+    const blob = await res.blob();
+    ttsAudio = URL.createObjectURL(blob);
+    ttsPlayer.src = ttsAudio;
+    ttsPlayer.onended = () => {
+      resetTtsBtn();
+      URL.revokeObjectURL(ttsAudio);
+      ttsAudio = null;
+    };
+    ttsPlayer.onerror = () => resetTtsBtn();
+    btn.querySelector('.tts-label').textContent = 'Playing...';
+    btn.classList.remove('loading');
+    await ttsPlayer.play();
+  } catch (e) {
+    resetTtsBtn();
+  }
+}
+
+initTts();
+
+// Enter key sends message
+document.getElementById('msgInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+});
+
+// --- iOS keyboard viewport fix ---
+// Body is position:fixed. We set its height to the visual viewport height
+// so the entire app shrinks when the keyboard opens. No position:fixed on
+// any child — everything is in normal flow and flexbox handles the rest.
+function updateAppHeight() {
+  const vv = window.visualViewport;
+  if (vv) {
+    document.body.style.height = vv.height + 'px';
+    // Counter any iOS scroll offset
+    document.body.style.top = vv.offsetTop + 'px';
+  } else {
+    document.body.style.height = window.innerHeight + 'px';
+  }
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', updateAppHeight);
+  window.visualViewport.addEventListener('scroll', updateAppHeight);
+}
+window.addEventListener('resize', updateAppHeight);
+updateAppHeight();
+
+// Start polling
+fetchSessions();
+pollTimer = setInterval(fetchSessions, 1500);
+</script>
+</body>
+</html>

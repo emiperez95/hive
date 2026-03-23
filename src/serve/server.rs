@@ -3,6 +3,7 @@
 //! Runs a loop that gathers local session data and writes JSON lines to stdout.
 //! Reads client commands from stdin and dispatches them (e.g., send-keys).
 
+use crate::common::persistence::load_skipped_sessions;
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions, send_key_to_pane};
@@ -19,7 +20,7 @@ use sysinfo::System;
 
 /// Gather session data from local tmux + sysinfo + hook state.
 /// This is a simplified version of App::refresh() that doesn't need TUI state.
-fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<RemoteSessionData> {
+pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<RemoteSessionData> {
     let sessions = match get_tmux_sessions() {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -42,6 +43,7 @@ fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<RemoteSessio
         by_cwd
     };
 
+    let skipped_sessions = load_skipped_sessions();
     let mut results = Vec::new();
 
     for session in &sessions {
@@ -94,7 +96,6 @@ fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<RemoteSessio
         let mut status: Option<SessionStatus> = None;
         let mut claude_pane: Option<(String, String, String)> = None;
         let mut last_activity: Option<String> = None;
-
         'outer: for window in &session.windows {
             for p in &window.panes {
                 let mut pane_pids = vec![p.pid];
@@ -141,6 +142,8 @@ fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<RemoteSessio
             last_activity,
             attached: other_client_sessions.contains(&session.name),
             pane: claude_pane,
+            skipped: skipped_sessions.contains(&session.name),
+            messages: Vec::new(),
         });
     }
 
