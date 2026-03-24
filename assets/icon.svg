@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="45%">
+      <stop offset="0%" stop-color="#00e5ff" stop-opacity="0.9"/>
+      <stop offset="40%" stop-color="#00b8d4" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#0058be" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cf" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00e5ff"/>
+      <stop offset="100%" stop-color="#0091ea"/>
+    </radialGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a2744"/>
+      <stop offset="100%" stop-color="#0d1528"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="98" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="120" fill="url(#glow)"/>
+
+  <g fill="none" stroke="rgba(160,215,255,0.65)" stroke-width="2.5" stroke-linejoin="round">
+    <polygon points="305.8,115.8 259.0,142.8 259.0,196.8 305.8,223.8 352.5,196.8 352.5,142.8"/>
+    <polygon points="206.2,115.8 159.5,142.8 159.5,196.8 206.2,223.8 253.0,196.8 253.0,142.8"/>
+    <polygon points="156.5,202.0 109.7,229.0 109.7,283.0 156.5,310.0 203.2,283.0 203.2,229.0"/>
+    <polygon points="206.2,288.2 159.5,315.2 159.5,369.2 206.2,396.2 253.0,369.2 253.0,315.2"/>
+    <polygon points="305.8,288.2 259.0,315.2 259.0,369.2 305.8,396.2 352.5,369.2 352.5,315.2"/>
+    <polygon points="355.5,202.0 308.8,229.0 308.8,283.0 355.5,310.0 402.3,283.0 402.3,229.0"/>
+  </g>
+
+  <polygon points="256.0,202.0 209.2,229.0 209.2,283.0 256.0,310.0 302.8,283.0 302.8,229.0"
+    fill="url(#cf)" stroke="rgba(80,230,255,0.85)" stroke-width="2.5" stroke-linejoin="round"/>
+</svg>

@@ -72,9 +72,12 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         None
     };
 
-    // Print local IP for convenience
+    // Print access URLs
+    if let Some(hostname) = get_local_hostname() {
+        eprintln!("  Access from phone: http://{}:{}", hostname, port);
+    }
     if let Some(ip) = get_local_ip() {
-        eprintln!("  Access from phone: http://{}:{}", ip, port);
+        eprintln!("  Or via IP: http://{}:{}", ip, port);
     }
 
     // Shared session data between the data thread and request handlers
@@ -610,6 +613,21 @@ fn urldecode(s: &str) -> String {
         }
     }
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).to_string())
+}
+
+/// Get the machine's .local hostname (Bonjour/mDNS).
+fn get_local_hostname() -> Option<String> {
+    let output = std::process::Command::new("hostname")
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else if name.ends_with(".local") {
+        Some(name)
+    } else {
+        Some(format!("{}.local", name))
+    }
 }
 
 /// Try to get the machine's local network IP address.
