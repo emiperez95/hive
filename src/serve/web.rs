@@ -74,10 +74,10 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 
     // Print access URLs
     if let Some(hostname) = get_local_hostname() {
-        eprintln!("  Access from phone: http://{}:{}", hostname, port);
+        eprintln!("  Local: http://{}:{}", hostname, port);
     }
-    if let Some(ip) = get_local_ip() {
-        eprintln!("  Or via IP: http://{}:{}", ip, port);
+    for (label, ip) in get_all_ips(port) {
+        eprintln!("  {}: http://{}:{}", label, ip, port);
     }
 
     // Shared session data between the data thread and request handlers
@@ -631,12 +631,36 @@ fn get_local_hostname() -> Option<String> {
 }
 
 /// Try to get the machine's local network IP address.
-fn get_local_ip() -> Option<String> {
-    let output = std::process::Command::new("ipconfig")
-        .args(["getifaddr", "en0"])
-        .output()
-        .ok()?;
+/// Get all non-loopback IPv4 addresses with interface labels.
+fn get_all_ips(_port: u16) -> Vec<(String, String)> {
+    let output = match std::process::Command::new("ifconfig").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
 
-    let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if ip.is_empty() { None } else { Some(ip) }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut results = Vec::new();
+    let mut current_iface = String::new();
+
+    for line in text.lines() {
+        if !line.starts_with('\t') && !line.starts_with(' ') && line.contains(':') {
+            current_iface = line.split(':').next().unwrap_or("").to_string();
+        }
+        if let Some(rest) = line.trim().strip_prefix("inet ") {
+            let ip = rest.split_whitespace().next().unwrap_or("").to_string();
+            if ip == "127.0.0.1" || ip.is_empty() {
+                continue;
+            }
+            let label = if current_iface.starts_with("en") {
+                "LAN".to_string()
+            } else if current_iface.starts_with("utun") || current_iface.starts_with("tun") {
+                "VPN".to_string()
+            } else {
+                current_iface.clone()
+            };
+            results.push((label, ip));
+        }
+    }
+
+    results
 }
