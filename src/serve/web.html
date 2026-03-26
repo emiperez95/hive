@@ -1696,6 +1696,9 @@
   </div>
 </div>
 
+<video id="ttsVideo" playsinline webkit-playsinline
+  style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;z-index:-1"></video>
+
 <script>
 let sessions = [];
 let selectedSession = null;
@@ -2253,7 +2256,7 @@ function showList() {
   stopMessagePolling();
   // Stop any TTS playback/generation when leaving
   ttsPlayer.pause();
-  if (ttsAbort) { ttsAbort.abort(); ttsAbort = null; }
+  if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
   ttsGenerating = false;
   resetTtsBtn();
   document.getElementById('listView').classList.remove('hidden');
@@ -2384,8 +2387,8 @@ let ttsAudio = null;
 
 // Persistent audio element in the DOM — iOS needs this for reliable playback.
 // We create it once, reuse it, and "unlock" it on the first user tap.
-const ttsPlayer = document.createElement('audio');
-ttsPlayer.setAttribute('playsinline', '');
+// TTS player — get from DOM element (iOS needs it visible and in the document)
+const ttsPlayer = document.getElementById('ttsVideo');
 
 async function initTts() {
   try {
@@ -2407,7 +2410,6 @@ function resetTtsBtn() {
 }
 
 let ttsGenerating = false;
-let ttsAbort = null;       // AbortController for in-flight TTS request
 let ttsCachedText = null;  // text that was last generated
 let ttsCachedUrl = null;   // blob URL of last generated audio
 
@@ -2416,6 +2418,7 @@ async function speakLastMessage() {
   if (!ttsPlayer.paused) {
     ttsPlayer.pause();
     ttsPlayer.currentTime = 0;
+    if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
     resetTtsBtn();
     return;
   }
@@ -2446,24 +2449,24 @@ async function speakLastMessage() {
   btn.querySelector('.tts-label').textContent = 'Generating...';
   btn.querySelector('.tts-icon').textContent = 'hourglass_top';
 
-  // Stop any current playback and clear old cache
+  // Stop any current playback
   ttsPlayer.pause();
-  if (ttsCachedUrl) { URL.revokeObjectURL(ttsCachedUrl); ttsCachedUrl = null; }
   ttsCachedText = null;
+  ttsCachedUrl = null;
 
-  // iOS audio unlock
+  // iOS user gesture unlock: play silent audio SYNCHRONOUSLY in the tap handler
+  // This "unlocks" the video element so we can swap src after async fetch
   ttsPlayer.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
   ttsPlayer.play().catch(() => {});
 
-  // Force browser to paint the loading state before the long fetch
+  // Force browser to paint the loading state
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   try {
-    ttsAbort = new AbortController();
-    const res = await fetch('/api/tts', {
+    // Request HLS session from TTS server
+    const res = await fetch('/api/tts-hls', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      signal: ttsAbort.signal,
       body: JSON.stringify({
         text: lastAssistant.text,
         voice: 'michael_caine',
@@ -2475,18 +2478,48 @@ async function speakLastMessage() {
 
     if (!res.ok) throw new Error('TTS request failed');
 
-    const blob = await res.blob();
-    ttsCachedUrl = URL.createObjectURL(blob);
+    const data = await res.json();
+    if (!data.playlist_url) throw new Error('No playlist URL');
+
     ttsCachedText = lastAssistant.text;
-    ttsPlayer.src = ttsCachedUrl;
-    ttsPlayer.onended = () => resetTtsBtn();
-    ttsPlayer.onerror = () => resetTtsBtn();
-    btn.querySelector('.tts-label').textContent = 'Stop';
-    btn.querySelector('.tts-icon').textContent = 'stop_circle';
-    btn.classList.add('busy-state');
-    btn.classList.remove('loading');
-    btn.classList.remove('loading');
-    await ttsPlayer.play();
+    ttsCachedUrl = data.playlist_url;
+
+    // Clean up previous hls.js instance
+    if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
+
+    ttsPlayer.oncanplay = () => {
+      btn.querySelector('.tts-label').textContent = 'Stop';
+      btn.querySelector('.tts-icon').textContent = 'stop_circle';
+      btn.classList.remove('loading');
+    };
+    ttsPlayer.onended = () => { resetTtsBtn(); if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; } };
+    ttsPlayer.onerror = () => { resetTtsBtn(); ttsGenerating = false; };
+
+    if (window.Hls && Hls.isSupported()) {
+      // Use hls.js — handles segment fetching/buffering via JS
+      const hls = new Hls({
+        enableWorker: false,
+        maxBufferHole: 0.5,           // tolerate gaps up to 500ms between segments
+        maxMaxBufferLength: 60,       // buffer up to 60s
+        nudgeOffset: 0.1,             // small nudge to skip past AAC priming gaps
+        nudgeMaxRetry: 5,
+      });
+      window._hlsInstance = hls;
+      hls.loadSource(data.playlist_url);
+      hls.attachMedia(ttsPlayer);
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        console.error('HLS.js error:', d.type, d.details);
+        if (d.fatal) { resetTtsBtn(); ttsGenerating = false; }
+      });
+      await ttsPlayer.play();
+    } else if (ttsPlayer.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari native HLS (fallback)
+      ttsPlayer.src = data.playlist_url;
+      ttsPlayer.load();
+      await ttsPlayer.play();
+    } else {
+      throw new Error('HLS not supported');
+    }
   } catch (e) {
     resetTtsBtn();
   } finally {
@@ -2929,5 +2962,6 @@ pollTimer = setInterval(fetchSessions, 1500);
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 </body>
 </html>

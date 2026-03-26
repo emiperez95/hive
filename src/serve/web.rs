@@ -116,6 +116,23 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(response);
             }
 
+            (Method::Post, "/api/debug-log") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                eprintln!("  [DEBUG] {}", body);
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(r#"{"ok":true}"#).with_header(header));
+            }
+
+            (Method::Get, "/debug") => {
+                let debug_html = std::fs::read_to_string("/tmp/tts_debug.html")
+                    .unwrap_or_else(|_| "Debug page not found".to_string());
+                let header =
+                    Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
+                let response = Response::from_string(debug_html).with_header(header);
+                let _ = request.respond(response);
+            }
+
             (Method::Get, "/api/sessions") => {
                 let json = if let Ok(data) = shared_data.lock() {
                     serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
@@ -196,64 +213,235 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(response);
             }
 
-            (Method::Post, "/api/tts") => {
+            (Method::Post, "/api/tts-hls") => {
                 if let Some(ref host) = tts_host {
                     let mut body = String::new();
                     let _ = request.as_reader().read_to_string(&mut body);
 
-                    let speak_url = format!("{}/speak", host);
+                    let text_len = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("text")?.as_str().map(|s| s.len()))
+                        .unwrap_or(0);
+
+                    let speak_url = format!("{}/speak/hls", host);
+                    eprintln!("  TTS HLS: requesting | {} chars input", text_len);
                     let start = std::time::Instant::now();
+
                     let output = std::process::Command::new("curl")
                         .args([
                             "-s",
-                            "--max-time", "60",
+                            "--max-time", "30",
                             "-X", "POST",
                             &speak_url,
                             "-H", "Content-Type: application/json",
                             "-d", &body,
                         ])
                         .output();
-                    let elapsed = start.elapsed();
-                    let latency_ms = elapsed.as_millis();
 
-                    // Parse text length for logging
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            let result: serde_json::Value =
+                                serde_json::from_slice(&out.stdout).unwrap_or_default();
+                            eprintln!(
+                                "  TTS HLS: session created in {}ms",
+                                start.elapsed().as_millis()
+                            );
+
+                            // Wait for first segment before returning to browser
+                            // Safari fails if playlist has no segments when first loaded
+                            if let Some(playlist_path) = result.get("playlist_url").and_then(|v| v.as_str()) {
+                                let playlist_url = format!("{}{}", host, playlist_path);
+                                for _ in 0..30 {
+                                    std::thread::sleep(Duration::from_millis(500));
+                                    if let Ok(check) = std::process::Command::new("curl")
+                                        .args(["-s", "--max-time", "2", &playlist_url])
+                                        .output()
+                                    {
+                                        let body = String::from_utf8_lossy(&check.stdout);
+                                        if body.contains("EXTINF") {
+                                            eprintln!(
+                                                "  TTS HLS: first segment ready at {}ms",
+                                                start.elapsed().as_millis()
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            let header =
+                                Header::from_bytes("Content-Type", "application/json").unwrap();
+                            let _ = request.respond(
+                                Response::from_string(result.to_string()).with_header(header),
+                            );
+                        }
+                        Ok(out) => {
+                            let err = String::from_utf8_lossy(&out.stderr);
+                            let header =
+                                Header::from_bytes("Content-Type", "application/json").unwrap();
+                            let _ = request.respond(
+                                Response::from_string(format!(r#"{{"error":"{}"}}"#, err.replace('"', "'")))
+                                    .with_header(header)
+                                    .with_status_code(502),
+                            );
+                        }
+                        Err(e) => {
+                            let header =
+                                Header::from_bytes("Content-Type", "application/json").unwrap();
+                            let _ = request.respond(
+                                Response::from_string(format!(r#"{{"error":"{}"}}"#, e))
+                                    .with_header(header)
+                                    .with_status_code(500),
+                            );
+                        }
+                    }
+                } else {
+                    let header =
+                        Header::from_bytes("Content-Type", "application/json").unwrap();
+                    let _ = request.respond(
+                        Response::from_string(r#"{"error":"TTS not configured"}"#)
+                            .with_header(header)
+                            .with_status_code(404),
+                    );
+                }
+            }
+
+            (Method::Get, url) if url.starts_with("/api/tts-stream?") => {
+                if let Some(ref host) = tts_host {
+                    // Parse query params
+                    let params: std::collections::HashMap<String, String> = url
+                        .split('?')
+                        .nth(1)
+                        .unwrap_or("")
+                        .split('&')
+                        .filter_map(|p| {
+                            let (k, v) = p.split_once('=')?;
+                            Some((k.to_string(), urldecode(v)))
+                        })
+                        .collect();
+
+                    let text = params.get("text").cloned().unwrap_or_default();
+                    let text_len = text.len();
+
+                    let body = serde_json::json!({
+                        "text": text,
+                        "voice": params.get("voice").cloned().unwrap_or_else(|| "michael_caine".to_string()),
+                        "language": params.get("language").cloned().unwrap_or_else(|| "English".to_string()),
+                        "speed": params.get("speed").and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0),
+                        "summarize": true,
+                    })
+                    .to_string();
+
+                    let speak_url = format!("{}/speak/stream", host);
+                    eprintln!(
+                        "  TTS: starting stream (GET) | {} chars input",
+                        text_len
+                    );
+                    let start = std::time::Instant::now();
+
+                    match std::process::Command::new("curl")
+                        .args([
+                            "-s",
+                            "--no-buffer",
+                            "--max-time", "60",
+                            "-X", "POST",
+                            &speak_url,
+                            "-H", "Content-Type: application/json",
+                            "-d", &body,
+                        ])
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            let stdout = child.stdout.unwrap();
+                            let header =
+                                Header::from_bytes("Content-Type", "audio/mpeg").unwrap();
+                            let response = Response::new(
+                                tiny_http::StatusCode(200),
+                                vec![header],
+                                stdout,
+                                None,
+                                None,
+                            );
+                            let _ = request.respond(response);
+                            eprintln!(
+                                "  TTS: stream complete | {}ms total | {} chars",
+                                start.elapsed().as_millis(), text_len
+                            );
+                        }
+                        Err(e) => {
+                            let header =
+                                Header::from_bytes("Content-Type", "application/json")
+                                    .unwrap();
+                            let response = Response::from_string(format!(
+                                r#"{{"error":"{}"}}"#, e
+                            ))
+                            .with_header(header)
+                            .with_status_code(500);
+                            let _ = request.respond(response);
+                        }
+                    }
+                } else {
+                    let header =
+                        Header::from_bytes("Content-Type", "application/json").unwrap();
+                    let response =
+                        Response::from_string(r#"{"error":"TTS not configured"}"#)
+                            .with_header(header)
+                            .with_status_code(404);
+                    let _ = request.respond(response);
+                }
+            }
+
+            (Method::Post, "/api/tts") => {
+                if let Some(ref host) = tts_host {
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+
                     let text_len = serde_json::from_str::<serde_json::Value>(&body)
                         .ok()
                         .and_then(|v| v.get("text")?.as_str().map(|s| s.len()))
                         .unwrap_or(0);
 
-                    match output {
-                        Ok(out) if out.status.success() => {
-                            let size_kb = out.stdout.len() / 1024;
-                            let audio_secs = wav_duration_secs(&out.stdout);
-                            eprintln!(
-                                "  TTS: {}ms | {:.1}s audio | {}KB | {} chars input",
-                                latency_ms, audio_secs, size_kb, text_len
+                    // Use /speak/stream for chunked MP3 — audio starts playing immediately
+                    let speak_url = format!("{}/speak/stream", host);
+                    eprintln!(
+                        "  TTS: starting stream request | {} chars input | {}",
+                        text_len, speak_url
+                    );
+                    let start = std::time::Instant::now();
+
+                    match std::process::Command::new("curl")
+                        .args([
+                            "-s",
+                            "--no-buffer",
+                            "--max-time", "60",
+                            "-X", "POST",
+                            &speak_url,
+                            "-H", "Content-Type: application/json",
+                            "-d", &body,
+                        ])
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            let spawn_ms = start.elapsed().as_millis();
+                            eprintln!("  TTS: curl spawned in {}ms, streaming to client...", spawn_ms);
+                            let stdout = child.stdout.unwrap();
+                            let header =
+                                Header::from_bytes("Content-Type", "audio/mpeg").unwrap();
+                            // Stream the response — tiny_http reads from the pipe as data arrives
+                            let response = Response::new(
+                                tiny_http::StatusCode(200),
+                                vec![header],
+                                stdout,
+                                None, // unknown content length = chunked
+                                None,
                             );
-                            let header =
-                                Header::from_bytes("Content-Type", "audio/wav").unwrap();
-                            let latency_header = Header::from_bytes(
-                                "X-TTS-Latency-Ms",
-                                latency_ms.to_string(),
-                            )
-                            .unwrap();
-                            let response = Response::from_data(out.stdout)
-                                .with_header(header)
-                                .with_header(latency_header);
                             let _ = request.respond(response);
-                        }
-                        Ok(out) => {
-                            let err = String::from_utf8_lossy(&out.stderr);
-                            let header =
-                                Header::from_bytes("Content-Type", "application/json")
-                                    .unwrap();
-                            let response = Response::from_string(format!(
-                                r#"{{"error":"TTS failed: {}"}}"#,
-                                err.replace('"', "'")
-                            ))
-                            .with_header(header)
-                            .with_status_code(502);
-                            let _ = request.respond(response);
+                            let total_ms = start.elapsed().as_millis();
+                            eprintln!(
+                                "  TTS: stream complete | {}ms total | {} chars input",
+                                total_ms, text_len
+                            );
                         }
                         Err(e) => {
                             let header =
@@ -546,6 +734,53 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            (Method::Get, url) if url.starts_with("/hls/") => {
+                // Proxy HLS playlist and segments from TTS server (same-origin for iOS Safari)
+                if let Some(ref host) = tts_host {
+                    let tts_url = format!("{}{}", host, url);
+                    eprintln!("  HLS proxy: {} -> {}", url, tts_url);
+                    let content_type = if url.ends_with(".m3u8") {
+                        "application/vnd.apple.mpegurl"
+                    } else if url.ends_with(".m4s") || url.ends_with(".mp4") {
+                        "audio/mp4"
+                    } else {
+                        "video/MP2T"
+                    };
+
+                    match std::process::Command::new("curl")
+                        .args(["-s", "--max-time", "10", &tts_url])
+                        .output()
+                    {
+                        Ok(out) if out.status.success() => {
+                            let body = &out.stdout;
+                            let is_error = body.first() == Some(&b'{');
+                            if is_error || body.is_empty() {
+                                let preview = String::from_utf8_lossy(&body[..body.len().min(100)]);
+                                eprintln!("  HLS proxy: {} -> 404 ({}B: {})", url, body.len(), preview);
+                                let response =
+                                    Response::from_string("Not Found").with_status_code(404);
+                                let _ = request.respond(response);
+                            } else {
+                                eprintln!("  HLS proxy: {} -> 200 ({} bytes, {})", url, body.len(), content_type);
+                                let header =
+                                    Header::from_bytes("Content-Type", content_type).unwrap();
+                                let response =
+                                    Response::from_data(body.to_vec()).with_header(header);
+                                let _ = request.respond(response);
+                            }
+                        }
+                        _ => {
+                            let response =
+                                Response::from_string("Not Found").with_status_code(404);
+                            let _ = request.respond(response);
+                        }
+                    }
+                } else {
+                    let response = Response::from_string("Not Found").with_status_code(404);
+                    let _ = request.respond(response);
+                }
+            }
+
             _ => {
                 let response = Response::from_string("Not Found").with_status_code(404);
                 let _ = request.respond(response);
@@ -554,38 +789,6 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     }
 
     Ok(())
-}
-
-/// Parse audio duration from a WAV file by scanning for the data chunk.
-/// Byte rate is always at offset 28. The data chunk may not be at offset 40
-/// if extra chunks exist between fmt and data.
-fn wav_duration_secs(data: &[u8]) -> f64 {
-    if data.len() < 44 {
-        return 0.0;
-    }
-    let byte_rate = u32::from_le_bytes([data[28], data[29], data[30], data[31]]) as f64;
-    if byte_rate <= 0.0 {
-        return 0.0;
-    }
-
-    // Scan for "data" chunk ID (0x64617461)
-    let mut i = 12; // skip RIFF header (12 bytes)
-    while i + 8 <= data.len() {
-        let chunk_id = &data[i..i + 4];
-        let chunk_size =
-            u32::from_le_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]) as f64;
-        if chunk_id == b"data" {
-            return chunk_size / byte_rate;
-        }
-        i += 8 + chunk_size as usize;
-        // Align to even boundary
-        if i % 2 != 0 {
-            i += 1;
-        }
-    }
-
-    // Fallback: estimate from total file size minus header
-    (data.len() as f64 - 44.0) / byte_rate
 }
 
 /// Percent-decoding for URL query parameters (handles multi-byte UTF-8).
