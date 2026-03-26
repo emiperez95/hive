@@ -2240,6 +2240,14 @@ function renderMessages() {
 
 // --- Navigation (uses History API so iOS back gesture works) ---
 function selectSession(encodedName) {
+  // Reset TTS state from previous session
+  ttsPlayer.pause();
+  if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
+  ttsGenerating = false;
+  ttsCachedText = null;
+  ttsCachedUrl = null;
+  resetTtsBtn();
+
   selectedSession = decodeURIComponent(encodedName);
   currentMessages = [];
   lastMessagesJson = '';
