@@ -44,6 +44,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
     };
 
     let skipped_sessions = load_skipped_sessions();
+    let auto_approve_sessions = crate::common::persistence::load_auto_approve_sessions();
     let session_todos = load_session_todos();
     let mut results = Vec::new();
 
@@ -124,6 +125,17 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
         // Detect listening ports from Claude pane processes
         let listening_ports = get_listening_ports_for_pids(&claude_pids, sys);
         let ports: Vec<u16> = listening_ports.iter().map(|lp| lp.port).collect();
+
+        // Auto-approved sessions should only show Working, not NeedsPermission/EditApproval
+        let status = if auto_approve_sessions.contains(&session.name) {
+            match &status {
+                Some(SessionStatus::NeedsPermission { .. })
+                | Some(SessionStatus::EditApproval { .. }) => Some(SessionStatus::Working),
+                other => other.clone(),
+            }
+        } else {
+            status
+        };
 
         results.push(RemoteSessionData {
             name: session.name.clone(),
