@@ -1633,7 +1633,11 @@
       <div class="tts-bar" id="ttsBar">
         <button class="tts-btn" id="ttsBtn" onclick="speakLastMessage()">
           <span class="material-symbols-outlined tts-icon">volume_up</span>
-          <span class="tts-label">Read Last Message</span>
+          <span class="tts-label">Read Last</span>
+        </button>
+        <button class="tts-btn" id="tldrBtn" onclick="speakTldr()">
+          <span class="material-symbols-outlined tts-icon">summarize</span>
+          <span class="tts-label">TLDR</span>
         </button>
       </div>
       <div class="quick-actions hidden" id="quickActions">
@@ -2240,13 +2244,7 @@ function renderMessages() {
 
 // --- Navigation (uses History API so iOS back gesture works) ---
 function selectSession(encodedName) {
-  // Reset TTS state from previous session
-  ttsPlayer.pause();
-  if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
-  ttsGenerating = false;
-  ttsCachedText = null;
-  ttsCachedUrl = null;
-  resetTtsBtn();
+  stopTts();
 
   selectedSession = decodeURIComponent(encodedName);
   currentMessages = [];
@@ -2262,11 +2260,7 @@ function showList() {
   selectedSession = null;
   currentMessages = [];
   stopMessagePolling();
-  // Stop any TTS playback/generation when leaving
-  ttsPlayer.pause();
-  if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
-  ttsGenerating = false;
-  resetTtsBtn();
+  stopTts();
   document.getElementById('listView').classList.remove('hidden');
   document.getElementById('detailView').classList.remove('active');
 }
@@ -2409,74 +2403,81 @@ async function initTts() {
   } catch (e) { /* TTS stays disabled */ }
 }
 
+let ttsGenerating = false;
+let ttsCachedText = null;
+let ttsCachedUrl = null;
+let ttsSessionId = null;
+let ttsActiveBtn = null; // 'last' | 'tldr' | null
+
 function resetTtsBtn() {
-  const btn = document.getElementById('ttsBtn');
-  btn.querySelector('.tts-label').textContent = 'Read Last Message';
-  btn.querySelector('.tts-icon').textContent = 'volume_up';
-  btn.classList.remove('loading');
-  btn.classList.remove('busy-state');
+  const lastBtn = document.getElementById('ttsBtn');
+  const tldrBtn = document.getElementById('tldrBtn');
+  lastBtn.querySelector('.tts-label').textContent = 'Read Last';
+  lastBtn.querySelector('.tts-icon').textContent = 'volume_up';
+  lastBtn.classList.remove('loading', 'busy-state');
+  lastBtn.style.display = '';
+  tldrBtn.querySelector('.tts-label').textContent = 'TLDR';
+  tldrBtn.querySelector('.tts-icon').textContent = 'summarize';
+  tldrBtn.classList.remove('loading', 'busy-state');
+  tldrBtn.style.display = '';
+  ttsGenerating = false;
+  ttsActiveBtn = null;
 }
 
-let ttsGenerating = false;
-let ttsCachedText = null;  // text that was last generated
-let ttsCachedUrl = null;   // blob URL of last generated audio
-
-async function speakLastMessage() {
-  // Stop check FIRST — always allow stopping, even if generating/disabled
-  if (!ttsPlayer.paused) {
-    ttsPlayer.pause();
-    ttsPlayer.currentTime = 0;
-    if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
-    resetTtsBtn();
-    return;
+function cancelTtsSession() {
+  if (ttsSessionId) {
+    fetch('/api/tts-cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: ttsSessionId })
+    }).catch(() => {});
+    ttsSessionId = null;
   }
+}
 
+function stopTts() {
+  ttsPlayer.pause();
+  ttsPlayer.removeAttribute('src');
+  ttsPlayer.load();
+  if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
+  cancelTtsSession();
+  ttsCachedText = null;
+  ttsCachedUrl = null;
+  resetTtsBtn();
+}
+
+async function playTtsHls(text, btnId) {
+  // Stop if already playing
+  if (!ttsPlayer.paused) { stopTts(); return; }
   if (!selectedSession || !ttsEnabled || ttsGenerating) return;
+  if (!text || !text.trim()) return;
 
-  const lastAssistant = [...currentMessages].reverse().find(m => m.role === 'assistant' && m.text);
-  if (!lastAssistant) return;
-
-  const btn = document.getElementById('ttsBtn');
-
-  // If we have a cached audio for the same text, replay it
-  if (ttsCachedUrl && ttsCachedText === lastAssistant.text) {
-    ttsPlayer.src = ttsCachedUrl;
-    ttsPlayer.onended = () => resetTtsBtn();
-    ttsPlayer.onerror = () => resetTtsBtn();
-    btn.querySelector('.tts-label').textContent = 'Stop';
-    btn.querySelector('.tts-icon').textContent = 'stop_circle';
-    btn.classList.add('busy-state');
-    btn.classList.remove('loading');
-    ttsPlayer.play().catch(() => resetTtsBtn());
-    return;
-  }
+  const btn = document.getElementById(btnId);
+  const otherBtn = document.getElementById(btnId === 'ttsBtn' ? 'tldrBtn' : 'ttsBtn');
 
   ttsGenerating = true;
-  btn.classList.add('loading');
-  btn.classList.add('busy-state');
+  ttsActiveBtn = btnId;
+  btn.classList.add('loading', 'busy-state');
   btn.querySelector('.tts-label').textContent = 'Generating...';
   btn.querySelector('.tts-icon').textContent = 'hourglass_top';
+  otherBtn.style.display = 'none';
 
-  // Stop any current playback
   ttsPlayer.pause();
   ttsCachedText = null;
   ttsCachedUrl = null;
 
-  // iOS user gesture unlock: play silent audio SYNCHRONOUSLY in the tap handler
-  // This "unlocks" the video element so we can swap src after async fetch
+  // iOS user gesture unlock
   ttsPlayer.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
   ttsPlayer.play().catch(() => {});
 
-  // Force browser to paint the loading state
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   try {
-    // Request HLS session from TTS server
     const res = await fetch('/api/tts-hls', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        text: lastAssistant.text,
+        text: text,
         voice: 'michael_caine',
         language: 'English',
         speed: 1.0,
@@ -2485,14 +2486,13 @@ async function speakLastMessage() {
     });
 
     if (!res.ok) throw new Error('TTS request failed');
-
     const data = await res.json();
     if (!data.playlist_url) throw new Error('No playlist URL');
 
-    ttsCachedText = lastAssistant.text;
+    ttsSessionId = data.session_id || null;
+    ttsCachedText = text;
     ttsCachedUrl = data.playlist_url;
 
-    // Clean up previous hls.js instance
     if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; }
 
     ttsPlayer.oncanplay = () => {
@@ -2501,27 +2501,24 @@ async function speakLastMessage() {
       btn.classList.remove('loading');
     };
     ttsPlayer.onended = () => { resetTtsBtn(); if (window._hlsInstance) { window._hlsInstance.destroy(); window._hlsInstance = null; } };
-    ttsPlayer.onerror = () => { resetTtsBtn(); ttsGenerating = false; };
+    ttsPlayer.onerror = () => resetTtsBtn();
 
     if (window.Hls && Hls.isSupported()) {
-      // Use hls.js — handles segment fetching/buffering via JS
       const hls = new Hls({
         enableWorker: false,
-        maxBufferHole: 0.5,           // tolerate gaps up to 500ms between segments
-        maxMaxBufferLength: 60,       // buffer up to 60s
-        nudgeOffset: 0.1,             // small nudge to skip past AAC priming gaps
+        maxBufferHole: 0.5,
+        maxMaxBufferLength: 60,
+        nudgeOffset: 0.1,
         nudgeMaxRetry: 5,
       });
       window._hlsInstance = hls;
       hls.loadSource(data.playlist_url);
       hls.attachMedia(ttsPlayer);
       hls.on(Hls.Events.ERROR, (_, d) => {
-        console.error('HLS.js error:', d.type, d.details);
-        if (d.fatal) { resetTtsBtn(); ttsGenerating = false; }
+        if (d.fatal) resetTtsBtn();
       });
       await ttsPlayer.play();
     } else if (ttsPlayer.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS (fallback)
       ttsPlayer.src = data.playlist_url;
       ttsPlayer.load();
       await ttsPlayer.play();
@@ -2533,6 +2530,38 @@ async function speakLastMessage() {
   } finally {
     ttsGenerating = false;
   }
+}
+
+function speakLastMessage() {
+  const lastAssistant = [...currentMessages].reverse().find(m => m.role === 'assistant' && m.text);
+  if (!lastAssistant) return;
+  playTtsHls(lastAssistant.text, 'ttsBtn');
+}
+
+function speakTldr() {
+  // Find last user message
+  let lastUserIdx = -1;
+  for (let i = currentMessages.length - 1; i >= 0; i--) {
+    if (currentMessages[i].role === 'user') { lastUserIdx = i; break; }
+  }
+
+  // Collect all assistant messages since then
+  const msgs = lastUserIdx >= 0
+    ? currentMessages.slice(lastUserIdx + 1)
+    : currentMessages;
+
+  // Build briefing text
+  let briefing = '';
+  for (const m of msgs) {
+    if (m.role !== 'assistant') continue;
+    if (m.text) briefing += m.text + '\n\n';
+    for (const t of (m.tools || [])) {
+      briefing += 'Used ' + t.name + ': ' + t.summary + '\n';
+    }
+  }
+
+  if (!briefing.trim()) return;
+  playTtsHls(briefing, 'tldrBtn');
 }
 
 initTts();

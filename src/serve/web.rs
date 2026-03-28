@@ -720,6 +720,29 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            (Method::Post, "/api/tts-cancel") => {
+                if let Some(ref host) = tts_host {
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let json = (|| -> Option<String> {
+                        let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                        let sid = req.get("session_id")?.as_str()?;
+                        let url = format!("{}/hls/{}", host, sid);
+                        eprintln!("  TTS cancel: {}", sid);
+                        let _ = std::process::Command::new("curl")
+                            .args(["-s", "-X", "DELETE", &url])
+                            .output();
+                        Some(r#"{"ok":true}"#.to_string())
+                    })()
+                    .unwrap_or_else(|| r#"{"ok":true}"#.to_string());
+                    let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                    let _ = request.respond(Response::from_string(json).with_header(header));
+                } else {
+                    let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                    let _ = request.respond(Response::from_string(r#"{"ok":true}"#).with_header(header));
+                }
+            }
+
             (Method::Post, "/api/kill-session") => {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
