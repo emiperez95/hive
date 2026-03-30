@@ -205,7 +205,8 @@ Mobile-first web app for monitoring and interacting with Claude sessions from a 
 ```
 hive web                                        # start on default port 8375
 hive web --dev                                  # serve web.html from disk (edit + refresh)
-hive web --tts-host http://10.18.1.2:9800       # enable TTS read-aloud
+hive web --tts-host http://10.18.1.2:9800       # enable TTS read-aloud via TTSQwen service
+hive web --port <N>                             # custom port (default: 8375)
 hive web --dev --tts-host http://10.18.1.2:9800 # both
 ```
 
@@ -220,7 +221,8 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 │  gather_sessions │     │  GET /api/messages → conversation    │
 │  → Arc<Mutex>    │     │  GET /api/config   → {tts: bool}    │
 │                  │     │  POST /api/send    → tmux send-keys  │
-└─────────────────┘     │  POST /api/tts     → proxy to TTS    │
+└─────────────────┘     │  POST /api/tts-hls → HLS via TTS    │
+                        │  GET /hls/*        → proxy segments  │
                         └──────────────────────────────────────┘
 ```
 
@@ -235,19 +237,21 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 | GET | `/api/projects` | All registered projects with exists flag |
 | GET | `/api/session-info?session=X` | Enriched session data: CWD, ports, processes, flags, todos |
 | POST | `/api/send` | Send text to session: `{"session": "...", "text": "..."}` |
-| POST | `/api/tts` | Proxy to TTS service, returns audio/wav (only when `--tts-host` set) |
-| POST | `/api/toggle-skip` | Toggle skip status: `{"session": "..."}` |
+| POST | `/api/tts-hls` | Create HLS TTS session, waits for first segment: `{"text": "...", ...}` |
+| POST | `/api/tts-cancel` | Cancel TTS generation: `{"session_id": "..."}` |
 | POST | `/api/toggle-flag` | Toggle favorite/auto_approve/skip: `{"session": "...", "flag": "..."}` |
 | POST | `/api/todos` | Manage todos: `{"session": "...", "action": "add|done|delete", ...}` |
 | POST | `/api/connect` | Create/attach session: `{"session_name": "..."}` |
 | POST | `/api/kill-session` | Kill tmux session (with frontend confirmation): `{"session": "..."}` |
+| GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
+| GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
 
 **Frontend features (web.html):**
 
 - Light theme based on Google Stitch designs (Inter font, Material Symbols icons, glass blur effects)
 - Session list: emoji in rounded squares, status labels (Idle=green, Busy=red), CPU/mem, todo count badges
 - Swipe left on session items to skip/unskip
-- Floating + button opens session picker (search projects, connect/create)
+- Floating + button opens session picker (search/filter projects, connect/create)
 - Skipped sessions in separate section with solid gray background
 - Full conversation view with markdown rendering (headers, bold, italic, code blocks, lists, links, tables)
 - Syntax highlighting via Prism.js CDN (JS, TS, Rust, Python, Bash, YAML, JSON, TOML)
@@ -256,13 +260,17 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 - Tappable session header opens info modal: CWD, ports, processes, flag toggles (favorite, auto-approve, skip), todo management (add/done/delete), kill session button
 - Quick action buttons (Approve/Reject/yes) — only shown when session needs attention
 - Text input with Send button for typing messages to sessions
-- TTS "Read Last Message" button (only when `--tts-host` configured)
+- TTS buttons (only when `--tts-host` configured):
+  - **Read Last** — reads the most recent assistant message aloud
+  - **TLDR** — summarizes all assistant messages + tool uses since user's last message into a spoken briefing
 - iOS keyboard handling via `visualViewport` API (body is `position: fixed`, height set by JS)
 - Browser back gesture navigation via History API (all modals use pushState)
 - Auto-scroll to bottom, preserves scroll position when reading older messages
 - Jump-to-bottom button appears when scrolled up, bottom bar auto-hides on scroll
 - Consecutive same-role messages collapse the role label
 - Smart re-rendering: session list and messages only update on actual data changes (JSON comparison)
+- Auto-approved sessions show as Busy (not Permission) since Claude auto-approves before the UI updates
+- Honeycomb app icon (SVG source in `assets/icon.svg`, embedded as favicon + iOS touch icon)
 
 **JSONL conversation extraction (`jsonl.rs`):**
 
@@ -279,17 +287,21 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 **TTS integration:**
 
-- Proxied through hive server via `curl` subprocess to avoid CORS issues
+- Uses HLS streaming via hls.js (12KB CDN) for ~3x faster time-to-audio vs full WAV download
+- Flow: POST `/api/tts-hls` → creates HLS session on TTS server → waits for first segment → returns playlist URL → hls.js handles segment fetching/playback
+- HLS segments proxied through hive at `/hls/*` (same-origin avoids iOS Safari CORS issues)
+- fMP4 segments with AAC-LC audio at 44100Hz stereo
+- Cancel endpoint (`POST /api/tts-cancel`) stops TTS generation on navigation/stop
 - Default config: Michael Caine voice (`voice: "michael_caine"`), English, 1.0x speed, `summarize: true`
-- Logs latency, audio duration, and input size to stderr
-- iOS audio playback: uses silent WAV unlock trick to work around iOS autoplay restrictions
-- 60s timeout on curl to prevent hanging
+- iOS audio unlock: plays silent WAV synchronously in tap handler before async HLS fetch
+- Logs TTS session creation time and first-segment latency to stderr
 
 **Dev mode (`--dev`):**
 
 - Reads `src/serve/web.html` from disk on every `GET /` request
 - Edit HTML/CSS/JS → refresh phone browser → see changes (no recompile needed)
 - Falls back to embedded HTML if file not found
+- For web development without affecting installed binary: `cargo run -- web --dev`
 
 ## Tmux Integration
 
