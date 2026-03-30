@@ -1917,11 +1917,6 @@ function toolIconClass(name) {
   return 'other';
 }
 
-function toolIconLabel(name) {
-  const map = { Bash: '$', Write: 'W', Edit: 'E', Read: 'R', Grep: '/', Glob: '*', Agent: 'A', Task: '$' };
-  return map[name] || name.charAt(0);
-}
-
 // Store tool details in a map keyed by unique ID (avoids inline onclick escaping issues)
 const toolDetailStore = {};
 
@@ -2639,10 +2634,10 @@ initTts();
 
 async function toggleSkip(sessionName) {
   try {
-    await fetch('/api/toggle-skip', {
+    await fetch('/api/toggle-flag', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sessionName })
+      body: JSON.stringify({ session: sessionName, flag: 'skip' })
     });
     lastSessionsJson = '';
     fetchSessions();

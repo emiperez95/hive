@@ -464,31 +464,6 @@ pub fn extract_conversation_messages(lines: &[String], max_messages: usize) -> V
     messages
 }
 
-/// Extract the last assistant text message from a list of JSONL lines.
-pub fn extract_last_assistant_text(lines: &[String]) -> Option<String> {
-    for line in lines.iter().rev() {
-        let entry: JsonlEntry = match serde_json::from_str(line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if entry.entry_type != "assistant" {
-            continue;
-        }
-
-        let text = entry
-            .message
-            .and_then(|m| m.content)
-            .and_then(|c| extract_text_from_content(&c));
-
-        if text.is_some() {
-            return text;
-        }
-    }
-
-    None
-}
-
 /// Get conversation messages for a given project working directory.
 /// Reads the full JSONL file and returns all messages.
 pub fn get_conversation_messages(cwd: &str) -> Vec<ConversationMessage> {
@@ -742,63 +717,6 @@ mod tests {
         let entries = vec![parse_entry(old_assistant), parse_entry(progress)];
         let (status, _) = parse_status_from_entries(&entries);
         assert!(matches!(status, ClaudeStatus::Unknown));
-    }
-
-    #[test]
-    fn test_extract_last_assistant_text_simple() {
-        let lines = vec![
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, I updated the file."}]}}"#.to_string(),
-        ];
-        let result = extract_last_assistant_text(&lines);
-        assert_eq!(result, Some("Hello, I updated the file.".to_string()));
-    }
-
-    #[test]
-    fn test_extract_last_assistant_text_multiple_blocks() {
-        let lines = vec![
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"First part."},{"type":"tool_use","name":"Write","input":{}},{"type":"text","text":"Second part."}]}}"#.to_string(),
-        ];
-        let result = extract_last_assistant_text(&lines);
-        assert_eq!(result, Some("First part.\n\nSecond part.".to_string()));
-    }
-
-    #[test]
-    fn test_extract_last_assistant_text_picks_last_entry() {
-        let lines = vec![
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Old message"}]}}"#.to_string(),
-            r#"{"type":"progress","data":{"hookEvent":"PostToolUse"}}"#.to_string(),
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"New message"}]}}"#.to_string(),
-        ];
-        let result = extract_last_assistant_text(&lines);
-        assert_eq!(result, Some("New message".to_string()));
-    }
-
-    #[test]
-    fn test_extract_last_assistant_text_no_text_blocks() {
-        let lines = vec![
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#.to_string(),
-        ];
-        let result = extract_last_assistant_text(&lines);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_last_assistant_text_empty() {
-        let lines: Vec<String> = vec![];
-        let result = extract_last_assistant_text(&lines);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_last_assistant_text_long() {
-        let long_text = "x".repeat(5000);
-        let line = format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
-            long_text
-        );
-        let lines = vec![line];
-        let result = extract_last_assistant_text(&lines).unwrap();
-        assert_eq!(result.len(), 5000);
     }
 
     #[test]
