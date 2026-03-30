@@ -406,9 +406,7 @@ impl App {
                 if let Some(info) = get_process_info(&self.sys, pid) {
                     total_cpu += info.cpu_percent;
                     total_mem_kb += info.memory_kb;
-                    if info.cpu_percent > 0.0 || info.memory_kb >= 1024 {
-                        processes.push(info);
-                    }
+                    processes.push(info);
                 }
             }
 

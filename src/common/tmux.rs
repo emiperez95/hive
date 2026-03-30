@@ -283,6 +283,19 @@ fn layout_3_panes(target: &str, mode: &str) {
         .output();
 }
 
+/// Send literal text to a tmux pane followed by Enter
+pub fn send_text_to_pane(session: &str, window: &str, pane: &str, text: &str) {
+    let target = format!("{}:{}.{}", session, window, pane);
+    // Send the text literally (-l flag prevents interpretation of special keys)
+    let _ = Command::new("tmux")
+        .args(["send-keys", "-t", &target, "-l", text])
+        .output();
+    // Then send Enter
+    let _ = Command::new("tmux")
+        .args(["send-keys", "-t", &target, "Enter"])
+        .output();
+}
+
 /// Kill a tmux session
 pub fn kill_tmux_session(name: &str) -> bool {
     Command::new("tmux")

@@ -126,6 +126,18 @@ enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Start web dashboard for mobile access
+    Web {
+        /// Port to listen on
+        #[arg(long, default_value = "8375")]
+        port: u16,
+        /// Dev mode: serve web.html from disk (live reload on browser refresh)
+        #[arg(long)]
+        dev: bool,
+        /// TTS service URL (e.g. http://10.18.1.2:9800)
+        #[arg(long)]
+        tts_host: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2875,6 +2887,9 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Remote { command }) => run_remote(command),
+        Some(Command::Web { port, dev, tts_host }) => {
+            crate::serve::web::run_web_server(port, dev, tts_host)
+        }
         Some(Command::Start) => {
             if let Some(target) = run_start()? {
                 use std::os::unix::process::CommandExt;
