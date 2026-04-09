@@ -224,6 +224,9 @@ enum WtCommand {
         /// Send a prompt to Claude after startup
         #[arg(long)]
         prompt: Option<String>,
+        /// Skip the project's startup command (create session without launching claude)
+        #[arg(long)]
+        no_startup: bool,
         /// Enable auto-approve for the new session
         #[arg(long)]
         auto_approve: bool,
@@ -2043,6 +2046,7 @@ fn run_project_import() -> Result<()> {
 }
 
 /// Create a new worktree: full 12-step workflow with hooks
+#[allow(clippy::too_many_arguments)]
 fn run_wt_new(
     project: &str,
     branch: &str,
@@ -2051,6 +2055,7 @@ fn run_wt_new(
     wt_type: &str,
     prompt: Option<&str>,
     auto_approve: bool,
+    no_startup: bool,
 ) -> Result<()> {
     use crate::common::persistence::{load_auto_approve_sessions, save_auto_approve_sessions};
     use crate::common::projects::expand_tilde;
@@ -2208,7 +2213,10 @@ fn run_wt_new(
 
         // 12. Run startup command (append prompt as CLI argument if provided)
         //     New worktrees have no conversation to continue, so strip `-c` from claude commands.
-        if let Some(ref cmd) = config.startup_command {
+        //     Skip if --no-startup was passed (e.g., for fork-to-worktree).
+        if no_startup {
+            // Don't run startup command — caller will start their own process
+        } else if let Some(ref cmd) = config.startup_command {
             let base_cmd = cmd.replace("claude -c", "claude");
             let full_cmd = match prompt {
                 Some(p) => format!("{} {:?}", base_cmd, p),
@@ -2790,6 +2798,7 @@ fn handle_post_action(action: PostAction) -> Result<()> {
                 "worktree",
                 None,
                 false,
+                false,
             )?;
             // Look up final session name from WorktreeState (hooks may override)
             let state = crate::common::worktree::WorktreeState::load();
@@ -2923,6 +2932,7 @@ fn main() -> Result<()> {
                 existing,
                 wt_type,
                 prompt,
+                no_startup,
                 auto_approve,
             } => run_wt_new(
                 &project,
@@ -2932,6 +2942,7 @@ fn main() -> Result<()> {
                 &wt_type,
                 prompt.as_deref(),
                 auto_approve,
+                no_startup,
             ),
             WtCommand::Delete {
                 project,
