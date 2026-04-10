@@ -86,9 +86,9 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 14px 20px;
+    padding: 10px 20px;
     background: var(--surface);
-    min-height: 56px;
+    min-height: 48px;
     flex-shrink: 0;
   }
 
@@ -96,6 +96,8 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
+    flex: 1;
   }
 
   .header .header-icon {
@@ -108,6 +110,22 @@
     font-weight: 700;
     letter-spacing: 0.04em;
     color: var(--on-surface);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  .header h1.tappable-title {
+    cursor: pointer;
+    padding: 4px 6px;
+    margin: -4px -6px;
+    border-radius: 6px;
+    transition: background 0.15s;
+  }
+
+  .header h1.tappable-title:active {
+    background: var(--surface-container-low);
   }
 
   .header .conn-pill {
@@ -137,8 +155,8 @@
     background: none;
     border: none;
     color: var(--primary);
-    padding: 8px;
-    margin-left: -8px;
+    padding: 6px;
+    margin-left: -6px;
     cursor: pointer;
     border-radius: 50%;
     display: flex;
@@ -301,16 +319,8 @@
   .detail-view.active { display: flex; }
 
   .detail-status {
-    padding: 20px 20px 16px;
+    padding: 0 20px 10px;
     flex-shrink: 0;
-  }
-
-  .detail-status .session-name {
-    font-size: 22px;
-    font-weight: 800;
-    letter-spacing: -0.01em;
-    color: var(--on-surface);
-    margin-bottom: 8px;
   }
 
   .detail-status .badges {
@@ -1314,6 +1324,13 @@
     animation: slideUp 0.25s ease-out;
   }
 
+  .info-meta-badges {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 0 0 16px;
+  }
+
   .info-section {
     padding: 0 0 16px;
   }
@@ -1573,17 +1590,6 @@
 
   .kill-session-btn .material-symbols-outlined { font-size: 18px; }
 
-  .detail-status.tappable {
-    cursor: pointer;
-    transition: background 0.15s;
-    border-radius: 0.5rem;
-    margin: 0 12px;
-    padding: 16px 8px 12px;
-  }
-
-  .detail-status.tappable:active {
-    background: var(--surface-container-low);
-  }
 </style>
 </head>
 <body>
@@ -1615,12 +1621,11 @@
         <button class="back-btn" onclick="history.back()">
           <span class="material-symbols-outlined">arrow_back</span>
         </button>
-        <h1>Session</h1>
+        <h1 id="detailName" class="tappable-title" onclick="openSessionInfo()"></h1>
       </div>
       <span id="detailDot" class="detail-dot"></span>
     </div>
-    <div class="detail-status tappable" onclick="openSessionInfo()">
-      <div class="session-name" id="detailName"></div>
+    <div class="detail-status" id="detailStatus">
       <div class="badges" id="detailBadges"></div>
     </div>
     <div class="chat-area" id="chatArea">
@@ -2172,11 +2177,12 @@ function updateDetailBadges(s) {
   document.getElementById('detailDot').style.background = si.dotColor;
 
   const badges = document.getElementById('detailBadges');
-  let badgeHtml = `<span class="badge ${si.cls}"><span class="badge-dot"></span>${si.label}</span>`;
-  if (s.cpu > 0) badgeHtml += `<span class="badge cpu">${s.cpu.toFixed(1)}% CPU</span>`;
   const detail = statusDetail(s);
-  if (detail) badgeHtml += `<span class="badge attention">${esc(detail)}</span>`;
+  const badgeHtml = detail ? `<span class="badge attention">${esc(detail)}</span>` : '';
   badges.innerHTML = badgeHtml;
+
+  const wrapper = document.getElementById('detailStatus');
+  if (wrapper) wrapper.style.display = badgeHtml ? '' : 'none';
 
   const qa = document.getElementById('quickActions');
   if (si.needsAction) {
@@ -2756,6 +2762,15 @@ function closeInfoModal(event) {
 function renderInfoModal(data) {
   document.getElementById('infoModalTitle').textContent = data.name || 'Session Info';
   let html = '';
+
+  // Status + CPU badges (previously lived in the detail view header)
+  const live = sessions.find(x => x.name === data.name);
+  if (live) {
+    const si = statusInfo(live);
+    let meta = `<span class="badge ${si.cls}"><span class="badge-dot"></span>${si.label}</span>`;
+    if (live.cpu > 0) meta += `<span class="badge cpu">${live.cpu.toFixed(1)}% CPU</span>`;
+    html += '<div class="info-meta-badges">' + meta + '</div>';
+  }
 
   // Section 1: Directory & Ports
   html += '<div class="info-section">';
