@@ -1,4 +1,7 @@
 //! CLI argument parsing and subcommand dispatch.
+//!
+//! This module defines the CLI interface (via clap) and re-exports all
+//! subcommand handlers. `main.rs` parses args and dispatches here.
 
 pub mod hook;
 pub mod project;
@@ -11,6 +14,7 @@ pub mod worktree;
 
 use clap::{Parser, Subcommand};
 
+/// Top-level CLI arguments for hive.
 #[derive(Parser, Debug)]
 #[command(name = "hive")]
 #[command(version)]
@@ -41,6 +45,7 @@ pub struct Args {
     pub picker: bool,
 }
 
+/// Available subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Open the TUI (default behavior)
@@ -292,7 +297,10 @@ pub enum RemoteCommand {
     Sync,
 }
 
-/// Action to perform after TUI exits (post terminal restore)
+/// Action to perform after the TUI exits and the terminal is restored.
+///
+/// Some actions (like spreading iTerm panes or exec-ing into tmux) must
+/// happen after ratatui has cleaned up the alternate screen.
 pub enum PostAction {
     None,
     Spread(usize),

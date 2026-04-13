@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 90 unit tests
+cargo test                # 171 tests (149 unit + 22 CLI smoke)
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -77,9 +77,19 @@ Installed to `~/.claude/agents/janus-wt-portal.md` globally so it's available in
 
 ```
 src/
-├── main.rs                 CLI entry point, key handlers, hook/setup/cycle subcommands
+├── main.rs                 CLI entry point: arg parsing + dispatch (~125 lines)
 ├── lib.rs                  exports common module for bench binary
 ├── bin/bench.rs            benchmark tool
+├── cli/
+│   ├── mod.rs              Args, Command, subcommand enums, PostAction
+│   ├── hook.rs             run_hook(): parse stdin JSON, update state, notify
+│   ├── setup.rs            run_setup(), run_uninstall(), is_hive_hook_command()
+│   ├── worktree.rs         run_wt_new/delete/list/import(): full worktree lifecycle
+│   ├── project.rs          run_project_add/remove/list/import()
+│   ├── todo.rs             run_todo*(), resolve_session()
+│   ├── session.rs          run_cycle/spread/collapse/connect/start()
+│   ├── remote.rs           run_remote(), send_keys_to_remote(), ensure_remote_sync()
+│   └── update.rs           run_update(): self-update from GitHub
 ├── common/
 │   ├── types.rs            TmuxSession, SessionInfo, ClaudeStatus, ProcessInfo, PERMISSION_KEYS
 │   ├── tmux.rs             tmux command helpers (list-sessions, switch, send-keys, kill, resolve_tmux_path, set_all_sessions_layout)
@@ -104,9 +114,12 @@ src/
 │   ├── server.rs           stdio server + gather_session_data() shared by TUI and web
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
 │   └── web.html            embedded mobile-first SPA (HTML/CSS/JS)
-└── tui/
-    ├── app.rs              App struct, refresh(), session management, search, favorites, todos
-    └── ui.rs               ratatui rendering (list, detail, search, help, input modals)
+├── tui/
+│   ├── app.rs              App struct, refresh(), session management, search, favorites, todos
+│   ├── event_loop.rs       run_tui(): key handling, input modes, post-action dispatch
+│   └── ui.rs               ratatui rendering (list, detail, search, help, input modals)
+└── tests/
+    └── cli_smoke.rs        22 integration tests: CLI arg parsing, read-only commands, todo roundtrip
 ```
 
 ## Key Types
@@ -322,7 +335,20 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 ## Testing
 
-90 tests in common/ modules. No TUI tests (interactive). Run with `cargo test`.
+171 tests total. Run with `cargo test`.
+
+**Unit tests (149)** — in-module `#[cfg(test)]` blocks:
+- `common/` modules: types, projects, worktree, jsonl, chrome, process, remotes, persistence (escape/unescape, set/todo file roundtrips)
+- `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
+- `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
+
+**Integration tests (22)** — `tests/cli_smoke.rs`, run the actual binary:
+- `--version`, `--help`, all subcommand help pages
+- Read-only commands exit 0 (project list, wt list, todo list, remote list)
+- Invalid args exit non-zero
+- Todo full roundtrip (add → list → next → done → clear)
+
+No TUI tests (interactive rendering). No tmux-dependent tests (would need integration test infrastructure).
 
 ## Conventions
 
