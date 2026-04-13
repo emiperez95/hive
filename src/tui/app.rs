@@ -1199,6 +1199,7 @@ impl App {
             database: crate::common::projects::DatabaseConfig::default(),
             files: crate::common::projects::FilePatterns::default(),
             hooks_dir: None,
+            auth_profile: None,
         };
         let session_name = ProjectRegistry::session_name(&key, &config);
         let mut registry = ProjectRegistry::load();

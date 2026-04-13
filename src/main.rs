@@ -1927,6 +1927,7 @@ fn run_project_add(cmd: ProjectCommand) -> Result<()> {
             symlink: symlink_files,
         },
         hooks_dir,
+        auth_profile: None,
     };
 
     let session_name = ProjectRegistry::session_name(&key, &config);
@@ -2165,15 +2166,25 @@ fn run_wt_new(
             env.insert("HIVE_SESSION_NAME".to_string(), session_name.clone());
         }
 
-        let tmux_output = std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-c",
-                &worktree_path.to_string_lossy(),
-            ])
+        // Build tmux new-session with env vars from project config (e.g. CLAUDE_CONFIG_DIR).
+        // -e passes env to the initial shell, so the startup command (claude) inherits it.
+        let env_vars = config.tmux_env();
+        let env_strings: Vec<String> = env_vars
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        let mut tmux_cmd = std::process::Command::new("tmux");
+        tmux_cmd.args(["new-session", "-d"]);
+        for es in &env_strings {
+            tmux_cmd.arg("-e").arg(es);
+        }
+        tmux_cmd.args([
+            "-s",
+            &session_name,
+            "-c",
+            &worktree_path.to_string_lossy(),
+        ]);
+        let tmux_output = tmux_cmd
             .output()
             .context("Failed to run tmux new-session")?;
 

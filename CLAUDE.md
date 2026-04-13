@@ -57,6 +57,16 @@ hive web --tts-host <url>                   # enable TTS read-aloud via TTSQwen 
 hive web --port <N>                         # custom port (default: 8375)
 ```
 
+## Auth Profiles
+
+Per-project Claude credentials via `CLAUDE_CONFIG_DIR`. Each profile (`~/.claude-{name}/`) has its own OAuth identity and conversation history, with shared resources (agents, commands, hooks, skills, plugins, settings) symlinked back to `~/.claude/`.
+
+Set `auth_profile = "work"` on a project in `projects.toml` → hive passes `-e CLAUDE_CONFIG_DIR=~/.claude-work` to `tmux new-session` → Claude uses the work identity. Worktrees inherit the parent project's profile.
+
+JSONL conversation lookup (`jsonl.rs`) searches across all `~/.claude*/projects/` dirs, so the TUI and web dashboard display conversations regardless of which profile created them.
+
+See `docs/claude-auth-profiles.md` for full setup guide.
+
 ## Janus WT Portal
 
 The **janus-wt-portal** agent (`.claude/agents/janus-wt-portal.md`) ships with hive and is installed by `hive setup`. It's the primary way to manage worktrees interactively — detects ticket mentions, extracts branch names, resolves the project from git remote, and runs `hive wt` commands.
@@ -77,7 +87,7 @@ src/
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
 │   ├── iterm.rs            iTerm2 pane spread/collapse via AppleScript (macOS only, #[cfg] guarded)
-│   ├── jsonl.rs            JSONL parsing for Claude status + conversation extraction from ~/.claude/projects/
+│   ├── jsonl.rs            JSONL parsing for Claude status + conversation extraction from ~/.claude/projects/ (searches all auth profiles)
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
@@ -108,7 +118,7 @@ src/
 - `SessionInfo` (common/types.rs) — enriched session data for display (processes, ports, status)
 - `ClaudeStatus` (common/types.rs) — TUI-side status enum mapped from SessionStatus
 - `ProjectRegistry` (common/projects.rs) — `HashMap<name, ProjectConfig>`, loaded from projects.toml
-- `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, etc.)
+- `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, auth_profile, etc.)
 - `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
 - `WorktreeEntry` (common/worktree.rs) — worktree record (project_key, branch, type, path, session_name, metadata, created_at)
 - `RemoteSessionData` (ipc/remote_protocol.rs) — session data for wire protocol (name, status, cpu, ports, pane, skipped, messages)

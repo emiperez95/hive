@@ -59,11 +59,38 @@ pub struct JsonlStatus {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
-/// Convert a project working directory to the Claude projects path
+/// Convert a project working directory to the Claude projects path (primary: ~/.claude/projects/).
 pub fn cwd_to_claude_projects_path(cwd: &str) -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
     let encoded = cwd.replace('/', "-");
     home.join(".claude").join("projects").join(encoded)
+}
+
+/// Return all candidate Claude projects paths for a cwd across all config profiles.
+/// Searches `~/.claude/projects/<slug>` and `~/.claude-*/projects/<slug>` (e.g. `~/.claude-work`).
+/// Only returns paths that actually exist.
+pub fn candidate_projects_paths(cwd: &str) -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let encoded = cwd.replace('/', "-");
+    let mut paths: Vec<PathBuf> = Vec::new();
+
+    // Primary profile
+    paths.push(home.join(".claude").join("projects").join(&encoded));
+
+    // Alt profiles: ~/.claude-*/projects/<slug>
+    if let Ok(entries) = fs::read_dir(&home) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".claude-") && entry.path().is_dir() {
+                paths.push(entry.path().join("projects").join(&encoded));
+            }
+        }
+    }
+
+    paths.into_iter().filter(|p| p.exists()).collect()
 }
 
 /// Find the most recently modified jsonl file in a Claude projects directory
@@ -80,6 +107,14 @@ pub fn find_latest_jsonl(projects_path: &PathBuf) -> Option<PathBuf> {
         })
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         .map(|e| e.path())
+}
+
+/// Find the most recently modified jsonl across all profile candidate dirs for a cwd.
+pub fn find_latest_jsonl_for_cwd(cwd: &str) -> Option<PathBuf> {
+    candidate_projects_paths(cwd)
+        .iter()
+        .filter_map(find_latest_jsonl)
+        .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
 /// Read the last N lines of a file efficiently
@@ -466,9 +501,9 @@ pub fn extract_conversation_messages(lines: &[String], max_messages: usize) -> V
 
 /// Get conversation messages for a given project working directory.
 /// Reads the full JSONL file and returns all messages.
+/// Searches all auth profiles (`~/.claude/projects/` + `~/.claude-*/projects/`).
 pub fn get_conversation_messages(cwd: &str) -> Vec<ConversationMessage> {
-    let projects_path = cwd_to_claude_projects_path(cwd);
-    let jsonl_path = match find_latest_jsonl(&projects_path) {
+    let jsonl_path = match find_latest_jsonl_for_cwd(cwd) {
         Some(p) => p,
         None => return Vec::new(),
     };
@@ -483,10 +518,10 @@ pub fn get_conversation_messages(cwd: &str) -> Vec<ConversationMessage> {
     extract_conversation_messages(&lines, usize::MAX)
 }
 
-/// Parse Claude status from jsonl file
+/// Parse Claude status from jsonl file.
+/// Searches all auth profiles (`~/.claude/projects/` + `~/.claude-*/projects/`).
 pub fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
-    let projects_path = cwd_to_claude_projects_path(cwd);
-    let jsonl_path = find_latest_jsonl(&projects_path)?;
+    let jsonl_path = find_latest_jsonl_for_cwd(cwd)?;
 
     let last_lines = read_last_lines(&jsonl_path, 10);
     if last_lines.is_empty() {
@@ -549,6 +584,14 @@ mod tests {
         let path_str = path.to_string_lossy();
         assert!(path_str.ends_with("-Users-test-project"));
         assert!(path_str.contains(".claude/projects"));
+    }
+
+    #[test]
+    fn test_candidate_projects_paths_filters_nonexistent() {
+        // With a cwd that definitely has no conversation history, we should get zero candidates
+        // (the primary path doesn't exist either). This verifies the .exists() filter works.
+        let paths = candidate_projects_paths("/definitely/does/not/exist/42");
+        assert!(paths.is_empty(), "expected no candidates, got: {:?}", paths);
     }
 
     #[test]

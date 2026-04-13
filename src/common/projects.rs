@@ -93,6 +93,27 @@ pub struct ProjectConfig {
     /// Custom hooks directory (defaults to ~/.hive/projects/{key}/hooks/)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_dir: Option<String>,
+    /// Claude auth profile name (sets CLAUDE_CONFIG_DIR to ~/.claude-{name})
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
+}
+
+impl ProjectConfig {
+    /// Build env vars to inject into tmux sessions for this project.
+    /// Currently only sets `CLAUDE_CONFIG_DIR` when `auth_profile` is set.
+    pub fn tmux_env(&self) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        if let Some(profile) = &self.auth_profile {
+            if let Some(home) = dirs::home_dir() {
+                let dir = home.join(format!(".claude-{}", profile));
+                env.push((
+                    "CLAUDE_CONFIG_DIR".into(),
+                    dir.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        env
+    }
 }
 
 /// Root configuration containing all projects
@@ -220,8 +241,14 @@ pub fn connect_session(session_name: &str) -> bool {
 
 /// Ensure a tmux session exists, creating it at the given path if needed.
 /// Optionally runs a startup command in the new session.
+/// `env` is passed via `tmux new-session -e KEY=VAL` so the initial shell inherits it.
 /// Returns true on success, false on failure.
-pub fn ensure_tmux_session(session_name: &str, cwd: &str, startup_cmd: Option<&str>) -> bool {
+pub fn ensure_tmux_session(
+    session_name: &str,
+    cwd: &str,
+    startup_cmd: Option<&str>,
+    env: &[(String, String)],
+) -> bool {
     let exists = Command::new("tmux")
         .args(["has-session", "-t", session_name])
         .output()
@@ -229,19 +256,23 @@ pub fn ensure_tmux_session(session_name: &str, cwd: &str, startup_cmd: Option<&s
         .unwrap_or(false);
 
     if !exists {
-        let success = Command::new("tmux")
-            .args(["new-session", "-d", "-s", session_name, "-c", cwd])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let mut cmd = Command::new("tmux");
+        cmd.args(["new-session", "-d"]);
+        let env_strings: Vec<String> =
+            env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        for es in &env_strings {
+            cmd.arg("-e").arg(es);
+        }
+        cmd.args(["-s", session_name, "-c", cwd]);
+        let success = cmd.output().map(|o| o.status.success()).unwrap_or(false);
 
         if !success {
             return false;
         }
 
-        if let Some(cmd) = startup_cmd {
+        if let Some(startup) = startup_cmd {
             let _ = Command::new("tmux")
-                .args(["send-keys", "-t", session_name, cmd, "Enter"])
+                .args(["send-keys", "-t", session_name, startup, "Enter"])
                 .output();
         }
     }
@@ -262,6 +293,7 @@ pub fn connect_project(session_name: &str) -> bool {
         &sess_name,
         &root.to_string_lossy(),
         config.startup_command.as_deref(),
+        &config.tmux_env(),
     )
 }
 
@@ -360,6 +392,7 @@ pub fn parse_sesh_toml(path: &std::path::Path) -> anyhow::Result<Vec<(String, Pr
                 database: DatabaseConfig::default(),
                 files: FilePatterns::default(),
                 hooks_dir: None,
+                auth_profile: None,
             },
         ));
     }
@@ -386,6 +419,7 @@ mod tests {
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
             hooks_dir: None,
+            auth_profile: None,
         };
         assert_eq!(ProjectRegistry::session_name("hive", &config), "🐝 hive");
     }
@@ -405,6 +439,7 @@ mod tests {
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
             hooks_dir: None,
+            auth_profile: None,
         };
         assert_eq!(
             ProjectRegistry::session_name("my-app", &config),
@@ -590,6 +625,7 @@ base_port = 3000
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
             hooks_dir: None,
+            auth_profile: None,
         };
         registry.add_project("test".to_string(), config);
         assert_eq!(registry.projects.len(), 1);
@@ -612,6 +648,7 @@ base_port = 3000
             database: DatabaseConfig::default(),
             files: FilePatterns::default(),
             hooks_dir: None,
+            auth_profile: None,
         };
         registry.add_project("test".to_string(), config);
         assert!(registry.remove_project("test"));

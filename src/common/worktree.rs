@@ -193,14 +193,18 @@ pub fn connect_worktree(session_name: &str) -> bool {
         return false;
     };
 
-    // Look up startup command from parent project config
+    // Look up startup command + env from parent project config
     let registry = crate::common::projects::ProjectRegistry::load();
-    let startup_cmd = registry
-        .projects
-        .get(&entry.project_key)
-        .and_then(|c| c.startup_command.as_deref());
+    let project_config = registry.projects.get(&entry.project_key);
+    let startup_cmd = project_config.and_then(|c| c.startup_command.as_deref());
+    let env = project_config.map(|c| c.tmux_env()).unwrap_or_default();
 
-    crate::common::projects::ensure_tmux_session(&entry.session_name, &entry.path, startup_cmd)
+    crate::common::projects::ensure_tmux_session(
+        &entry.session_name,
+        &entry.path,
+        startup_cmd,
+        &env,
+    )
 }
 
 // ─── Import ─────────────────────────────────────────────────────────────────
@@ -745,6 +749,7 @@ mod tests {
             database: crate::common::projects::DatabaseConfig::default(),
             files: crate::common::projects::FilePatterns::default(),
             hooks_dir: None,
+            auth_profile: None,
         }
     }
 
