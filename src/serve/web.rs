@@ -12,7 +12,7 @@ use crate::common::persistence::{
 use crate::common::projects::{connect_project, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
 use crate::ipc::messages::HookState;
-use crate::serve::protocol::{ConversationMessage, ToolSummary};
+use crate::serve::web_types::{ConversationMessage, ToolSummary};
 use crate::serve::server::gather_session_data;
 
 use anyhow::Result;

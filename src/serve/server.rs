@@ -9,14 +9,14 @@ use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::{HookState, SessionStatus};
-use crate::serve::protocol::{RemoteProcessInfo, RemoteSessionData};
+use crate::serve::web_types::{ProcessView, SessionView};
 
 use std::collections::HashMap;
 use sysinfo::System;
 
 /// Gather session data from local tmux + sysinfo + hook state.
 /// This is a simplified version of App::refresh() that doesn't need TUI state.
-pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<RemoteSessionData> {
+pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<SessionView> {
     let sessions = match get_tmux_sessions() {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -102,7 +102,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
             if let Some(info) = get_process_info(sys, pid) {
                 total_cpu += info.cpu_percent;
                 total_mem_kb += info.memory_kb;
-                processes.push(RemoteProcessInfo {
+                processes.push(ProcessView {
                     pid: info.pid,
                     name: info.name.clone(),
                     cpu_percent: info.cpu_percent,
@@ -133,7 +133,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
             status
         };
 
-        results.push(RemoteSessionData {
+        results.push(SessionView {
             name: session.name.clone(),
             status,
             cpu: total_cpu,

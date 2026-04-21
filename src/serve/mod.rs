@@ -1,5 +1,5 @@
-//! Session serving over stdio (SSH transport) and HTTP (web dashboard).
+//! HTTP web dashboard and the data-gathering layer that feeds it.
 
-pub mod protocol;
 pub mod server;
 pub mod web;
+pub mod web_types;

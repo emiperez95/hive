@@ -1,8 +1,8 @@
-//! Serializable session data types used by the web dashboard JSON API.
+//! Serializable types for the web dashboard JSON API.
 //!
-//! `RemoteSessionData` and friends are produced by `serve::server::gather_session_data()`
-//! and serialized to JSON for the web frontend. The "Remote" prefix is historical —
-//! these types only describe local sessions today.
+//! `SessionView` is produced by `serve::server::gather_session_data()` and
+//! returned by `/api/sessions`. `ConversationMessage` is returned by
+//! `/api/messages`.
 
 use crate::ipc::messages::SessionStatus;
 use serde::{Deserialize, Serialize};
@@ -11,9 +11,9 @@ fn is_zero(v: &u32) -> bool {
     *v == 0
 }
 
-/// Session data serialized for the web dashboard
+/// One session as exposed to the web dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteSessionData {
+pub struct SessionView {
     /// tmux session name
     pub name: String,
     /// Claude status from hook state (None if no Claude process)
@@ -25,7 +25,7 @@ pub struct RemoteSessionData {
     /// Listening TCP ports
     pub ports: Vec<u16>,
     /// Process info for display
-    pub processes: Vec<RemoteProcessInfo>,
+    pub processes: Vec<ProcessView>,
     /// Working directory (from first pane)
     pub cwd: Option<String>,
     /// Last activity timestamp (ISO 8601)
@@ -40,12 +40,12 @@ pub struct RemoteSessionData {
     /// Active todo count for this session
     #[serde(default, skip_serializing_if = "is_zero")]
     pub todo_count: u32,
-    /// Conversation messages for web dashboard (user + assistant)
+    /// Conversation messages for the dashboard (user + assistant)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<ConversationMessage>,
 }
 
-/// A single message in the conversation (user or assistant text)
+/// One message in the conversation (user or assistant text).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub role: String,
@@ -57,7 +57,7 @@ pub struct ConversationMessage {
     pub tools: Vec<ToolSummary>,
 }
 
-/// Compact summary of a tool use for the web dashboard
+/// Compact summary of a tool use for the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSummary {
     /// Tool name (Bash, Write, Edit, Read, Grep, etc.)
@@ -68,9 +68,9 @@ pub struct ToolSummary {
     pub detail: String,
 }
 
-/// Minimal process info for the web dashboard
+/// Minimal process info for the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteProcessInfo {
+pub struct ProcessView {
     pub pid: u32,
     pub name: String,
     pub cpu_percent: f32,

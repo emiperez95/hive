@@ -105,14 +105,13 @@ src/
 │   ├── hooks.rs            handle_hook_event(): maps HookEvent → SessionState updates
 │   └── notifier.rs         platform-native notifications (terminal-notifier/osascript/notify-send)
 ├── ipc/
-│   ├── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
-│   └── remote_protocol.rs  Web JSON types (RemoteSessionData, ConversationMessage, ToolSummary) — name is historical
+│   └── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
 ├── serve/
-│   ├── mod.rs              module registration (server, web, protocol)
-│   ├── protocol.rs         re-exports from ipc/remote_protocol.rs
+│   ├── mod.rs              module registration (server, web, web_types)
 │   ├── server.rs           gather_session_data() — collects local sessions for the web API
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
-│   └── web.html            embedded mobile-first SPA (HTML/CSS/JS)
+│   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
+│   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
 ├── tui/
 │   ├── app.rs              App struct, refresh(), session management, search, favorites, todos
 │   ├── event_loop.rs       run_tui(): key handling, input modes, post-action dispatch
@@ -133,9 +132,10 @@ src/
 - `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, auth_profile, etc.)
 - `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
 - `WorktreeEntry` (common/worktree.rs) — worktree record (project_key, branch, type, path, session_name, metadata, created_at)
-- `RemoteSessionData` (ipc/remote_protocol.rs) — serializable session data for the web API (name, status, cpu, ports, pane, skipped, messages)
-- `ConversationMessage` (ipc/remote_protocol.rs) — chat message with role, text, and tool summaries
-- `ToolSummary` (ipc/remote_protocol.rs) — compact tool use info (name, summary, detail for modal)
+- `SessionView` (serve/web_types.rs) — serializable session data for the web API (name, status, cpu, ports, pane, skipped, messages)
+- `ProcessView` (serve/web_types.rs) — minimal process info for the web dashboard
+- `ConversationMessage` (serve/web_types.rs) — chat message with role, text, and tool summaries
+- `ToolSummary` (serve/web_types.rs) — compact tool use info (name, summary, detail for modal)
 
 ## Data Directory
 
