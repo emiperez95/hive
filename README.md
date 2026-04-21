@@ -1,23 +1,26 @@
 # hive
 
-Interactive Claude Code session dashboard for tmux.
+[![CI](https://github.com/emiperez95/hive/actions/workflows/ci.yml/badge.svg)](https://github.com/emiperez95/hive/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-Monitor and manage multiple parallel Claude Code sessions from a single TUI. See which sessions need permission, approve them with a keypress, and switch between sessions instantly.
+Interactive [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) session dashboard for tmux.
+
+Monitor and manage multiple parallel Claude Code sessions from a single TUI. See which sessions need permission, approve them with a keypress, and switch between sessions instantly. A hive "session" is just a tmux session — hive tracks Claude's status inside each one via Claude Code hooks and mirrors it in the dashboard.
 
 ## Features
 
-- **Session overview** — all tmux sessions with Claude activity, CPU/memory usage
+- **Session overview** — every tmux session running Claude, with CPU/memory and real-time status
 - **Permission approval** — approve Bash, Write, Edit permissions with single keypresses
 - **Detail view** — per-session todos, listening ports, Chrome tab matching, process tree
 - **Search** — fuzzy search across active sessions and registered projects
-- **Project registry** — manage projects with emoji identifiers, startup commands, and config
+- **Project registry** — emoji identifiers, startup commands, per-project auth profiles
 - **Worktree management** — create/delete git worktrees with tmux sessions and lifecycle hooks
 - **Mobile dashboard** — `hive web` exposes a phone-friendly UI with conversation view, TTS playback, and remote session control
 - **iTerm2 pane spread** — split into N panes, each auto-attaching to a session
-- **Notifications** — native macOS/Linux notifications when sessions need attention
-- **Hook-based status** — real-time Claude status via Claude Code hooks
-- **Port detection** — discovers listening TCP ports per session (macOS via libproc)
-- **Chrome integration** — matches localhost Chrome tabs to session ports (macOS)
+- **Notifications** — native macOS notifications when sessions need attention
+- **Hook-based status** — Claude Code hooks push status into hive in real time
+- **Port + Chrome matching** — discovers each session's listening TCP ports and maps them to Chrome tabs
 
 ## Prerequisites
 
@@ -67,14 +70,19 @@ hive setup
 
 This will:
 - Add hook entries to `~/.claude/settings.json` (preserves existing hooks)
-- Optionally bind `prefix+s` (list view) and `prefix+d` (detail view) in tmux
+- Install the `janus-wt-portal` agent to `~/.claude/agents/`
+- Install the `hive/create-project` slash command to `~/.claude/commands/`
+- Optionally bind `prefix+s` (list view), `prefix+d` (detail view), `Ctrl+n`/`Ctrl+p` (cycle) in tmux
 
-Running `hive setup` again shows what's already installed and only offers to add what's missing.
+> Tmux keybindings are applied to the **currently running tmux server only** — they don't persist across reboots. `hive setup` prints the `bind-key …` snippets you should paste into `~/.tmux.conf` for persistence.
 
-To remove everything:
+Running `hive setup` again shows what's already installed and only offers to add what's missing. Pass `--yes` (`-y`) to auto-accept every prompt — useful for scripted installs.
+
+To remove everything (hooks, agent, command, tmux bindings):
 
 ```bash
-hive uninstall
+hive uninstall            # interactive
+hive uninstall --yes      # non-interactive
 ```
 
 ## Quick start
@@ -131,7 +139,7 @@ hive collapse           # close all panes except the current one
 hive project add <key>  # add a project (supports --emoji, --path, --startup, etc.)
 hive project remove <key>
 hive project list
-hive project import     # import from sesh.toml
+hive project import     # import from sesh.toml (only relevant if you already use `sesh`)
 ```
 
 ### Worktrees
@@ -156,10 +164,15 @@ hive todo clear [--session <name>]
 
 ```bash
 hive setup              # register hooks, agent, and tmux keybindings
-hive update             # update to latest version from GitHub + re-run setup
+hive setup --yes        # non-interactive: auto-accept all prompts
+hive update             # update to latest prebuilt release + re-run setup
 hive uninstall          # remove hooks and keybindings
+hive uninstall --yes    # non-interactive uninstall
 hive hook <event>       # process hook event from stdin (used by Claude Code hooks)
+hive --debug <command>  # enable verbose logging to ~/.cache/hive/debug.log
 ```
+
+Set `HIVE_NO_NOTIFY=1` to suppress desktop notifications (useful for CI / scripts).
 
 ### Tmux Keybindings
 
@@ -233,37 +246,15 @@ TUI refreshes every 1s
 
 No background daemon. No async runtime. No Unix sockets. Just a state file.
 
-## Platform Support
+## Advanced
 
-| Feature | macOS | Linux |
-|---|---|---|
-| TUI dashboard | yes | yes |
-| Hook status | yes | yes |
-| Notifications | osascript/terminal-notifier | notify-send |
-| Port detection | libproc | stub (empty) |
-| Chrome tabs | AppleScript | stub (empty) |
-| iTerm2 panes | AppleScript | stub (empty) |
+- **[Auth profiles](./docs/claude-auth-profiles.md)** — assign each project a separate Claude identity via `CLAUDE_CONFIG_DIR`. Useful for keeping work + personal accounts separate.
+- **Worktree lifecycle hooks** — project-specific shell scripts (`pre-create`, `post-worktree`, `post-copy`, `post-setup`, `pre-delete`, `post-delete`) run at defined points of `hive wt new` / `hive wt delete`. See [CLAUDE.md](./CLAUDE.md) for the contract + env vars.
+- **Web dashboard internals** — endpoints, HLS streaming, message extraction, dev mode: see [CLAUDE.md](./CLAUDE.md#web-dashboard-hive-web).
 
-## Adding Terminal Support
+## Platform support
 
-The iTerm2 pane spread/collapse feature lives in `src/common/iterm.rs` and is guarded behind `#[cfg(target_os = "macos")]`. To add support for another terminal emulator:
-
-1. **Create a new module** (e.g., `src/common/wezterm.rs` or `src/common/kitty.rs`) implementing:
-   - `get_pane_count() -> usize` — return the number of panes/splits in the current tab/window
-   - `spread_panes(n: usize) -> bool` — open `n` new panes, each running `hive start` with the current PATH
-   - `collapse_panes() -> bool` — close all panes except the current one
-
-2. **Register the module** in `src/common/mod.rs`.
-
-3. **Wire it up** in `src/main.rs`: `run_spread()` and `run_collapse()` currently call `crate::common::iterm::*`. Add detection logic or a config flag to select the right backend. The TUI key handler for `L` in `run_tui()` uses `get_iterm_pane_count()` to decide between spread and collapse.
-
-Each terminal has different automation APIs:
-- **iTerm2**: AppleScript (`tell application "iTerm2"`)
-- **WezTerm**: CLI (`wezterm cli split-pane`) or Lua scripting
-- **Kitty**: Remote control protocol (`kitten @ launch`, `kitten @ close-window`)
-- **Alacritty/tmux-only**: No terminal splits — could fall back to tmux splits instead
-
-Key consideration: new panes need the full PATH to find tmux. iTerm2 panes get minimal environment, so hive passes `env PATH='...'` explicitly. Other terminals may or may not have this issue.
+v0.1.0 is **macOS-only** (Apple Silicon and Intel). Linux is deferred — the signature integrations (port detection, Chrome tab matching, iTerm pane spread) all rely on macOS-specific APIs.
 
 ## License
 
