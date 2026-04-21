@@ -55,9 +55,17 @@ pub enum Command {
         event: String,
     },
     /// Register hooks in ~/.claude/settings.json and tmux keybinding
-    Setup,
+    Setup {
+        /// Auto-accept all prompts (for scripted installs)
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Remove hive hooks from ~/.claude/settings.json and tmux keybinding
-    Uninstall,
+    Uninstall {
+        /// Auto-accept all prompts
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Cycle to next tmux session (skipping skipped sessions)
     CycleNext,
     /// Cycle to previous tmux session (skipping skipped sessions)

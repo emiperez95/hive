@@ -1,6 +1,6 @@
 //! Setup and uninstall commands.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 /// Bundled janus-wt-portal agent definition, embedded at compile time.
 const JANUS_AGENT_CONTENT: &str = include_str!("../../.claude/agents/janus-wt-portal.md");
@@ -20,8 +20,65 @@ pub(crate) fn is_hive_hook_command(cmd: &str) -> bool {
     is_hive_event && (cmd.contains("/hive hook ") || cmd.starts_with("hive hook "))
 }
 
+/// Read a Y/n answer from stdin, or auto-accept when `yes` is set.
+/// The caller is expected to have already printed the question + `[Y/n] `.
+fn read_yn(yes: bool) -> Result<bool> {
+    if yes {
+        println!("[auto-yes]");
+        return Ok(true);
+    }
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+    Ok(input.is_empty() || input == "y" || input == "yes")
+}
+
+/// Parse ~/.claude/settings.json as JSON. If the file is malformed, move
+/// it aside to `.bak.malformed.<timestamp>` and return a user-facing error
+/// that points at the backup — never silently corrupts user state.
+fn load_settings(path: &std::path::Path) -> Result<serde_json::Value> {
+    use std::fs;
+
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let content = fs::read_to_string(path)?;
+    match serde_json::from_str(&content) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let backup = path.with_extension(format!("json.bak.malformed.{}", ts));
+            fs::rename(path, &backup)?;
+            bail!(
+                "settings.json was malformed ({}). Backed up to {}. Re-run `hive setup` to write a clean one.",
+                e,
+                backup.display()
+            );
+        }
+    }
+}
+
+/// Write settings.json atomically (write `.tmp`, rename). Creates a
+/// sibling `.bak` of the prior contents if the file existed.
+fn save_settings(path: &std::path::Path, settings: &serde_json::Value) -> Result<()> {
+    use std::fs;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        fs::copy(path, &backup)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let content = serde_json::to_string_pretty(settings)?;
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Setup hooks in ~/.claude/settings.json
-pub fn run_setup() -> Result<()> {
+pub fn run_setup(yes: bool) -> Result<()> {
     use std::fs;
 
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
@@ -37,13 +94,8 @@ pub fn run_setup() -> Result<()> {
 
     let binary_str = binary_path.to_string_lossy();
 
-    // Read existing settings
-    let settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::json!({})
-    };
+    // Read existing settings (malformed files are safely moved aside).
+    let settings = load_settings(&settings_path)?;
 
     let hook_events = [
         "Stop",
@@ -229,10 +281,7 @@ pub fn run_setup() -> Result<()> {
         print!("[Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if !input.is_empty() && input != "y" && input != "yes" {
+        if !read_yn(yes)? {
             println!("Skipped hooks.");
         } else {
             let mut settings = settings.clone();
@@ -321,13 +370,7 @@ pub fn run_setup() -> Result<()> {
                 }
             }
 
-            // Ensure .claude directory exists
-            if let Some(parent) = settings_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let content = serde_json::to_string_pretty(&settings)?;
-            fs::write(&settings_path, content)?;
+            save_settings(&settings_path, &settings)?;
 
             println!("Hooks installed. Restart Claude Code sessions for hooks to take effect.");
         }
@@ -362,10 +405,7 @@ pub fn run_setup() -> Result<()> {
         print!("[Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if input.is_empty() || input == "y" || input == "yes" {
+        if read_yn(yes)? {
             let mut registered = Vec::new();
             let mut failed = Vec::new();
 
@@ -420,14 +460,10 @@ pub fn run_setup() -> Result<()> {
     // Install janus-wt-portal agent
     if agent_needs_install {
         println!();
-        println!("Install janus-wt-portal agent to ~/.claude/agents/?");
-        print!("[Y/n] ");
+        print!("Install janus-wt-portal agent to ~/.claude/agents/? [Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if input.is_empty() || input == "y" || input == "yes" {
+        if read_yn(yes)? {
             if let Some(parent) = agent_dest.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -441,14 +477,10 @@ pub fn run_setup() -> Result<()> {
     // Install create-project command
     if cmd_needs_install {
         println!();
-        println!("Install create-project command to ~/.claude/commands/hive/?");
-        print!("[Y/n] ");
+        print!("Install create-project command to ~/.claude/commands/hive/? [Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if input.is_empty() || input == "y" || input == "yes" {
+        if read_yn(yes)? {
             if let Some(parent) = cmd_dest.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -468,128 +500,120 @@ pub fn run_setup() -> Result<()> {
     Ok(())
 }
 
-/// Remove hive hooks from ~/.claude/settings.json
-pub fn run_uninstall() -> Result<()> {
+/// Remove hive hooks from ~/.claude/settings.json and related files.
+pub fn run_uninstall(yes: bool) -> Result<()> {
     use std::fs;
 
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
     let settings_path = home.join(".claude").join("settings.json");
 
+    // --- Hooks in settings.json ---------------------------------------
+    let mut hooks_action = "none"; // "removed" | "none-found" | "file-missing"
     if !settings_path.exists() {
+        hooks_action = "file-missing";
         println!(
-            "No settings file found at {:?}, nothing to do.",
+            "No settings file found at {:?}, skipping hook removal.",
             settings_path
         );
-        return Ok(());
-    }
+    } else {
+        let mut settings = load_settings(&settings_path)?;
 
-    let mut settings: serde_json::Value = {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    };
-
-    let hooks_map = match settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        Some(map) => map,
-        None => {
-            println!("No hooks found in settings, nothing to do.");
-            return Ok(());
-        }
-    };
-
-    // Find which events have hive hooks
-    let mut found_events: Vec<String> = Vec::new();
-    for (event, groups) in hooks_map.iter() {
-        if let Some(arr) = groups.as_array() {
-            for group in arr {
-                if let Some(hooks) = group.get("hooks").and_then(|h| h.as_array()) {
-                    for hook in hooks {
-                        if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                            if is_hive_hook_command(cmd) {
-                                found_events.push(event.clone());
-                                break;
+        let had_hive_hooks = {
+            let mut found: Vec<String> = Vec::new();
+            if let Some(map) = settings.get("hooks").and_then(|h| h.as_object()) {
+                for (event, groups) in map.iter() {
+                    if let Some(arr) = groups.as_array() {
+                        for group in arr {
+                            if let Some(hooks) = group.get("hooks").and_then(|h| h.as_array()) {
+                                for hook in hooks {
+                                    if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
+                                    {
+                                        if is_hive_hook_command(cmd) {
+                                            found.push(event.clone());
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-    }
+            found.sort();
+            found.dedup();
+            found
+        };
 
-    if found_events.is_empty() {
-        println!("No hive hooks found in settings, nothing to do.");
-        return Ok(());
-    }
-
-    found_events.sort();
-    found_events.dedup();
-
-    println!("Found hive hooks for the following events:");
-    for event in &found_events {
-        println!("  {}", event);
-    }
-    println!();
-    println!("Other hooks will be preserved.");
-    print!("Remove hive hooks? [Y/n] ");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
-    if !input.is_empty() && input != "y" && input != "yes" {
-        println!("Aborted.");
-        return Ok(());
-    }
-
-    // Remove hive hooks from all groups
-    for (_event, groups) in hooks_map.iter_mut() {
-        if let Some(arr) = groups.as_array_mut() {
-            for group in arr.iter_mut() {
-                if let Some(hooks_arr) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-                    hooks_arr.retain(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|c| !is_hive_hook_command(c))
-                            .unwrap_or(true)
-                    });
-                }
+        if had_hive_hooks.is_empty() {
+            hooks_action = "none-found";
+            println!("No hive hooks found in settings.json.");
+        } else {
+            println!("Found hive hooks for the following events:");
+            for event in &had_hive_hooks {
+                println!("  {}", event);
             }
-            // Remove empty groups
-            arr.retain(|group| {
-                group
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(true)
-            });
+            println!();
+            println!("Other hooks will be preserved.");
+            print!("Remove hive hooks? [Y/n] ");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            if read_yn(yes)? {
+                let hooks_map = settings
+                    .get_mut("hooks")
+                    .and_then(|h| h.as_object_mut())
+                    .expect("checked above");
+                for (_event, groups) in hooks_map.iter_mut() {
+                    if let Some(arr) = groups.as_array_mut() {
+                        for group in arr.iter_mut() {
+                            if let Some(hooks_arr) =
+                                group.get_mut("hooks").and_then(|h| h.as_array_mut())
+                            {
+                                hooks_arr.retain(|h| {
+                                    h.get("command")
+                                        .and_then(|c| c.as_str())
+                                        .map(|c| !is_hive_hook_command(c))
+                                        .unwrap_or(true)
+                                });
+                            }
+                        }
+                        arr.retain(|group| {
+                            group
+                                .get("hooks")
+                                .and_then(|h| h.as_array())
+                                .map(|a| !a.is_empty())
+                                .unwrap_or(true)
+                        });
+                    }
+                }
+                hooks_map.retain(|_, groups| {
+                    groups.as_array().map(|a| !a.is_empty()).unwrap_or(true)
+                });
+
+                save_settings(&settings_path, &settings)?;
+                hooks_action = "removed";
+                println!("Hive hooks removed from {:?}", settings_path);
+            } else {
+                println!("Skipped hook removal.");
+            }
         }
     }
 
-    // Remove event keys that now have empty arrays
-    hooks_map.retain(|_, groups| groups.as_array().map(|a| !a.is_empty()).unwrap_or(true));
-
-    let content = serde_json::to_string_pretty(&settings)?;
-    fs::write(&settings_path, content)?;
-
-    println!("Hive hooks removed from {:?}", settings_path);
-
-    // Offer to unbind tmux keys
+    // --- Tmux keybindings -------------------------------------------
     println!();
-    println!("Unbind tmux keybindings (prefix+s, prefix+d, Ctrl+n, Ctrl+p)?");
-    print!("[Y/n] ");
+    print!("Unbind tmux keybindings (prefix+s, prefix+d, Ctrl+n, Ctrl+p)? [Y/n] ");
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
-    let mut input2 = String::new();
-    std::io::stdin().read_line(&mut input2)?;
-    let input2 = input2.trim().to_lowercase();
-    if input2.is_empty() || input2 == "y" || input2 == "yes" {
+    if read_yn(yes)? {
         for key in &["s", "d"] {
             let _ = std::process::Command::new("tmux")
                 .args(["unbind-key", key])
+                .stderr(std::process::Stdio::null())
                 .status();
         }
         for key in &["C-n", "C-p"] {
             let _ = std::process::Command::new("tmux")
                 .args(["unbind-key", "-n", key])
+                .stderr(std::process::Stdio::null())
                 .status();
         }
         println!("Tmux keybindings unbound (current session only).");
@@ -598,7 +622,7 @@ pub fn run_uninstall() -> Result<()> {
         println!("Skipped tmux keybinding removal.");
     }
 
-    // Remove janus-wt-portal agent
+    // --- janus-wt-portal agent --------------------------------------
     let agent_path = home
         .join(".claude")
         .join("agents")
@@ -608,16 +632,60 @@ pub fn run_uninstall() -> Result<()> {
         print!("Remove janus-wt-portal agent? [Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        let mut input3 = String::new();
-        std::io::stdin().read_line(&mut input3)?;
-        let input3 = input3.trim().to_lowercase();
-        if input3.is_empty() || input3 == "y" || input3 == "yes" {
+        if read_yn(yes)? {
             fs::remove_file(&agent_path)?;
             println!("Removed {:?}", agent_path);
+            rmdir_if_empty(agent_path.parent());
         } else {
             println!("Skipped agent removal.");
         }
     }
 
+    // --- create-project command -------------------------------------
+    let cmd_path = home
+        .join(".claude")
+        .join("commands")
+        .join("hive")
+        .join("create-project.md");
+    if cmd_path.exists() {
+        println!();
+        print!("Remove create-project command? [Y/n] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        if read_yn(yes)? {
+            fs::remove_file(&cmd_path)?;
+            println!("Removed {:?}", cmd_path);
+            rmdir_if_empty(cmd_path.parent());
+        } else {
+            println!("Skipped create-project command removal.");
+        }
+    }
+
+    // --- Completion footer: what was left behind --------------------
+    println!();
+    println!("Uninstall complete.");
+    let hive_dir = home.join(".hive");
+    if hive_dir.exists() {
+        println!("Your hive data is still at {}", hive_dir.display());
+        println!("  Remove it with: rm -rf {}", hive_dir.display());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        println!("The hive binary is at {}", exe.display());
+        println!("  Remove it with: rm {}", exe.display());
+    }
+    let _ = hooks_action; // marker for future telemetry; kept to avoid unused-variable cleanup churn
+
     Ok(())
+}
+
+/// Remove a directory if it is empty. Ignores all errors (best-effort cleanup).
+fn rmdir_if_empty(path: Option<&std::path::Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut entries) = std::fs::read_dir(path) {
+        if entries.next().is_none() {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
 }

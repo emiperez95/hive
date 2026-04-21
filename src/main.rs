@@ -30,9 +30,9 @@ fn main() -> Result<()> {
 
     match args.command {
         Some(Command::Hook { event }) => cli::hook::run_hook(&event),
-        Some(Command::Setup) => cli::setup::run_setup(),
+        Some(Command::Setup { yes }) => cli::setup::run_setup(yes),
         Some(Command::Update) => cli::update::run_update(),
-        Some(Command::Uninstall) => cli::setup::run_uninstall(),
+        Some(Command::Uninstall { yes }) => cli::setup::run_uninstall(yes),
         Some(Command::CycleNext) => cli::session::run_cycle(true),
         Some(Command::CyclePrev) => cli::session::run_cycle(false),
         Some(Command::Connect { key }) => cli::session::run_connect(&key),

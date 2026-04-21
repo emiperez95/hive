@@ -2,8 +2,16 @@
 
 use std::process::Command;
 
-/// Send a notification when a session needs attention
+/// Send a notification when a session needs attention.
+///
+/// Respects `HIVE_NO_NOTIFY=1` — when set (in CI, test harnesses, or
+/// scripted invocations), all notification paths (native, tmux) are
+/// short-circuited so hook calls don't produce desktop popups.
 pub fn notify_needs_attention(session_name: &str, status: &str) {
+    if std::env::var("HIVE_NO_NOTIFY").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return;
+    }
+
     let title = "hive";
     let message = format!("{}: {}", session_name, status);
 
