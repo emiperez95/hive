@@ -20,6 +20,40 @@ pub(crate) fn is_hive_hook_command(cmd: &str) -> bool {
     is_hive_event && (cmd.contains("/hive hook ") || cmd.starts_with("hive hook "))
 }
 
+/// Check whether `cmd` is available on PATH.
+fn has_command(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Warn about missing external dependencies. Setup is safe to run
+/// without them (it's idempotent; the user can install and re-run),
+/// but we want them to see the problem now rather than discover it
+/// later when tmux keybindings silently no-op or no hooks ever fire.
+fn warn_missing_deps() {
+    let tmux_ok = has_command("tmux");
+    let claude_ok = has_command("claude");
+    if tmux_ok && claude_ok {
+        return;
+    }
+    println!("Warning: some required tools are missing from PATH.");
+    if !tmux_ok {
+        println!("  tmux not found — install with `brew install tmux` (hive uses tmux for sessions).");
+    }
+    if !claude_ok {
+        println!(
+            "  claude CLI not found — see https://docs.claude.com/en/docs/claude-code/overview"
+        );
+    }
+    println!("Setup will continue, but these need to be installed before hive works end-to-end.");
+    println!();
+}
+
 /// Read a Y/n answer from stdin, or auto-accept when `yes` is set.
 /// The caller is expected to have already printed the question + `[Y/n] `.
 fn read_yn(yes: bool) -> Result<bool> {
@@ -80,6 +114,8 @@ fn save_settings(path: &std::path::Path, settings: &serde_json::Value) -> Result
 /// Setup hooks in ~/.claude/settings.json
 pub fn run_setup(yes: bool) -> Result<()> {
     use std::fs;
+
+    warn_missing_deps();
 
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
     let settings_path = home.join(".claude").join("settings.json");
