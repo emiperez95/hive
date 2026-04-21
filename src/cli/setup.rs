@@ -378,7 +378,14 @@ pub fn run_setup() -> Result<()> {
                 } else {
                     vec!["bind-key", key, cmd]
                 };
-                match std::process::Command::new("tmux").args(&args).status() {
+                // stderr is suppressed because tmux prints "no server
+                // running on ..." once per invocation; we surface a
+                // single friendly line from the `failed` branch below.
+                match std::process::Command::new("tmux")
+                    .args(&args)
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
                     Ok(s) if s.success() => registered.push(*key),
                     _ => failed.push(*key),
                 }
@@ -386,20 +393,24 @@ pub fn run_setup() -> Result<()> {
 
             if !registered.is_empty() {
                 println!("Tmux keybindings registered (current session only).");
+            }
+            if !failed.is_empty() {
+                println!("No running tmux server — keybindings not applied yet.");
+            }
+
+            // Always print the tmux.conf snippets for every non-bound
+            // key, so the user can paste them into ~/.tmux.conf to
+            // persist (or start tmux and re-run `hive setup`).
+            let unbound: Vec<_> = bindings.iter().filter(|(_, _, _, b)| !*b).collect();
+            if !unbound.is_empty() {
                 println!("Add to ~/.tmux.conf to persist:");
-                for (table, key, cmd, bound) in &bindings {
-                    if *bound || !registered.contains(key) {
-                        continue;
-                    }
+                for (table, key, cmd, _) in &unbound {
                     if *table == "root" {
                         println!("  bind-key -n {} {}", key, cmd);
                     } else {
                         println!("  bind-key {} {}", key, cmd);
                     }
                 }
-            }
-            if !failed.is_empty() {
-                println!("Could not register some keybindings (tmux not running?).");
             }
         } else {
             println!("Skipped tmux keybindings.");
@@ -447,6 +458,12 @@ pub fn run_setup() -> Result<()> {
             println!("Skipped command installation.");
         }
     }
+
+    println!();
+    println!("Setup complete. Try:");
+    println!("  hive project add <key> --path <dir>   # register your first project");
+    println!("  hive connect <key>                    # launch a tmux session");
+    println!("  hive                                  # open the dashboard");
 
     Ok(())
 }

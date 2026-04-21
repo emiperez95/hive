@@ -7,7 +7,7 @@ mod ipc;
 mod serve;
 mod tui;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,6 +16,13 @@ use crate::cli::{Args, Command, ProjectCommand};
 use crate::common::debug::init_debug;
 use crate::common::tmux::resolve_tmux_path;
 use crate::tui::event_loop::{handle_post_action, run_tui};
+
+/// Initialize ratatui. Returns a clean anyhow error instead of panicking
+/// when stdout isn't a TTY (e.g. piped or redirected invocations).
+fn init_terminal() -> Result<ratatui::DefaultTerminal> {
+    ratatui::try_init()
+        .context("hive: this command needs a terminal. Run it from an interactive shell.")
+}
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
@@ -61,7 +68,7 @@ fn main() -> Result<()> {
             })
             .expect("Error setting Ctrl-C handler");
 
-            let mut terminal = ratatui::init();
+            let mut terminal = init_terminal()?;
             let action = run_tui(&mut terminal, &args, running);
             ratatui::restore();
             handle_post_action(action?)
@@ -107,7 +114,7 @@ fn main() -> Result<()> {
             })
             .expect("Error setting Ctrl-C handler");
 
-            let mut terminal = ratatui::init();
+            let mut terminal = init_terminal()?;
             let action = run_tui(&mut terminal, &args, running);
             ratatui::restore();
             // Run spread/collapse after terminal is restored (popup closed)

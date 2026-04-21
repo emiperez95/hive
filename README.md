@@ -12,6 +12,7 @@ Monitor and manage multiple parallel Claude Code sessions from a single TUI. See
 - **Search** — fuzzy search across active sessions and registered projects
 - **Project registry** — manage projects with emoji identifiers, startup commands, and config
 - **Worktree management** — create/delete git worktrees with tmux sessions and lifecycle hooks
+- **Mobile dashboard** — `hive web` exposes a phone-friendly UI with conversation view, TTS playback, and remote session control
 - **iTerm2 pane spread** — split into N panes, each auto-attaching to a session
 - **Notifications** — native macOS/Linux notifications when sessions need attention
 - **Hook-based status** — real-time Claude status via Claude Code hooks
@@ -200,6 +201,21 @@ hive hook <event>       # process hook event from stdin (used by Claude Code hoo
 | `M` | Toggle mute |
 | `S` | Toggle skip from cycling |
 | `Esc` / `Q` | Quit |
+
+## Mobile dashboard (`hive web`)
+
+Start a local HTTP server that exposes hive to your phone over your LAN:
+
+```bash
+hive web                            # default port 8375
+hive web --port 9000                # custom port
+hive web --tts-host <url>           # optional: read messages aloud via TTSQwen
+hive web --dev                      # serve web.html from disk for live editing
+```
+
+The dashboard is mobile-first: tap to switch sessions, swipe a session row to skip, tap the header to see cwd / ports / flags, send text back to Claude, and approve or reject pending permission prompts from the phone. Conversations render with markdown and tool-use cards (Bash, Write, Edit, Read, Grep, Agent) you can expand.
+
+See [CLAUDE.md](./CLAUDE.md) for the full feature list and API reference.
 
 ## Architecture
 

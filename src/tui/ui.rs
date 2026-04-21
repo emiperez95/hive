@@ -309,6 +309,24 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut shown_non_claude_divider = false;
     let mut shown_skipped_divider = false;
 
+    if app.session_infos.is_empty() {
+        let dim = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        lines.push(Line::from(Span::styled("  No sessions yet.", dim)));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  Press  N   to register a project,",
+            dim,
+        )));
+        lines.push(Line::from(Span::styled(
+            "  or run:  hive project add <key> --path <dir>",
+            dim,
+        )));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
     while idx < app.session_infos.len() {
         let session_info = &app.session_infos[idx];
         let is_skipped = app.is_skipped(&session_info.name);
