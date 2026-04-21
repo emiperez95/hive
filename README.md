@@ -18,15 +18,43 @@ Monitor and manage multiple parallel Claude Code sessions from a single TUI. See
 - **Port detection** — discovers listening TCP ports per session (macOS via libproc)
 - **Chrome integration** — matches localhost Chrome tabs to session ports (macOS)
 
+## Prerequisites
+
+- **macOS** — v0.1.0 is macOS-only (Apple Silicon or Intel). Linux is deferred.
+- **[tmux](https://github.com/tmux/tmux)** on your `PATH`.
+- **[Claude Code](https://docs.claude.com/en/docs/claude-code/overview)** CLI on your `PATH`.
+- `curl` and `tar` (installed by default on macOS) for the prebuilt install path.
+- Optional: iTerm2 for pane spread/collapse; Chrome for tab matching.
+
 ## Install
 
-```bash
-# Build and install
-cargo install --path . --root ~/.local
+### Prebuilt binary (recommended)
 
-# Or use the install script
-./install.sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/emiperez95/hive/main/install.sh | bash
 ```
+
+This downloads the latest mac tarball from [GitHub Releases](https://github.com/emiperez95/hive/releases/latest) and drops `hive` into `~/.local/bin/`. If that's not on your `PATH`, the script tells you what to add to your shell rc.
+
+To pin a version: `./install.sh v0.1.0`.
+
+### Build from source (contributors)
+
+Needs a stable Rust toolchain (`rustup` from [rustup.rs](https://rustup.rs)).
+
+```bash
+git clone https://github.com/emiperez95/hive
+cd hive
+cargo install --path . --root ~/.local
+```
+
+### Update
+
+```bash
+hive update
+```
+
+Downloads the latest release tarball and replaces the running binary in place, then re-runs `hive setup` to keep hook paths current.
 
 ## Setup
 
@@ -47,6 +75,26 @@ To remove everything:
 ```bash
 hive uninstall
 ```
+
+## Quick start
+
+After `hive setup`, register your first project and watch it light up:
+
+```bash
+# 1. Register a project — emoji + path
+hive project add myproj --emoji 🚀 --path ~/code/myproj
+
+# 2. Create the tmux session and attach
+hive connect myproj
+
+# 3. Inside the tmux session, start Claude
+claude
+
+# 4. In another pane (or tmux window), open the dashboard
+hive
+```
+
+As Claude runs tools, its status in the dashboard flips between Working / Waiting / Needs Permission in real time. Press `y` to approve a pending permission.
 
 ## Commands
 
