@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions
+    url: https://github.com/emiperez95/hive/discussions
+    about: Questions, help, and ideas that aren't quite bugs or features.

@@ -2,9 +2,25 @@
 name = "hive"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "Interactive Claude Code session dashboard for tmux"
+authors = ["Emiliano Perez <emiliano.perez.mauri@gmail.com>"]
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/emiperez95/hive"
+homepage = "https://github.com/emiperez95/hive"
+documentation = "https://github.com/emiperez95/hive#readme"
+keywords = ["claude", "tmux", "tui", "dashboard", "claude-code"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "target",
+    ".github",
+    ".githooks",
+    "docs/publish-plan.md",
+    "docs/publish-plan-a5-findings.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+]
 
 [[bin]]
 name = "hive"

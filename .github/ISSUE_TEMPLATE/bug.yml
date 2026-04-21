@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in hive didn't behave as expected.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal commands / actions that trigger the issue.
+      placeholder: |
+        1. hive setup
+        2. hive project add demo --path ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: hive-version
+    attributes:
+      label: hive version
+      description: Output of `hive --version`.
+      placeholder: "hive 0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: macOS version + architecture (Apple Silicon / Intel).
+      placeholder: "macOS 14.5 (arm64)"
+    validations:
+      required: true
+  - type: input
+    id: tmux-version
+    attributes:
+      label: tmux version
+      description: Output of `tmux -V`.
+      placeholder: "tmux 3.4"
+  - type: textarea
+    id: debug-log
+    attributes:
+      label: Relevant log output
+      description: Run with `hive --debug` and attach `~/.cache/hive/debug.log` if useful.
+      render: shell
