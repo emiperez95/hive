@@ -1,21 +1,17 @@
-//! `hive serve --stdio` implementation.
+//! Session data gathering for the web dashboard.
 //!
-//! Runs a loop that gathers local session data and writes JSON lines to stdout.
-//! Reads client commands from stdin and dispatches them (e.g., send-keys).
+//! Provides `gather_session_data()` — a TUI-state-free version of `App::refresh()`
+//! that collects local tmux/sysinfo/hook data into serializable structs for the
+//! web API.
 
 use crate::common::persistence::{load_session_todos, load_skipped_sessions};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
-use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions, send_key_to_pane};
+use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::{HookState, SessionStatus};
-use crate::serve::protocol::{ClientMessage, RemoteProcessInfo, RemoteSessionData, ServerMessage};
+use crate::serve::protocol::{RemoteProcessInfo, RemoteSessionData};
 
-use anyhow::Result;
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use sysinfo::System;
 
 /// Gather session data from local tmux + sysinfo + hook state.
@@ -160,7 +156,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<R
     results
 }
 
-/// Convert TUI ClaudeStatus back to SessionStatus for wire protocol
+/// Convert a TUI `ClaudeStatus` (parsed from JSONL) back to wire `SessionStatus`.
 fn convert_claude_to_session_status(
     status: &crate::common::types::ClaudeStatus,
 ) -> SessionStatus {
@@ -178,109 +174,4 @@ fn convert_claude_to_session_status(
         ClaudeStatus::QuestionAsked => SessionStatus::QuestionAsked,
         ClaudeStatus::Unknown => SessionStatus::Working,
     }
-}
-
-/// Handle a client command received on stdin
-fn handle_client_message(msg: ClientMessage) {
-    match msg {
-        ClientMessage::SendKeys {
-            session,
-            window,
-            pane,
-            keys,
-        } => {
-            for key in &keys {
-                send_key_to_pane(&session, &window, &pane, key);
-            }
-        }
-    }
-}
-
-/// Run the stdio server: gather sessions, write JSON lines to stdout, read commands from stdin.
-pub fn run_stdio_server() -> Result<()> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    // Spawn stdin reader thread
-    let shutdown_stdin = shutdown.clone();
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ClientMessage>();
-
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let reader = stdin.lock();
-        for line in reader.lines() {
-            match line {
-                Ok(line) if !line.trim().is_empty() => {
-                    match serde_json::from_str::<ClientMessage>(&line) {
-                        Ok(msg) => {
-                            if cmd_tx.send(msg).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("hive serve: invalid message: {}", e);
-                        }
-                    }
-                }
-                Ok(_) => {} // empty line, ignore
-                Err(_) => {
-                    // stdin EOF or error — SSH died
-                    shutdown_stdin.store(true, Ordering::SeqCst);
-                    break;
-                }
-            }
-        }
-    });
-
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    let mut last_json = String::new();
-    let mut last_send = Instant::now();
-    let heartbeat_interval = Duration::from_secs(3);
-    let tick_interval = Duration::from_secs(1);
-
-    while !shutdown.load(Ordering::SeqCst) {
-        // Process any pending commands
-        while let Ok(msg) = cmd_rx.try_recv() {
-            handle_client_message(msg);
-        }
-
-        // Gather current state
-        sys.refresh_all();
-        let hook_state = HookState::load();
-        let sessions = gather_session_data(&sys, &hook_state);
-
-        let state_msg = ServerMessage::State { sessions };
-        let json = serde_json::to_string(&state_msg).unwrap_or_default();
-
-        let now = Instant::now();
-
-        if json != last_json {
-            // State changed — send immediately
-            if writeln!(out, "{}", json).is_err() {
-                break; // stdout closed
-            }
-            if out.flush().is_err() {
-                break;
-            }
-            last_json = json;
-            last_send = now;
-        } else if now.duration_since(last_send) >= heartbeat_interval {
-            // No change for 3s — send heartbeat
-            let hb = serde_json::to_string(&ServerMessage::Heartbeat).unwrap_or_default();
-            if writeln!(out, "{}", hb).is_err() {
-                break;
-            }
-            if out.flush().is_err() {
-                break;
-            }
-            last_send = now;
-        }
-
-        std::thread::sleep(tick_interval);
-    }
-
-    Ok(())
 }

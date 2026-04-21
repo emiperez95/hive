@@ -41,7 +41,37 @@ pub fn run_cycle(forward: bool) -> Result<()> {
                 filtered[(idx + filtered.len() - 1) % filtered.len()]
             }
         }
-        None => filtered[0],
+        None => {
+            // Current session is not in `filtered` (e.g. it was just skipped).
+            // Find its position in the full session list and pick the nearest
+            // non-skipped neighbor in the requested direction.
+            let full_idx = current
+                .as_ref()
+                .and_then(|c| all_sessions.iter().position(|name| name == c));
+            match full_idx {
+                Some(idx) => {
+                    let n = all_sessions.len();
+                    let mut target = None;
+                    for step in 1..=n {
+                        let probe = if forward {
+                            (idx + step) % n
+                        } else {
+                            (idx + n - step) % n
+                        };
+                        let name = &all_sessions[probe];
+                        if filtered.contains(&name) {
+                            target = Some(name);
+                            break;
+                        }
+                    }
+                    match target {
+                        Some(t) => t,
+                        None => return Ok(()),
+                    }
+                }
+                None => filtered[0],
+            }
+        }
     };
 
     switch_to_session(target);

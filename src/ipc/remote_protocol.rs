@@ -1,7 +1,8 @@
-//! Wire protocol types for remote session communication.
+//! Serializable session data types used by the web dashboard JSON API.
 //!
-//! Server writes JSON lines to stdout, client writes JSON lines to stdin.
-//! Transport is SSH stdio — one JSON object per line, newline-delimited.
+//! `RemoteSessionData` and friends are produced by `serve::server::gather_session_data()`
+//! and serialized to JSON for the web frontend. The "Remote" prefix is historical —
+//! these types only describe local sessions today.
 
 use crate::ipc::messages::SessionStatus;
 use serde::{Deserialize, Serialize};
@@ -10,19 +11,7 @@ fn is_zero(v: &u32) -> bool {
     *v == 0
 }
 
-/// Server → Client messages (written as JSON lines to stdout)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ServerMessage {
-    /// Full snapshot of all sessions on this machine
-    State {
-        sessions: Vec<RemoteSessionData>,
-    },
-    /// Keep-alive signal (sent every 3s if no state change)
-    Heartbeat,
-}
-
-/// Session data sent from the remote server to the client
+/// Session data serialized for the web dashboard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteSessionData {
     /// tmux session name
@@ -79,7 +68,7 @@ pub struct ToolSummary {
     pub detail: String,
 }
 
-/// Minimal process info for remote display
+/// Minimal process info for the web dashboard
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteProcessInfo {
     pub pid: u32,
@@ -87,17 +76,4 @@ pub struct RemoteProcessInfo {
     pub cpu_percent: f32,
     pub memory_kb: u64,
     pub command: String,
-}
-
-/// Client → Server messages (written as JSON lines to stdin)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ClientMessage {
-    /// Send keys to a specific tmux pane on the remote
-    SendKeys {
-        session: String,
-        window: String,
-        pane: String,
-        keys: Vec<String>,
-    },
 }

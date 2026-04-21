@@ -6,50 +6,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cli::remote::{ensure_remote_sync, send_keys_to_remote};
 use crate::cli::session::{run_collapse, run_spread};
 use crate::cli::worktree::{run_wt_delete, run_wt_new};
 use crate::cli::{Args, PostAction};
 use crate::common::debug::debug_log;
 use crate::common::projects::{connect_session, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session, resolve_tmux_path, switch_to_session};
-use crate::common::types::PERMISSION_KEYS;
-use crate::tui::app::{find_session_by_permission_key, App, InputMode, SearchResult};
+use crate::common::types::{SessionInfo, PERMISSION_KEYS};
+use crate::tui::app::{find_session_by_permission_key, gather_sessions, App, InputMode, SearchResult};
 use crate::tui::ui::ui;
+use sysinfo::System;
 
-/// Switch to a session or return a ConnectRemote post-action for remote sessions.
-/// For local sessions, performs the switch immediately and returns None.
-/// For remote sessions, returns Some(PostAction::ConnectRemote).
-fn switch_or_connect(
-    session_info: &crate::common::types::SessionInfo,
-    app: &mut App,
-) -> Option<PostAction> {
-    use crate::common::types::SessionSource;
-    match &session_info.source {
-        SessionSource::Local => {
-            app.unskip(&session_info.name);
-            switch_to_session(&session_info.name);
-            app.save_restorable();
-            None
-        }
-        SessionSource::Remote {
-            remote_key,
-            remote_label,
-            remote_emoji,
-        } => {
-            let ssh_host = crate::common::remotes::RemoteRegistry::load()
-                .remotes
-                .get(remote_key)
-                .map(|c| c.ssh_host.clone())
-                .unwrap_or_else(|| remote_key.clone());
-            Some(PostAction::ConnectRemote {
-                ssh_host,
-                label: remote_label.clone(),
-                emoji: remote_emoji.clone(),
-                session_name: session_info.name.clone(),
-            })
-        }
-    }
+/// Switch to a session and update skip/restorable state.
+fn switch_to(session_info: &SessionInfo, app: &mut App) {
+    app.unskip(&session_info.name);
+    switch_to_session(&session_info.name);
+    app.save_restorable();
 }
 
 pub fn run_tui(
@@ -57,9 +29,6 @@ pub fn run_tui(
     args: &Args,
     running: Arc<AtomicBool>,
 ) -> Result<PostAction> {
-    // Auto-start remote sync if remotes are configured and sync isn't running
-    ensure_remote_sync();
-
     let mut app = App::new(args.filter.clone(), args.watch);
     app.auto_detail = args.detail;
 
@@ -77,63 +46,95 @@ pub fn run_tui(
         app.update_search_results();
     }
 
+    // Background refresh: gather session data on a separate thread so key
+    // handling is never blocked by sysinfo/tmux/process-tree calls (~700ms).
+    let refresh_interval = Duration::from_secs(app.interval);
+    let filter = app.filter.clone();
+    let bg_running = running.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<SessionInfo>>();
+
+    std::thread::spawn(move || {
+        let mut sys = System::new_all();
+        sys.refresh_all(); // baseline for CPU deltas
+
+        loop {
+            if !bg_running.load(Ordering::SeqCst) {
+                break;
+            }
+            let data = gather_sessions(&mut sys, &filter);
+            if tx.send(data).is_err() {
+                break; // receiver dropped
+            }
+            std::thread::sleep(refresh_interval);
+        }
+    });
+
+    let mut needs_redraw = true;
+
     loop {
         if !running.load(Ordering::SeqCst) {
             app.save_restorable();
             return Ok(PostAction::None);
         }
 
-        if app.input_mode != InputMode::Search
-            && app.input_mode != InputMode::WorktreeBase
-            && app.input_mode != InputMode::WorktreeConfirmDelete
-            && app.input_mode != InputMode::NewProjectKey
-            && app.input_mode != InputMode::NewProjectEmoji
-        {
-            app.refresh()?;
-            app.maybe_periodic_save();
-        }
+        // Check for new data from background refresh thread
+        let skip_refresh = matches!(
+            app.input_mode,
+            InputMode::Search
+                | InputMode::WorktreeBase
+                | InputMode::WorktreeConfirmDelete
+                | InputMode::NewProjectKey
+                | InputMode::NewProjectEmoji
+        );
+        if !skip_refresh {
+            // Drain channel — use latest snapshot if multiple are queued
+            let mut latest = None;
+            while let Ok(data) = rx.try_recv() {
+                latest = Some(data);
+            }
+            if let Some(data) = latest {
+                app.apply_refresh(data);
+                app.maybe_periodic_save();
+                needs_redraw = true;
 
-        // Auto-open detail view for current tmux session (once, after first refresh)
-        if app.auto_detail {
-            app.auto_detail = false;
-            if let Some(current) = get_current_tmux_session() {
-                if let Some(idx) = app.session_infos.iter().position(|s| s.name == current) {
-                    app.open_detail(idx);
-                } else {
-                    app.error_message = Some((
-                        format!("Session '{}' not found in list", current),
-                        std::time::Instant::now(),
-                    ));
+                // Auto-open detail view for current tmux session (once, after first refresh)
+                if app.auto_detail {
+                    app.auto_detail = false;
+                    if let Some(current) = get_current_tmux_session() {
+                        if let Some(idx) = app.session_infos.iter().position(|s| s.name == current)
+                        {
+                            app.open_detail(idx);
+                        } else {
+                            app.error_message = Some((
+                                format!("Session '{}' not found in list", current),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    } else {
+                        app.error_message = Some((
+                            "Could not detect current tmux session".to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    }
                 }
-            } else {
-                app.error_message = Some((
-                    "Could not detect current tmux session".to_string(),
-                    std::time::Instant::now(),
-                ));
             }
         }
 
-        terminal.draw(|frame| ui(frame, &mut app))?;
+        // Draw only when state changed
+        if needs_redraw {
+            terminal.draw(|frame| ui(frame, &mut app))?;
+            needs_redraw = false;
+        }
 
-        let sleep_ms = 100u64;
-        let iterations = (app.interval * 1000) / sleep_ms;
-        let mut should_refresh = false;
-        let mut needs_redraw = false;
-
-        for _ in 0..iterations {
-            if !running.load(Ordering::SeqCst) {
-                app.save_restorable();
-                return Ok(PostAction::None);
-            }
-
-            if poll(Duration::from_millis(sleep_ms))? {
-                if let Event::Key(KeyEvent {
-                    code,
-                    modifiers,
-                    kind: KeyEventKind::Press,
-                    ..
-                }) = read()?
-                {
+        // Poll for key events — short timeout keeps UI responsive
+        if poll(Duration::from_millis(50))? {
+            if let Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            }) = read()?
+            {
                     debug_log(&format!(
                         "KEY: {:?} (mode={:?}, showing_detail={:?}, showing_help={})",
                         code,
@@ -509,15 +510,11 @@ pub fn run_tui(
                                         }
                                         needs_redraw = true;
                                     } else if let Some(info) = app.detail_session_info().cloned() {
-                                        if let Some(action) = switch_or_connect(&info, &mut app) {
-                                            return Ok(action);
-                                        }
+                                        switch_to(&info, &mut app);
                                         return Ok(PostAction::None);
                                     }
                                 } else if let Some(info) = app.detail_session_info().cloned() {
-                                    if let Some(action) = switch_or_connect(&info, &mut app) {
-                                        return Ok(action);
-                                    }
+                                    switch_to(&info, &mut app);
                                     return Ok(PostAction::None);
                                 }
                             }
@@ -584,8 +581,9 @@ pub fn run_tui(
                                 }
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
-                                should_refresh = true;
-                                break;
+                                // Background thread refreshes on its own timer;
+                                // R just triggers a redraw with current data
+                                needs_redraw = true;
                             }
                             KeyCode::Char('m') | KeyCode::Char('M') => {
                                 app.toggle_global_mute();
@@ -629,11 +627,7 @@ pub fn run_tui(
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                                 let idx = c.to_digit(10).unwrap() as usize - 1;
                                 if let Some(session_info) = app.session_infos.get(idx).cloned() {
-                                    if let Some(action) =
-                                        switch_or_connect(&session_info, &mut app)
-                                    {
-                                        return Ok(action);
-                                    }
+                                    switch_to(&session_info, &mut app);
                                     return Ok(PostAction::None);
                                 }
                             }
@@ -658,37 +652,14 @@ pub fn run_tui(
                                             vec!["1".to_string(), "Enter".to_string()]
                                         };
 
-                                        match &session_info.source {
-                                            crate::common::types::SessionSource::Local => {
-                                                use crate::common::tmux::send_key_to_pane;
-                                                for key in &keys {
-                                                    send_key_to_pane(sess, win, pane, key);
-                                                }
-                                            }
-                                            crate::common::types::SessionSource::Remote {
-                                                remote_key,
-                                                ..
-                                            } => {
-                                                let registry =
-                                                    crate::common::remotes::RemoteRegistry::load();
-                                                if let Some(config) =
-                                                    registry.remotes.get(remote_key)
-                                                {
-                                                    send_keys_to_remote(
-                                                        &config.ssh_host,
-                                                        sess,
-                                                        win,
-                                                        pane,
-                                                        &keys,
-                                                    );
-                                                }
-                                            }
+                                        use crate::common::tmux::send_key_to_pane;
+                                        for key in &keys {
+                                            send_key_to_pane(sess, win, pane, key);
                                         }
 
                                         app.pending_approvals.insert(session_info.name.clone());
                                         app.hide_selection();
-                                        should_refresh = true;
-                                        break;
+                                        needs_redraw = true;
                                     }
                                 }
                             }
@@ -702,11 +673,6 @@ pub fn run_tui(
                     }
                 }
             }
-        }
-
-        if should_refresh {
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 }
 
@@ -750,34 +716,6 @@ pub fn handle_post_action(action: PostAction) -> Result<()> {
         PostAction::DeleteWorktree { project, branch } => {
             eprintln!("Deleting worktree {}/{}...", project, branch);
             run_wt_delete(&project, &branch, false, true)?;
-            Ok(())
-        }
-        PostAction::ConnectRemote {
-            ssh_host,
-            label,
-            emoji,
-            session_name,
-        } => {
-            let wrapper = format!("{} {} | {}", emoji, label, session_name);
-
-            // Check if wrapper session already exists
-            let exists = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &wrapper])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            if !exists {
-                let ssh_cmd = format!(
-                    "ssh -t -o RemoteCommand=none {} 'export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; exec tmux attach -t \"{}\"'",
-                    ssh_host, session_name
-                );
-                std::process::Command::new("tmux")
-                    .args(["new-session", "-d", "-s", &wrapper, &ssh_cmd])
-                    .output()?;
-            }
-
-            switch_to_session(&wrapper);
             Ok(())
         }
         PostAction::None => Ok(()),

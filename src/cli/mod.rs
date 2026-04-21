@@ -5,7 +5,6 @@
 
 pub mod hook;
 pub mod project;
-pub mod remote;
 pub mod session;
 pub mod setup;
 pub mod todo;
@@ -94,17 +93,6 @@ pub enum Command {
     Collapse,
     /// Auto-attach to the first available tmux session
     Start,
-    /// Run as a remote session server (stdio transport for SSH)
-    Serve {
-        /// Use stdio transport (JSON lines on stdin/stdout)
-        #[arg(long)]
-        stdio: bool,
-    },
-    /// Manage remote machine connections
-    Remote {
-        #[command(subcommand)]
-        command: RemoteCommand,
-    },
     /// Start web dashboard for mobile access
     Web {
         /// Port to listen on
@@ -270,33 +258,6 @@ pub enum TodoCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
-pub enum RemoteCommand {
-    /// Add a remote machine
-    Add {
-        /// Remote name (identifier)
-        name: String,
-        /// SSH host (from ~/.ssh/config)
-        #[arg(long)]
-        host: String,
-        /// Display label (defaults to name)
-        #[arg(long)]
-        label: Option<String>,
-        /// Emoji for remote sessions
-        #[arg(long, default_value = "🖥️")]
-        emoji: String,
-    },
-    /// Remove a remote machine
-    Remove {
-        /// Remote name to remove
-        name: String,
-    },
-    /// List configured remotes
-    List,
-    /// Keep SSH connections alive and cache remote sessions in the background
-    Sync,
-}
-
 /// Action to perform after the TUI exits and the terminal is restored.
 ///
 /// Some actions (like spreading iTerm panes or exec-ing into tmux) must
@@ -317,12 +278,5 @@ pub enum PostAction {
     DeleteWorktree {
         project: String,
         branch: String,
-    },
-    /// Connect to a remote session by creating a local wrapper tmux session
-    ConnectRemote {
-        ssh_host: String,
-        label: String,
-        emoji: String,
-        session_name: String,
     },
 }

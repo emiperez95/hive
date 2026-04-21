@@ -38,14 +38,6 @@ fn main() -> Result<()> {
         Some(Command::Todo { command }) => cli::todo::run_todo(command),
         Some(Command::Spread { count }) => cli::session::run_spread(count),
         Some(Command::Collapse) => cli::session::run_collapse(),
-        Some(Command::Serve { stdio }) => {
-            if stdio {
-                crate::serve::server::run_stdio_server()
-            } else {
-                bail!("hive serve requires --stdio flag");
-            }
-        }
-        Some(Command::Remote { command }) => cli::remote::run_remote(command),
         Some(Command::Web { port, dev, tts_host }) => {
             crate::serve::web::run_web_server(port, dev, tts_host)
         }

@@ -35,7 +35,7 @@ fn help_lists_all_subcommands() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for cmd in [
         "hook", "setup", "uninstall", "connect", "project", "todo", "wt", "spread", "collapse",
-        "start", "serve", "remote", "web", "update",
+        "start", "web", "update",
     ] {
         assert!(
             stdout.contains(cmd),
@@ -96,20 +96,6 @@ fn todo_help_exits_zero() {
 }
 
 #[test]
-fn remote_help_exits_zero() {
-    let output = hive_cmd().args(["remote", "--help"]).output().unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for sub in ["add", "remove", "list", "sync"] {
-        assert!(
-            stdout.contains(sub),
-            "Missing remote subcommand '{}'",
-            sub
-        );
-    }
-}
-
-#[test]
 fn web_help_exits_zero() {
     let output = hive_cmd().args(["web", "--help"]).output().unwrap();
     assert!(output.status.success());
@@ -159,12 +145,6 @@ fn todo_next_exits_one_when_empty() {
         .unwrap();
     // exit 1 is expected when there are no todos
     assert_eq!(output.status.code(), Some(1));
-}
-
-#[test]
-fn remote_list_exits_zero() {
-    let output = hive_cmd().args(["remote", "list"]).output().unwrap();
-    assert!(output.status.success());
 }
 
 // --- Invalid args ---

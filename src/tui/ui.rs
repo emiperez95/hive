@@ -2,7 +2,6 @@
 
 use crate::common::types::{
     format_duration_ago, format_memory, lines_for_session, truncate_command, ClaudeStatus,
-    SessionSource,
 };
 use crate::tui::app::{App, InputMode, SearchResult};
 use ratatui::{
@@ -297,15 +296,11 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let non_claude_start = app
         .session_infos
         .iter()
-        .position(|s| !app.is_skipped(&s.name) && !s.source.is_remote() && s.claude_status.is_none());
+        .position(|s| !app.is_skipped(&s.name) && s.claude_status.is_none());
     let skipped_start = app
         .session_infos
         .iter()
         .position(|s| app.is_skipped(&s.name));
-    let remote_start = app
-        .session_infos
-        .iter()
-        .position(|s| s.source.is_remote());
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
@@ -313,42 +308,13 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut idx = app.scroll_offset;
     let mut shown_non_claude_divider = false;
     let mut shown_skipped_divider = false;
-    let mut shown_remote_divider = false;
 
     while idx < app.session_infos.len() {
         let session_info = &app.session_infos[idx];
         let is_skipped = app.is_skipped(&session_info.name);
         let is_claude = session_info.claude_status.is_some();
-        let is_remote = session_info.source.is_remote();
 
-        // Remote divider
-        if is_remote && !shown_remote_divider && remote_start == Some(idx) {
-            shown_remote_divider = true;
-            if lines_remaining < 2 {
-                break;
-            }
-            // Build label from first remote's info
-            let remote_label = if let SessionSource::Remote {
-                remote_emoji,
-                remote_label,
-                ..
-            } = &session_info.source
-            {
-                format!("── {} {} ──", remote_emoji, remote_label)
-            } else {
-                "── remote ──".to_string()
-            };
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                remote_label,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::DIM),
-            )));
-            lines_remaining -= 2;
-        }
-
-        if !is_skipped && !is_claude && !is_remote && !shown_non_claude_divider && non_claude_start == Some(idx) {
+        if !is_skipped && !is_claude && !shown_non_claude_divider && non_claude_start == Some(idx) {
             shown_non_claude_divider = true;
             if lines_remaining < 2 {
                 break;
@@ -839,22 +805,6 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Color::Red
     };
-
-    // Show remote source info
-    if let SessionSource::Remote {
-        remote_emoji,
-        remote_label,
-        ..
-    } = &session_info.source
-    {
-        lines.push(Line::from(vec![
-            Span::styled("Remote: ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(
-                format!("{} {}", remote_emoji, remote_label),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]));
-    }
 
     lines.push(Line::from(vec![
         Span::styled("CPU: ", Style::default().add_modifier(Modifier::DIM)),

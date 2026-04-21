@@ -10,15 +10,12 @@ use crate::common::persistence::{
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::projects::{has_project_config, ProjectConfig, ProjectRegistry};
-use crate::common::remotes::RemoteRegistry;
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
-    lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, SessionSource,
-    PERMISSION_KEYS,
+    lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
 };
 use crate::common::worktree::sanitize_branch_name;
 use crate::ipc::messages::{HookState, SessionState, SessionStatus};
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -48,7 +45,6 @@ pub enum SearchResult {
 
 /// TUI application state
 pub struct App {
-    pub sys: System,
     pub session_infos: Vec<SessionInfo>,
     pub filter: Option<String>,
     pub interval: u64,
@@ -117,13 +113,7 @@ pub struct App {
 
 impl App {
     pub fn new(filter: Option<String>, interval: u64) -> Self {
-        // Create persistent System instance - needs two refresh_all() calls
-        // to establish baseline for CPU delta measurements
-        let mut sys = System::new_all();
-        sys.refresh_all();
-
         Self {
-            sys,
             session_infos: Vec::new(),
             filter,
             interval,
@@ -343,237 +333,14 @@ impl App {
     }
 
     /// Refresh session data (gather from tmux + sysinfo, with hook state overlay)
-    pub fn refresh(&mut self) -> Result<()> {
-        self.sys.refresh_all();
-
-        // Load hook state from file (written by `hive hook`)
-        let hook_state = HookState::load();
-
-        // Index hook sessions by cwd — keep only most recently active per cwd
-        let hook_sessions: HashMap<String, &SessionState> = {
-            let mut by_cwd: HashMap<String, &SessionState> = HashMap::new();
-            for session in hook_state.sessions.values() {
-                let key = session.cwd.clone();
-                let is_newer = by_cwd
-                    .get(&key)
-                    .is_none_or(|existing| session.last_activity > existing.last_activity);
-                if is_newer {
-                    by_cwd.insert(key, session);
-                }
-            }
-            by_cwd
-        };
-
-        let using_hooks = !hook_sessions.is_empty();
-        if using_hooks {
-            debug_log(&format!(
-                "REFRESH: Using hook state for {} sessions (by cwd)",
-                hook_sessions.len()
-            ));
-        }
-
-        let sessions = get_tmux_sessions()?;
-        let other_client_sessions = get_other_client_sessions();
-        let current_session = get_current_session();
-        let mut session_infos = Vec::new();
-
-        for session in sessions {
-            if !matches_filter(&session.name, &self.filter) {
-                continue;
-            }
-
-            // Get session CWD from first pane
-            let session_cwd = session
-                .windows
-                .first()
-                .and_then(|w| w.panes.first())
-                .map(|p| p.cwd.clone());
-
-            // Calculate session totals and collect per-process info
-            let mut all_pids = Vec::new();
-            for window in &session.windows {
-                for pane in &window.panes {
-                    all_pids.push(pane.pid);
-                    get_all_descendants(&self.sys, pane.pid, &mut all_pids);
-                }
-            }
-
-            let mut total_cpu = 0.0;
-            let mut total_mem_kb = 0u64;
-            let mut processes: Vec<ProcessInfo> = Vec::new();
-
-            for &pid in &all_pids {
-                if let Some(info) = get_process_info(&self.sys, pid) {
-                    total_cpu += info.cpu_percent;
-                    total_mem_kb += info.memory_kb;
-                    processes.push(info);
-                }
-            }
-
-            processes.sort_by(|a, b| {
-                b.cpu_percent
-                    .partial_cmp(&a.cpu_percent)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            // Detect listening ports for all PIDs in this session
-            let listening_ports = get_listening_ports_for_pids(&all_pids, &self.sys);
-
-            // Find Claude pane: check hook state by cwd, or detect Claude process
-            let mut claude_status: Option<ClaudeStatus> = None;
-            let mut claude_pane: Option<(String, String, String)> = None;
-            let mut last_activity = None;
-
-            'outer: for window in &session.windows {
-                for p in &window.panes {
-                    let mut pane_pids = vec![p.pid];
-                    get_all_descendants(&self.sys, p.pid, &mut pane_pids);
-
-                    let has_claude_process = pane_pids.iter().any(|&pid| {
-                        get_process_info(&self.sys, pid)
-                            .map(|info| is_claude_process(&info))
-                            .unwrap_or(false)
-                    });
-
-                    if has_claude_process {
-                        // Use hook state if available (richer status info)
-                        if let Some(hook_session) = hook_sessions.get(&p.cwd) {
-                            claude_status = Some(convert_hook_status(&hook_session.status));
-                            last_activity = hook_session
-                                .last_activity
-                                .as_ref()
-                                .and_then(|s| parse_timestamp(s));
-                        } else {
-                            // No hook state (stale cleanup removed it) — fall back to JSONL
-                            if let Some(jsonl_status) =
-                                crate::common::jsonl::get_claude_status_from_jsonl(&p.cwd)
-                            {
-                                claude_status = Some(jsonl_status.status);
-                                last_activity = jsonl_status.timestamp;
-                            } else {
-                                claude_status = Some(ClaudeStatus::Unknown);
-                            }
-                        }
-                        claude_pane =
-                            Some((session.name.clone(), window.index.clone(), p.index.clone()));
-                        break 'outer;
-                    }
-                }
-            }
-
-            session_infos.push(SessionInfo {
-                name: session.name.clone(),
-                source: SessionSource::Local,
-                claude_status,
-                claude_pane,
-                permission_key: None,
-                total_cpu,
-                total_mem_kb,
-                last_activity,
-                processes,
-                cwd: session_cwd,
-                listening_ports,
-                attached_other_client: other_client_sessions.contains(&session.name),
-                is_current_session: current_session.as_deref() == Some(session.name.as_str()),
-            });
-        }
-
-        // Enrich local wrapper sessions with remote Claude status.
-        // Wrapper sessions are named "{emoji} {label} | {remote_session}" and contain
-        // just an SSH process locally — overlay the remote's status so they sort/render correctly.
-        let remote_registry = RemoteRegistry::load();
-        for (_key, config) in &remote_registry.remotes {
-            let cached = crate::common::remote_client::load_cache_pub(_key);
-            let wrapper_prefix = format!("{} {} | ", config.emoji, config.label);
-            for rs in &cached {
-                let wrapper_name = format!("{}{}", wrapper_prefix, rs.name);
-                if let Some(local) = session_infos.iter_mut().find(|s| s.name == wrapper_name) {
-                    if local.claude_status.is_none() {
-                        local.claude_status = rs.status.as_ref().map(convert_hook_status);
-                        local.claude_pane = rs.pane.clone();
-                        local.last_activity = rs
-                            .last_activity
-                            .as_ref()
-                            .and_then(|s| parse_timestamp(s));
-                        local.source = SessionSource::Remote {
-                            remote_key: _key.clone(),
-                            remote_label: config.label.clone(),
-                            remote_emoji: config.emoji.clone(),
-                        };
-                    }
-                }
-            }
-        }
-
-        // Merge remote sessions from cache files (written by `hive remote sync`)
-        let local_names: HashSet<String> = session_infos.iter().map(|s| s.name.clone()).collect();
-        let remote_registry = RemoteRegistry::load();
-        for (key, config) in &remote_registry.remotes {
-            let cached = crate::common::remote_client::load_cache_pub(key);
-            // Build wrapper prefix to detect open remote sessions: "{emoji} {label} | "
-            let wrapper_prefix = format!("{} {} | ", config.emoji, config.label);
-            for rs in &cached {
-                if !matches_filter(&rs.name, &self.filter) {
-                    continue;
-                }
-                // Skip if a local wrapper session exists for this remote session
-                let wrapper_name = format!("{}{}", wrapper_prefix, rs.name);
-                if local_names.contains(&wrapper_name) {
-                    continue;
-                }
-                let claude_status = rs.status.as_ref().map(convert_hook_status);
-                let last_activity = rs
-                    .last_activity
-                    .as_ref()
-                    .and_then(|s| parse_timestamp(s));
-                let processes = rs
-                    .processes
-                    .iter()
-                    .map(|p| ProcessInfo {
-                        pid: p.pid,
-                        name: p.name.clone(),
-                        cpu_percent: p.cpu_percent,
-                        memory_kb: p.memory_kb,
-                        command: p.command.clone(),
-                    })
-                    .collect();
-                let listening_ports = rs
-                    .ports
-                    .iter()
-                    .map(|&port| crate::common::ports::ListeningPort {
-                        port,
-                        pid: 0,
-                        process_name: String::new(),
-                    })
-                    .collect();
-                session_infos.push(SessionInfo {
-                    name: rs.name.clone(),
-                    source: SessionSource::Remote {
-                        remote_key: key.clone(),
-                        remote_label: config.label.clone(),
-                        remote_emoji: config.emoji.clone(),
-                    },
-                    claude_status,
-                    claude_pane: rs.pane.clone(),
-                    permission_key: None,
-                    total_cpu: rs.cpu,
-                    total_mem_kb: rs.mem_kb,
-                    last_activity,
-                    processes,
-                    cwd: rs.cwd.clone(),
-                    listening_ports,
-                    attached_other_client: rs.attached,
-                    is_current_session: false,
-                });
-            }
-        }
-
-        // Sort: remote after local, skipped last, Claude before non-Claude, favorites first
+    /// Apply gathered session data to app state (cheap — runs on main thread).
+    /// Handles sorting, permission key assignment, and selection stabilization.
+    pub fn apply_refresh(&mut self, mut session_infos: Vec<SessionInfo>) {
+        // Sort: skipped last, Claude before non-Claude, favorites first
         session_infos.sort_by_key(|s| {
-            let is_remote = s.source.is_remote();
-            let is_favorite = self.favorite_sessions.contains(&s.persistence_key());
-            let is_skipped = self.skipped_sessions.contains(&s.persistence_key());
-            (is_remote, is_skipped, s.claude_status.is_none(), !is_favorite)
+            let is_favorite = self.favorite_sessions.contains(&s.name);
+            let is_skipped = self.skipped_sessions.contains(&s.name);
+            (is_skipped, s.claude_status.is_none(), !is_favorite)
         });
 
         // Stable permission key assignment
@@ -638,8 +405,6 @@ impl App {
             }
         }
 
-        // Chrome tabs are fetched on-demand (refresh_chrome_tabs), not every cycle
-
         // Fetch branch commits for worktree sessions in detail view
         if let Some(name) = self.detail_session_name() {
             if let Some(entry) = crate::common::worktree::find_worktree_by_session_name(&name) {
@@ -657,26 +422,6 @@ impl App {
             self.detail_commits.clear();
         }
 
-        // Debug log refresh summary
-        if crate::common::debug::is_debug_enabled() {
-            let summary: Vec<String> = self
-                .session_infos
-                .iter()
-                .map(|s| {
-                    format!(
-                        "{}:{:?}",
-                        s.name,
-                        s.claude_status.as_ref().map(|cs| format!("{}", cs))
-                    )
-                })
-                .collect();
-            debug_log(&format!(
-                "REFRESH: {} sessions: [{}]",
-                self.session_infos.len(),
-                summary.join(", ")
-            ));
-        }
-
         if !self.session_infos.is_empty() {
             if self.selected >= self.session_infos.len() {
                 self.selected = self.session_infos.len() - 1;
@@ -684,8 +429,6 @@ impl App {
         } else {
             self.selected = 0;
         }
-
-        Ok(())
     }
 
     pub fn hide_selection(&mut self) {
@@ -752,15 +495,11 @@ impl App {
         let non_claude_start = self
             .session_infos
             .iter()
-            .position(|s| !self.is_skipped(&s.name) && !s.source.is_remote() && s.claude_status.is_none());
+            .position(|s| !self.is_skipped(&s.name) && s.claude_status.is_none());
         let skipped_start = self
             .session_infos
             .iter()
             .position(|s| self.is_skipped(&s.name));
-        let remote_start = self
-            .session_infos
-            .iter()
-            .position(|s| s.source.is_remote());
 
         loop {
             // Start with 1 for the initial blank line the renderer always adds
@@ -771,9 +510,6 @@ impl App {
                     used += 2;
                 }
                 if Some(i) == skipped_start {
-                    used += 2;
-                }
-                if Some(i) == remote_start {
                     used += 2;
                 }
                 used += lines_for_session(&self.session_infos[i], self.is_auto_approved(&self.session_infos[i].name));
@@ -921,7 +657,7 @@ impl App {
         let restorable: Vec<String> = self
             .session_infos
             .iter()
-            .filter(|s| !s.source.is_remote() && has_project_config(&s.name))
+            .filter(|s| has_project_config(&s.name))
             .map(|s| s.name.clone())
             .collect();
         save_restorable_sessions(&restorable);
@@ -1222,6 +958,151 @@ impl App {
         self.input_buffer.clear();
         self.np_key = None;
     }
+}
+
+/// Gather session data from tmux, sysinfo, and hooks.
+/// This is the expensive operation (~700ms) that runs on a background thread.
+/// Returns raw `Vec<SessionInfo>` for `App::apply_refresh()` to consume.
+pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<SessionInfo> {
+    let t0 = Instant::now();
+    sys.refresh_all();
+    let t_sysinfo = t0.elapsed();
+
+    // Load hook state from file
+    let t1 = Instant::now();
+    let hook_state = HookState::load();
+    let hook_sessions: HashMap<String, &SessionState> = {
+        let mut by_cwd: HashMap<String, &SessionState> = HashMap::new();
+        for session in hook_state.sessions.values() {
+            let key = session.cwd.clone();
+            let is_newer = by_cwd
+                .get(&key)
+                .is_none_or(|existing| session.last_activity > existing.last_activity);
+            if is_newer {
+                by_cwd.insert(key, session);
+            }
+        }
+        by_cwd
+    };
+    let t_hooks = t1.elapsed();
+
+    let t2 = Instant::now();
+    let sessions = match get_tmux_sessions() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let t_tmux = t2.elapsed();
+
+    let t3 = Instant::now();
+    let other_client_sessions = get_other_client_sessions();
+    let current_session = get_current_session();
+    let t_other = t3.elapsed();
+
+    let mut session_infos = Vec::new();
+    let t4 = Instant::now();
+
+    for session in sessions {
+        if !matches_filter(&session.name, filter) {
+            continue;
+        }
+
+        let session_cwd = session
+            .windows
+            .first()
+            .and_then(|w| w.panes.first())
+            .map(|p| p.cwd.clone());
+
+        // Collect all PIDs and process info
+        let mut all_pids = Vec::new();
+        for window in &session.windows {
+            for pane in &window.panes {
+                all_pids.push(pane.pid);
+                get_all_descendants(sys, pane.pid, &mut all_pids);
+            }
+        }
+
+        let mut total_cpu = 0.0;
+        let mut total_mem_kb = 0u64;
+        let mut processes: Vec<ProcessInfo> = Vec::new();
+
+        for &pid in &all_pids {
+            if let Some(info) = get_process_info(sys, pid) {
+                total_cpu += info.cpu_percent;
+                total_mem_kb += info.memory_kb;
+                processes.push(info);
+            }
+        }
+
+        processes.sort_by(|a, b| {
+            b.cpu_percent
+                .partial_cmp(&a.cpu_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let listening_ports = get_listening_ports_for_pids(&all_pids, sys);
+
+        // Find Claude pane
+        let mut claude_status: Option<ClaudeStatus> = None;
+        let mut claude_pane: Option<(String, String, String)> = None;
+        let mut last_activity = None;
+
+        'outer: for window in &session.windows {
+            for p in &window.panes {
+                let mut pane_pids = vec![p.pid];
+                get_all_descendants(sys, p.pid, &mut pane_pids);
+
+                let has_claude_process = pane_pids.iter().any(|&pid| {
+                    get_process_info(sys, pid)
+                        .map(|info| is_claude_process(&info))
+                        .unwrap_or(false)
+                });
+
+                if has_claude_process {
+                    if let Some(hook_session) = hook_sessions.get(&p.cwd) {
+                        claude_status = Some(convert_hook_status(&hook_session.status));
+                        last_activity = hook_session
+                            .last_activity
+                            .as_ref()
+                            .and_then(|s| parse_timestamp(s));
+                    } else if let Some(jsonl_status) =
+                        crate::common::jsonl::get_claude_status_from_jsonl(&p.cwd)
+                    {
+                        claude_status = Some(jsonl_status.status);
+                        last_activity = jsonl_status.timestamp;
+                    } else {
+                        claude_status = Some(ClaudeStatus::Unknown);
+                    }
+                    claude_pane =
+                        Some((session.name.clone(), window.index.clone(), p.index.clone()));
+                    break 'outer;
+                }
+            }
+        }
+
+        session_infos.push(SessionInfo {
+            name: session.name.clone(),
+            claude_status,
+            claude_pane,
+            permission_key: None,
+            total_cpu,
+            total_mem_kb,
+            last_activity,
+            processes,
+            cwd: session_cwd,
+            listening_ports,
+            attached_other_client: other_client_sessions.contains(&session.name),
+            is_current_session: current_session.as_deref() == Some(session.name.as_str()),
+        });
+    }
+
+    let t_loop = t4.elapsed();
+    let t_total = t0.elapsed();
+    debug_log(&format!(
+        "GATHER TIMING: total={:?} sysinfo={:?} hooks={:?} tmux={:?} other={:?} loop={:?} sessions={}",
+        t_total, t_sysinfo, t_hooks, t_tmux, t_other, t_loop, session_infos.len()
+    ));
+
+    session_infos
 }
 
 /// Get the current branch of a git repo.
