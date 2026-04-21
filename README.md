@@ -249,12 +249,19 @@ No background daemon. No async runtime. No Unix sockets. Just a state file.
 ## Advanced
 
 - **[Auth profiles](./docs/claude-auth-profiles.md)** — assign each project a separate Claude identity via `CLAUDE_CONFIG_DIR`. Useful for keeping work + personal accounts separate.
-- **Worktree lifecycle hooks** — project-specific shell scripts (`pre-create`, `post-worktree`, `post-copy`, `post-setup`, `pre-delete`, `post-delete`) run at defined points of `hive wt new` / `hive wt delete`. See [CLAUDE.md](./CLAUDE.md) for the contract + env vars.
+- **[Worktree lifecycle hooks](./docs/hooks.md)** — project-specific shell scripts (`pre-create`, `post-worktree`, `post-copy`, `post-setup`, `pre-delete`, `post-delete`) run at defined points of `hive wt new` / `hive wt delete`. Contract, env vars, and examples.
 - **Web dashboard internals** — endpoints, HLS streaming, message extraction, dev mode: see [CLAUDE.md](./CLAUDE.md#web-dashboard-hive-web).
 
 ## Platform support
 
 v0.1.0 is **macOS-only** (Apple Silicon and Intel). Linux is deferred — the signature integrations (port detection, Chrome tab matching, iTerm pane spread) all rely on macOS-specific APIs.
+
+## Troubleshooting + contributing
+
+- Stuck? Check the [troubleshooting guide](./docs/troubleshooting.md).
+- See something off or want to hack on it? Start with [CONTRIBUTING.md](./CONTRIBUTING.md).
+- Reporting a vulnerability: [SECURITY.md](./SECURITY.md).
+- Change history: [CHANGELOG.md](./CHANGELOG.md).
 
 ## License
 
