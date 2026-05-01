@@ -430,20 +430,72 @@ pub fn copy_file_patterns(
     Ok(())
 }
 
-/// Recursively copy a directory
+/// Recursively copy a directory.
+///
+/// Differences from a naive walk:
+/// - Symlinks are recreated, not dereferenced (avoids exploding pnpm's
+///   hardlink + symlink layout under `node_modules/.pnpm/`).
+/// - Directory type is determined by `lstat` (via `DirEntry::file_type`) so a
+///   symlinked directory is treated as a symlink, not recursed into.
+/// - Paths matched by `should_skip_copy` are skipped (e.g. `.claude/worktrees/`,
+///   which holds Claude Code's per-agent isolated git worktrees and should
+///   never be propagated into a new worktree).
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+
+        if should_skip_copy(&src_path) {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+
+        if file_type.is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&src_path)?;
+                std::os::unix::fs::symlink(&target, &dst_path).with_context(|| {
+                    format!(
+                        "Failed to recreate symlink {} -> {}",
+                        dst_path.display(),
+                        target.display()
+                    )
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                if src_path.is_dir() {
+                    copy_dir_recursive(&src_path, &dst_path)?;
+                } else if src_path.is_file() {
+                    std::fs::copy(&src_path, &dst_path)?;
+                }
+            }
+        } else if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
+        } else if file_type.is_file() {
             std::fs::copy(&src_path, &dst_path)?;
         }
     }
     Ok(())
+}
+
+/// Returns true for paths we never want to clone into a new worktree.
+///
+/// Currently this covers `.claude/worktrees/` — Claude Code's isolated agent
+/// worktrees. Each one is a full git worktree with its own `node_modules` and
+/// a `.git` pointer back at the source repo. Copying it on every new hive
+/// worktree turned 1.7G of dangling state into 9–12G per worktree.
+fn should_skip_copy(path: &Path) -> bool {
+    if path.file_name().and_then(|s| s.to_str()) != Some("worktrees") {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        == Some(".claude")
 }
 
 /// Create symlinks for file patterns from project_root into worktree_path.
@@ -979,6 +1031,115 @@ mod tests {
             path_to_claude_dir_name(Path::new("/Users/foo/project")),
             "-Users-foo-project"
         );
+    }
+
+    #[test]
+    fn test_should_skip_copy_dotclaude_worktrees() {
+        assert!(should_skip_copy(Path::new(
+            "/Users/x/proj/.claude/worktrees"
+        )));
+    }
+
+    #[test]
+    fn test_should_skip_copy_other_worktrees_dir() {
+        // `worktrees` outside of `.claude/` is fine to copy.
+        assert!(!should_skip_copy(Path::new("/Users/x/proj/worktrees")));
+        assert!(!should_skip_copy(Path::new(
+            "/Users/x/proj/something/worktrees"
+        )));
+    }
+
+    #[test]
+    fn test_should_skip_copy_unrelated_dirs() {
+        assert!(!should_skip_copy(Path::new("/Users/x/proj/.claude")));
+        assert!(!should_skip_copy(Path::new("/Users/x/proj/.claude/skills")));
+    }
+
+    #[test]
+    fn test_copy_dir_recursive_recreates_symlinks() {
+        let tmp = std::env::temp_dir().join(format!(
+            "hive-test-copy-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let target_file = src.join("real.txt");
+        std::fs::write(&target_file, b"hello").unwrap();
+        // Relative symlink so we can verify the link itself, not just the target.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("real.txt", src.join("link.txt")).unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        let copied_link = dst.join("link.txt");
+        let meta = std::fs::symlink_metadata(&copied_link).unwrap();
+        assert!(meta.file_type().is_symlink(), "link.txt was dereferenced");
+        let resolved = std::fs::read_link(&copied_link).unwrap();
+        assert_eq!(resolved, Path::new("real.txt"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_copy_dir_recursive_does_not_follow_symlinked_dir() {
+        // A symlink *to a directory* must be recreated as a symlink, not walked
+        // into. Otherwise pnpm's `.pnpm/<pkg>/node_modules/<dep>` symlinks
+        // explode into real copies.
+        let tmp = std::env::temp_dir().join(format!(
+            "hive-test-symlink-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        let other = tmp.join("other");
+        let dst = tmp.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("a.txt"), b"a").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&other, src.join("linked-dir")).unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        let linked = dst.join("linked-dir");
+        let meta = std::fs::symlink_metadata(&linked).unwrap();
+        assert!(meta.file_type().is_symlink());
+        // The contents shouldn't have been duplicated under dst.
+        assert!(!dst.join("linked-dir/a.txt").is_file() || meta.file_type().is_symlink());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_copy_dir_recursive_skips_claude_worktrees() {
+        let tmp = std::env::temp_dir().join(format!(
+            "hive-test-skip-worktrees-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src_claude = tmp.join("src/.claude");
+        std::fs::create_dir_all(src_claude.join("worktrees/agent-x")).unwrap();
+        std::fs::write(src_claude.join("settings.local.json"), b"{}").unwrap();
+        std::fs::write(
+            src_claude.join("worktrees/agent-x/big.bin"),
+            vec![0u8; 1024],
+        )
+        .unwrap();
+
+        let dst_claude = tmp.join("dst/.claude");
+        copy_dir_recursive(&src_claude, &dst_claude).unwrap();
+
+        assert!(dst_claude.join("settings.local.json").is_file());
+        assert!(
+            !dst_claude.join("worktrees").exists(),
+            "worktrees/ should have been skipped"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
