@@ -8,7 +8,9 @@ use crate::common::persistence::{
     set_global_mute,
 };
 use crate::common::ports::get_listening_ports_for_pids;
-use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
+use crate::common::process::{
+    build_children_map, collect_descendants, get_process_info, is_claude_process,
+};
 use crate::common::projects::{has_project_config, ProjectConfig, ProjectRegistry};
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
@@ -1001,6 +1003,10 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
     let mut session_infos = Vec::new();
     let t4 = Instant::now();
 
+    // Build the process parent→children map once per gather pass so the per-pane
+    // descendant walk is a HashMap lookup instead of a fresh `ps` subprocess each time.
+    let children_map = build_children_map();
+
     for session in sessions {
         if !matches_filter(&session.name, filter) {
             continue;
@@ -1012,12 +1018,48 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
             .and_then(|w| w.panes.first())
             .map(|p| p.cwd.clone());
 
-        // Collect all PIDs and process info
         let mut all_pids = Vec::new();
+        let mut claude_status: Option<ClaudeStatus> = None;
+        let mut claude_pane: Option<(String, String, String)> = None;
+        let mut last_activity = None;
+
+        // Single pass over panes: collect descendants and detect the Claude pane.
         for window in &session.windows {
             for pane in &window.panes {
+                let pane_start = all_pids.len();
                 all_pids.push(pane.pid);
-                get_all_descendants(sys, pane.pid, &mut all_pids);
+                collect_descendants(&children_map, pane.pid, &mut all_pids);
+
+                // Only check for Claude until we've found the pane.
+                if claude_pane.is_none() {
+                    let has_claude_process = all_pids[pane_start..].iter().any(|&pid| {
+                        get_process_info(sys, pid)
+                            .map(|info| is_claude_process(&info))
+                            .unwrap_or(false)
+                    });
+
+                    if has_claude_process {
+                        if let Some(hook_session) = hook_sessions.get(&pane.cwd) {
+                            claude_status = Some(convert_hook_status(&hook_session.status));
+                            last_activity = hook_session
+                                .last_activity
+                                .as_ref()
+                                .and_then(|s| parse_timestamp(s));
+                        } else if let Some(jsonl_status) =
+                            crate::common::jsonl::get_claude_status_from_jsonl(&pane.cwd)
+                        {
+                            claude_status = Some(jsonl_status.status);
+                            last_activity = jsonl_status.timestamp;
+                        } else {
+                            claude_status = Some(ClaudeStatus::Unknown);
+                        }
+                        claude_pane = Some((
+                            session.name.clone(),
+                            window.index.clone(),
+                            pane.index.clone(),
+                        ));
+                    }
+                }
             }
         }
 
@@ -1040,44 +1082,6 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
         });
 
         let listening_ports = get_listening_ports_for_pids(&all_pids, sys);
-
-        // Find Claude pane
-        let mut claude_status: Option<ClaudeStatus> = None;
-        let mut claude_pane: Option<(String, String, String)> = None;
-        let mut last_activity = None;
-
-        'outer: for window in &session.windows {
-            for p in &window.panes {
-                let mut pane_pids = vec![p.pid];
-                get_all_descendants(sys, p.pid, &mut pane_pids);
-
-                let has_claude_process = pane_pids.iter().any(|&pid| {
-                    get_process_info(sys, pid)
-                        .map(|info| is_claude_process(&info))
-                        .unwrap_or(false)
-                });
-
-                if has_claude_process {
-                    if let Some(hook_session) = hook_sessions.get(&p.cwd) {
-                        claude_status = Some(convert_hook_status(&hook_session.status));
-                        last_activity = hook_session
-                            .last_activity
-                            .as_ref()
-                            .and_then(|s| parse_timestamp(s));
-                    } else if let Some(jsonl_status) =
-                        crate::common::jsonl::get_claude_status_from_jsonl(&p.cwd)
-                    {
-                        claude_status = Some(jsonl_status.status);
-                        last_activity = jsonl_status.timestamp;
-                    } else {
-                        claude_status = Some(ClaudeStatus::Unknown);
-                    }
-                    claude_pane =
-                        Some((session.name.clone(), window.index.clone(), p.index.clone()));
-                    break 'outer;
-                }
-            }
-        }
 
         session_infos.push(SessionInfo {
             name: session.name.clone(),

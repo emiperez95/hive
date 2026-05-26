@@ -12,7 +12,7 @@
 use clap::Parser;
 use hive::common::chrome::{get_chrome_tabs, match_tabs_to_ports};
 use hive::common::ports::get_listening_ports_for_pids;
-use hive::common::process::get_all_descendants;
+use hive::common::process::{build_children_map, collect_descendants};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -218,6 +218,7 @@ fn run_refresh_cycle() -> Metrics {
     let mut pane_count = 0;
     let mut pane_cwds: Vec<String> = Vec::new();
     let mut all_pids: Vec<u32> = Vec::new();
+    let children_map = build_children_map();
 
     for session in sessions_str.lines() {
         let windows_output = Command::new("tmux")
@@ -245,7 +246,7 @@ fn run_refresh_cycle() -> Metrics {
                 if let Some(pid_str) = parts.next() {
                     if let Ok(pid) = pid_str.parse::<u32>() {
                         all_pids.push(pid);
-                        get_all_descendants(&sys, pid, &mut all_pids);
+                        collect_descendants(&children_map, pid, &mut all_pids);
                     }
                 }
                 if let Some(cwd) = parts.next() {

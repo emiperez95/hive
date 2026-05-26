@@ -6,7 +6,9 @@
 
 use crate::common::persistence::{load_session_todos, load_skipped_sessions};
 use crate::common::ports::get_listening_ports_for_pids;
-use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
+use crate::common::process::{
+    build_children_map, collect_descendants, get_process_info, is_claude_process,
+};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::{HookState, SessionStatus};
 use crate::serve::web_types::{ProcessView, SessionView};
@@ -44,6 +46,10 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<S
     let session_todos = load_session_todos();
     let mut results = Vec::new();
 
+    // Build the process parent→children map once per gather pass so descendant
+    // walks are in-memory lookups rather than a fresh `ps` subprocess per pane.
+    let children_map = build_children_map();
+
     for session in &sessions {
         let session_cwd = session
             .windows
@@ -60,7 +66,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<S
         'outer: for window in &session.windows {
             for p in &window.panes {
                 let mut pane_pids = vec![p.pid];
-                get_all_descendants(sys, p.pid, &mut pane_pids);
+                collect_descendants(&children_map, p.pid, &mut pane_pids);
 
                 let has_claude = pane_pids.iter().any(|&pid| {
                     get_process_info(sys, pid)
