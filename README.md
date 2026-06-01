@@ -217,14 +217,17 @@ Set `HIVE_NO_NOTIFY=1` to suppress desktop notifications (useful for CI / script
 
 ## Mobile dashboard (`hive web`)
 
-Start a local HTTP server that exposes hive to your phone over your LAN:
+Start a local HTTP server for the dashboard. By default it binds to localhost (`127.0.0.1`), so it's only reachable from the same machine. To open it from your phone or another device on your network, pass `--lan` (binds `0.0.0.0`) and visit `http://<your-computer-ip>:8375`:
 
 ```bash
-hive web                            # default port 8375
+hive web                            # default port 8375 (localhost only)
+hive web --lan                      # expose to other devices on your LAN
 hive web --port 9000                # custom port
-hive web --tts-host <url>           # optional: read messages aloud via TTSQwen
+hive web --tts-host http://localhost:9800  # optional: read messages aloud via TTSQwen
 hive web --dev                      # serve web.html from disk for live editing
 ```
+
+Note: the dashboard has no authentication — only use `--lan` on trusted networks.
 
 The dashboard is mobile-first: tap to switch sessions, swipe a session row to skip, tap the header to see cwd / ports / flags, send text back to Claude, and approve or reject pending permission prompts from the phone. Conversations render with markdown and tool-use cards (Bash, Write, Edit, Read, Grep, Agent) you can expand.
 

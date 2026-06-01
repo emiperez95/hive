@@ -106,10 +106,13 @@ pub enum Command {
         /// Port to listen on
         #[arg(long, default_value = "8375")]
         port: u16,
+        /// Expose the dashboard to other devices on your LAN (binds 0.0.0.0). Off by default (binds 127.0.0.1). The dashboard has no authentication — only use --lan on trusted networks.
+        #[arg(long)]
+        lan: bool,
         /// Dev mode: serve web.html from disk (live reload on browser refresh)
         #[arg(long)]
         dev: bool,
-        /// TTS service URL (e.g. http://10.18.1.2:9800)
+        /// TTS service URL (e.g. http://localhost:9800)
         #[arg(long)]
         tts_host: Option<String>,
     },

@@ -227,9 +227,9 @@ Mobile-first web app for monitoring and interacting with Claude sessions from a 
 ```
 hive web                                        # start on default port 8375
 hive web --dev                                  # serve web.html from disk (edit + refresh)
-hive web --tts-host http://10.18.1.2:9800       # enable TTS read-aloud via TTSQwen service
+hive web --tts-host http://localhost:9800       # enable TTS read-aloud via TTSQwen service
 hive web --port <N>                             # custom port (default: 8375)
-hive web --dev --tts-host http://10.18.1.2:9800 # both
+hive web --dev --tts-host http://localhost:9800 # both
 ```
 
 **Architecture:**

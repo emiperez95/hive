@@ -47,38 +47,45 @@ struct SendRequest {
 }
 
 /// Run the HTTP web server on the given port.
+/// When `lan` is true, binds 0.0.0.0 (reachable from other devices); otherwise binds
+/// 127.0.0.1 (localhost only). The dashboard has no authentication.
 /// When `dev` is true, serves web.html from disk (re-read per request) for live editing.
 /// When `tts_host` is set, enables TTS proxy endpoints.
-pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<()> {
-    let bind_addr = format!("0.0.0.0:{}", port);
+pub fn run_web_server(port: u16, lan: bool, dev: bool, tts_host: Option<String>) -> Result<()> {
+    let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
+    let bind_addr = format!("{}:{}", host, port);
     let server =
         Server::http(&bind_addr).map_err(|e| anyhow::anyhow!("Failed to bind {}: {}", bind_addr, e))?;
+
+    let dev_suffix = if dev { " (dev mode)" } else { "" };
+    eprintln!("hive web listening on http://{}:{}{}", host, port, dev_suffix);
+    if lan {
+        eprintln!(
+            "⚠  --lan: dashboard reachable by other devices on your network and has NO authentication. Only use on trusted networks."
+        );
+        // Print LAN-reachable access URLs
+        if let Some(hostname) = get_local_hostname() {
+            eprintln!("  Local: http://{}:{}", hostname, port);
+        }
+        for (label, ip) in get_all_ips(port) {
+            eprintln!("  {}: http://{}:{}", label, ip, port);
+        }
+    }
 
     let dev_path = if dev {
         let path = std::env::current_dir()
             .unwrap_or_default()
             .join("src/serve/web.html");
         if path.exists() {
-            eprintln!("Hive web dashboard running at http://0.0.0.0:{} (dev mode)", port);
             eprintln!("  Serving HTML from: {}", path.display());
             Some(path)
         } else {
-            eprintln!("Hive web dashboard running at http://0.0.0.0:{}", port);
             eprintln!("  warn: --dev but {} not found, using embedded HTML", path.display());
             None
         }
     } else {
-        eprintln!("Hive web dashboard running at http://0.0.0.0:{}", port);
         None
     };
-
-    // Print access URLs
-    if let Some(hostname) = get_local_hostname() {
-        eprintln!("  Local: http://{}:{}", hostname, port);
-    }
-    for (label, ip) in get_all_ips(port) {
-        eprintln!("  {}: http://{}:{}", label, ip, port);
-    }
 
     // Shared session data between the data thread and request handlers
     let shared_data = Arc::new(Mutex::new(Vec::new()));

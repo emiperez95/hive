@@ -45,8 +45,8 @@ fn main() -> Result<()> {
         Some(Command::Todo { command }) => cli::todo::run_todo(command),
         Some(Command::Spread { count }) => cli::session::run_spread(count),
         Some(Command::Collapse) => cli::session::run_collapse(),
-        Some(Command::Web { port, dev, tts_host }) => {
-            crate::serve::web::run_web_server(port, dev, tts_host)
+        Some(Command::Web { port, lan, dev, tts_host }) => {
+            crate::serve::web::run_web_server(port, lan, dev, tts_host)
         }
         Some(Command::Start) => {
             if let Some(target) = cli::session::run_start()? {
