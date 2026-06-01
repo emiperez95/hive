@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 # Auto-increment version in Cargo.toml on each commit.
 # Default: bump patch. Override with BUMP=minor or BUMP=major.
+# Skip entirely with HIVE_NO_BUMP=1 (e.g. for docs-only or WIP commits).
 
 set -euo pipefail
 
 CARGO_TOML="Cargo.toml"
 
-# Only bump if there are staged changes (skip empty commits)
-if ! git diff --cached --quiet --exit-code 2>/dev/null; then
-    :
-else
+# Opt-out escape hatch.
+if [ "${HIVE_NO_BUMP:-0}" = "1" ]; then
     exit 0
 fi
 
-# Read current version
-current=$(grep -m1 '^version' "$CARGO_TOML" | sed 's/.*"\(.*\)".*/\1/')
+# Only bump if there are staged changes (skip empty commits).
+if git diff --cached --quiet --exit-code 2>/dev/null; then
+    exit 0
+fi
+
+# Read current version (first `version = "x"` line = the package version).
+current=$(grep -m1 '^version = ' "$CARGO_TOML" | sed 's/.*"\(.*\)".*/\1/')
 IFS='.' read -r major minor patch <<< "$current"
 
 bump="${BUMP:-patch}"
@@ -27,12 +31,21 @@ esac
 
 new_version="$major.$minor.$patch"
 
-# Update Cargo.toml (first version = line only)
-sed -i '' "0,/^version = \".*\"/s//version = \"$new_version\"/" "$CARGO_TOML"
+# Update Cargo.toml's package version. Use `-i.bak` + a plain `^version`
+# anchor so it works on both BSD/macOS sed and GNU sed (the old GNU-only
+# `0,/re/` address silently no-ops on macOS).
+sed -i.bak "s/^version = \".*\"/version = \"$new_version\"/" "$CARGO_TOML"
+rm -f "$CARGO_TOML.bak"
 
-# Update Cargo.lock if it exists and is tracked
-if [ -f Cargo.lock ] && git ls-files --error-unmatch Cargo.lock &>/dev/null; then
-    cargo generate-lockfile --quiet 2>/dev/null || true
+# Sync Cargo.lock's own entry for this package ONLY, if the lockfile is
+# tracked. `cargo update -p hive` rewrites just the one line; the old
+# `cargo generate-lockfile` refreshed every dependency and swept unrelated
+# churn into the commit.
+if [ -f Cargo.lock ] && git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+    if command -v cargo >/dev/null 2>&1; then
+        cargo update -p hive --precise "$new_version" >/dev/null 2>&1 \
+            || cargo update -p hive >/dev/null 2>&1 || true
+    fi
     git add Cargo.lock
 fi
 
