@@ -205,6 +205,8 @@ When the picker is used (case 3), selecting a session returns `PostAction::Attac
 
 In the TUI, `L` toggles: if multiple panes exist → collapse, otherwise → show SpreadPrompt for digit input.
 
+**iTerm2-only.** Spread/collapse use iTerm2's AppleScript split API, so they're gated on `iterm::is_iterm2_terminal()` (detects iTerm2 via `TERM_PROGRAM`, `LC_TERMINAL`, or `ITERM_SESSION_ID` — the latter two survive tmux/ssh where `TERM_PROGRAM` is overwritten). Outside iTerm2 the CLI errors and the TUI `L` key shows a message instead of silently launching iTerm2.
+
 **Tmux pane layout adjustment**: Spread and collapse also rearrange tmux panes within each session to optimize for the available space. Only windows with 2 or 3 panes are affected (1 or 4+ are left untouched):
 
 | Panes | Spread (narrow iTerm columns) | Collapse (full width) |

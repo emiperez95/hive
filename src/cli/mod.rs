@@ -36,7 +36,7 @@ pub struct Args {
     #[arg(short = 'D', long, global = true)]
     pub detail: bool,
 
-    /// Enable debug logging to ~/.cache/hive/debug.log
+    /// Enable debug logging to ~/.hive/cache/debug.log
     #[arg(long, global = true)]
     pub debug: bool,
 

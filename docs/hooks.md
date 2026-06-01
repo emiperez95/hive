@@ -153,7 +153,7 @@ PORT=$(printf '%s' "$HIVE_METADATA" | jq -r '.port // empty')
 ## Debugging hooks
 
 - Run `hive wt new` with `--debug` to see hook stdout/stderr streamed.
-- Check `~/.cache/hive/debug.log` for the full command line hive invoked.
+- Check `~/.hive/cache/debug.log` for the full command line hive invoked.
 - Test a hook in isolation by exporting the env vars yourself:
 
 ```bash

@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues and how to diagnose them. If none of these match, open an issue with the bug template and include `~/.cache/hive/debug.log` (generate with `hive --debug <your-command>`).
+Common issues and how to diagnose them. If none of these match, open an issue with the bug template and include `~/.hive/cache/debug.log` (generate with `hive --debug <your-command>`).
 
 ## Status in the dashboard never updates
 
@@ -127,11 +127,11 @@ Approval works by sending tmux keystrokes (`1` or `2` then `Enter`) to the Claud
 
 ## Debug logging
 
-Most non-TUI commands honor `--debug` and write to `~/.cache/hive/debug.log`. The TUI itself logs refresh cycles and state reads when you pass `--debug`.
+Most non-TUI commands honor `--debug` and write to `~/.hive/cache/debug.log`. The TUI itself logs refresh cycles and state reads when you pass `--debug`.
 
 ```bash
 hive --debug hook PreToolUse < payload.json
-cat ~/.cache/hive/debug.log
+cat ~/.hive/cache/debug.log
 ```
 
 If a specific subcommand doesn't produce log output, that's a gap — please file an issue.

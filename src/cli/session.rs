@@ -9,6 +9,12 @@ use crate::common::tmux::{
     switch_to_session,
 };
 
+/// Shown when spread/collapse is invoked outside iTerm2. The feature drives
+/// iTerm2 via AppleScript, so it can't open GUI panes in other terminals.
+pub const SPREAD_REQUIRES_ITERM2: &str =
+    "spread/collapse requires iTerm2 (it splits panes via iTerm2's AppleScript). \
+You're on a different terminal, so there's nothing to spread.";
+
 /// Cycle to next/prev tmux session, skipping skipped sessions
 pub fn run_cycle(forward: bool) -> Result<()> {
     let skipped = load_skipped_sessions();
@@ -83,6 +89,9 @@ pub fn run_spread(count: usize) -> Result<()> {
     if count <= 1 {
         return Ok(());
     }
+    if !crate::common::iterm::is_iterm2_terminal() {
+        anyhow::bail!("{}", SPREAD_REQUIRES_ITERM2);
+    }
     crate::common::tmux::set_all_sessions_layout("spread");
     crate::common::iterm::spread_panes(count - 1);
     Ok(())
@@ -90,6 +99,9 @@ pub fn run_spread(count: usize) -> Result<()> {
 
 /// Collapse iTerm2 panes back to a single pane
 pub fn run_collapse() -> Result<()> {
+    if !crate::common::iterm::is_iterm2_terminal() {
+        anyhow::bail!("{}", SPREAD_REQUIRES_ITERM2);
+    }
     crate::common::iterm::collapse_panes();
     crate::common::tmux::set_all_sessions_layout("collapse");
     Ok(())

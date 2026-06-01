@@ -46,5 +46,5 @@ body:
     id: debug-log
     attributes:
       label: Relevant log output
-      description: Run with `hive --debug` and attach `~/.cache/hive/debug.log` if useful.
+      description: Run with `hive --debug` and attach `~/.hive/cache/debug.log` if useful.
       render: shell

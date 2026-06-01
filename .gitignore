@@ -2,4 +2,7 @@
 .DS_Store
 CLAUDE.local.md
 .claude/settings.local.json
-.claude/commands/hive/
+# Keep the shipped create-project command tracked (compiled into the binary via include_str!);
+# ignore any other local hive commands.
+.claude/commands/hive/*
+!.claude/commands/hive/create-project.md

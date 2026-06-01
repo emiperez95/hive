@@ -590,13 +590,24 @@ pub fn run_tui(
                                 needs_redraw = true;
                             }
                             KeyCode::Char('l') | KeyCode::Char('L') => {
-                                let pane_count = crate::common::iterm::get_iterm_pane_count();
-                                if pane_count > 1 {
-                                    app.save_restorable();
-                                    return Ok(PostAction::Collapse);
-                                } else {
-                                    app.input_mode = InputMode::SpreadPrompt;
+                                if !crate::common::iterm::is_iterm2_terminal() {
+                                    // Not in iTerm2: don't open the prompt (which would
+                                    // launch iTerm2 via AppleScript). Explain instead.
+                                    app.error_message = Some((
+                                        crate::cli::session::SPREAD_REQUIRES_ITERM2.to_string(),
+                                        std::time::Instant::now(),
+                                    ));
                                     needs_redraw = true;
+                                } else {
+                                    let pane_count =
+                                        crate::common::iterm::get_iterm_pane_count();
+                                    if pane_count > 1 {
+                                        app.save_restorable();
+                                        return Ok(PostAction::Collapse);
+                                    } else {
+                                        app.input_mode = InputMode::SpreadPrompt;
+                                        needs_redraw = true;
+                                    }
                                 }
                             }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {

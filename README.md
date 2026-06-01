@@ -128,6 +128,11 @@ hive connect <key>      # create/attach tmux session for a registered project
 
 ### iTerm2 Panes
 
+> **Requires iTerm2.** Spread/collapse drive iTerm2 via AppleScript, so they only
+> work when hive is running inside iTerm2. On any other terminal (Terminal.app,
+> Ghostty, WezTerm, …) `hive spread`/`collapse` and the `L` key report that iTerm2
+> is required instead of doing anything.
+
 ```bash
 hive spread <N>         # split into N vertical iTerm2 panes (each runs hive start)
 hive collapse           # close all panes except the current one

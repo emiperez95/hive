@@ -42,6 +42,44 @@ pub fn get_iterm_pane_count() -> usize {
     0
 }
 
+/// Pure detection logic for whether the host terminal is iTerm2.
+///
+/// Split out from the env lookup so it can be unit-tested without mutating
+/// process-global environment variables.
+fn iterm2_from_env(
+    term_program: Option<&str>,
+    lc_terminal: Option<&str>,
+    iterm_session_id: Option<&str>,
+) -> bool {
+    // `TERM_PROGRAM` is the cleanest signal, but tmux overwrites it with "tmux".
+    // `LC_TERMINAL` (set by iTerm2) survives ssh/tmux better, and
+    // `ITERM_SESSION_ID` is set per pane and persists in tmux's env snapshot.
+    term_program == Some("iTerm.app")
+        || lc_terminal == Some("iTerm2")
+        || iterm_session_id.is_some()
+}
+
+/// Whether hive is running inside iTerm2.
+///
+/// spread/collapse drive iTerm2 via AppleScript, so they only work there.
+/// This guard lets callers report a clear message instead of silently
+/// launching iTerm2 when the user is on another terminal (Terminal.app,
+/// Ghostty, WezTerm, …). Always false off macOS.
+#[cfg(target_os = "macos")]
+pub fn is_iterm2_terminal() -> bool {
+    use std::env::var;
+    iterm2_from_env(
+        var("TERM_PROGRAM").ok().as_deref(),
+        var("LC_TERMINAL").ok().as_deref(),
+        var("ITERM_SESSION_ID").ok().as_deref(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_iterm2_terminal() -> bool {
+    false
+}
+
 /// Open N new vertical iTerm2 panes, each running `hive start`.
 ///
 /// The current pane is untouched. Each new pane runs hive start which
@@ -143,4 +181,34 @@ end tell
 #[cfg(not(target_os = "macos"))]
 pub fn collapse_panes() -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::iterm2_from_env;
+
+    #[test]
+    fn detects_iterm_via_term_program() {
+        assert!(iterm2_from_env(Some("iTerm.app"), None, None));
+    }
+
+    #[test]
+    fn detects_iterm_via_lc_terminal_under_tmux() {
+        // Inside tmux, TERM_PROGRAM is overwritten with "tmux", but LC_TERMINAL
+        // and ITERM_SESSION_ID survive.
+        assert!(iterm2_from_env(Some("tmux"), Some("iTerm2"), None));
+    }
+
+    #[test]
+    fn detects_iterm_via_session_id_under_tmux() {
+        assert!(iterm2_from_env(Some("tmux"), None, Some("w0t0p0:ABC-123")));
+    }
+
+    #[test]
+    fn rejects_other_terminals() {
+        assert!(!iterm2_from_env(Some("Apple_Terminal"), None, None));
+        assert!(!iterm2_from_env(Some("ghostty"), None, None));
+        assert!(!iterm2_from_env(Some("WezTerm"), None, None));
+        assert!(!iterm2_from_env(None, None, None));
+    }
 }

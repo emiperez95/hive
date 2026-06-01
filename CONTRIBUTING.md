@@ -100,7 +100,7 @@ Gotcha: new panes need the full `PATH` to find `tmux`. iTerm2 split panes get a 
 
 Use the issue templates (`.github/ISSUE_TEMPLATE/`):
 
-- **Bug**: include `hive --version`, `tmux -V`, macOS version + arch, and `~/.cache/hive/debug.log` if you ran with `hive --debug`.
+- **Bug**: include `hive --version`, `tmux -V`, macOS version + arch, and `~/.hive/cache/debug.log` if you ran with `hive --debug`.
 - **Feature**: describe the use case in terms of a concrete scenario before sketching the UI.
 
 Questions or discussion → [Discussions](https://github.com/emiperez95/hive/discussions).
