@@ -44,3 +44,24 @@ jobs:
           components: rustfmt
       - name: Format check
         run: cargo fmt --check
+
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard against leaked identifiers
+        run: |
+          # Patterns are built from fragments so this workflow does not match itself.
+          # git grep exits 0 when it finds a match, so a hit trips the `if` and fails the build.
+          org='wye''works'
+          ip='10\.18''\.1\.2'
+          # Skip this workflow file (it documents the patterns) to avoid self-matches.
+          if git grep -nI -e "$org" -e "$ip" -- . ':!.github/workflows/ci.yml' ; then
+            echo "Leaked identifier found in tracked files"
+            exit 1
+          fi
+          # Only scan shipped assets for clear-session (src/ test fixtures legitimately use it).
+          if git grep -nI 'clear-session' -- .claude/ ; then
+            echo "Leaked identifier in shipped assets"
+            exit 1
+          fi

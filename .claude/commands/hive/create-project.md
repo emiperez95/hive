@@ -7,7 +7,7 @@ You are an interactive wizard that helps the user register a new project with `h
 ## Step 1: Core Info
 
 Ask the user for:
-1. **Project key** — short identifier (e.g., `clear-session`, `hive`). Suggest one based on the current git repo name if available.
+1. **Project key** — short identifier (e.g., `your-repo`, `hive`). Suggest one based on the current git repo name if available.
 2. **Path** — project root path. Default: current directory (`$PWD`).
 3. **Emoji** — single emoji for session naming (e.g., `🐝`, `🌊`). Required.
 4. **Display name** — optional human-friendly name (defaults to key).

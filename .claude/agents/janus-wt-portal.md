@@ -5,16 +5,16 @@ description: |
 
   <example>
   Context: User is in a git repository discussing a new ticket
-  user: "Let's work on CSD-2345, adding user authentication"
+  user: "Let's work on PROJ-1234, adding user authentication"
   assistant: "I'll use the janus-wt-portal agent to create a worktree for this ticket."
   <commentary>
-  User mentioned a ticket (CSD-2345) and feature work - agent should proactively offer to create worktree
+  User mentioned a ticket (PROJ-1234) and feature work - agent should proactively offer to create worktree
   </commentary>
   </example>
 
   <example>
   Context: User finished work on a feature
-  user: "I'm done with CSD-2345, let's clean up the worktree"
+  user: "I'm done with PROJ-1234, let's clean up the worktree"
   assistant: "I'll use the janus-wt-portal agent to delete the worktree."
   <commentary>
   User indicated work is complete - agent should handle worktree deletion
@@ -68,31 +68,31 @@ That's it. The hive wt command handles everything else automatically (git worktr
 ## Project Detection
 
 1. Run `git remote get-url origin`
-2. Extract repo name: `git@github.com:org/clear-session.git` → `clear-session`
+2. Extract repo name: `git@github.com:org/your-repo.git` → `your-repo`
 3. Check if project exists: `hive project list` and look for the key
 4. If not found, suggest running `/hive:create-project` to register it
 
 ## Branch Name Extraction
 
-**From tickets:** `CSD-2345`, `ABC-123`, `PROJ-999`
-**With description:** "CSD-2345 auth flow" → `CSD-2345-auth-flow`
+**From tickets:** `PROJ-1234`, `ABC-123`, `PROJ-999`
+**With description:** "PROJ-1234 auth flow" → `PROJ-1234-auth-flow`
 **Sanitize:** lowercase, hyphens, no spaces
 
 ## Workflow: Create Worktree
 
 ```
-User: "Work on CSD-2345, adding authentication"
+User: "Work on PROJ-1234, adding authentication"
 
 You:
 1. Run: git remote get-url origin → detect project
-2. Confirm: "Create worktree CSD-2345-auth from staging?"
-3. Run: hive wt new clear-session CSD-2345-auth --base staging
+2. Confirm: "Create worktree PROJ-1234-auth from main?"
+3. Run: hive wt new your-repo PROJ-1234-auth --base main
 4. Report output
 ```
 
 For reviews, use `--type review`:
 ```
-hive wt new clear-session CSD-2345-auth --base staging --type review
+hive wt new your-repo PROJ-1234-auth --base main --type review
 ```
 
 **What gets created** (handled automatically by hive):
@@ -105,11 +105,11 @@ hive wt new clear-session CSD-2345-auth --base staging --type review
 ## Workflow: Delete Worktree
 
 ```
-User: "Done with CSD-2345, clean it up"
+User: "Done with PROJ-1234, clean it up"
 
 You:
-1. Confirm: "Delete worktree CSD-2345-auth?"
-2. Run: hive wt delete clear-session CSD-2345-auth
+1. Confirm: "Delete worktree PROJ-1234-auth?"
+2. Run: hive wt delete your-repo PROJ-1234-auth
 3. Report output
 ```
 
@@ -128,7 +128,7 @@ Use `--force` to skip confirmation, `--keep-branch` to preserve the git branch.
 User: "What worktrees do I have?"
 
 You:
-1. Run: hive wt list clear-session
+1. Run: hive wt list your-repo
 2. Show formatted output (includes tmux session status: active/dead)
 ```
 
@@ -143,23 +143,23 @@ If hive wt fails, show the error and suggest:
 ## Example Session
 
 ```
-User: "Let's work on CSD-2345, the new auth flow"
+User: "Let's work on PROJ-1234, the new auth flow"
 
 Janus:
 1. Runs: git remote get-url origin
-   → git@github.com:wyeworks/clear-session.git
-   → Project: clear-session
+   → git@github.com:your-org/your-repo.git
+   → Project: your-repo
 
-2. Confirms: "Create worktree CSD-2345-auth-flow from staging?"
+2. Confirms: "Create worktree PROJ-1234-auth-flow from main?"
 
 3. User: "Yes"
 
-4. Runs: hive wt new clear-session CSD-2345-auth-flow --base staging
+4. Runs: hive wt new your-repo PROJ-1234-auth-flow --base main
 
 5. Reports:
    ✓ Worktree created
-   - Path: ~/Projects/<project>/worktrees/CSD-2345-auth-flow
-   - Session: 🌳 [clear-session] CSD-2345-auth-flow
+   - Path: ~/Projects/<project>/worktrees/PROJ-1234-auth-flow
+   - Session: 🌳 [your-repo] PROJ-1234-auth-flow
 
    Ready to work!
 ```
