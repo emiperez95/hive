@@ -33,6 +33,10 @@ hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
 hive setup              # register hooks, agent, and tmux keybindings
 hive update             # update to latest version from GitHub + re-run setup
+hive config list                            # show all config defaults
+hive config set defaults.projects_dir ~/code  # set base dir for new projects
+hive config get defaults.projects_dir       # read one value
+hive config path                            # print config file location
 hive --version          # print current version
 hive cycle-next         # switch to next tmux session (skipping skipped)
 hive cycle-prev         # switch to previous tmux session
@@ -144,6 +148,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 ```
 ~/.hive/
 ├── projects.toml              # project registry
+├── config.toml                # global config (defaults for new projects)
 ├── cache/                     # runtime state
 │   ├── state.json             # hook state (session statuses)
 │   ├── worktrees.json         # registered worktrees

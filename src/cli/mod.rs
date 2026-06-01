@@ -3,6 +3,7 @@
 //! This module defines the CLI interface (via clap) and re-exports all
 //! subcommand handlers. `main.rs` parses args and dispatches here.
 
+pub mod config;
 pub mod hook;
 pub mod project;
 pub mod session;
@@ -82,6 +83,11 @@ pub enum Command {
     },
     /// Update hive to the latest version from GitHub
     Update,
+    /// View or edit hive configuration (~/.hive/config.toml)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage git worktrees for registered projects
     Wt {
         #[command(subcommand)]
@@ -180,6 +186,26 @@ pub enum ProjectCommand {
     List,
     /// Import projects from sesh.toml
     Import,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// List all config keys and their current values
+    List,
+    /// Print the value of a single config key
+    Get {
+        /// Dotted config key (e.g. defaults.projects_dir)
+        key: String,
+    },
+    /// Set a config key to a value
+    Set {
+        /// Dotted config key (e.g. defaults.projects_dir)
+        key: String,
+        /// New value
+        value: String,
+    },
+    /// Print the path to the config file
+    Path,
 }
 
 #[derive(Subcommand, Debug)]

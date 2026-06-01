@@ -59,11 +59,19 @@ pub struct JsonlStatus {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
+/// Base directory for the primary Claude config.
+/// Honors the `CLAUDE_CONFIG_DIR` env override; otherwise falls back to `~/.claude`.
+pub fn claude_config_base() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir().unwrap_or_default().join(".claude")
+}
+
 /// Convert a project working directory to the Claude projects path (primary: ~/.claude/projects/).
 pub fn cwd_to_claude_projects_path(cwd: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
     let encoded = cwd.replace('/', "-");
-    home.join(".claude").join("projects").join(encoded)
+    claude_config_base().join("projects").join(encoded)
 }
 
 /// Return all candidate Claude projects paths for a cwd across all config profiles.
@@ -76,8 +84,8 @@ pub fn candidate_projects_paths(cwd: &str) -> Vec<PathBuf> {
     let encoded = cwd.replace('/', "-");
     let mut paths: Vec<PathBuf> = Vec::new();
 
-    // Primary profile
-    paths.push(home.join(".claude").join("projects").join(&encoded));
+    // Primary profile (honors CLAUDE_CONFIG_DIR override)
+    paths.push(claude_config_base().join("projects").join(&encoded));
 
     // Alt profiles: ~/.claude-*/projects/<slug>
     if let Ok(entries) = fs::read_dir(&home) {
@@ -573,6 +581,13 @@ pub fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `CLAUDE_CONFIG_DIR` is process-global, so every test that reads or mutates
+    /// it must hold this lock. Without serialization the env-override test races
+    /// the path-derivation tests (cargo runs tests in parallel by default) and
+    /// they intermittently see each other's value.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn parse_entry(json: &str) -> JsonlEntry {
         serde_json::from_str(json).expect("Failed to parse test JSON")
@@ -580,6 +595,10 @@ mod tests {
 
     #[test]
     fn test_cwd_to_claude_projects_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Force the default (~/.claude) base so a stray CLAUDE_CONFIG_DIR doesn't
+        // change the expected suffix.
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         let path = cwd_to_claude_projects_path("/Users/test/project");
         let path_str = path.to_string_lossy();
         assert!(path_str.ends_with("-Users-test-project"));
@@ -588,10 +607,28 @@ mod tests {
 
     #[test]
     fn test_candidate_projects_paths_filters_nonexistent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Force the default base; a stray CLAUDE_CONFIG_DIR pointing at an existing
+        // dir would otherwise add a candidate and break the emptiness assertion.
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         // With a cwd that definitely has no conversation history, we should get zero candidates
         // (the primary path doesn't exist either). This verifies the .exists() filter works.
         let paths = candidate_projects_paths("/definitely/does/not/exist/42");
         assert!(paths.is_empty(), "expected no candidates, got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_claude_config_base_honors_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Saving/restoring around env mutation keeps this test self-contained.
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        let custom = "/tmp/hive-test-claude-config-dir";
+        std::env::set_var("CLAUDE_CONFIG_DIR", custom);
+        assert_eq!(claude_config_base(), PathBuf::from(custom));
+        match prev {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
     }
 
     #[test]

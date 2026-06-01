@@ -1,6 +1,7 @@
 //! Common types and utilities shared between TUI and hook command.
 
 pub mod chrome;
+pub mod config;
 pub mod debug;
 pub mod iterm;
 #[allow(dead_code)]

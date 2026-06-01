@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         Some(Command::Hook { event }) => cli::hook::run_hook(&event),
         Some(Command::Setup { yes }) => cli::setup::run_setup(yes),
         Some(Command::Update) => cli::update::run_update(),
+        Some(Command::Config { command }) => cli::config::run_config(command),
         Some(Command::Uninstall { yes }) => cli::setup::run_uninstall(yes),
         Some(Command::CycleNext) => cli::session::run_cycle(true),
         Some(Command::CyclePrev) => cli::session::run_cycle(false),

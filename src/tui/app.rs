@@ -912,15 +912,18 @@ impl App {
     /// Complete the wizard: create project, return session name for connect+switch.
     pub fn np_complete(&mut self) -> Option<String> {
         let key = self.np_key.take()?;
+        let defaults = crate::common::config::HiveConfig::load().defaults;
         let emoji = {
             let e = self.input_buffer.trim().to_string();
             if e.is_empty() {
-                "📁".to_string()
+                defaults.emoji.clone()
             } else {
                 e
             }
         };
-        let project_root = format!("~/Projects/00-Personal/{}", key);
+        // Root new projects under the configured projects_dir ({dir}/{key}),
+        // falling back to the built-in default (~/projects) when unconfigured.
+        let project_root = format!("{}/{}", defaults.projects_dir.trim_end_matches('/'), key);
         // Ensure the project directory exists before creating the tmux session
         let expanded = crate::common::projects::expand_tilde(&project_root);
         let _ = std::fs::create_dir_all(&expanded);
@@ -928,7 +931,7 @@ impl App {
             emoji: emoji.clone(),
             project_root,
             display_name: None,
-            startup_command: Some("claude -c".to_string()),
+            startup_command: Some(defaults.startup_command.clone()),
             worktrees_dir: None,
             default_base_branch: None,
             worktree_types: Vec::new(),

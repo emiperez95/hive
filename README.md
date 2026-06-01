@@ -169,8 +169,14 @@ hive update             # update to latest prebuilt release + re-run setup
 hive uninstall          # remove hooks and keybindings
 hive uninstall --yes    # non-interactive uninstall
 hive hook <event>       # process hook event from stdin (used by Claude Code hooks)
-hive --debug <command>  # enable verbose logging to ~/.cache/hive/debug.log
+hive --debug <command>  # enable verbose logging to ~/.hive/cache/debug.log
+hive config list                       # show all config defaults
+hive config set defaults.projects_dir ~/code  # set the base dir for new projects
+hive config get defaults.projects_dir  # read one value
+hive config path                       # print config file location
 ```
+
+> New projects created from the TUI wizard are placed under `defaults.projects_dir` (default `~/projects`), configurable via `hive config`.
 
 Set `HIVE_NO_NOTIFY=1` to suppress desktop notifications (useful for CI / scripts).
 
