@@ -104,6 +104,11 @@ pub struct SessionState {
     pub needs_attention: bool,
     /// Timestamp of last activity (ISO 8601)
     pub last_activity: Option<String>,
+    /// tmux pane id (e.g. "%1") this session is running in, captured from the
+    /// hook's `TMUX_PANE` env var. Lets us correlate a tmux pane with its Claude
+    /// `session_id` even when multiple Claude instances share a working directory.
+    #[serde(default)]
+    pub tmux_pane: Option<String>,
 }
 
 /// File-based state shared between `hive hook` and the TUI.
@@ -153,6 +158,7 @@ impl HookState {
                 status: SessionStatus::Unknown,
                 needs_attention: false,
                 last_activity: None,
+                tmux_pane: None,
             })
     }
 
@@ -295,6 +301,7 @@ mod tests {
                 status: SessionStatus::Waiting,
                 needs_attention: false,
                 last_activity: Some(old_time),
+                tmux_pane: None,
             },
         );
 
@@ -308,6 +315,7 @@ mod tests {
                 status: SessionStatus::Working,
                 needs_attention: false,
                 last_activity: Some(recent_time),
+                tmux_pane: None,
             },
         );
 
@@ -330,6 +338,7 @@ mod tests {
                 status: SessionStatus::Unknown,
                 needs_attention: false,
                 last_activity: None,
+                tmux_pane: None,
             },
         );
 
@@ -352,6 +361,7 @@ mod tests {
                     status: SessionStatus::Working,
                     needs_attention: false,
                     last_activity: Some(now.clone()),
+                    tmux_pane: None,
                 },
             );
         }
@@ -376,6 +386,7 @@ mod tests {
                 },
                 needs_attention: true,
                 last_activity: Some("2025-01-01T00:00:00Z".into()),
+                tmux_pane: None,
             },
         );
 
@@ -391,6 +402,36 @@ mod tests {
             SessionStatus::NeedsPermission { tool_name, description }
             if tool_name == "Bash: cargo test" && description.as_deref() == Some("Run tests")
         ));
+    }
+
+    #[test]
+    fn test_session_state_tmux_pane_backward_compat() {
+        // State written before tmux_pane existed must still deserialize (field defaults to None).
+        let legacy = r#"{
+            "sessions": {
+                "s1": {
+                    "session_id": "s1",
+                    "cwd": "/project",
+                    "status": "Working",
+                    "needs_attention": false,
+                    "last_activity": "2025-01-01T00:00:00Z"
+                }
+            }
+        }"#;
+        let state: HookState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(state.sessions["s1"].tmux_pane, None);
+    }
+
+    #[test]
+    fn test_session_state_tmux_pane_roundtrip() {
+        let mut state = HookState::default();
+        let session = state.get_or_create_session("s1", "/project");
+        session.tmux_pane = Some("%3".into());
+        session.last_activity = Some("2025-01-01T00:00:00Z".into());
+
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: HookState = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.sessions["s1"].tmux_pane.as_deref(), Some("%3"));
     }
 
     #[test]
@@ -450,6 +491,7 @@ mod tests {
                 status: SessionStatus::Waiting,
                 needs_attention: false,
                 last_activity: Some(chrono::Utc::now().to_rfc3339()),
+                tmux_pane: None,
             },
         );
 

@@ -73,7 +73,7 @@ pub fn get_tmux_panes(session: &str, window_index: &str) -> Result<Vec<TmuxPane>
             "-t",
             &target,
             "-F",
-            "#{pane_index}\t#{pane_pid}\t#{pane_current_path}",
+            "#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_path}",
         ])
         .output()
         .context("Failed to list tmux panes")?;
@@ -87,12 +87,13 @@ pub fn get_tmux_panes(session: &str, window_index: &str) -> Result<Vec<TmuxPane>
         }
 
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            if let Ok(pid) = parts[1].parse::<u32>() {
+        if parts.len() >= 4 {
+            if let Ok(pid) = parts[2].parse::<u32>() {
                 panes.push(TmuxPane {
                     index: parts[0].to_string(),
+                    id: parts[1].to_string(),
                     pid,
-                    cwd: parts[2].to_string(),
+                    cwd: parts[3].to_string(),
                 });
             }
         }
@@ -105,6 +106,14 @@ pub fn get_tmux_panes(session: &str, window_index: &str) -> Result<Vec<TmuxPane>
 pub fn switch_to_session(session_name: &str) {
     let _ = Command::new("tmux")
         .args(["switch-client", "-t", session_name])
+        .output();
+}
+
+/// Select a window within a session (does not switch the attached client).
+pub fn select_window(session: &str, window_index: &str) {
+    let target = format!("{}:{}", session, window_index);
+    let _ = Command::new("tmux")
+        .args(["select-window", "-t", &target])
         .output();
 }
 

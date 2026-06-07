@@ -43,6 +43,39 @@ pub struct SessionView {
     /// Conversation messages for the dashboard (user + assistant)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<ConversationMessage>,
+    /// One entry per Claude instance running in this tmux session. When more than
+    /// one window is present the web dashboard renders the session as an accordion
+    /// so a specific window can be selected. Empty when no Claude is running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<WindowView>,
+}
+
+/// One Claude instance (tmux window/pane) within a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowView {
+    /// tmux global pane id (e.g. "%1") — the unique selector used by the web API.
+    pub pane_id: String,
+    /// tmux window index.
+    pub window_index: String,
+    /// tmux window name.
+    pub window_name: String,
+    /// Resolved Claude session id (jsonl basename), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Claude status for this specific window.
+    pub status: Option<SessionStatus>,
+    /// CPU usage across this window's Claude process tree.
+    pub cpu: f32,
+    /// Memory usage in KB across this window's Claude process tree.
+    pub mem_kb: u64,
+    /// Listening TCP ports for this window's processes.
+    pub ports: Vec<u16>,
+    /// Working directory of the window's pane.
+    pub cwd: Option<String>,
+    /// Last activity timestamp (ISO 8601) for this window.
+    pub last_activity: Option<String>,
+    /// (session, window, pane) for routing send-keys to this window.
+    pub pane: Option<(String, String, String)>,
 }
 
 /// One message in the conversation (user or assistant text).

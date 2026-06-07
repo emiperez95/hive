@@ -13,7 +13,9 @@ use crate::common::debug::debug_log;
 use crate::common::projects::{connect_session, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session, resolve_tmux_path, switch_to_session};
 use crate::common::types::{SessionInfo, PERMISSION_KEYS};
-use crate::tui::app::{find_session_by_permission_key, gather_sessions, App, InputMode, SearchResult};
+use crate::tui::app::{
+    find_session_by_permission_key, gather_sessions, App, HintTarget, InputMode, SearchResult,
+};
 use crate::tui::ui::ui;
 use sysinfo::System;
 
@@ -85,6 +87,7 @@ pub fn run_tui(
                 | InputMode::WorktreeConfirmDelete
                 | InputMode::NewProjectKey
                 | InputMode::NewProjectEmoji
+                | InputMode::Hint
         );
         if !skip_refresh {
             // Drain channel — use latest snapshot if multiple are queued
@@ -190,6 +193,44 @@ pub fn run_tui(
                             }
                             KeyCode::Esc => {
                                 app.input_mode = InputMode::Normal;
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.input_mode == InputMode::Hint {
+                        match code {
+                            KeyCode::Esc => {
+                                app.cancel_hint_mode();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.hint_buffer.pop();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(target) = app.hint_input(c) {
+                                    app.cancel_hint_mode();
+                                    match target {
+                                        HintTarget::Session(name) => {
+                                            if let Some(info) = app
+                                                .session_infos
+                                                .iter()
+                                                .find(|s| s.name == name)
+                                                .cloned()
+                                            {
+                                                switch_to(&info, &mut app);
+                                            }
+                                            return Ok(PostAction::None);
+                                        }
+                                        HintTarget::Window(name, window) => {
+                                            app.unskip(&name);
+                                            crate::common::tmux::select_window(&name, &window);
+                                            switch_to_session(&name);
+                                            app.save_restorable();
+                                            return Ok(PostAction::None);
+                                        }
+                                    }
+                                }
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -390,6 +431,16 @@ pub fn run_tui(
                                 if app.selected + 1 < app.search_results.len() {
                                     app.selected += 1;
                                 }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Delete => {
+                                app.toggle_archive_selected_project();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R')
+                                if modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                app.toggle_show_archived();
                                 needs_redraw = true;
                             }
                             KeyCode::Char(c) => {
@@ -622,6 +673,10 @@ pub fn run_tui(
                                 app.load_project_names();
                                 app.update_search_results();
                                 app.selected = 0;
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('f') | KeyCode::Char('F') => {
+                                app.enter_hint_mode();
                                 needs_redraw = true;
                             }
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {

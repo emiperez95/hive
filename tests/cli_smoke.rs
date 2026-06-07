@@ -66,7 +66,7 @@ fn project_help_exits_zero() {
     let output = hive_cmd().args(["project", "--help"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for sub in ["add", "remove", "list", "import"] {
+    for sub in ["add", "remove", "archive", "unarchive", "list", "import"] {
         assert!(
             stdout.contains(sub),
             "Missing project subcommand '{}'",
@@ -247,4 +247,57 @@ fn todo_add_and_done_roundtrip() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
+}
+
+// --- Project archive roundtrip (isolated HOME so the real registry is untouched) ---
+
+#[test]
+fn project_archive_roundtrip() {
+    // Isolate ~/.hive by pointing HOME at a temp dir; dirs::home_dir() honors $HOME.
+    let home = std::env::temp_dir().join(format!("hive-smoke-archive-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let run = |args: &[&str]| {
+        hive_cmd().args(args).env("HOME", &home).output().unwrap()
+    };
+
+    // Add a project to the isolated registry.
+    let output = run(&["project", "add", "demo", "--emoji", "🧪", "--path", "/tmp/demo"]);
+    assert!(output.status.success());
+
+    // Archive it.
+    let output = run(&["project", "archive", "demo"]);
+    assert!(output.status.success());
+
+    // Default list hides it.
+    let output = run(&["project", "list"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("demo"), "Archived project should be hidden: {}", stdout);
+
+    // --all shows it, marked.
+    let output = run(&["project", "list", "--all"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("demo"), "--all should show archived: {}", stdout);
+    assert!(stdout.contains("[archived]"), "--all should mark archived: {}", stdout);
+
+    // Persisted as archived = true.
+    let toml = std::fs::read_to_string(home.join(".hive/projects.toml")).unwrap();
+    assert!(toml.contains("archived = true"), "TOML missing archived flag: {}", toml);
+
+    // Unarchive removes the flag and the project reappears in the default list.
+    let output = run(&["project", "unarchive", "demo"]);
+    assert!(output.status.success());
+    let output = run(&["project", "list"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("demo"), "Unarchived project should reappear: {}", stdout);
+    let toml = std::fs::read_to_string(home.join(".hive/projects.toml")).unwrap();
+    assert!(!toml.contains("archived"), "archived flag should be gone: {}", toml);
+
+    // Archiving a missing key fails.
+    let output = run(&["project", "archive", "does-not-exist"]);
+    assert!(!output.status.success());
+
+    std::fs::remove_dir_all(&home).ok();
 }

@@ -117,6 +117,29 @@ pub fn find_latest_jsonl_for_cwd(cwd: &str) -> Option<PathBuf> {
         .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+/// Find a specific session's jsonl file (`<session_id>.jsonl`) across profile dirs for a cwd.
+/// The Claude `session_id` is exactly the jsonl basename, so this resolves an instance to
+/// its own conversation even when several Claude instances share the same working directory.
+pub fn find_jsonl_by_session_id(cwd: &str, session_id: &str) -> Option<PathBuf> {
+    let filename = format!("{session_id}.jsonl");
+    candidate_projects_paths(cwd)
+        .into_iter()
+        .map(|dir| dir.join(&filename))
+        .find(|p| p.is_file())
+}
+
+/// Resolve the jsonl path for a conversation. When `session_id` is known, prefer the exact
+/// `<session_id>.jsonl`; otherwise (or if that file is missing) fall back to the most recently
+/// modified jsonl for the cwd.
+pub fn resolve_jsonl_path(cwd: &str, session_id: Option<&str>) -> Option<PathBuf> {
+    if let Some(sid) = session_id {
+        if let Some(path) = find_jsonl_by_session_id(cwd, sid) {
+            return Some(path);
+        }
+    }
+    find_latest_jsonl_for_cwd(cwd)
+}
+
 /// Read the last N lines of a file efficiently
 pub fn read_last_lines(path: &PathBuf, n: usize) -> Vec<String> {
     let file = match fs::File::open(path) {
@@ -215,11 +238,51 @@ pub fn parse_status_from_entries(entries: &[JsonlEntry]) -> (ClaudeStatus, Optio
         // Turn completed, waiting for input
         (Some("Stop"), _) => ClaudeStatus::Waiting,
         (Some("PostToolUse"), _) => ClaudeStatus::Unknown, // Processing/working
-        // No clear signal, assume working
-        _ => ClaudeStatus::Unknown,
+        // No hook-event signal. Current native Claude transcripts no longer emit
+        // `progress` entries, so fall back to inferring status from the conversation flow.
+        _ => infer_status_from_conversation(entries),
     };
 
     (status, timestamp)
+}
+
+/// Infer status from the conversation flow when no hook-event `progress` entries
+/// are present (the current native Claude transcript format).
+///
+/// - Last turn is an assistant message ending in a `text` block → the turn finished
+///   and Claude is waiting for input → `Waiting`.
+/// - Last turn ends in a `tool_use`, or the last message is a user/tool_result →
+///   Claude is still working → `Unknown`.
+///
+/// Permission/edit/plan states are intentionally not inferred here — those rely on
+/// live hook state (state.json); this fallback only distinguishes idle from working.
+fn infer_status_from_conversation(entries: &[JsonlEntry]) -> ClaudeStatus {
+    // Find the last user/assistant message, skipping system/attachment/mode/etc. entries.
+    let last_msg = entries
+        .iter()
+        .rev()
+        .find(|e| e.entry_type == "user" || e.entry_type == "assistant");
+
+    match last_msg {
+        Some(e) if e.entry_type == "assistant" => {
+            let ends_with_text = e
+                .message
+                .as_ref()
+                .and_then(|m| m.content.as_ref())
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.last())
+                .and_then(|block| block.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("text");
+            if ends_with_text {
+                ClaudeStatus::Waiting
+            } else {
+                ClaudeStatus::Unknown
+            }
+        }
+        // Last message is a user/tool_result (Claude is processing) or none found.
+        _ => ClaudeStatus::Unknown,
+    }
 }
 
 /// Read lines from the last `max_bytes` of a file (efficient tail read).
@@ -503,7 +566,16 @@ pub fn extract_conversation_messages(lines: &[String], max_messages: usize) -> V
 /// Reads the full JSONL file and returns all messages.
 /// Searches all auth profiles (`~/.claude/projects/` + `~/.claude-*/projects/`).
 pub fn get_conversation_messages(cwd: &str) -> Vec<ConversationMessage> {
-    let jsonl_path = match find_latest_jsonl_for_cwd(cwd) {
+    get_conversation_messages_for(cwd, None)
+}
+
+/// Like [`get_conversation_messages`], but resolves the conversation for a specific Claude
+/// `session_id` when known (so multiple instances sharing a cwd map to their own transcripts).
+pub fn get_conversation_messages_for(
+    cwd: &str,
+    session_id: Option<&str>,
+) -> Vec<ConversationMessage> {
+    let jsonl_path = match resolve_jsonl_path(cwd, session_id) {
         Some(p) => p,
         None => return Vec::new(),
     };
@@ -521,9 +593,20 @@ pub fn get_conversation_messages(cwd: &str) -> Vec<ConversationMessage> {
 /// Parse Claude status from jsonl file.
 /// Searches all auth profiles (`~/.claude/projects/` + `~/.claude-*/projects/`).
 pub fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
-    let jsonl_path = find_latest_jsonl_for_cwd(cwd)?;
+    get_claude_status_from_jsonl_for(cwd, None)
+}
 
-    let last_lines = read_last_lines(&jsonl_path, 10);
+/// Like [`get_claude_status_from_jsonl`], but resolves status for a specific Claude
+/// `session_id` when known.
+pub fn get_claude_status_from_jsonl_for(
+    cwd: &str,
+    session_id: Option<&str>,
+) -> Option<JsonlStatus> {
+    let jsonl_path = resolve_jsonl_path(cwd, session_id)?;
+
+    // Read a generous tail: current transcripts interleave many system/attachment/mode
+    // entries between conversational turns, so 10 lines can miss the last assistant message.
+    let last_lines = read_last_lines(&jsonl_path, 40);
     if last_lines.is_empty() {
         return None;
     }
@@ -604,6 +687,56 @@ mod tests {
     }
 
     #[test]
+    fn test_idle_inferred_from_trailing_assistant_text() {
+        // Current native transcripts have no `progress` entries. An assistant message
+        // ending in a text block means the turn finished → Waiting.
+        let user = r#"{"type":"user","message":{"content":"do the thing"},"timestamp":"2026-01-29T10:00:00Z"}"#;
+        let thinking = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All done."}]},"timestamp":"2026-01-29T10:00:05Z"}"#;
+        let system = r#"{"type":"system","timestamp":"2026-01-29T10:00:06Z"}"#;
+        let entries = vec![
+            parse_entry(user),
+            parse_entry(thinking),
+            parse_entry(text),
+            parse_entry(system),
+        ];
+        let (status, _) = parse_status_from_entries(&entries);
+        assert!(
+            matches!(status, ClaudeStatus::Waiting),
+            "expected Waiting, got {:?}",
+            status
+        );
+    }
+
+    #[test]
+    fn test_working_inferred_from_trailing_tool_use() {
+        // No progress entries; last assistant block is a tool_use → still working.
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."}]}}"#;
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let entries = vec![parse_entry(text), parse_entry(tool)];
+        let (status, _) = parse_status_from_entries(&entries);
+        assert!(
+            matches!(status, ClaudeStatus::Unknown),
+            "expected Unknown/working, got {:?}",
+            status
+        );
+    }
+
+    #[test]
+    fn test_working_inferred_from_trailing_user_message() {
+        // No progress entries; last conversational message is a user/tool_result → working.
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let user = r#"{"type":"user","message":{"content":"next request"}}"#;
+        let entries = vec![parse_entry(text), parse_entry(user)];
+        let (status, _) = parse_status_from_entries(&entries);
+        assert!(
+            matches!(status, ClaudeStatus::Unknown),
+            "expected Unknown/working, got {:?}",
+            status
+        );
+    }
+
+    #[test]
     fn test_needs_permission_bash() {
         let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pnpm exec prettier --write file.json","description":"Format JSON files"}}]}}"#;
         let progress =
@@ -676,12 +809,14 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_no_progress() {
+    fn test_no_progress_trailing_text_is_waiting() {
+        // Without progress entries, a trailing assistant text block means the turn
+        // finished and Claude is idle → Waiting (current native transcript format).
         let assistant =
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}"#;
         let entries = vec![parse_entry(assistant)];
         let (status, _) = parse_status_from_entries(&entries);
-        assert!(matches!(status, ClaudeStatus::Unknown));
+        assert!(matches!(status, ClaudeStatus::Waiting));
     }
 
     #[test]

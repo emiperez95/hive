@@ -68,6 +68,7 @@ pub fn run_project_add(cmd: ProjectCommand) -> Result<()> {
         },
         hooks_dir,
         auth_profile: None,
+        archived: false,
     };
 
     let session_name = ProjectRegistry::session_name(&key, &config);
@@ -88,8 +89,20 @@ pub fn run_project_remove(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Archive or unarchive a project in the registry
+pub fn run_project_set_archived(key: &str, archived: bool) -> Result<()> {
+    let mut registry = ProjectRegistry::load();
+    if !registry.set_archived(key, archived) {
+        anyhow::bail!("Project '{}' not found in registry", key);
+    }
+    registry.save()?;
+    let verb = if archived { "Archived" } else { "Unarchived" };
+    println!("{} project '{}'", verb, key);
+    Ok(())
+}
+
 /// List all configured projects
-pub fn run_project_list() -> Result<()> {
+pub fn run_project_list(all: bool) -> Result<()> {
     let registry = ProjectRegistry::load();
 
     if registry.projects.is_empty() {
@@ -97,9 +110,20 @@ pub fn run_project_list() -> Result<()> {
         return Ok(());
     }
 
-    // Sort by key for consistent output
-    let mut entries: Vec<_> = registry.projects.iter().collect();
+    let archived_total = registry.projects.values().filter(|c| c.archived).count();
+
+    // Sort by key for consistent output; hide archived unless --all
+    let mut entries: Vec<_> = registry
+        .projects
+        .iter()
+        .filter(|(_, c)| all || !c.archived)
+        .collect();
     entries.sort_by_key(|(k, _)| k.as_str());
+
+    if entries.is_empty() {
+        println!("No active projects. Use 'hive project list --all' to show archived.");
+        return Ok(());
+    }
 
     // Calculate column widths
     let max_key = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -126,17 +150,29 @@ pub fn run_project_list() -> Result<()> {
 
     for (key, config) in &entries {
         let session = ProjectRegistry::session_name(key, config);
+        let marker = if config.archived { "  [archived]" } else { "" };
         println!(
-            "{:<width_k$}  {:<width_s$}  {}",
+            "{:<width_k$}  {:<width_s$}  {}{}",
             key,
             session,
             config.project_root,
+            marker,
             width_k = max_key,
             width_s = max_session
         );
     }
 
-    println!("\n{} project(s)", entries.len());
+    if all {
+        println!("\n{} project(s) ({} archived)", entries.len(), archived_total);
+    } else if archived_total > 0 {
+        println!(
+            "\n{} project(s) ({} archived hidden — use --all)",
+            entries.len(),
+            archived_total
+        );
+    } else {
+        println!("\n{} project(s)", entries.len());
+    }
     Ok(())
 }
 

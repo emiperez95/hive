@@ -11,10 +11,12 @@ use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{
     build_children_map, collect_descendants, get_process_info, is_claude_process,
 };
+use crate::common::instances::{detect_claude_instances, ClaudeInstance, HookIndex};
 use crate::common::projects::{has_project_config, ProjectConfig, ProjectRegistry};
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
-    lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
+    lines_for_session, matches_filter, ClaudeStatus, ClaudeWindowInfo, ProcessInfo, SessionInfo,
+    PERMISSION_KEYS,
 };
 use crate::common::worktree::sanitize_branch_name;
 use crate::ipc::messages::{HookState, SessionState, SessionStatus};
@@ -35,6 +37,7 @@ pub enum InputMode {
     WorktreeConfirmDelete, // Confirming worktree deletion
     NewProjectKey,         // Typing project key in new project wizard
     NewProjectEmoji,       // Typing emoji in new project wizard
+    Hint,                  // Vim-style quick-jump: type a 2-char label to switch
 }
 
 /// Search result item - active session, inactive project, or worktree
@@ -43,6 +46,33 @@ pub enum SearchResult {
     Active(String),   // Session name
     Project(String),  // Project name from registry (not active)
     Worktree(String), // Worktree session name from worktrees.json (not active)
+}
+
+/// A quick-jump target in hint mode: either a whole session or a specific
+/// window within a multi-window session.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HintTarget {
+    Session(String),        // session name
+    Window(String, String), // (session name, window index)
+}
+
+/// Home-row alphabet for hint labels. 9 keys → 81 two-char labels.
+const HINT_ALPHABET: &[u8] = b"asdfghjkl";
+
+/// Generate `count` unique fixed-length (2-char) labels from the home-row
+/// alphabet, in a stable order: aa, as, ad, … Caps out at 81 labels; any
+/// targets beyond that get no label (unreachable, but never happens in practice).
+fn gen_hint_labels(count: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(count);
+    'outer: for &a in HINT_ALPHABET {
+        for &b in HINT_ALPHABET {
+            if out.len() >= count {
+                break 'outer;
+            }
+            out.push(format!("{}{}", a as char, b as char));
+        }
+    }
+    out
 }
 
 /// TUI application state
@@ -78,6 +108,10 @@ pub struct App {
     pub project_names: Vec<String>,  // Cached list of all project session names
     pub worktree_names: Vec<String>, // Flat list of all worktree session names
     pub worktrees_by_project: HashMap<String, Vec<String>>, // project_key → worktree session names
+    pub show_archived: bool, // Reveal archived projects in the picker
+    pub archived_session_names: HashSet<String>, // Archived project session names (for styling)
+    pub archived_worktree_names: HashSet<String>, // Worktrees of archived projects (inherit status)
+    pub orphan_worktree_names: HashSet<String>, // Worktrees whose parent project was deleted
     // Per-session auto-approve toggle
     pub auto_approve_sessions: HashSet<String>,
     // Per-session notification mute
@@ -111,6 +145,9 @@ pub struct App {
     pub wt_delete_branch: Option<String>,
     // New project wizard: stored key from step 1
     pub np_key: Option<String>,
+    // Hint mode: (label, target) pairs in display order, and keys typed so far
+    pub hint_targets: Vec<(String, HintTarget)>,
+    pub hint_buffer: String,
 }
 
 impl App {
@@ -139,6 +176,10 @@ impl App {
             project_names: Vec::new(),
             worktree_names: Vec::new(),
             worktrees_by_project: HashMap::new(),
+            show_archived: false,
+            archived_session_names: HashSet::new(),
+            archived_worktree_names: HashSet::new(),
+            orphan_worktree_names: HashSet::new(),
             auto_approve_sessions: load_auto_approve_sessions(),
             muted_sessions: load_muted_sessions(),
             global_mute: is_globally_muted(),
@@ -157,6 +198,8 @@ impl App {
             wt_delete_project: None,
             wt_delete_branch: None,
             np_key: None,
+            hint_targets: Vec::new(),
+            hint_buffer: String::new(),
         }
     }
 
@@ -188,6 +231,15 @@ impl App {
         // Add projects with their worktrees grouped underneath.
         // Uses cached project_names (loaded once when entering search mode).
         for session_name in &self.project_names {
+            // Archived projects are hidden only on the full list (empty query);
+            // they appear as soon as the user types, or when revealed via Ctrl+R.
+            if query.is_empty()
+                && !self.show_archived
+                && self.archived_session_names.contains(session_name)
+            {
+                continue;
+            }
+
             // Skip if this is a worktree name
             if worktree_names_set.contains(session_name) {
                 continue;
@@ -241,12 +293,25 @@ impl App {
             }
         }
 
-        // Add any orphan worktrees (no matching project in registry)
+        // Add worktrees not already grouped under a project above. Worktrees whose
+        // parent project was deleted (true orphans) are hidden from the full list
+        // (empty query) so they don't clutter it, but stay findable by typing.
+        // Worktrees of an existing project that simply weren't grouped (fuzzy
+        // name-match miss) still show on the full list as before.
         for name in &self.worktree_names {
             if added_worktrees.contains(name) || active_names.contains(name) {
                 continue;
             }
-            if query.is_empty() || name.to_lowercase().contains(&query) {
+            // Orphan (deleted project) and archived-project worktrees are hidden
+            // from the full list but stay findable by typing.
+            let hidden_on_full_list = self.orphan_worktree_names.contains(name)
+                || (self.archived_worktree_names.contains(name) && !self.show_archived);
+            let matches = if hidden_on_full_list {
+                !query.is_empty() && name.to_lowercase().contains(&query)
+            } else {
+                query.is_empty() || name.to_lowercase().contains(&query)
+            };
+            if matches {
                 self.search_results
                     .push(SearchResult::Worktree(name.clone()));
             }
@@ -283,15 +348,52 @@ impl App {
         }
     }
 
-    /// Load project and worktree names lists (called when entering search mode)
+    /// Load project and worktree names lists (called when entering search mode).
+    /// `project_names` holds *all* projects; archived ones are recorded in
+    /// `archived_session_names` and filtered out at search time (see
+    /// `update_search_results`) only when the query is empty and not revealed.
     pub fn load_project_names(&mut self) {
-        self.project_names = ProjectRegistry::load().list_session_names();
+        // Sort by session name so the picker order is stable across reloads
+        // (HashMap iteration order is randomized per instance, so an unsorted
+        // list reshuffles every time the registry is reloaded).
+        let registry = ProjectRegistry::load();
+        let mut with_archived = registry.list_session_names_with_archived();
+        with_archived.sort_by(|a, b| a.0.cmp(&b.0));
+        self.archived_session_names = with_archived
+            .iter()
+            .filter(|(_, archived)| *archived)
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.project_names = with_archived.into_iter().map(|(name, _)| name).collect();
         let wt_state = crate::common::worktree::WorktreeState::load();
         self.worktree_names = wt_state
             .worktrees
             .values()
             .map(|e| e.session_name.clone())
             .collect();
+        // A worktree is an orphan when its parent project no longer exists in the
+        // registry (project deleted). These are hidden from the full list.
+        self.orphan_worktree_names = wt_state
+            .worktrees
+            .values()
+            .filter(|e| !registry.projects.contains_key(&e.project_key))
+            .map(|e| e.session_name.clone())
+            .collect();
+        // Archived is a project status: worktrees of an archived project inherit it
+        // (hidden from the full list, shown dimmed with an [archived] tag).
+        let archived_keys: HashSet<&String> = registry
+            .projects
+            .iter()
+            .filter(|(_, c)| c.archived)
+            .map(|(k, _)| k)
+            .collect();
+        self.archived_worktree_names = wt_state
+            .worktrees
+            .values()
+            .filter(|e| archived_keys.contains(&e.project_key))
+            .map(|e| e.session_name.clone())
+            .collect();
+        self.worktree_names.sort();
         let mut by_project: HashMap<String, Vec<String>> = HashMap::new();
         for entry in wt_state.worktrees.values() {
             by_project
@@ -299,7 +401,36 @@ impl App {
                 .or_default()
                 .push(entry.session_name.clone());
         }
+        for names in by_project.values_mut() {
+            names.sort();
+        }
         self.worktrees_by_project = by_project;
+    }
+
+    /// Toggle whether archived projects are revealed in the picker.
+    pub fn toggle_show_archived(&mut self) {
+        self.show_archived = !self.show_archived;
+        self.load_project_names();
+        self.update_search_results();
+    }
+
+    /// Archive/unarchive the highlighted project in the picker.
+    /// No-op when the highlighted result is an active session or a worktree.
+    pub fn toggle_archive_selected_project(&mut self) {
+        let Some(SearchResult::Project(name)) = self.search_results.get(self.selected).cloned()
+        else {
+            return;
+        };
+        let mut registry = ProjectRegistry::load();
+        let Some((key, config)) = registry.find_by_session_name(&name) else {
+            return;
+        };
+        let key = key.to_string();
+        let new_archived = !config.archived;
+        if registry.set_archived(&key, new_archived) && registry.save().is_ok() {
+            self.load_project_names();
+            self.update_search_results();
+        }
     }
 
     /// Calculate lines needed to display a search result
@@ -938,6 +1069,7 @@ impl App {
             files: crate::common::projects::FilePatterns::default(),
             hooks_dir: None,
             auth_profile: None,
+            archived: false,
         };
         let session_name = ProjectRegistry::session_name(&key, &config);
         let mut registry = ProjectRegistry::load();
@@ -959,6 +1091,73 @@ impl App {
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.np_key = None;
+    }
+
+    // --- Hint mode (vim-style quick-jump) ---
+
+    /// Enter hint mode: assign a 2-char label to every jump target (each session,
+    /// or each window of a multi-window session) and freeze the list. No-op if
+    /// there are no sessions to target.
+    pub fn enter_hint_mode(&mut self) {
+        let mut raw: Vec<HintTarget> = Vec::new();
+        for s in &self.session_infos {
+            if s.windows.len() > 1 {
+                for w in &s.windows {
+                    raw.push(HintTarget::Window(s.name.clone(), w.window_index.clone()));
+                }
+            } else {
+                raw.push(HintTarget::Session(s.name.clone()));
+            }
+        }
+        if raw.is_empty() {
+            return;
+        }
+        self.hint_targets = gen_hint_labels(raw.len()).into_iter().zip(raw).collect();
+        self.hint_buffer.clear();
+        self.input_mode = InputMode::Hint;
+    }
+
+    /// Cancel hint mode, returning to the normal list.
+    pub fn cancel_hint_mode(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.hint_buffer.clear();
+        self.hint_targets.clear();
+    }
+
+    /// Feed a typed character into hint mode. Returns the matched target when the
+    /// buffer completes a full label. Characters that don't extend any label's
+    /// prefix are ignored (buffer unchanged).
+    pub fn hint_input(&mut self, c: char) -> Option<HintTarget> {
+        let mut candidate = self.hint_buffer.clone();
+        candidate.push(c.to_ascii_lowercase());
+        if !self
+            .hint_targets
+            .iter()
+            .any(|(l, _)| l.starts_with(&candidate))
+        {
+            return None;
+        }
+        self.hint_buffer = candidate.clone();
+        self.hint_targets
+            .iter()
+            .find(|(l, _)| *l == candidate)
+            .map(|(_, t)| t.clone())
+    }
+
+    /// Label assigned to a whole-session target, if any (single-window sessions).
+    pub fn hint_label_for_session(&self, name: &str) -> Option<&str> {
+        self.hint_targets.iter().find_map(|(l, t)| match t {
+            HintTarget::Session(n) if n == name => Some(l.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Label assigned to a specific window target (multi-window sessions).
+    pub fn hint_label_for_window(&self, name: &str, window_index: &str) -> Option<&str> {
+        self.hint_targets.iter().find_map(|(l, t)| match t {
+            HintTarget::Window(n, w) if n == name && w == window_index => Some(l.as_str()),
+            _ => None,
+        })
     }
 }
 
@@ -1006,6 +1205,17 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
     // Build the process parent→children map once per gather pass so the per-pane
     // descendant walk is a HashMap lookup instead of a fresh `ps` subprocess each time.
     let children_map = build_children_map();
+
+    // Detect every Claude instance across all sessions via the shared core, grouped by
+    // session. Used to populate per-window display for sessions hosting multiple Claudes.
+    let hook_index = HookIndex::build(&hook_state);
+    let mut instances_by_session: HashMap<String, Vec<ClaudeInstance>> = HashMap::new();
+    for inst in detect_claude_instances(&sessions, sys, &children_map, &hook_index) {
+        instances_by_session
+            .entry(inst.session_name.clone())
+            .or_default()
+            .push(inst);
+    }
 
     for session in sessions {
         if !matches_filter(&session.name, filter) {
@@ -1083,6 +1293,46 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
 
         let listening_ports = get_listening_ports_for_pids(&all_pids, sys);
 
+        // Per-window breakdown, only when the session hosts more than one Claude.
+        // (Single-window sessions display via `claude_status`, avoiding extra jsonl reads.)
+        let mut session_instances = instances_by_session
+            .remove(&session.name)
+            .unwrap_or_default();
+        let windows: Vec<ClaudeWindowInfo> = if session_instances.len() > 1 {
+            session_instances.sort_by(|a, b| a.window_index.cmp(&b.window_index));
+            session_instances
+                .iter()
+                .map(|inst| {
+                    let status = if let Some(h) = hook_index.resolve(&inst.pane_id, &inst.cwd) {
+                        Some(convert_hook_status(&h.status))
+                    } else if let Some(js) =
+                        crate::common::jsonl::get_claude_status_from_jsonl_for(
+                            &inst.cwd,
+                            inst.session_id.as_deref(),
+                        )
+                    {
+                        Some(js.status)
+                    } else {
+                        Some(ClaudeStatus::Unknown)
+                    };
+                    let cpu = inst
+                        .pids
+                        .iter()
+                        .filter_map(|&pid| get_process_info(sys, pid))
+                        .map(|i| i.cpu_percent)
+                        .sum();
+                    ClaudeWindowInfo {
+                        window_index: inst.window_index.clone(),
+                        window_name: inst.window_name.clone(),
+                        status,
+                        cpu,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         session_infos.push(SessionInfo {
             name: session.name.clone(),
             claude_status,
@@ -1096,6 +1346,7 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
             listening_ports,
             attached_other_client: other_client_sessions.contains(&session.name),
             is_current_session: current_session.as_deref() == Some(session.name.as_str()),
+            windows,
         });
     }
 
@@ -1183,5 +1434,38 @@ fn get_commits_ahead(repo_path: &str, base_branch: &str) -> Vec<String> {
             text.lines().map(|l| l.to_string()).collect()
         }
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gen_hint_labels_count_and_length() {
+        let labels = gen_hint_labels(5);
+        assert_eq!(labels.len(), 5);
+        assert!(labels.iter().all(|l| l.chars().count() == 2));
+    }
+
+    #[test]
+    fn test_gen_hint_labels_unique() {
+        let labels = gen_hint_labels(40);
+        let set: HashSet<&String> = labels.iter().collect();
+        assert_eq!(set.len(), labels.len(), "labels must be unique");
+    }
+
+    #[test]
+    fn test_gen_hint_labels_stable_order() {
+        // First labels are deterministic: aa, as, ad, ...
+        let labels = gen_hint_labels(3);
+        assert_eq!(labels, vec!["aa", "as", "ad"]);
+    }
+
+    #[test]
+    fn test_gen_hint_labels_caps_at_alphabet_squared() {
+        // 9-letter alphabet → at most 81 two-char labels.
+        let labels = gen_hint_labels(200);
+        assert_eq!(labels.len(), HINT_ALPHABET.len() * HINT_ALPHABET.len());
     }
 }

@@ -173,8 +173,22 @@ pub enum ProjectCommand {
         /// Project key to remove
         key: String,
     },
+    /// Archive a project (hide from picker and default list)
+    Archive {
+        /// Project key to archive
+        key: String,
+    },
+    /// Unarchive a project
+    Unarchive {
+        /// Project key to unarchive
+        key: String,
+    },
     /// List all configured projects
-    List,
+    List {
+        /// Include archived projects
+        #[arg(long)]
+        all: bool,
+    },
     /// Import projects from sesh.toml
     Import,
 }

@@ -96,6 +96,9 @@ pub struct ProjectConfig {
     /// Claude auth profile name (sets CLAUDE_CONFIG_DIR to ~/.claude-{name})
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_profile: Option<String>,
+    /// Archived: hidden from the picker and default `project list`
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 impl ProjectConfig {
@@ -215,12 +218,23 @@ impl ProjectRegistry {
         None
     }
 
-    /// List all project session names
-    pub fn list_session_names(&self) -> Vec<String> {
+    /// List (session_name, archived) for all projects.
+    pub fn list_session_names_with_archived(&self) -> Vec<(String, bool)> {
         self.projects
             .iter()
-            .map(|(key, config)| Self::session_name(key, config))
+            .map(|(key, config)| (Self::session_name(key, config), config.archived))
             .collect()
+    }
+
+    /// Set the archived flag by project key. Returns false if the key is not found.
+    pub fn set_archived(&mut self, key: &str, archived: bool) -> bool {
+        match self.projects.get_mut(key) {
+            Some(config) => {
+                config.archived = archived;
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -393,6 +407,7 @@ pub fn parse_sesh_toml(path: &std::path::Path) -> anyhow::Result<Vec<(String, Pr
                 files: FilePatterns::default(),
                 hooks_dir: None,
                 auth_profile: None,
+                archived: false,
             },
         ));
     }
@@ -420,6 +435,7 @@ mod tests {
             files: FilePatterns::default(),
             hooks_dir: None,
             auth_profile: None,
+            archived: false,
         };
         assert_eq!(ProjectRegistry::session_name("hive", &config), "🐝 hive");
     }
@@ -440,6 +456,7 @@ mod tests {
             files: FilePatterns::default(),
             hooks_dir: None,
             auth_profile: None,
+            archived: false,
         };
         assert_eq!(
             ProjectRegistry::session_name("my-app", &config),
@@ -554,7 +571,7 @@ project_root = "~/projects/hive"
         let registry: ProjectRegistry = toml::from_str("").unwrap();
         assert!(registry.projects.is_empty());
         assert!(!registry.has_project("anything"));
-        assert!(registry.list_session_names().is_empty());
+        assert!(registry.list_session_names_with_archived().is_empty());
     }
 
     #[test]
@@ -570,7 +587,11 @@ display_name = "My App"
 project_root = "~/projects/my-app"
 "#;
         let registry: ProjectRegistry = toml::from_str(toml_str).unwrap();
-        let names = registry.list_session_names();
+        let names: Vec<String> = registry
+            .list_session_names_with_archived()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"🐝 hive".to_string()));
         assert!(names.contains(&"🌐 My App".to_string()));
@@ -626,6 +647,7 @@ base_port = 3000
             files: FilePatterns::default(),
             hooks_dir: None,
             auth_profile: None,
+            archived: false,
         };
         registry.add_project("test".to_string(), config);
         assert_eq!(registry.projects.len(), 1);
@@ -649,11 +671,72 @@ base_port = 3000
             files: FilePatterns::default(),
             hooks_dir: None,
             auth_profile: None,
+            archived: false,
         };
         registry.add_project("test".to_string(), config);
         assert!(registry.remove_project("test"));
         assert!(!registry.remove_project("test"));
         assert!(registry.projects.is_empty());
+    }
+
+    #[test]
+    fn test_archived_omitted_when_false() {
+        let toml_str = r#"
+[projects.hive]
+emoji = "🐝"
+project_root = "~/projects/hive"
+"#;
+        let registry: ProjectRegistry = toml::from_str(toml_str).unwrap();
+        assert!(!registry.projects["hive"].archived);
+        // Round-trips without emitting an `archived` key.
+        let out = toml::to_string_pretty(&registry).unwrap();
+        assert!(!out.contains("archived"));
+    }
+
+    #[test]
+    fn test_archived_roundtrip_when_true() {
+        let toml_str = r#"
+[projects.hive]
+emoji = "🐝"
+project_root = "~/projects/hive"
+archived = true
+"#;
+        let registry: ProjectRegistry = toml::from_str(toml_str).unwrap();
+        assert!(registry.projects["hive"].archived);
+        let out = toml::to_string_pretty(&registry).unwrap();
+        assert!(out.contains("archived = true"));
+    }
+
+    #[test]
+    fn test_set_archived() {
+        let toml_str = r#"
+[projects.hive]
+emoji = "🐝"
+project_root = "~/projects/hive"
+"#;
+        let mut registry: ProjectRegistry = toml::from_str(toml_str).unwrap();
+        assert!(registry.set_archived("hive", true));
+        assert!(registry.projects["hive"].archived);
+        assert!(!registry.set_archived("nonexistent", true));
+    }
+
+    #[test]
+    fn test_list_session_names_with_archived() {
+        let toml_str = r#"
+[projects.hive]
+emoji = "🐝"
+project_root = "~/projects/hive"
+
+[projects.old]
+emoji = "📦"
+project_root = "~/projects/old"
+archived = true
+"#;
+        let registry: ProjectRegistry = toml::from_str(toml_str).unwrap();
+        let names = registry.list_session_names_with_archived();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&("🐝 hive".to_string(), false)));
+        assert!(names.contains(&("📦 old".to_string(), true)));
     }
 
     #[test]

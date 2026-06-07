@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 166 tests (146 unit + 20 CLI smoke)
+cargo test                # 171 tests (150 unit + 21 CLI smoke)
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -39,7 +39,9 @@ hive cycle-prev         # switch to previous tmux session
 hive connect <key>      # create/attach tmux session for a registered project
 hive project add <key>  # add a project to the registry (supports all config flags)
 hive project remove <key> # remove a project from the registry
-hive project list       # list all configured projects
+hive project archive <key>   # archive a project (hide from picker + default list)
+hive project unarchive <key> # unarchive a project
+hive project list [--all]    # list configured projects (--all includes archived)
 hive project import     # import projects from sesh.toml
 hive wt new <project> <branch>  # create worktree + tmux session (with hooks)
 hive wt delete <project> <branch>  # delete worktree + session + branch
@@ -117,7 +119,7 @@ src/
 │   ├── event_loop.rs       run_tui(): key handling, input modes, post-action dispatch
 │   └── ui.rs               ratatui rendering (list, detail, search, help, input modals)
 └── tests/
-    └── cli_smoke.rs        20 integration tests: CLI arg parsing, read-only commands, todo roundtrip
+    └── cli_smoke.rs        21 integration tests: CLI arg parsing, read-only commands, todo roundtrip
 ```
 
 ## Key Types
@@ -176,7 +178,7 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 1. Help screen → `?`/Esc dismiss, `Q` quit
 2. AddTodo input → text entry modal
 3. SpreadPrompt → digit 1-9 triggers spread, Esc cancels
-4. Search mode → filter, navigate, select
+4. Search mode → filter, navigate, select; `Del` archive/unarchive highlighted project, `Ctrl+R` reveal archived projects (archived are hidden from the picker by default)
 5. Detail view → todos, ports, switch, favorite, flags, `O` open Chrome tabs
 6. Normal list → navigate, switch (exits app), approve permissions, search, `L` spread/collapse, quit
 
@@ -334,18 +336,19 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 ## Testing
 
-166 tests total. Run with `cargo test`.
+171 tests total. Run with `cargo test`.
 
-**Unit tests (146)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (150)** — in-module `#[cfg(test)]` blocks:
 - `common/` modules: types, projects, worktree, jsonl, chrome, process, persistence (escape/unescape, set/todo file roundtrips)
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
 
-**Integration tests (20)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (21)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list)
 - Invalid args exit non-zero
 - Todo full roundtrip (add → list → next → done → clear)
+- Project archive roundtrip (add → archive → list hides → `--all` shows → unarchive), isolated via a temp `$HOME`
 
 No TUI tests (interactive rendering). No tmux-dependent tests (would need integration test infrastructure).
 

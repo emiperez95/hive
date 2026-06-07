@@ -1118,6 +1118,74 @@
     transition: transform 0.25s ease;
   }
 
+  /* Accordion (multi-window sessions) */
+  .session-item .window-count {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--on-surface-variant);
+  }
+  .session-item .chevron {
+    font-size: 20px;
+    color: var(--on-surface-variant);
+    transition: transform 0.2s ease;
+    margin-left: 2px;
+  }
+  .session-item-wrapper.expanded .chevron {
+    transform: rotate(180deg);
+  }
+  .accordion-windows {
+    display: none;
+    position: relative;
+    z-index: 1;
+    padding: 4px 8px 8px 8px;
+    background: var(--surface-container, rgba(0,0,0,0.02));
+    border-radius: 0 0 0.5rem 0.5rem;
+  }
+  .session-item-wrapper.expanded .accordion-windows {
+    display: block;
+  }
+  .window-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    margin-top: 6px;
+    border-radius: 0.5rem;
+    background: var(--surface, #fff);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    cursor: pointer;
+  }
+  .window-item:active {
+    background: var(--surface-variant, #eee);
+  }
+  .window-item .w-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .window-item .w-name {
+    flex: 1;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--on-surface);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .window-item .w-status {
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .window-item .w-meta {
+    font-size: 10px;
+    color: var(--on-surface-variant);
+    font-weight: 600;
+  }
+
   /* ============================================
      TODO COUNT BADGE
      ============================================ */
@@ -1711,6 +1779,8 @@
 <script>
 let sessions = [];
 let selectedSession = null;
+let selectedWindow = null; // pane id (e.g. "%1") when a specific window is selected
+let expandedSessions = new Set(); // session names whose accordion is open
 let currentMessages = [];
 let pollTimer = null;
 let msgPollTimer = null;
@@ -2136,6 +2206,32 @@ function renderSessionItem(s, isSkipped) {
     : '';
   if (todoBadge) metaParts.push(null); // placeholder, we'll append the badge HTML directly
 
+  // Multi-window session → render as an accordion: tap the header to expand and
+  // pick a specific Claude window; the header itself does not open a conversation.
+  const windows = s.windows || [];
+  if (windows.length > 1 && !isSkipped) {
+    const expanded = expandedSessions.has(s.name) ? ' expanded' : '';
+    const windowRows = windows.map(w => renderWindowRow(s, w)).join('');
+    return `<div class="session-item-wrapper${expanded}" data-session-name="${esc(s.name)}">
+      <div class="swipe-action ${swipeClass}">${swipeLabel}</div>
+      <div class="session-item accordion-header" onclick="toggleAccordion('${encodeURIComponent(s.name)}')">
+        <div class="emoji-box">${displayEmoji}</div>
+        <div class="info">
+          <div class="name-row">
+            <div class="name">${esc(displayName)}</div>
+            <div class="status-indicator">
+              <span class="status-dot" style="background:${si.dotColor}"></span>
+              <span class="status-label" style="color:${si.color}">${si.label}</span>
+              <span class="material-symbols-outlined chevron">expand_more</span>
+            </div>
+          </div>
+          <div class="meta"><span class="window-count"><span class="material-symbols-outlined" style="font-size:14px">grid_view</span>${windows.length} windows</span>${[cpu, mem].filter(Boolean).map(m => '<span>' + esc(m) + '</span>').join('')}${todoBadge}</div>
+        </div>
+      </div>
+      <div class="accordion-windows">${windowRows}</div>
+    </div>`;
+  }
+
   return `<div class="session-item-wrapper" data-session-name="${esc(s.name)}">
     <div class="swipe-action ${swipeClass}">${swipeLabel}</div>
     <div class="session-item${skippedClass}" onclick="selectSession('${encodeURIComponent(s.name)}')">
@@ -2151,6 +2247,22 @@ function renderSessionItem(s, isSkipped) {
         <div class="meta">${[cpu, mem].filter(Boolean).map(m => '<span>' + esc(m) + '</span>').join('')}${todoBadge}</div>
       </div>
     </div>
+  </div>`;
+}
+
+// One row inside an expanded accordion, representing a single Claude window.
+function renderWindowRow(s, w) {
+  const si = statusInfo(w);
+  const idx = w.window_index;
+  // Prefer a meaningful window name; fall back to "Window N".
+  let label = (w.window_name && !/^[0-9.]+$/.test(w.window_name)) ? w.window_name : ('Window ' + idx);
+  const cpu = w.cpu > 0 ? 'CPU ' + w.cpu.toFixed(0) + '%' : '';
+  const meta = [cpu].filter(Boolean).join(' · ');
+  return `<div class="window-item" onclick="selectWindow('${encodeURIComponent(s.name)}','${encodeURIComponent(w.pane_id)}')">
+    <span class="w-dot" style="background:${si.dotColor}"></span>
+    <span class="w-name">${esc(label)}</span>
+    ${meta ? `<span class="w-meta">${esc(meta)}</span>` : ''}
+    <span class="w-status" style="color:${si.color}">${si.label}</span>
   </div>`;
 }
 
@@ -2192,13 +2304,36 @@ function updateDetailBadges(s) {
   }
 }
 
+// Human-friendly label for a window (its name, or "Window N").
+function windowLabel(w) {
+  return (w.window_name && !/^[0-9.]+$/.test(w.window_name)) ? w.window_name : ('Window ' + w.window_index);
+}
+
+// The object whose status drives the detail view: the selected window when one is
+// chosen, otherwise the session aggregate.
+function currentDetailObj() {
+  const s = sessions.find(x => x.name === selectedSession);
+  if (!s) return null;
+  if (selectedWindow && s.windows) {
+    const w = s.windows.find(w => w.pane_id === selectedWindow);
+    if (w) return w;
+  }
+  return s;
+}
+
 function renderDetail() {
   if (!selectedSession) return;
   const s = sessions.find(x => x.name === selectedSession);
   if (!s) return;
 
-  document.getElementById('detailName').textContent = s.name;
-  updateDetailBadges(s);
+  // Show the window name in the header only for multi-window sessions.
+  let title = s.name;
+  if (selectedWindow && s.windows && s.windows.length > 1) {
+    const w = s.windows.find(w => w.pane_id === selectedWindow);
+    if (w) title = s.name + ' · ' + windowLabel(w);
+  }
+  document.getElementById('detailName').textContent = title;
+  updateDetailBadges(currentDetailObj() || s);
   renderMessages();
 }
 
@@ -2244,21 +2379,47 @@ function renderMessages() {
 }
 
 // --- Navigation (uses History API so iOS back gesture works) ---
-function selectSession(encodedName) {
+function openConversation(name, paneId) {
   stopTts();
-
-  selectedSession = decodeURIComponent(encodedName);
+  selectedSession = name;
+  selectedWindow = paneId || null;
   currentMessages = [];
   lastMessagesJson = '';
   wasAtBottom = true;
-  history.pushState({ view: 'detail', session: selectedSession }, '');
+  history.pushState({ view: 'detail', session: name, window: selectedWindow }, '');
   showDetailView();
   fetchMessages();
   startMessagePolling();
 }
 
+function selectSession(encodedName) {
+  const name = decodeURIComponent(encodedName);
+  const s = sessions.find(x => x.name === name);
+  // A single-window session routes straight to its one Claude; a session with no
+  // window data falls back to the session-level conversation (paneId null).
+  const paneId = (s && s.windows && s.windows.length === 1) ? s.windows[0].pane_id : null;
+  openConversation(name, paneId);
+}
+
+// Toggle a multi-window session's accordion open/closed.
+function toggleAccordion(encodedName) {
+  const name = decodeURIComponent(encodedName);
+  if (expandedSessions.has(name)) {
+    expandedSessions.delete(name);
+  } else {
+    expandedSessions.add(name);
+  }
+  renderList();
+}
+
+// Open the conversation for a specific window within a session.
+function selectWindow(encodedName, encodedPaneId) {
+  openConversation(decodeURIComponent(encodedName), decodeURIComponent(encodedPaneId));
+}
+
 function showList() {
   selectedSession = null;
+  selectedWindow = null;
   currentMessages = [];
   stopMessagePolling();
   stopTts();
@@ -2277,7 +2438,8 @@ let lastMessagesJson = '';
 async function fetchMessages() {
   if (!selectedSession) return;
   try {
-    const res = await fetch('/api/messages?session=' + encodeURIComponent(selectedSession));
+    const windowParam = selectedWindow ? '&window=' + encodeURIComponent(selectedWindow) : '';
+    const res = await fetch('/api/messages?session=' + encodeURIComponent(selectedSession) + windowParam);
     const json = await res.text();
     if (json === lastMessagesJson) return; // No change, skip re-render
     lastMessagesJson = json;
@@ -2333,10 +2495,12 @@ async function sendQuick(text) {
   const s = sessions.find(x => x.name === selectedSession);
   if (!s || !s.pane) return;
   try {
+    const body = { session: s.name, text: text };
+    if (selectedWindow) body.window = selectedWindow;
     await fetch('/api/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: s.name, text: text })
+      body: JSON.stringify(body)
     });
   } catch (e) { /* ignore */ }
 }
@@ -2370,8 +2534,8 @@ async function fetchSessions() {
 
     // In detail view, only update badges (not chat — that has its own poll)
     if (selectedSession) {
-      const s = sessions.find(x => x.name === selectedSession);
-      if (s) updateDetailBadges(s);
+      const obj = currentDetailObj();
+      if (obj) updateDetailBadges(obj);
     }
   } catch (e) {
     document.getElementById('connDot').style.background = 'var(--error)';

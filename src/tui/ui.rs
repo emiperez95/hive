@@ -2,6 +2,7 @@
 
 use crate::common::types::{
     format_duration_ago, format_memory, lines_for_session, truncate_command, ClaudeStatus,
+    ClaudeWindowInfo,
 };
 use crate::tui::app::{App, InputMode, SearchResult};
 use ratatui::{
@@ -180,6 +181,22 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" cancel"),
         ])
+    } else if app.input_mode == InputMode::Hint {
+        Line::from(vec![
+            Span::styled("jump: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                app.hint_buffer.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw("  "),
+            Span::styled("type label", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw("  "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("cancel"),
+        ])
     } else if app.showing_detail.is_some() {
         Line::from(vec![
             Span::styled("[A]", Style::default().add_modifier(Modifier::BOLD)),
@@ -215,6 +232,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("detail "),
             Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("switch "),
+            Span::styled("[f]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("jump "),
             Span::styled("[/]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("search "),
             Span::styled("[N]", Style::default().add_modifier(Modifier::BOLD)),
@@ -243,6 +262,7 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    ↑/↓ j/k    Navigate sessions"),
         Line::raw("    Enter       Open detail view"),
         Line::raw("    1-9         Switch to session by number"),
+        Line::raw("    f           Quick-jump: type a 2-char label (incl. windows)"),
         Line::raw("    y/z/x/w/v  Approve permission (once)"),
         Line::raw("    Y/Z/X/W/V  Approve permission (always)"),
         Line::raw("    /           Search sessions"),
@@ -274,6 +294,8 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    Type        Filter by name"),
         Line::raw("    ↑/↓         Navigate results"),
         Line::raw("    Enter       Open / connect"),
+        Line::raw("    Del         Archive/unarchive project"),
+        Line::raw("    ^R          Toggle archived projects"),
         Line::raw("    Esc         Cancel search"),
         Line::raw(""),
         Line::from(Span::styled(
@@ -285,6 +307,67 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
     ];
 
     frame.render_widget(Paragraph::new(help_text), area);
+}
+
+/// Style for a hint-mode quick-jump label (black on yellow, like Vimium).
+fn hint_label_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Short status label + color for a Claude window (used in per-window summaries).
+fn short_status(status: &Option<ClaudeStatus>) -> (&'static str, Color) {
+    match status {
+        Some(ClaudeStatus::Waiting) => ("idle", Color::Cyan),
+        Some(ClaudeStatus::PlanReview) => ("plan", Color::Magenta),
+        Some(ClaudeStatus::QuestionAsked) => ("ask?", Color::Magenta),
+        Some(ClaudeStatus::NeedsPermission(_, _)) => ("perm", Color::Yellow),
+        Some(ClaudeStatus::EditApproval(_)) => ("edit", Color::Yellow),
+        Some(ClaudeStatus::Unknown) => ("work", Color::DarkGray),
+        None => ("—", Color::DarkGray),
+    }
+}
+
+/// Build one status line per window for a multi-window session, e.g.
+/// ```text
+///    → 1: idle
+///    → 2: work
+///    → 3: ask?
+/// ```
+fn window_status_lines(
+    windows: &[ClaudeWindowInfo],
+    is_auto: bool,
+    hint_labels: &[Option<String>],
+) -> Vec<Line<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    windows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            // Auto-approved sessions handle permission/edit prompts automatically, so
+            // surface those as "work" rather than a blocking state (matches the compact layout).
+            let (label, color) = if is_auto
+                && matches!(
+                    w.status,
+                    Some(ClaudeStatus::NeedsPermission(_, _)) | Some(ClaudeStatus::EditApproval(_))
+                ) {
+                ("work", Color::DarkGray)
+            } else {
+                short_status(&w.status)
+            };
+            let mut spans = Vec::new();
+            if let Some(Some(hint)) = hint_labels.get(i) {
+                spans.push(Span::styled(format!("   {} ", hint), hint_label_style()));
+                spans.push(Span::styled(format!("→ {}: ", w.window_index), dim));
+            } else {
+                spans.push(Span::styled(format!("   → {}: ", w.window_index), dim));
+            }
+            spans.push(Span::styled(label, Style::default().fg(color)));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Render the normal session list view
@@ -388,7 +471,15 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             Color::Red
         };
 
-        let prefix_span = if is_selected {
+        let hint_mode = app.input_mode == InputMode::Hint;
+        let prefix_span = if hint_mode {
+            // Multi-window sessions carry labels on their per-window lines, so the
+            // header prefix stays blank; single-target sessions show their label here.
+            match app.hint_label_for_session(&session_info.name) {
+                Some(label) => Span::styled(label.to_string(), hint_label_style()),
+                None => Span::raw("  "),
+            }
+        } else if is_selected {
             Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
         } else if display_num <= 9 {
             Span::styled(
@@ -433,7 +524,52 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let todo_count = app.todo_count(&session_info.name);
 
-            if is_auto {
+            if session_info.windows.len() > 1 {
+                // Unified multi-window layout: name + [cpu/mem] on line 1 (consistent
+                // with single-window rows), then one status line per window below.
+                let mut header_spans = vec![
+                    prefix_span,
+                    sep,
+                    current_marker,
+                    Span::styled(session_info.name.clone(), name_style),
+                    Span::styled(" [", header_style),
+                    Span::styled(cpu_text, header_style.fg(cpu_color)),
+                    Span::styled("/", header_style),
+                    Span::styled(mem_text, header_style.fg(mem_color)),
+                    Span::styled("]", header_style),
+                ];
+                if todo_count > 0 {
+                    header_spans.push(Span::styled(
+                        format!(" [{}]", todo_count),
+                        Style::default().fg(Color::Magenta),
+                    ));
+                }
+                if app.is_muted(&session_info.name) {
+                    header_spans.push(Span::styled(
+                        " [muted]",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                lines.push(Line::from(header_spans));
+                let win_hint_labels: Vec<Option<String>> = if hint_mode {
+                    session_info
+                        .windows
+                        .iter()
+                        .map(|w| {
+                            app.hint_label_for_window(&session_info.name, &w.window_index)
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                lines.extend(window_status_lines(
+                    &session_info.windows,
+                    is_auto,
+                    &win_hint_labels,
+                ));
+                lines.push(Line::raw(""));
+            } else if is_auto {
                 // Auto-approved layout:
                 // Line 1: name only (+ fav star, todo count)
                 // Line 2: [cpu/mem] [auto] [muted]
@@ -701,6 +837,26 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
 
+    if app.show_archived {
+        lines.push(Line::from(Span::styled(
+            "  showing archived · [^R] hide · [Del] archive/unarchive".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if !app.archived_session_names.is_empty() {
+        let hint = if app.search_query.is_empty() {
+            format!(
+                "  {} archived hidden · type to search or [^R] to show · [Del] archive",
+                app.archived_session_names.len()
+            )
+        } else {
+            "  [Del] archive/unarchive project".to_string()
+        };
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     if app.search_results.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No matches",
@@ -767,12 +923,25 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         Span::styled(". ", style)
                     };
-                    lines.push(Line::from(vec![
+                    let archived = app.archived_session_names.contains(name);
+                    let name_style = if archived {
+                        style.add_modifier(Modifier::DIM)
+                    } else {
+                        style
+                    };
+                    let mut spans = vec![
                         prefix,
                         star,
-                        Span::styled(name.clone(), style),
+                        Span::styled(name.clone(), name_style),
                         Span::styled(" [project]", Style::default().fg(Color::Cyan)),
-                    ]));
+                    ];
+                    if archived {
+                        spans.push(Span::styled(
+                            " [archived]",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
                     lines_remaining -= 1;
                 }
                 SearchResult::Worktree(name) => {
@@ -781,12 +950,25 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         Span::styled(". ", style)
                     };
-                    lines.push(Line::from(vec![
+                    let archived = app.archived_worktree_names.contains(name);
+                    let name_style = if archived {
+                        style.add_modifier(Modifier::DIM)
+                    } else {
+                        style
+                    };
+                    let mut spans = vec![
                         prefix,
                         star,
-                        Span::styled(name.clone(), style),
+                        Span::styled(name.clone(), name_style),
                         Span::styled(" [worktree]", Style::default().fg(Color::Green)),
-                    ]));
+                    ];
+                    if archived {
+                        spans.push(Span::styled(
+                            " [archived]",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
                     lines_remaining -= 1;
                 }
             }
@@ -884,6 +1066,36 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("Flags: ", Style::default().add_modifier(Modifier::DIM)),
         );
         lines.push(Line::from(flag_spans));
+    }
+
+    // Per-window breakdown for sessions hosting multiple Claude instances.
+    if session_info.windows.len() > 1 {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Windows:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for w in &session_info.windows {
+            let (label, color) = short_status(&w.status);
+            let name_suffix = if !w.window_name.is_empty()
+                && !w.window_name.chars().all(|c| c.is_ascii_digit() || c == '.')
+            {
+                format!(" ({})", w.window_name)
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}{}: ", w.window_index, name_suffix),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(format!("{:<5}", label), Style::default().fg(color)),
+                Span::styled(
+                    format!("  {:.1}%", w.cpu),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
     }
 
     lines.push(Line::raw(""));

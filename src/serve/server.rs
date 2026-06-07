@@ -3,15 +3,19 @@
 //! Provides `gather_session_data()` — a TUI-state-free version of `App::refresh()`
 //! that collects local tmux/sysinfo/hook data into serializable structs for the
 //! web API.
+//!
+//! A single tmux session can host several Claude instances (one per window). This
+//! builds one [`WindowView`] per Claude instance via the shared
+//! [`crate::common::instances`] core, then aggregates them into a session-level
+//! [`SessionView`]. The web dashboard renders multi-window sessions as an accordion.
 
+use crate::common::instances::{detect_claude_instances, ClaudeInstance, HookIndex};
 use crate::common::persistence::{load_session_todos, load_skipped_sessions};
 use crate::common::ports::get_listening_ports_for_pids;
-use crate::common::process::{
-    build_children_map, collect_descendants, get_process_info, is_claude_process,
-};
+use crate::common::process::{build_children_map, get_process_info};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::{HookState, SessionStatus};
-use crate::serve::web_types::{ProcessView, SessionView};
+use crate::serve::web_types::{ProcessView, SessionView, WindowView};
 
 use std::collections::HashMap;
 use sysinfo::System;
@@ -25,30 +29,23 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<S
     };
 
     let other_client_sessions = get_other_client_sessions();
+    let hook_index = HookIndex::build(hook_state);
 
-    // Index hook sessions by cwd (most recent per cwd)
-    let hook_sessions: HashMap<String, &crate::ipc::messages::SessionState> = {
-        let mut by_cwd: HashMap<String, &crate::ipc::messages::SessionState> = HashMap::new();
-        for session in hook_state.sessions.values() {
-            let key = session.cwd.clone();
-            let is_newer = by_cwd
-                .get(&key)
-                .is_none_or(|existing| session.last_activity > existing.last_activity);
-            if is_newer {
-                by_cwd.insert(key, session);
-            }
-        }
-        by_cwd
-    };
+    // Detect every Claude instance across all sessions in one pass, then group by session.
+    let children_map = build_children_map();
+    let instances = detect_claude_instances(&sessions, sys, &children_map, &hook_index);
+    let mut instances_by_session: HashMap<String, Vec<ClaudeInstance>> = HashMap::new();
+    for inst in instances {
+        instances_by_session
+            .entry(inst.session_name.clone())
+            .or_default()
+            .push(inst);
+    }
 
     let skipped_sessions = load_skipped_sessions();
     let auto_approve_sessions = crate::common::persistence::load_auto_approve_sessions();
     let session_todos = load_session_todos();
     let mut results = Vec::new();
-
-    // Build the process parent→children map once per gather pass so descendant
-    // walks are in-memory lookups rather than a fresh `ps` subprocess per pane.
-    let children_map = build_children_map();
 
     for session in &sessions {
         let session_cwd = session
@@ -57,115 +54,180 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<S
             .and_then(|w| w.panes.first())
             .map(|p| p.cwd.clone());
 
-        // Find Claude pane first, then only count resources from that pane's tree.
-        // This avoids counting hive web (which may run in another pane) and its descendants.
-        let mut status: Option<SessionStatus> = None;
-        let mut claude_pane: Option<(String, String, String)> = None;
-        let mut last_activity: Option<String> = None;
-        let mut claude_pids: Vec<u32> = Vec::new();
-        'outer: for window in &session.windows {
-            for p in &window.panes {
-                let mut pane_pids = vec![p.pid];
-                collect_descendants(&children_map, p.pid, &mut pane_pids);
+        let is_auto_approve = auto_approve_sessions.contains(&session.name);
 
-                let has_claude = pane_pids.iter().any(|&pid| {
-                    get_process_info(sys, pid)
-                        .map(|info| is_claude_process(&info))
-                        .unwrap_or(false)
-                });
+        // Build one window per Claude instance in this session (ordered by window index).
+        let mut session_instances = instances_by_session
+            .remove(&session.name)
+            .unwrap_or_default();
+        session_instances.sort_by(|a, b| a.window_index.cmp(&b.window_index));
 
-                if has_claude {
-                    claude_pids = pane_pids;
-                    if let Some(hook_session) = hook_sessions.get(&p.cwd) {
-                        status = Some(hook_session.status.clone());
-                        last_activity = hook_session.last_activity.clone();
-                    } else if let Some(jsonl_status) =
-                        crate::common::jsonl::get_claude_status_from_jsonl(&p.cwd)
-                    {
-                        status = Some(convert_claude_to_session_status(&jsonl_status.status));
-                        last_activity = jsonl_status
-                            .timestamp
-                            .map(|t| t.to_rfc3339());
-                    } else {
-                        status = Some(SessionStatus::Unknown);
-                    }
-                    claude_pane = Some((
-                        session.name.clone(),
-                        window.index.clone(),
-                        p.index.clone(),
-                    ));
-                    break 'outer;
-                }
-            }
-        }
+        let windows: Vec<WindowView> = session_instances
+            .iter()
+            .map(|inst| build_window_view(inst, sys, &hook_index, is_auto_approve))
+            .collect();
 
-        // Count resources only from the Claude pane's process tree
-        let mut total_cpu = 0.0f32;
-        let mut total_mem_kb = 0u64;
-        let mut processes = Vec::new();
+        // Aggregate the windows into session-level fields. Single-window sessions
+        // mirror their one window so existing single-Claude behaviour is unchanged.
+        let cpu = windows.iter().map(|w| w.cpu).sum();
+        let mem_kb = windows.iter().map(|w| w.mem_kb).sum();
+        let mut ports: Vec<u16> = windows.iter().flat_map(|w| w.ports.iter().copied()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        let last_activity = windows.iter().filter_map(|w| w.last_activity.clone()).max();
+        let pane = windows.first().and_then(|w| w.pane.clone());
+        let status = aggregate_status(&windows);
 
-        for &pid in &claude_pids {
-            if let Some(info) = get_process_info(sys, pid) {
-                total_cpu += info.cpu_percent;
-                total_mem_kb += info.memory_kb;
-                processes.push(ProcessView {
+        // Resources are counted from the Claude panes' process trees only.
+        let mut processes: Vec<ProcessView> = session_instances
+            .iter()
+            .flat_map(|inst| inst.pids.iter().copied())
+            .filter_map(|pid| {
+                get_process_info(sys, pid).map(|info| ProcessView {
                     pid: info.pid,
-                    name: info.name.clone(),
+                    name: info.name,
                     cpu_percent: info.cpu_percent,
                     memory_kb: info.memory_kb,
-                    command: info.command.clone(),
-                });
-            }
-        }
-
+                    command: info.command,
+                })
+            })
+            .collect();
         processes.sort_by(|a, b| {
             b.cpu_percent
                 .partial_cmp(&a.cpu_percent)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Detect listening ports from Claude pane processes
-        let listening_ports = get_listening_ports_for_pids(&claude_pids, sys);
-        let ports: Vec<u16> = listening_ports.iter().map(|lp| lp.port).collect();
-
-        // Auto-approved sessions should only show Working, not NeedsPermission/EditApproval
-        let status = if auto_approve_sessions.contains(&session.name) {
-            match &status {
-                Some(SessionStatus::NeedsPermission { .. })
-                | Some(SessionStatus::EditApproval { .. }) => Some(SessionStatus::Working),
-                other => other.clone(),
-            }
-        } else {
-            status
-        };
-
         results.push(SessionView {
             name: session.name.clone(),
             status,
-            cpu: total_cpu,
-            mem_kb: total_mem_kb,
+            cpu,
+            mem_kb,
             ports,
             processes,
             cwd: session_cwd,
             last_activity,
             attached: other_client_sessions.contains(&session.name),
-            pane: claude_pane,
+            pane,
             skipped: skipped_sessions.contains(&session.name),
             todo_count: session_todos
                 .get(&session.name)
                 .map(|t| t.len() as u32)
                 .unwrap_or(0),
             messages: Vec::new(),
+            windows,
         });
     }
 
     results
 }
 
+/// Build a [`WindowView`] for a single Claude instance: per-window status, CPU/mem, ports.
+fn build_window_view(
+    inst: &ClaudeInstance,
+    sys: &System,
+    hook_index: &HookIndex,
+    is_auto_approve: bool,
+) -> WindowView {
+    // Status: prefer the hook session bound to this pane; fall back to the instance's
+    // own jsonl transcript (by session_id when known); else Unknown.
+    let (status, last_activity) = if let Some(hook) = hook_index.resolve(&inst.pane_id, &inst.cwd) {
+        (Some(hook.status.clone()), hook.last_activity.clone())
+    } else if let Some(jsonl) = crate::common::jsonl::get_claude_status_from_jsonl_for(
+        &inst.cwd,
+        inst.session_id.as_deref(),
+    ) {
+        (
+            Some(convert_claude_to_session_status(&jsonl.status)),
+            jsonl.timestamp.map(|t| t.to_rfc3339()),
+        )
+    } else {
+        (Some(SessionStatus::Unknown), None)
+    };
+
+    let status = mask_auto_approve(status, is_auto_approve);
+
+    let mut cpu = 0.0f32;
+    let mut mem_kb = 0u64;
+    for &pid in &inst.pids {
+        if let Some(info) = get_process_info(sys, pid) {
+            cpu += info.cpu_percent;
+            mem_kb += info.memory_kb;
+        }
+    }
+
+    let ports: Vec<u16> = get_listening_ports_for_pids(&inst.pids, sys)
+        .iter()
+        .map(|lp| lp.port)
+        .collect();
+
+    let (s, w, p) = inst.target();
+    WindowView {
+        pane_id: inst.pane_id.clone(),
+        window_index: inst.window_index.clone(),
+        window_name: inst.window_name.clone(),
+        session_id: inst.session_id.clone(),
+        status,
+        cpu,
+        mem_kb,
+        ports,
+        cwd: Some(inst.cwd.clone()),
+        last_activity,
+        pane: Some((s, w, p)),
+    }
+}
+
+/// Auto-approved sessions should surface as Working, never as a permission/edit prompt.
+fn mask_auto_approve(status: Option<SessionStatus>, is_auto_approve: bool) -> Option<SessionStatus> {
+    if !is_auto_approve {
+        return status;
+    }
+    match status {
+        Some(SessionStatus::NeedsPermission { .. }) | Some(SessionStatus::EditApproval { .. }) => {
+            Some(SessionStatus::Working)
+        }
+        other => other,
+    }
+}
+
+/// Pick the session-level status from its windows: a window needing attention wins,
+/// then any working window, then waiting, falling back to the first window's status.
+fn aggregate_status(windows: &[WindowView]) -> Option<SessionStatus> {
+    if windows.is_empty() {
+        return None;
+    }
+    let needs_attention = |s: &SessionStatus| {
+        matches!(
+            s,
+            SessionStatus::NeedsPermission { .. }
+                | SessionStatus::EditApproval { .. }
+                | SessionStatus::PlanReview
+                | SessionStatus::QuestionAsked
+        )
+    };
+    if let Some(w) = windows
+        .iter()
+        .find(|w| w.status.as_ref().is_some_and(needs_attention))
+    {
+        return w.status.clone();
+    }
+    if windows
+        .iter()
+        .any(|w| matches!(w.status, Some(SessionStatus::Working)))
+    {
+        return Some(SessionStatus::Working);
+    }
+    if windows
+        .iter()
+        .any(|w| matches!(w.status, Some(SessionStatus::Waiting)))
+    {
+        return Some(SessionStatus::Waiting);
+    }
+    windows.first().and_then(|w| w.status.clone())
+}
+
 /// Convert a TUI `ClaudeStatus` (parsed from JSONL) back to wire `SessionStatus`.
-fn convert_claude_to_session_status(
-    status: &crate::common::types::ClaudeStatus,
-) -> SessionStatus {
+fn convert_claude_to_session_status(status: &crate::common::types::ClaudeStatus) -> SessionStatus {
     use crate::common::types::ClaudeStatus;
     match status {
         ClaudeStatus::Waiting => SessionStatus::Waiting,

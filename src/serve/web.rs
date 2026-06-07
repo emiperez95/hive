@@ -3,7 +3,6 @@
 //! Serves an embedded single-page app and JSON API for monitoring
 //! and interacting with Claude sessions from a mobile browser.
 
-use crate::common::jsonl::get_conversation_messages;
 use crate::common::persistence::{
     load_auto_approve_sessions, load_completed_todos, load_favorite_sessions,
     load_session_todos, load_skipped_sessions, save_auto_approve_sessions,
@@ -44,6 +43,10 @@ fn get_html(dev_path: &Option<PathBuf>) -> String {
 struct SendRequest {
     session: String,
     text: String,
+    /// Optional tmux pane id (e.g. "%1") to target a specific window's Claude.
+    /// When omitted, falls back to the session's primary pane.
+    #[serde(default)]
+    window: Option<String>,
 }
 
 /// Run the HTTP web server on the given port.
@@ -130,35 +133,36 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Get, url) if url.starts_with("/api/messages?") => {
-                // Parse ?session=... from query string
-                let session_name = url
-                    .split('?')
-                    .nth(1)
-                    .and_then(|qs| {
-                        qs.split('&').find_map(|param| {
-                            let (k, v) = param.split_once('=')?;
-                            if k == "session" {
-                                Some(urldecode(v))
-                            } else {
-                                None
-                            }
-                        })
-                    });
+                // Parse ?session=...&window=<pane_id> from query string
+                let session_name = query_param(url, "session");
+                let window = query_param(url, "window");
 
                 let json = if let Some(name) = session_name {
-                    // Find the session's CWD from cached data
-                    let cwd = shared_data
+                    // Resolve the conversation source from cached data. When a window
+                    // (pane id) is given, use that instance's cwd + session_id so each
+                    // Claude in a multi-window session maps to its own transcript.
+                    let source: Option<(String, Option<String>)> = shared_data
                         .lock()
                         .ok()
                         .and_then(|data| {
-                            data.iter()
-                                .find(|s| s.name == name)
-                                .and_then(|s| s.cwd.clone())
+                            let s = data.iter().find(|s| s.name == name)?;
+                            let win = match &window {
+                                Some(pid) => s.windows.iter().find(|w| &w.pane_id == pid),
+                                None => s.windows.first(),
+                            };
+                            if let Some(w) = win {
+                                Some((w.cwd.clone()?, w.session_id.clone()))
+                            } else {
+                                Some((s.cwd.clone()?, None))
+                            }
                         });
 
-                    if let Some(cwd) = cwd {
+                    if let Some((cwd, session_id)) = source {
                         let messages: Vec<ConversationMessage> =
-                            get_conversation_messages(&cwd)
+                            crate::common::jsonl::get_conversation_messages_for(
+                                &cwd,
+                                session_id.as_deref(),
+                            )
                                 .into_iter()
                                 .map(|m| ConversationMessage {
                                     role: m.role,
@@ -296,14 +300,21 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     let req: SendRequest = serde_json::from_str(&body)
                         .map_err(|e| format!("Invalid JSON: {}", e))?;
 
-                    // Find the session's pane info from cached data
+                    // Resolve the target pane from cached data. A window (pane id) targets
+                    // that specific Claude; otherwise fall back to the session's primary pane.
                     let pane = shared_data
                         .lock()
                         .ok()
                         .and_then(|data| {
-                            data.iter()
-                                .find(|s| s.name == req.session)
-                                .and_then(|s| s.pane.clone())
+                            let s = data.iter().find(|s| s.name == req.session)?;
+                            match &req.window {
+                                Some(pid) => s
+                                    .windows
+                                    .iter()
+                                    .find(|w| &w.pane_id == pid)
+                                    .and_then(|w| w.pane.clone()),
+                                None => s.pane.clone(),
+                            }
                         })
                         .ok_or_else(|| "Session not found or has no Claude pane".to_string())?;
 
@@ -614,6 +625,20 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 }
 
 /// Percent-decoding for URL query parameters (handles multi-byte UTF-8).
+/// Extract and URL-decode a query-string parameter from a request URL.
+fn query_param(url: &str, key: &str) -> Option<String> {
+    url.split('?').nth(1).and_then(|qs| {
+        qs.split('&').find_map(|param| {
+            let (k, v) = param.split_once('=')?;
+            if k == key {
+                Some(urldecode(v))
+            } else {
+                None
+            }
+        })
+    })
+}
+
 fn urldecode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.bytes();

@@ -42,6 +42,12 @@ pub fn run_hook(event_type: &str) -> Result<()> {
         .unwrap_or("")
         .to_string();
 
+    // The hook runs inside the Claude pane, so TMUX_PANE identifies which tmux pane
+    // this session_id lives in. Recording it lets the TUI/web tell apart multiple
+    // Claude instances that share a working directory (one per window/pane).
+    let session_id_for_pane = session_id.clone();
+    let tmux_pane = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty());
+
     // Build HookEvent based on event type
     let hook_event = match event_type {
         "Stop" => HookEvent::Stop { session_id, cwd },
@@ -132,7 +138,16 @@ pub fn run_hook(event_type: &str) -> Result<()> {
         }
     }
 
-    if let Some(updated_session) = handle_hook_event(&mut state, hook_event) {
+    let updated = handle_hook_event(&mut state, hook_event);
+
+    // Record which tmux pane this session is running in (pane-id → session_id link).
+    if let Some(pane) = &tmux_pane {
+        if let Some(session) = state.sessions.get_mut(&session_id_for_pane) {
+            session.tmux_pane = Some(pane.clone());
+        }
+    }
+
+    if let Some(updated_session) = updated {
         // Send notification if session needs attention, not muted, and not auto-approved
         if updated_session.needs_attention && !auto_approved {
             let muted = load_muted_sessions();

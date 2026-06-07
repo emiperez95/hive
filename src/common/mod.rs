@@ -2,6 +2,8 @@
 
 pub mod chrome;
 pub mod debug;
+// Shared multi-Claude-per-session detection (consumed by the web server; TUI next).
+pub mod instances;
 pub mod iterm;
 #[allow(dead_code)]
 pub mod jsonl;

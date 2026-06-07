@@ -39,7 +39,13 @@ fn main() -> Result<()> {
         Some(Command::Project { command }) => match *command {
             cmd @ ProjectCommand::Add { .. } => cli::project::run_project_add(cmd),
             ProjectCommand::Remove { key } => cli::project::run_project_remove(&key),
-            ProjectCommand::List => cli::project::run_project_list(),
+            ProjectCommand::Archive { key } => {
+                cli::project::run_project_set_archived(&key, true)
+            }
+            ProjectCommand::Unarchive { key } => {
+                cli::project::run_project_set_archived(&key, false)
+            }
+            ProjectCommand::List { all } => cli::project::run_project_list(all),
             ProjectCommand::Import => cli::project::run_project_import(),
         },
         Some(Command::Todo { command }) => cli::todo::run_todo(command),

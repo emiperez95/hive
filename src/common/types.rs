@@ -7,6 +7,9 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
     pub index: String,
+    /// tmux global pane id, e.g. "%1" (stable for the pane's lifetime).
+    /// Used to correlate a pane with the Claude `session_id` recorded by hooks.
+    pub id: String,
     pub pid: u32,
     pub cwd: String,
 }
@@ -91,6 +94,22 @@ pub struct SessionInfo {
     pub attached_other_client: bool,
     /// This is the session the caller's tmux client is attached to
     pub is_current_session: bool,
+    /// Per-window Claude instances when this session hosts more than one. Empty
+    /// for single-Claude sessions (display falls back to `claude_status`).
+    pub windows: Vec<ClaudeWindowInfo>,
+}
+
+/// One Claude window within a multi-window session, for read-only display.
+#[derive(Debug, Clone)]
+pub struct ClaudeWindowInfo {
+    /// tmux window index (e.g. "1", "2").
+    pub window_index: String,
+    /// tmux window name.
+    pub window_name: String,
+    /// Status of this window's Claude.
+    pub status: Option<ClaudeStatus>,
+    /// CPU usage across this window's Claude process tree.
+    pub cpu: f32,
 }
 
 /// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'f' for favorite)
@@ -159,7 +178,13 @@ pub fn matches_filter(session_name: &str, filter: &Option<String>) -> bool {
 /// Returns the number of display lines a session occupies:
 /// Claude sessions get 3 lines (header + status + blank).
 /// Non-Claude sessions get 1 line.
+/// Multi-window sessions render one status line per window, so they grow with the
+/// window count: header (name + cpu/mem) + N window lines + trailing blank.
 pub fn lines_for_session(session: &SessionInfo, _is_auto_approved: bool) -> usize {
+    let n = session.windows.len();
+    if n > 1 {
+        return n + 2;
+    }
     if session.claude_status.is_some() {
         3
     } else {
