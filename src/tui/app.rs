@@ -30,6 +30,8 @@ use sysinfo::System;
 pub enum InputMode {
     Normal,
     AddTodo,               // Adding a todo in detail view
+    FreezeWindowPick,      // Choosing which Claude window to freeze (multi-window session)
+    FreezeNote,            // Typing a note while freezing a window
     Search,                // Interactive session search
     SpreadPrompt,          // Waiting for digit 1-9 to spread iTerm2 panes
     WorktreeBranch,        // Typing branch name for new worktree
@@ -46,6 +48,7 @@ pub enum SearchResult {
     Active(String),   // Session name
     Project(String),  // Project name from registry (not active)
     Worktree(String), // Worktree session name from worktrees.json (not active)
+    Frozen(String),   // Frozen (hibernated) session name from frozen.json (not live)
 }
 
 /// A quick-jump target in hint mode: either a whole session or a specific
@@ -148,6 +151,13 @@ pub struct App {
     // Hint mode: (label, target) pairs in display order, and keys typed so far
     pub hint_targets: Vec<(String, HintTarget)>,
     pub hint_buffer: String,
+    // Frozen (hibernated) Claude windows, reloaded each refresh
+    pub frozen_state: crate::common::frozen::FrozenState,
+    // Window chosen to freeze, carried into the note prompt
+    pub pending_freeze: Option<crate::common::frozen::FreezeTarget>,
+    // Window picker (multi-Claude session): candidate windows + highlighted index
+    pub freeze_choices: Vec<crate::common::frozen::FreezeTarget>,
+    pub freeze_choice_selected: usize,
 }
 
 impl App {
@@ -200,6 +210,10 @@ impl App {
             np_key: None,
             hint_targets: Vec::new(),
             hint_buffer: String::new(),
+            frozen_state: crate::common::frozen::FrozenState::load(),
+            pending_freeze: None,
+            freeze_choices: Vec::new(),
+            freeze_choice_selected: 0,
         }
     }
 
@@ -210,6 +224,20 @@ impl App {
     pub fn update_search_results(&mut self) {
         self.search_results.clear();
         let query = self.search_query.to_lowercase();
+
+        // Frozen Claude windows are pinned at the top as their own group, each a window to
+        // resume. They sit alongside (not in place of) the parent session row — the session
+        // may still be alive with other windows, or gone entirely. Keyed by entry key so two
+        // frozen windows of the same session are distinct, selectable rows.
+        for entry in self.frozen_state.sorted() {
+            let matches = query.is_empty()
+                || entry.session_name.to_lowercase().contains(&query)
+                || entry.window_name.to_lowercase().contains(&query)
+                || entry.note.to_lowercase().contains(&query);
+            if matches {
+                self.search_results.push(SearchResult::Frozen(entry.key()));
+            }
+        }
 
         // Collect active session names for deduplication
         let active_names: HashSet<String> =
@@ -317,20 +345,21 @@ impl App {
             }
         }
 
-        // Sort non-active results: favorites first, preserving relative order
-        let active_count = self
+        // Sort the non-pinned results (projects/worktrees): favorites first, preserving
+        // relative order. The pinned prefix is the leading run of Frozen then Active rows.
+        let pinned_count = self
             .search_results
             .iter()
-            .take_while(|r| matches!(r, SearchResult::Active(_)))
+            .take_while(|r| matches!(r, SearchResult::Frozen(_) | SearchResult::Active(_)))
             .count();
-        if active_count < self.search_results.len() {
-            let non_active = self.search_results.split_off(active_count);
+        if pinned_count < self.search_results.len() {
+            let non_active = self.search_results.split_off(pinned_count);
             let mut fav_results = Vec::new();
             let mut rest_results = Vec::new();
             for r in non_active {
                 let name = match &r {
                     SearchResult::Project(n) | SearchResult::Worktree(n) => n,
-                    SearchResult::Active(_) => unreachable!(),
+                    SearchResult::Active(_) | SearchResult::Frozen(_) => unreachable!(),
                 };
                 if self.favorite_sessions.contains(name) {
                     fav_results.push(r);
@@ -436,7 +465,10 @@ impl App {
     /// Calculate lines needed to display a search result
     fn lines_for_search_result(&self, result: &SearchResult) -> usize {
         match result {
-            SearchResult::Active(_) | SearchResult::Project(_) | SearchResult::Worktree(_) => 1,
+            SearchResult::Active(_)
+            | SearchResult::Project(_)
+            | SearchResult::Worktree(_)
+            | SearchResult::Frozen(_) => 1,
         }
     }
 
@@ -469,6 +501,9 @@ impl App {
     /// Apply gathered session data to app state (cheap — runs on main thread).
     /// Handles sorting, permission key assignment, and selection stabilization.
     pub fn apply_refresh(&mut self, mut session_infos: Vec<SessionInfo>) {
+        // Keep frozen state current so the picker group and footer count stay fresh.
+        self.reload_frozen();
+
         // Sort: skipped last, Claude before non-Claude, favorites first
         session_infos.sort_by_key(|s| {
             let is_favorite = self.favorite_sessions.contains(&s.name);
@@ -748,6 +783,122 @@ impl App {
     pub fn cancel_add_todo(&mut self) {
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
+    }
+
+    /// Begin freezing from the detail view. Enumerates the session's Claude windows:
+    /// one window → straight to the note prompt; several → open the window picker first.
+    pub fn start_freeze_from_detail(&mut self) {
+        let Some(session_name) = self.detail_session_name() else {
+            return;
+        };
+        use crate::common::frozen::FreezeTarget;
+        let mut choices: Vec<FreezeTarget> = crate::common::instances::instances_for_session(
+            &session_name,
+        )
+        .into_iter()
+        .map(|inst| FreezeTarget {
+            session_name: inst.session_name,
+            window_index: inst.window_index,
+            window_name: inst.window_name,
+            cwd: inst.cwd,
+            claude_session_id: inst.session_id,
+        })
+        .collect();
+        choices.sort_by(|a, b| a.window_index.cmp(&b.window_index));
+
+        match choices.len() {
+            0 => {
+                self.error_message = Some((
+                    format!("No Claude window to freeze in '{session_name}'"),
+                    Instant::now(),
+                ));
+            }
+            1 => {
+                self.pending_freeze = Some(choices.into_iter().next().unwrap());
+                self.input_mode = InputMode::FreezeNote;
+                self.input_buffer.clear();
+            }
+            _ => {
+                self.freeze_choices = choices;
+                self.freeze_choice_selected = 0;
+                self.input_mode = InputMode::FreezeWindowPick;
+            }
+        }
+    }
+
+    pub fn freeze_pick_up(&mut self) {
+        if self.freeze_choice_selected > 0 {
+            self.freeze_choice_selected -= 1;
+        }
+    }
+
+    pub fn freeze_pick_down(&mut self) {
+        if self.freeze_choice_selected + 1 < self.freeze_choices.len() {
+            self.freeze_choice_selected += 1;
+        }
+    }
+
+    /// Confirm the highlighted window in the picker and move on to the note prompt.
+    pub fn freeze_pick_confirm(&mut self) {
+        if let Some(target) = self.freeze_choices.get(self.freeze_choice_selected).cloned() {
+            self.pending_freeze = Some(target);
+            self.freeze_choices.clear();
+            self.input_mode = InputMode::FreezeNote;
+            self.input_buffer.clear();
+        }
+    }
+
+    /// Complete the freeze with the typed note. Kills just that window and records it.
+    /// Returns true on success.
+    pub fn complete_freeze(&mut self) -> bool {
+        let Some(target) = self.pending_freeze.take() else {
+            self.input_mode = InputMode::Normal;
+            self.input_buffer.clear();
+            return false;
+        };
+        let note = self.input_buffer.trim().to_string();
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        match crate::common::frozen::freeze_window(&target, &note) {
+            Ok(_) => {
+                self.reload_frozen();
+                // Leave detail view: the window is gone, and the session may be too.
+                self.showing_detail = None;
+                self.detail_selected = None;
+                true
+            }
+            Err(e) => {
+                self.error_message = Some((
+                    format!("Failed to freeze '{}': {e}", target.session_name),
+                    Instant::now(),
+                ));
+                false
+            }
+        }
+    }
+
+    pub fn cancel_freeze(&mut self) {
+        self.pending_freeze = None;
+        self.freeze_choices.clear();
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    /// Reload frozen state from disk (after freeze/thaw/discard or on refresh).
+    pub fn reload_frozen(&mut self) {
+        self.frozen_state = crate::common::frozen::FrozenState::load();
+    }
+
+    /// Discard the highlighted frozen entry in the picker without restoring it.
+    pub fn discard_selected_frozen(&mut self) {
+        let Some(SearchResult::Frozen(name)) = self.search_results.get(self.selected).cloned()
+        else {
+            return;
+        };
+        if crate::common::frozen::discard_frozen(&name).unwrap_or(false) {
+            self.reload_frozen();
+            self.update_search_results();
+        }
     }
 
     pub fn delete_selected_todo(&mut self) {

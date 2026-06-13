@@ -64,6 +64,14 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         format!("{}s refresh", app.interval),
         Style::default().add_modifier(Modifier::DIM),
     ));
+    let frozen_count = app.frozen_state.frozen.len();
+    if frozen_count > 0 {
+        header_spans.push(Span::raw("  "));
+        header_spans.push(Span::styled(
+            format!("💤 {frozen_count} frozen (/)"),
+            Style::default().fg(Color::Blue),
+        ));
+    }
     let header = Line::from(header_spans);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -106,6 +114,24 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_base_picker_modal(frame, app, chunks[1]);
         } else if app.input_mode == InputMode::WorktreeConfirmDelete {
             render_delete_confirm_modal(frame, app, chunks[1]);
+        } else if app.input_mode == InputMode::FreezeWindowPick {
+            render_freeze_window_picker(frame, app, chunks[1]);
+        } else if app.input_mode == InputMode::FreezeNote {
+            let ctx = app
+                .pending_freeze
+                .as_ref()
+                .map(|t| format!("{} · {}", t.session_name, t.window_name))
+                .unwrap_or_else(|| "window".to_string());
+            render_input_modal(
+                frame,
+                app,
+                chunks[1],
+                "Freeze Window",
+                &ctx,
+                Some("note / theme (optional)"),
+                "freeze",
+                Color::Blue,
+            );
         }
     } else {
         render_session_list(frame, app, chunks[1]);
@@ -197,6 +223,26 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("cancel"),
         ])
+    } else if app.input_mode == InputMode::FreezeWindowPick {
+        Line::from(vec![
+            Span::styled("💤 freeze ", Style::default().fg(Color::Blue)),
+            Span::styled("pick window ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("[↑↓]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" select "),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" next "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ])
+    } else if app.input_mode == InputMode::FreezeNote {
+        Line::from(vec![
+            Span::styled("💤 freeze ", Style::default().fg(Color::Blue)),
+            Span::styled("note ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" freeze "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ])
     } else if app.showing_detail.is_some() {
         Line::from(vec![
             Span::styled("[A]", Style::default().add_modifier(Modifier::BOLD)),
@@ -213,6 +259,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("ute "),
             Span::styled("[S]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("kip "),
+            Span::styled("[Z]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("freeze "),
             Span::styled("[W]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("t "),
             Span::styled("[X]", Style::default().add_modifier(Modifier::BOLD)),
@@ -283,7 +331,8 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
         Line::raw("    F           Toggle favorite"),
         Line::raw("    !           Toggle auto-approve"),
         Line::raw("    M           Toggle notifications mute"),
-        Line::raw("    S           Toggle skip from cycling"),
+        Line::raw("    S           Toggle skip from cycling (stays alive)"),
+        Line::raw("    Z           Freeze a Claude window (pick if several), resumable"),
         Line::raw("    W           New worktree from session"),
         Line::raw("    X           Delete worktree"),
         Line::raw(""),
@@ -291,10 +340,10 @@ fn render_help_screen(frame: &mut Frame, area: Rect) {
             "  Search",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::raw("    Type        Filter by name"),
+        Line::raw("    Type        Filter by name or frozen note"),
         Line::raw("    ↑/↓         Navigate results"),
-        Line::raw("    Enter       Open / connect"),
-        Line::raw("    Del         Archive/unarchive project"),
+        Line::raw("    Enter       Open / connect / thaw frozen (resume)"),
+        Line::raw("    Del         Archive project · discard frozen entry"),
         Line::raw("    ^R          Toggle archived projects"),
         Line::raw("    Esc         Cancel search"),
         Line::raw(""),
@@ -971,6 +1020,40 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                     lines.push(Line::from(spans));
                     lines_remaining -= 1;
                 }
+                SearchResult::Frozen(key) => {
+                    let Some(entry) = app.frozen_state.get(key) else {
+                        idx += 1;
+                        continue;
+                    };
+                    let mut spans = vec![
+                        prefix,
+                        Span::styled("💤 ", style),
+                        Span::styled(entry.session_name.clone(), style.add_modifier(Modifier::BOLD)),
+                    ];
+                    let win_label = entry.window_label();
+                    if !win_label.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · {win_label}"),
+                            Style::default().fg(Color::Cyan),
+                        ));
+                    }
+                    spans.push(Span::styled(" [frozen]", Style::default().fg(Color::Blue)));
+                    if !entry.note.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" “{}”", entry.note),
+                            Style::default().fg(Color::Gray),
+                        ));
+                    }
+                    let rel = crate::common::frozen::relative_time(&entry.frozen_at);
+                    if !rel.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · {rel}"),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                    lines_remaining -= 1;
+                }
             }
             idx += 1;
         }
@@ -1468,6 +1551,59 @@ fn render_base_picker_modal(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
         Span::styled(" select  ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[↑↓]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" navigate  ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" cancel", Style::default().add_modifier(Modifier::DIM)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the "which Claude window to freeze" picker (multi-window session).
+fn render_freeze_window_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let item_count = app.freeze_choices.len();
+    let modal_height = (item_count as u16 + 4).min(area.height.saturating_sub(2));
+    let modal_width = 54u16.min(area.width.saturating_sub(4));
+
+    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(x, y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(" Freeze which window? ");
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, choice) in app.freeze_choices.iter().enumerate() {
+        let is_selected = i == app.freeze_choice_selected;
+        let label = if choice.window_name.is_empty() {
+            format!("win {}", choice.window_index)
+        } else {
+            format!("{} · {}", choice.window_index, choice.window_name)
+        };
+        let marker = if is_selected { "> " } else { "  " };
+        let name_style = if is_selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(label, name_style),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" freeze  ", Style::default().add_modifier(Modifier::DIM)),
         Span::styled("[↑↓]", Style::default().add_modifier(Modifier::DIM)),
         Span::styled(" navigate  ", Style::default().add_modifier(Modifier::DIM)),
         Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),

@@ -183,6 +183,48 @@ pub fn run_tui(
                             }
                             _ => {}
                         }
+                    } else if app.input_mode == InputMode::FreezeWindowPick {
+                        match code {
+                            KeyCode::Esc => {
+                                app.cancel_freeze();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.freeze_pick_up();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.freeze_pick_down();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Enter => {
+                                app.freeze_pick_confirm();
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.input_mode == InputMode::FreezeNote {
+                        match code {
+                            KeyCode::Esc => {
+                                app.cancel_freeze();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Enter => {
+                                // Freeze (note may be empty); on success the session is gone
+                                // and we drop back to the list.
+                                app.complete_freeze();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.input_buffer.pop();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                app.input_buffer.push(c);
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
                     } else if app.input_mode == InputMode::SpreadPrompt {
                         match code {
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
@@ -408,6 +450,32 @@ pub fn run_tui(
                                                 needs_redraw = true;
                                             }
                                         }
+                                        SearchResult::Frozen(key) => {
+                                            // Thaw: re-add the window to its session (or recreate
+                                            // the session) and `claude --resume` the conversation.
+                                            app.input_mode = InputMode::Normal;
+                                            app.search_query.clear();
+                                            app.search_results.clear();
+                                            match crate::common::frozen::thaw_window(&key) {
+                                                Ok(session_name) => {
+                                                    app.reload_frozen();
+                                                    app.unskip(&session_name);
+                                                    app.save_restorable();
+                                                    if app.auto_picker {
+                                                        return Ok(PostAction::Attach(session_name));
+                                                    }
+                                                    switch_to_session(&session_name);
+                                                    return Ok(PostAction::None);
+                                                }
+                                                Err(e) => {
+                                                    app.error_message = Some((
+                                                        format!("Failed to thaw: {}", e),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                    needs_redraw = true;
+                                                }
+                                            }
+                                        }
                                     }
                                 } else {
                                     app.input_mode = InputMode::Normal;
@@ -434,7 +502,15 @@ pub fn run_tui(
                                 needs_redraw = true;
                             }
                             KeyCode::Delete => {
-                                app.toggle_archive_selected_project();
+                                // On a frozen row, discard it; otherwise archive a project.
+                                if matches!(
+                                    app.search_results.get(app.selected),
+                                    Some(SearchResult::Frozen(_))
+                                ) {
+                                    app.discard_selected_frozen();
+                                } else {
+                                    app.toggle_archive_selected_project();
+                                }
                                 needs_redraw = true;
                             }
                             KeyCode::Char('r') | KeyCode::Char('R')
@@ -592,6 +668,12 @@ pub fn run_tui(
                                     app.toggle_skip(&name);
                                     needs_redraw = true;
                                 }
+                            }
+                            KeyCode::Char('z') | KeyCode::Char('Z') => {
+                                // Freeze a Claude window: kill just that window, keep it
+                                // resumable. Picks the window first if the session has several.
+                                app.start_freeze_from_detail();
+                                needs_redraw = true;
                             }
                             KeyCode::Char('o') | KeyCode::Char('O') => {
                                 app.refresh_chrome_tabs();

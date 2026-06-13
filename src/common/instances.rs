@@ -20,7 +20,9 @@ use std::collections::HashMap;
 
 use sysinfo::System;
 
-use crate::common::process::{collect_descendants, get_process_info, is_claude_process};
+use crate::common::process::{
+    build_children_map, collect_descendants, get_process_info, is_claude_process,
+};
 use crate::common::types::TmuxSession;
 use crate::ipc::messages::{HookState, SessionState};
 
@@ -149,6 +151,25 @@ pub fn detect_claude_instances(
     }
 
     instances
+}
+
+/// Enumerate the Claude instances (one per Claude-running pane) in a single tmux session,
+/// building the heavy inputs (process table, children map, hook index) on demand.
+///
+/// Intended for one-shot user actions like freeze — not per-refresh use, where the caller
+/// should reuse a long-lived `System` and build the indexes once.
+pub fn instances_for_session(session_name: &str) -> Vec<ClaudeInstance> {
+    let Ok(sessions) = crate::common::tmux::get_tmux_sessions() else {
+        return Vec::new();
+    };
+    let sys = System::new_all();
+    let children_map = build_children_map();
+    let hook_state = HookState::load();
+    let hook_index = HookIndex::build(&hook_state);
+    detect_claude_instances(&sessions, &sys, &children_map, &hook_index)
+        .into_iter()
+        .filter(|inst| inst.session_name == session_name)
+        .collect()
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 
 pub mod chrome;
 pub mod debug;
+pub mod frozen;
 // Shared multi-Claude-per-session detection (consumed by the web server; TUI next).
 pub mod instances;
 pub mod iterm;

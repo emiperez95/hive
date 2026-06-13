@@ -134,6 +134,9 @@ src/
 - `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, auth_profile, etc.)
 - `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
 - `WorktreeEntry` (common/worktree.rs) — worktree record (project_key, branch, type, path, session_name, metadata, created_at)
+- `FrozenState` (common/frozen.rs) — `HashMap<entry_key, FrozenEntry>` (key = claude_session_id, else `session#window`), persisted to frozen.json
+- `FrozenEntry` (common/frozen.rs) — one frozen Claude *window* (session_name, window_name, window_index, cwd, claude_session_id, claude_config_dir, note, frozen_at)
+- `FreezeTarget` (common/frozen.rs) — the window chosen to freeze (session_name, window_index, window_name, cwd, claude_session_id)
 - `SessionView` (serve/web_types.rs) — serializable session data for the web API (name, status, cpu, ports, pane, skipped, messages)
 - `ProcessView` (serve/web_types.rs) — minimal process info for the web dashboard
 - `ConversationMessage` (serve/web_types.rs) — chat message with role, text, and tool summaries
@@ -149,6 +152,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 ├── cache/                     # runtime state
 │   ├── state.json             # hook state (session statuses)
 │   ├── worktrees.json         # registered worktrees
+│   ├── frozen.json            # frozen (hibernated) Claude windows — resume metadata + notes
 │   ├── favorites.txt           # favorite session names
 │   ├── todos.txt              # per-session todo lists (active)
 │   ├── todos-done.txt         # per-session completed todos
@@ -178,11 +182,47 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 1. Help screen → `?`/Esc dismiss, `Q` quit
 2. AddTodo input → text entry modal
 3. SpreadPrompt → digit 1-9 triggers spread, Esc cancels
-4. Search mode → filter, navigate, select; `Del` archive/unarchive highlighted project, `Ctrl+R` reveal archived projects (archived are hidden from the picker by default)
-5. Detail view → todos, ports, switch, favorite, flags, `O` open Chrome tabs
+3b. FreezeWindowPick → choose which Claude window to freeze (multi-window session); FreezeNote → text entry for the note
+4. Search mode → filter, navigate, select; `Del` archive/unarchive highlighted project (or discard a highlighted frozen window), `Ctrl+R` reveal archived projects (archived are hidden from the picker by default)
+5. Detail view → todos, ports, switch, favorite, flags, `Z` freeze window, `O` open Chrome tabs
 6. Normal list → navigate, switch (exits app), approve permissions, search, `L` spread/collapse, quit
 
-Switching sessions (1-9, Enter in detail, connect project) always exits the app.
+Switching sessions (1-9, Enter in detail, connect project, thawing a frozen session) always exits the app.
+
+## Frozen Windows (Freeze / Thaw)
+
+Granularity is the **Claude window**, not the tmux session. A project session can host several
+Claude windows (see `common/instances.rs`); each can be frozen/thawed independently. **Skip vs
+Freeze** are two distinct ways to set work aside:
+
+| | Skip (`S`) | Freeze (`Z`) |
+|---|---|---|
+| Scope | whole session | one Claude window |
+| tmux | stays alive | **window killed** (its Claude process + RAM/CPU freed) |
+| Use case | watching a server, waiting for input — don't kill | postpone one task, tackle later |
+| Restore | un-skip | re-add window + `claude --resume <id>` |
+
+Freeze works because Claude persists every conversation to JSONL on disk.
+
+- **Freeze** (`freeze_window`): captures the window's Claude `session_id`, cwd, window name,
+  and `CLAUDE_CONFIG_DIR` (from `tmux show-environment`) into a `FrozenEntry` keyed by the
+  conversation id, then `tmux kill-window` on just that window. The session and its other
+  windows keep running; freezing the last window lets tmux drop the empty session. Worktree
+  dirs and conversation history on disk are untouched.
+- **Thaw** (`thaw_window`): if the parent session is still alive, `tmux new-window` in it +
+  `claude --resume <id>` (falls back to `claude -c`); if the session is gone, recreate it via
+  `ensure_tmux_session` with that window. Then the entry is removed.
+
+Window enumeration at freeze time uses `instances::instances_for_session` (builds the process
+table + hook index on demand — fine for a one-shot action).
+
+**UI**: `Z` in the detail view freezes a Claude window — if the session has several, a window
+picker (`FreezeWindowPick`) appears first; then a note prompt (`FreezeNote`). Frozen windows
+are pinned as a `💤 … [frozen]` group at the top of the search picker (`/`), showing
+`session · window`, the note, and relative time; the main-list header shows a `💤 N frozen`
+count. Enter on a frozen row thaws + switches to it; `Del` discards a frozen entry (history
+stays on disk). Frozen rows sit alongside the parent session row (which may still be live), not
+in place of it.
 
 ## `hive start`
 
