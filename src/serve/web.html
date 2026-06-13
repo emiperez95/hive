@@ -1658,6 +1658,51 @@
 
   .kill-session-btn .material-symbols-outlined { font-size: 18px; }
 
+  /* Frozen windows */
+  .frozen-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    background: var(--surface-container-lowest);
+    border: 1px dashed var(--outline);
+    border-radius: 0.5rem;
+    margin-bottom: 10px;
+    cursor: pointer;
+    transition: transform 0.15s;
+  }
+  .frozen-item:active { transform: scale(0.98); }
+  .frozen-item .frozen-emoji { font-size: 22px; }
+  .frozen-item .frozen-info { flex: 1; min-width: 0; }
+  .frozen-item .frozen-name {
+    font-size: 13px; font-weight: 600; color: var(--on-surface);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .frozen-item .frozen-note {
+    font-size: 12px; color: var(--on-surface-variant);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .frozen-item .frozen-time {
+    font-size: 10px; color: var(--outline);
+    text-transform: uppercase; font-weight: 700; white-space: nowrap;
+  }
+  .frozen-discard {
+    background: none; border: none; color: var(--outline);
+    cursor: pointer; padding: 6px; display: flex;
+  }
+  .frozen-discard:active { color: var(--error); }
+  .frozen-discard .material-symbols-outlined { font-size: 20px; }
+
+  .freeze-btn {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100%; padding: 10px;
+    background: none; border: 1px solid var(--primary);
+    border-radius: 0.5rem; color: var(--primary);
+    font-size: 13px; font-weight: 600; cursor: pointer; margin-bottom: 8px;
+    transition: background 0.15s;
+  }
+  .freeze-btn:active { background: var(--primary-container); color: #fff; }
+
 </style>
 </head>
 <body>
@@ -1778,6 +1823,7 @@
 
 <script>
 let sessions = [];
+let frozenList = []; // frozen Claude windows (from /api/frozen)
 let selectedSession = null;
 let selectedWindow = null; // pane id (e.g. "%1") when a specific window is selected
 let expandedSessions = new Set(); // session names whose accordion is open
@@ -2281,7 +2327,28 @@ function renderList() {
     html += '<div class="section-header skipped-header">SKIPPED</div>';
     html += skipped.map(s => renderSessionItem(s, true)).join('');
   }
+  if (frozenList.length) {
+    html += '<div class="section-header">FROZEN</div>';
+    html += frozenList.map(renderFrozenItem).join('');
+  }
   el.innerHTML = html;
+}
+
+// A frozen Claude window: tap to thaw (resume), trash icon to discard.
+function renderFrozenItem(f) {
+  const { emoji, rest } = extractEmoji(f.session_name);
+  const win = f.window_label ? ' · ' + esc(f.window_label) : '';
+  const note = f.note ? esc(f.note) : '<span style="opacity:0.5">no note</span>';
+  const key = encodeURIComponent(f.key);
+  return `<div class="frozen-item" onclick="thawFrozen('${key}')">
+    <div class="frozen-emoji">\u{1F4A4}</div>
+    <div class="frozen-info">
+      <div class="frozen-name">${esc(rest || f.session_name)}${win}</div>
+      <div class="frozen-note">${note}</div>
+    </div>
+    <div class="frozen-time">${esc(f.relative || '')}</div>
+    <button class="frozen-discard" onclick="event.stopPropagation();discardFrozen('${key}')"><span class="material-symbols-outlined">delete</span></button>
+  </div>`;
 }
 
 function updateDetailBadges(s) {
@@ -2516,6 +2583,7 @@ async function sendMessage() {
 
 // --- Polling ---
 let lastSessionsJson = '';
+let lastFrozenJson = '';
 
 async function fetchSessions() {
   try {
@@ -2523,13 +2591,18 @@ async function fetchSessions() {
     const json = await res.text();
     document.getElementById('connDot').style.background = 'var(--secondary)';
 
-    // Only re-render the list if the session data actually changed
-    if (json !== lastSessionsJson) {
+    // Frozen windows are polled alongside sessions (cheap on localhost).
+    let frJson = '[]';
+    try { frJson = await (await fetch('/api/frozen')).text(); } catch (e) { /* keep last */ }
+
+    sessions = JSON.parse(json);
+    frozenList = JSON.parse(frJson);
+
+    // Only re-render the list when either set actually changed.
+    if (json !== lastSessionsJson || frJson !== lastFrozenJson) {
       lastSessionsJson = json;
-      sessions = JSON.parse(json);
+      lastFrozenJson = frJson;
       renderList();
-    } else {
-      sessions = JSON.parse(json);
     }
 
     // In detail view, only update badges (not chat — that has its own poll)
@@ -2985,12 +3058,87 @@ function renderInfoModal(data) {
     html += '</div>';
   }
 
-  // Section 5: Danger zone
+  // Section 5: Freeze (one button per Claude window — kills the window, keeps it resumable)
+  const liveS = sessions.find(x => x.name === data.name);
+  const wins = (liveS && liveS.windows) ? liveS.windows : [];
+  if (wins.length > 0) {
+    html += '<div class="info-section">';
+    html += '<div class="info-section-title">Freeze</div>';
+    if (wins.length === 1) {
+      html += '<button class="freeze-btn" onclick="freezeWindow(0)">\u{1F4A4} Freeze window (resume later)</button>';
+    } else {
+      wins.forEach((w, i) => {
+        html += '<button class="freeze-btn" onclick="freezeWindow(' + i + ')">\u{1F4A4} Freeze ' + esc(windowLabel(w)) + '</button>';
+      });
+    }
+    html += '</div>';
+  }
+
+  // Section 6: Danger zone
   html += '<div class="info-section" style="padding-top:8px">';
   html += '<button class="kill-session-btn" onclick="confirmKillSession()"><span class="material-symbols-outlined">power_settings_new</span>Kill Session</button>';
   html += '</div>';
 
   document.getElementById('infoModalContent').innerHTML = html;
+}
+
+// Freeze one Claude window of the current session. The window list comes from the live
+// /api/sessions data (which carries per-window identity); we post the chosen window.
+async function freezeWindow(i) {
+  const live = sessions.find(x => x.name === currentInfoSession);
+  if (!live || !live.windows || !live.windows[i]) return;
+  const w = live.windows[i];
+  const note = prompt('Note for this frozen window (why / theme):', '');
+  if (note === null) return; // cancelled
+  try {
+    const res = await fetch('/api/freeze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session: currentInfoSession,
+        window_index: w.window_index,
+        window_name: w.window_name,
+        cwd: w.cwd,
+        session_id: w.session_id,
+        note: note
+      })
+    });
+    const r = await res.json();
+    if (r.error) { alert('Freeze failed: ' + r.error); return; }
+    closeInfoModal();
+    history.back(); // back to the session list
+    lastSessionsJson = ''; lastFrozenJson = '';
+    fetchSessions();
+  } catch (e) { /* ignore */ }
+}
+
+// Thaw a frozen window: recreate it (in its session, or a fresh one) and resume.
+async function thawFrozen(key) {
+  try {
+    const res = await fetch('/api/thaw', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: decodeURIComponent(key) })
+    });
+    const r = await res.json();
+    if (r.error) { alert('Thaw failed: ' + r.error); return; }
+    lastSessionsJson = ''; lastFrozenJson = '';
+    fetchSessions();
+  } catch (e) { /* ignore */ }
+}
+
+// Discard a frozen window without restoring it (conversation stays on disk).
+async function discardFrozen(key) {
+  if (!confirm('Discard this frozen window? The conversation stays on disk but is removed from the list.')) return;
+  try {
+    await fetch('/api/discard-frozen', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: decodeURIComponent(key) })
+    });
+    lastFrozenJson = '';
+    fetchSessions();
+  } catch (e) { /* ignore */ }
 }
 
 async function confirmKillSession() {

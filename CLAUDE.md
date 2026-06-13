@@ -216,13 +216,18 @@ Freeze works because Claude persists every conversation to JSONL on disk.
 Window enumeration at freeze time uses `instances::instances_for_session` (builds the process
 table + hook index on demand — fine for a one-shot action).
 
-**UI**: `Z` in the detail view freezes a Claude window — if the session has several, a window
+**TUI**: `Z` in the detail view freezes a Claude window — if the session has several, a window
 picker (`FreezeWindowPick`) appears first; then a note prompt (`FreezeNote`). Frozen windows
 are pinned as a `💤 … [frozen]` group at the top of the search picker (`/`), showing
 `session · window`, the note, and relative time; the main-list header shows a `💤 N frozen`
 count. Enter on a frozen row thaws + switches to it; `Del` discards a frozen entry (history
 stays on disk). Frozen rows sit alongside the parent session row (which may still be live), not
 in place of it.
+
+**Web**: same `frozen.rs` layer via `/api/frozen` (list), `/api/freeze`, `/api/thaw`,
+`/api/discard-frozen`. The info modal shows a per-window Freeze button (the window identity
+comes from the live `/api/sessions` `windows` array); a `FROZEN` section in the session list
+thaws on tap and discards via a trash icon.
 
 ## `hive start`
 
@@ -307,6 +312,10 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 | POST | `/api/todos` | Manage todos: `{"session": "...", "action": "add|done|delete", ...}` |
 | POST | `/api/connect` | Create/attach session: `{"session_name": "..."}` |
 | POST | `/api/kill-session` | Kill tmux session (with frontend confirmation): `{"session": "..."}` |
+| GET | `/api/frozen` | List frozen Claude windows (key, session_name, window_label, note, relative) |
+| POST | `/api/freeze` | Freeze one window: `{"session","window_index","window_name","cwd","session_id","note"}` |
+| POST | `/api/thaw` | Thaw a frozen window by key: `{"key": "..."}` |
+| POST | `/api/discard-frozen` | Discard a frozen window (no restore): `{"key": "..."}` |
 | GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
 | GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
 
@@ -321,7 +330,8 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 - Syntax highlighting via Prism.js CDN (JS, TS, Rust, Python, Bash, YAML, JSON, TOML)
 - Tool use cards (Bash, Write, Edit, Read, Grep, Glob, Agent) with expandable detail modals
 - Styled tool modals: dark terminal block for Bash (copy button), unified LCS diff for Edit, file viewer for Write/Read
-- Tappable session header opens info modal: CWD, ports, processes, flag toggles (favorite, auto-approve, skip), todo management (add/done/delete), kill session button
+- Tappable session header opens info modal: CWD, ports, processes, flag toggles (favorite, auto-approve, skip), todo management (add/done/delete), per-window Freeze buttons, kill session button
+- Frozen windows: a `FROZEN` section (💤) in the session list — tap to thaw (resume), trash icon to discard; freeze from the info modal prompts for a note
 - Quick action buttons (Approve/Reject/yes) — only shown when session needs attention
 - Text input with Send button for typing messages to sessions
 - TTS buttons (only when `--tts-host` configured):

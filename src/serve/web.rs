@@ -567,6 +567,99 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            (Method::Get, "/api/frozen") => {
+                // List frozen Claude windows, newest first.
+                use crate::common::frozen::{relative_time, FrozenState};
+                let state = FrozenState::load();
+                let list: Vec<serde_json::Value> = state
+                    .sorted()
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "key": e.key(),
+                            "session_name": e.session_name,
+                            "window_label": e.window_label(),
+                            "note": e.note,
+                            "frozen_at": e.frozen_at,
+                            "relative": relative_time(&e.frozen_at),
+                        })
+                    })
+                    .collect();
+                let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/freeze") => {
+                // Freeze one Claude window. The frontend posts the window's identity (it has
+                // it from /api/sessions); we kill that window and record it for resume.
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    use crate::common::frozen::{freeze_window, FreezeTarget};
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let session_name = req.get("session")?.as_str()?.to_string();
+                    let window_index = req.get("window_index")?.as_str()?.to_string();
+                    let cwd = req.get("cwd")?.as_str()?.to_string();
+                    let window_name = req
+                        .get("window_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let claude_session_id = req
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let note = req.get("note").and_then(|v| v.as_str()).unwrap_or("");
+                    let target = FreezeTarget {
+                        session_name,
+                        window_index,
+                        window_name,
+                        cwd,
+                        claude_session_id,
+                    };
+                    match freeze_window(&target, note) {
+                        Ok(_) => Some(r#"{"ok":true}"#.to_string()),
+                        Err(e) => Some(format!(r#"{{"error":"{}"}}"#, e)),
+                    }
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/thaw") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let key = req.get("key")?.as_str()?;
+                    match crate::common::frozen::thaw_window(key) {
+                        Ok(session_name) => {
+                            Some(format!(r#"{{"ok":true,"session":"{}"}}"#, session_name))
+                        }
+                        Err(e) => Some(format!(r#"{{"error":"{}"}}"#, e)),
+                    }
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/discard-frozen") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let key = req.get("key")?.as_str()?;
+                    let ok = crate::common::frozen::discard_frozen(key).unwrap_or(false);
+                    Some(format!(r#"{{"ok":{}}}"#, ok))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
             (Method::Get, url) if url.starts_with("/hls/") => {
                 // Proxy HLS playlist and segments from TTS server (same-origin for iOS Safari)
                 if let Some(ref host) = tts_host {
