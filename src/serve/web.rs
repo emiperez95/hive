@@ -4,15 +4,15 @@
 //! and interacting with Claude sessions from a mobile browser.
 
 use crate::common::persistence::{
-    load_auto_approve_sessions, load_completed_todos, load_favorite_sessions,
-    load_session_todos, load_skipped_sessions, save_auto_approve_sessions,
-    save_completed_todos, save_favorite_sessions, save_session_todos, save_skipped_sessions,
+    load_auto_approve_sessions, load_completed_todos, load_favorite_sessions, load_session_todos,
+    load_skipped_sessions, save_auto_approve_sessions, save_completed_todos,
+    save_favorite_sessions, save_session_todos, save_skipped_sessions,
 };
 use crate::common::projects::{connect_project, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
 use crate::ipc::messages::HookState;
-use crate::serve::web_types::{ConversationMessage, ToolSummary};
 use crate::serve::server::gather_session_data;
+use crate::serve::web_types::{ConversationMessage, ToolSummary};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -32,7 +32,11 @@ fn get_html(dev_path: &Option<PathBuf>) -> String {
         match std::fs::read_to_string(path) {
             Ok(contents) => return contents,
             Err(e) => {
-                eprintln!("  warn: failed to read {}: {}, using embedded", path.display(), e);
+                eprintln!(
+                    "  warn: failed to read {}: {}, using embedded",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -54,20 +58,26 @@ struct SendRequest {
 /// When `tts_host` is set, enables TTS proxy endpoints.
 pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<()> {
     let bind_addr = format!("0.0.0.0:{}", port);
-    let server =
-        Server::http(&bind_addr).map_err(|e| anyhow::anyhow!("Failed to bind {}: {}", bind_addr, e))?;
+    let server = Server::http(&bind_addr)
+        .map_err(|e| anyhow::anyhow!("Failed to bind {}: {}", bind_addr, e))?;
 
     let dev_path = if dev {
         let path = std::env::current_dir()
             .unwrap_or_default()
             .join("src/serve/web.html");
         if path.exists() {
-            eprintln!("Hive web dashboard running at http://0.0.0.0:{} (dev mode)", port);
+            eprintln!(
+                "Hive web dashboard running at http://0.0.0.0:{} (dev mode)",
+                port
+            );
             eprintln!("  Serving HTML from: {}", path.display());
             Some(path)
         } else {
             eprintln!("Hive web dashboard running at http://0.0.0.0:{}", port);
-            eprintln!("  warn: --dev but {} not found, using embedded HTML", path.display());
+            eprintln!(
+                "  warn: --dev but {} not found, using embedded HTML",
+                path.display()
+            );
             None
         }
     } else {
@@ -126,8 +136,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     "[]".to_string()
                 };
 
-                let header =
-                    Header::from_bytes("Content-Type", "application/json").unwrap();
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let response = Response::from_string(json).with_header(header);
                 let _ = request.respond(response);
             }
@@ -141,10 +150,8 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     // Resolve the conversation source from cached data. When a window
                     // (pane id) is given, use that instance's cwd + session_id so each
                     // Claude in a multi-window session maps to its own transcript.
-                    let source: Option<(String, Option<String>)> = shared_data
-                        .lock()
-                        .ok()
-                        .and_then(|data| {
+                    let source: Option<(String, Option<String>)> =
+                        shared_data.lock().ok().and_then(|data| {
                             let s = data.iter().find(|s| s.name == name)?;
                             let win = match &window {
                                 Some(pid) => s.windows.iter().find(|w| &w.pane_id == pid),
@@ -163,21 +170,21 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                 &cwd,
                                 session_id.as_deref(),
                             )
-                                .into_iter()
-                                .map(|m| ConversationMessage {
-                                    role: m.role,
-                                    text: m.text,
-                                    tools: m
-                                        .tools
-                                        .into_iter()
-                                        .map(|t| ToolSummary {
-                                            name: t.name,
-                                            summary: t.summary,
-                                            detail: t.detail,
-                                        })
-                                        .collect(),
-                                })
-                                .collect();
+                            .into_iter()
+                            .map(|m| ConversationMessage {
+                                role: m.role,
+                                text: m.text,
+                                tools: m
+                                    .tools
+                                    .into_iter()
+                                    .map(|t| ToolSummary {
+                                        name: t.name,
+                                        summary: t.summary,
+                                        detail: t.detail,
+                                    })
+                                    .collect(),
+                            })
+                            .collect();
                         serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string())
                     } else {
                         "[]".to_string()
@@ -186,16 +193,14 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     "[]".to_string()
                 };
 
-                let header =
-                    Header::from_bytes("Content-Type", "application/json").unwrap();
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let response = Response::from_string(json).with_header(header);
                 let _ = request.respond(response);
             }
 
             (Method::Get, "/api/config") => {
                 let json = format!(r#"{{"tts":{}}}"#, tts_host.is_some());
-                let header =
-                    Header::from_bytes("Content-Type", "application/json").unwrap();
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let response = Response::from_string(json).with_header(header);
                 let _ = request.respond(response);
             }
@@ -217,11 +222,15 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     let output = std::process::Command::new("curl")
                         .args([
                             "-s",
-                            "--max-time", "30",
-                            "-X", "POST",
+                            "--max-time",
+                            "30",
+                            "-X",
+                            "POST",
                             &speak_url,
-                            "-H", "Content-Type: application/json",
-                            "-d", &body,
+                            "-H",
+                            "Content-Type: application/json",
+                            "-d",
+                            &body,
                         ])
                         .output();
 
@@ -236,7 +245,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 
                             // Wait for first segment before returning to browser
                             // Safari fails if playlist has no segments when first loaded
-                            if let Some(playlist_path) = result.get("playlist_url").and_then(|v| v.as_str()) {
+                            if let Some(playlist_path) =
+                                result.get("playlist_url").and_then(|v| v.as_str())
+                            {
                                 let playlist_url = format!("{}{}", host, playlist_path);
                                 for _ in 0..30 {
                                     std::thread::sleep(Duration::from_millis(500));
@@ -266,9 +277,12 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             let header =
                                 Header::from_bytes("Content-Type", "application/json").unwrap();
                             let _ = request.respond(
-                                Response::from_string(format!(r#"{{"error":"{}"}}"#, err.replace('"', "'")))
-                                    .with_header(header)
-                                    .with_status_code(502),
+                                Response::from_string(format!(
+                                    r#"{{"error":"{}"}}"#,
+                                    err.replace('"', "'")
+                                ))
+                                .with_header(header)
+                                .with_status_code(502),
                             );
                         }
                         Err(e) => {
@@ -282,8 +296,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         }
                     }
                 } else {
-                    let header =
-                        Header::from_bytes("Content-Type", "application/json").unwrap();
+                    let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                     let _ = request.respond(
                         Response::from_string(r#"{"error":"TTS not configured"}"#)
                             .with_header(header)
@@ -297,8 +310,8 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.as_reader().read_to_string(&mut body);
 
                 let result: Result<(), String> = (|| {
-                    let req: SendRequest = serde_json::from_str(&body)
-                        .map_err(|e| format!("Invalid JSON: {}", e))?;
+                    let req: SendRequest =
+                        serde_json::from_str(&body).map_err(|e| format!("Invalid JSON: {}", e))?;
 
                     // Resolve the target pane from cached data. A window (pane id) targets
                     // that specific Claude; otherwise fall back to the session's primary pane.
@@ -327,8 +340,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     Err(msg) => (400, format!(r#"{{"error":"{}"}}"#, msg)),
                 };
 
-                let header =
-                    Header::from_bytes("Content-Type", "application/json").unwrap();
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let response = Response::from_string(body)
                     .with_header(header)
                     .with_status_code(status);
@@ -345,19 +357,37 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     let value = match flag {
                         "favorite" => {
                             let mut set = load_favorite_sessions();
-                            let v = if set.contains(session) { set.remove(session); false } else { set.insert(session.to_string()); true };
+                            let v = if set.contains(session) {
+                                set.remove(session);
+                                false
+                            } else {
+                                set.insert(session.to_string());
+                                true
+                            };
                             save_favorite_sessions(&set);
                             v
                         }
                         "auto_approve" => {
                             let mut set = load_auto_approve_sessions();
-                            let v = if set.contains(session) { set.remove(session); false } else { set.insert(session.to_string()); true };
+                            let v = if set.contains(session) {
+                                set.remove(session);
+                                false
+                            } else {
+                                set.insert(session.to_string());
+                                true
+                            };
                             save_auto_approve_sessions(&set);
                             v
                         }
                         "skip" => {
                             let mut set = load_skipped_sessions();
-                            let v = if set.contains(session) { set.remove(session); false } else { set.insert(session.to_string()); true };
+                            let v = if set.contains(session) {
+                                set.remove(session);
+                                false
+                            } else {
+                                set.insert(session.to_string());
+                                true
+                            };
                             save_skipped_sessions(&set);
                             v
                         }
@@ -390,7 +420,8 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 projects.sort_by(|a, b| {
                     let a_exists = a["exists"].as_bool().unwrap_or(false);
                     let b_exists = b["exists"].as_bool().unwrap_or(false);
-                    b_exists.cmp(&a_exists)
+                    b_exists
+                        .cmp(&a_exists)
                         .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
                 });
                 let json = serde_json::to_string(&projects).unwrap_or_else(|_| "[]".to_string());
@@ -413,20 +444,22 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Get, url) if url.starts_with("/api/session-info?") => {
-                let session_name = url
-                    .split('?')
-                    .nth(1)
-                    .and_then(|qs| {
-                        qs.split('&').find_map(|param| {
-                            let (k, v) = param.split_once('=')?;
-                            if k == "session" { Some(urldecode(v)) } else { None }
-                        })
-                    });
+                let session_name = url.split('?').nth(1).and_then(|qs| {
+                    qs.split('&').find_map(|param| {
+                        let (k, v) = param.split_once('=')?;
+                        if k == "session" {
+                            Some(urldecode(v))
+                        } else {
+                            None
+                        }
+                    })
+                });
 
                 let json = if let Some(name) = session_name {
-                    let session_data = shared_data.lock().ok().and_then(|data| {
-                        data.iter().find(|s| s.name == name).cloned()
-                    });
+                    let session_data = shared_data
+                        .lock()
+                        .ok()
+                        .and_then(|data| data.iter().find(|s| s.name == name).cloned());
 
                     if let Some(s) = session_data {
                         let favorites = load_favorite_sessions();
@@ -549,7 +582,8 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     let _ = request.respond(Response::from_string(json).with_header(header));
                 } else {
                     let header = Header::from_bytes("Content-Type", "application/json").unwrap();
-                    let _ = request.respond(Response::from_string(r#"{"ok":true}"#).with_header(header));
+                    let _ = request
+                        .respond(Response::from_string(r#"{"ok":true}"#).with_header(header));
                 }
             }
 
@@ -682,12 +716,22 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             let is_error = body.first() == Some(&b'{');
                             if is_error || body.is_empty() {
                                 let preview = String::from_utf8_lossy(&body[..body.len().min(100)]);
-                                eprintln!("  HLS proxy: {} -> 404 ({}B: {})", url, body.len(), preview);
+                                eprintln!(
+                                    "  HLS proxy: {} -> 404 ({}B: {})",
+                                    url,
+                                    body.len(),
+                                    preview
+                                );
                                 let response =
                                     Response::from_string("Not Found").with_status_code(404);
                                 let _ = request.respond(response);
                             } else {
-                                eprintln!("  HLS proxy: {} -> 200 ({} bytes, {})", url, body.len(), content_type);
+                                eprintln!(
+                                    "  HLS proxy: {} -> 200 ({} bytes, {})",
+                                    url,
+                                    body.len(),
+                                    content_type
+                                );
                                 let header =
                                     Header::from_bytes("Content-Type", content_type).unwrap();
                                 let response =
@@ -696,8 +740,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             }
                         }
                         _ => {
-                            let response =
-                                Response::from_string("Not Found").with_status_code(404);
+                            let response = Response::from_string("Not Found").with_status_code(404);
                             let _ = request.respond(response);
                         }
                     }
@@ -760,9 +803,7 @@ fn urldecode(s: &str) -> String {
 
 /// Get the machine's .local hostname (Bonjour/mDNS).
 fn get_local_hostname() -> Option<String> {
-    let output = std::process::Command::new("hostname")
-        .output()
-        .ok()?;
+    let output = std::process::Command::new("hostname").output().ok()?;
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if name.is_empty() {
         None

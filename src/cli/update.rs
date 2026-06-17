@@ -20,8 +20,8 @@ pub fn run_update() -> Result<()> {
         REPO, asset
     );
 
-    let current_exe = std::env::current_exe()
-        .context("Could not determine current hive binary path")?;
+    let current_exe =
+        std::env::current_exe().context("Could not determine current hive binary path")?;
 
     println!("Current version: {}", env!("CARGO_PKG_VERSION"));
     println!("Downloading: {}", url);
@@ -38,12 +38,7 @@ pub fn run_update() -> Result<()> {
 
     let archive = tmp_dir.join(&asset);
     let status = Command::new("curl")
-        .args([
-            "-fsSL",
-            &url,
-            "-o",
-            &archive.to_string_lossy(),
-        ])
+        .args(["-fsSL", &url, "-o", &archive.to_string_lossy()])
         .status()
         .context("Failed to invoke curl")?;
     if !status.success() {

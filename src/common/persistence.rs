@@ -344,18 +344,18 @@ pub fn migrate_session_names(renames: &HashMap<String, String>) {
     }
 
     // Todos (tab-separated: name\ttodo)
-    let migrate_todos =
-        |load: fn() -> HashMap<String, Vec<String>>, save: fn(&HashMap<String, Vec<String>>)| {
-            let old = load();
-            let new: HashMap<String, Vec<String>> = old
-                .into_iter()
-                .map(|(name, items)| {
-                    let new_name = renames.get(&name).cloned().unwrap_or(name);
-                    (new_name, items)
-                })
-                .collect();
-            save(&new);
-        };
+    let migrate_todos = |load: fn() -> HashMap<String, Vec<String>>,
+                         save: fn(&HashMap<String, Vec<String>>)| {
+        let old = load();
+        let new: HashMap<String, Vec<String>> = old
+            .into_iter()
+            .map(|(name, items)| {
+                let new_name = renames.get(&name).cloned().unwrap_or(name);
+                (new_name, items)
+            })
+            .collect();
+        save(&new);
+    };
 
     migrate_todos(load_session_todos, save_session_todos);
     migrate_todos(load_completed_todos, save_completed_todos);
@@ -450,11 +450,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "hive-test-{}-{}",
-            std::process::id(),
-            id
-        ));
+        let dir = std::env::temp_dir().join(format!("hive-test-{}-{}", std::process::id(), id));
         let _ = fs::create_dir_all(&dir);
         dir
     }
@@ -647,10 +643,7 @@ mod tests {
         let path = dir.join("todos-backslash.txt");
 
         let mut todos = HashMap::new();
-        todos.insert(
-            "s1".to_string(),
-            vec!["path\\to\\file".to_string()],
-        );
+        todos.insert("s1".to_string(), vec!["path\\to\\file".to_string()]);
 
         save_todos_to(&path, &todos);
         let loaded = load_todos_from(&path);

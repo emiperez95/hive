@@ -41,9 +41,7 @@ fn main() -> Result<()> {
         Some(Command::Project { command }) => match *command {
             cmd @ ProjectCommand::Add { .. } => cli::project::run_project_add(cmd),
             ProjectCommand::Remove { key } => cli::project::run_project_remove(&key),
-            ProjectCommand::Archive { key } => {
-                cli::project::run_project_set_archived(&key, true)
-            }
+            ProjectCommand::Archive { key } => cli::project::run_project_set_archived(&key, true),
             ProjectCommand::Unarchive { key } => {
                 cli::project::run_project_set_archived(&key, false)
             }
@@ -53,9 +51,11 @@ fn main() -> Result<()> {
         Some(Command::Todo { command }) => cli::todo::run_todo(command),
         Some(Command::Spread { count }) => cli::session::run_spread(count),
         Some(Command::Collapse) => cli::session::run_collapse(),
-        Some(Command::Web { port, dev, tts_host }) => {
-            crate::serve::web::run_web_server(port, dev, tts_host)
-        }
+        Some(Command::Web {
+            port,
+            dev,
+            tts_host,
+        }) => crate::serve::web::run_web_server(port, dev, tts_host),
         Some(Command::Start) => {
             if let Some(target) = cli::session::run_start()? {
                 use std::os::unix::process::CommandExt;

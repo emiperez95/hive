@@ -484,8 +484,7 @@ mod tests {
 
     #[test]
     fn test_hook_state_save_load_roundtrip() {
-        let dir =
-            std::env::temp_dir().join(format!("hive-msg-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hive-msg-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("state.json");
 

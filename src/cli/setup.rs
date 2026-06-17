@@ -43,7 +43,9 @@ fn warn_missing_deps() {
     }
     println!("Warning: some required tools are missing from PATH.");
     if !tmux_ok {
-        println!("  tmux not found — install with `brew install tmux` (hive uses tmux for sessions).");
+        println!(
+            "  tmux not found — install with `brew install tmux` (hive uses tmux for sessions)."
+        );
     }
     if !claude_ok {
         println!(
@@ -203,9 +205,9 @@ pub fn run_setup(yes: bool) -> Result<()> {
     let tmux_cp_bound = tmux_keys
         .lines()
         .any(|line| line.contains("C-p") && line.contains("hive") && line.contains("cycle-prev"));
-    let tmux_wn_bound = tmux_keys.lines().any(|line| {
-        line.contains("C-\\") && line.contains("hive") && line.contains("window-next")
-    });
+    let tmux_wn_bound = tmux_keys
+        .lines()
+        .any(|line| line.contains("C-\\") && line.contains("hive") && line.contains("window-next"));
 
     // Report status
     println!("hive setup status:");
@@ -632,9 +634,8 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
                         });
                     }
                 }
-                hooks_map.retain(|_, groups| {
-                    groups.as_array().map(|a| !a.is_empty()).unwrap_or(true)
-                });
+                hooks_map
+                    .retain(|_, groups| groups.as_array().map(|a| !a.is_empty()).unwrap_or(true));
 
                 save_settings(&settings_path, &settings)?;
                 hooks_action = "removed";

@@ -288,7 +288,9 @@ pub fn relative_time(rfc3339: &str) -> String {
         return String::new();
     };
     let now = chrono::Utc::now();
-    let secs = (now - then.with_timezone(&chrono::Utc)).num_seconds().max(0);
+    let secs = (now - then.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0);
     match secs {
         0..=59 => "just now".to_string(),
         60..=3599 => format!("{}m ago", secs / 60),
@@ -316,7 +318,12 @@ mod tests {
 
     #[test]
     fn key_prefers_session_id_else_session_window() {
-        let with_id = entry("🌳 Clear Session", "1", Some("abc-123"), "2026-06-12T10:00:00Z");
+        let with_id = entry(
+            "🌳 Clear Session",
+            "1",
+            Some("abc-123"),
+            "2026-06-12T10:00:00Z",
+        );
         assert_eq!(with_id.key(), "abc-123");
         let no_id = entry("🌳 Clear Session", "2", None, "2026-06-12T10:00:00Z");
         assert_eq!(no_id.key(), "🌳 Clear Session#2");

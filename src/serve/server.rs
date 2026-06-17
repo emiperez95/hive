@@ -71,7 +71,10 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<S
         // mirror their one window so existing single-Claude behaviour is unchanged.
         let cpu = windows.iter().map(|w| w.cpu).sum();
         let mem_kb = windows.iter().map(|w| w.mem_kb).sum();
-        let mut ports: Vec<u16> = windows.iter().flat_map(|w| w.ports.iter().copied()).collect();
+        let mut ports: Vec<u16> = windows
+            .iter()
+            .flat_map(|w| w.ports.iter().copied())
+            .collect();
         ports.sort_unstable();
         ports.dedup();
         let last_activity = windows.iter().filter_map(|w| w.last_activity.clone()).max();
@@ -188,7 +191,10 @@ fn build_window_view(
 }
 
 /// Auto-approved sessions should surface as Working, never as a permission/edit prompt.
-fn mask_auto_approve(status: Option<SessionStatus>, is_auto_approve: bool) -> Option<SessionStatus> {
+fn mask_auto_approve(
+    status: Option<SessionStatus>,
+    is_auto_approve: bool,
+) -> Option<SessionStatus> {
     if !is_auto_approve {
         return status;
     }

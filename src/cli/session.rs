@@ -82,7 +82,11 @@ pub fn run_cycle(forward: bool) -> Result<()> {
 pub fn run_window_cycle(forward: bool) -> Result<()> {
     use crate::common::tmux::resolve_tmux_path;
     let tmux = resolve_tmux_path();
-    let cmd = if forward { "next-window" } else { "previous-window" };
+    let cmd = if forward {
+        "next-window"
+    } else {
+        "previous-window"
+    };
     std::process::Command::new(tmux).arg(cmd).status().ok();
     Ok(())
 }

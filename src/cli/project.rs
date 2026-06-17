@@ -3,7 +3,9 @@
 use anyhow::Result;
 
 use super::ProjectCommand;
-use crate::common::projects::{DatabaseConfig, FilePatterns, PortConfig, ProjectConfig, ProjectRegistry};
+use crate::common::projects::{
+    DatabaseConfig, FilePatterns, PortConfig, ProjectConfig, ProjectRegistry,
+};
 
 /// Add a project to the registry
 pub fn run_project_add(cmd: ProjectCommand) -> Result<()> {
@@ -163,7 +165,11 @@ pub fn run_project_list(all: bool) -> Result<()> {
     }
 
     if all {
-        println!("\n{} project(s) ({} archived)", entries.len(), archived_total);
+        println!(
+            "\n{} project(s) ({} archived)",
+            entries.len(),
+            archived_total
+        );
     } else if archived_total > 0 {
         println!(
             "\n{} project(s) ({} archived hidden — use --all)",

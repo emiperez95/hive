@@ -272,8 +272,7 @@ pub fn ensure_tmux_session(
     if !exists {
         let mut cmd = Command::new("tmux");
         cmd.args(["new-session", "-d"]);
-        let env_strings: Vec<String> =
-            env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        let env_strings: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         for es in &env_strings {
             cmd.arg("-e").arg(es);
         }

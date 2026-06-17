@@ -117,8 +117,12 @@ impl WorktreeState {
                 continue;
             };
 
-            let new_name =
-                build_session_name(config, &entry.project_key, &entry.worktree_type, &entry.branch);
+            let new_name = build_session_name(
+                config,
+                &entry.project_key,
+                &entry.worktree_type,
+                &entry.branch,
+            );
 
             // Rename tmux session if it exists
             let _ = std::process::Command::new("tmux")
@@ -258,7 +262,9 @@ pub fn import_worktrees(
                         .iter()
                         .find(|s| s.contains(branch))
                         .cloned()
-                        .unwrap_or_else(|| build_session_name(config, project_key, "worktree", branch));
+                        .unwrap_or_else(|| {
+                            build_session_name(config, project_key, "worktree", branch)
+                        });
 
                     let entry = WorktreeEntry {
                         project_key: project_key.to_string(),
@@ -1058,10 +1064,8 @@ mod tests {
 
     #[test]
     fn test_copy_dir_recursive_recreates_symlinks() {
-        let tmp = std::env::temp_dir().join(format!(
-            "hive-test-copy-symlink-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("hive-test-copy-symlink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let src = tmp.join("src");
         let dst = tmp.join("dst");
@@ -1089,10 +1093,8 @@ mod tests {
         // A symlink *to a directory* must be recreated as a symlink, not walked
         // into. Otherwise pnpm's `.pnpm/<pkg>/node_modules/<dep>` symlinks
         // explode into real copies.
-        let tmp = std::env::temp_dir().join(format!(
-            "hive-test-symlink-dir-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("hive-test-symlink-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let src = tmp.join("src");
         let other = tmp.join("other");
@@ -1117,10 +1119,8 @@ mod tests {
 
     #[test]
     fn test_copy_dir_recursive_skips_claude_worktrees() {
-        let tmp = std::env::temp_dir().join(format!(
-            "hive-test-skip-worktrees-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("hive-test-skip-worktrees-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let src_claude = tmp.join("src/.claude");
         std::fs::create_dir_all(src_claude.join("worktrees/agent-x")).unwrap();

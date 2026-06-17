@@ -226,7 +226,10 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     } else if app.input_mode == InputMode::FreezeWindowPick {
         Line::from(vec![
             Span::styled("💤 freeze ", Style::default().fg(Color::Blue)),
-            Span::styled("pick window ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "pick window ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::styled("[↑↓]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" select "),
             Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
@@ -1044,7 +1047,10 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                     let mut spans = vec![
                         prefix,
                         Span::styled("💤 ", style),
-                        Span::styled(entry.session_name.clone(), style.add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            entry.session_name.clone(),
+                            style.add_modifier(Modifier::BOLD),
+                        ),
                     ];
                     let win_label = entry.window_label();
                     if !win_label.is_empty() {
@@ -1178,7 +1184,10 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
         for w in &session_info.windows {
             let (label, color) = short_status(&w.status);
             let name_suffix = if !w.window_name.is_empty()
-                && !w.window_name.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && !w
+                    .window_name
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '.')
             {
                 format!(" ({})", w.window_name)
             } else {

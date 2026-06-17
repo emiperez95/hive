@@ -1,6 +1,7 @@
 //! TUI application state and logic.
 
 use crate::common::debug::debug_log;
+use crate::common::instances::{detect_claude_instances, ClaudeInstance, HookIndex};
 use crate::common::persistence::{
     is_globally_muted, load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions,
     load_session_todos, load_skipped_sessions, save_auto_approve_sessions, save_favorite_sessions,
@@ -11,7 +12,6 @@ use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{
     build_children_map, collect_descendants, get_process_info, is_claude_process,
 };
-use crate::common::instances::{detect_claude_instances, ClaudeInstance, HookIndex};
 use crate::common::projects::{has_project_config, ProjectConfig, ProjectRegistry};
 use crate::common::tmux::{get_current_session, get_other_client_sessions, get_tmux_sessions};
 use crate::common::types::{
@@ -111,7 +111,7 @@ pub struct App {
     pub project_names: Vec<String>,  // Cached list of all project session names
     pub worktree_names: Vec<String>, // Flat list of all worktree session names
     pub worktrees_by_project: HashMap<String, Vec<String>>, // project_key → worktree session names
-    pub show_archived: bool, // Reveal archived projects in the picker
+    pub show_archived: bool,         // Reveal archived projects in the picker
     pub archived_session_names: HashSet<String>, // Archived project session names (for styling)
     pub archived_worktree_names: HashSet<String>, // Worktrees of archived projects (inherit status)
     pub orphan_worktree_names: HashSet<String>, // Worktrees whose parent project was deleted
@@ -680,7 +680,10 @@ impl App {
                 if Some(i) == skipped_start {
                     used += 2;
                 }
-                used += lines_for_session(&self.session_infos[i], self.is_auto_approved(&self.session_infos[i].name));
+                used += lines_for_session(
+                    &self.session_infos[i],
+                    self.is_auto_approved(&self.session_infos[i].name),
+                );
             }
             if used <= available_height {
                 break;
@@ -792,18 +795,17 @@ impl App {
             return;
         };
         use crate::common::frozen::FreezeTarget;
-        let mut choices: Vec<FreezeTarget> = crate::common::instances::instances_for_session(
-            &session_name,
-        )
-        .into_iter()
-        .map(|inst| FreezeTarget {
-            session_name: inst.session_name,
-            window_index: inst.window_index,
-            window_name: inst.window_name,
-            cwd: inst.cwd,
-            claude_session_id: inst.session_id,
-        })
-        .collect();
+        let mut choices: Vec<FreezeTarget> =
+            crate::common::instances::instances_for_session(&session_name)
+                .into_iter()
+                .map(|inst| FreezeTarget {
+                    session_name: inst.session_name,
+                    window_index: inst.window_index,
+                    window_name: inst.window_name,
+                    cwd: inst.cwd,
+                    claude_session_id: inst.session_id,
+                })
+                .collect();
         choices.sort_by(|a, b| a.window_index.cmp(&b.window_index));
 
         match choices.len() {
@@ -840,7 +842,11 @@ impl App {
 
     /// Confirm the highlighted window in the picker and move on to the note prompt.
     pub fn freeze_pick_confirm(&mut self) {
-        if let Some(target) = self.freeze_choices.get(self.freeze_choice_selected).cloned() {
+        if let Some(target) = self
+            .freeze_choices
+            .get(self.freeze_choice_selected)
+            .cloned()
+        {
             self.pending_freeze = Some(target);
             self.freeze_choices.clear();
             self.input_mode = InputMode::FreezeNote;
@@ -1465,12 +1471,10 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
                 .map(|inst| {
                     let status = if let Some(h) = hook_index.resolve(&inst.pane_id, &inst.cwd) {
                         Some(convert_hook_status(&h.status))
-                    } else if let Some(js) =
-                        crate::common::jsonl::get_claude_status_from_jsonl_for(
-                            &inst.cwd,
-                            inst.session_id.as_deref(),
-                        )
-                    {
+                    } else if let Some(js) = crate::common::jsonl::get_claude_status_from_jsonl_for(
+                        &inst.cwd,
+                        inst.session_id.as_deref(),
+                    ) {
                         Some(js.status)
                     } else {
                         Some(ClaudeStatus::Unknown)

@@ -136,12 +136,7 @@ pub fn run_wt_new(
         for es in &env_strings {
             tmux_cmd.arg("-e").arg(es);
         }
-        tmux_cmd.args([
-            "-s",
-            &session_name,
-            "-c",
-            &worktree_path.to_string_lossy(),
-        ]);
+        tmux_cmd.args(["-s", &session_name, "-c", &worktree_path.to_string_lossy()]);
         let tmux_output = tmux_cmd
             .output()
             .context("Failed to run tmux new-session")?;

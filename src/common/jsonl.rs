@@ -472,10 +472,7 @@ fn extract_tools_from_content(content: &serde_json::Value) -> Vec<ToolSummary> {
                     .and_then(|i| i.get("prompt"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                (
-                    desc.to_string(),
-                    truncate_str(prompt, 2000),
-                )
+                (desc.to_string(), truncate_str(prompt, 2000))
             }
             _ => {
                 // Generic: show first string field from input as summary
@@ -521,7 +518,10 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 /// Extract conversation messages (user + assistant) from JSONL lines.
 /// Returns messages in chronological order, limited to the last `max_messages`.
-pub fn extract_conversation_messages(lines: &[String], max_messages: usize) -> Vec<ConversationMessage> {
+pub fn extract_conversation_messages(
+    lines: &[String],
+    max_messages: usize,
+) -> Vec<ConversationMessage> {
     let mut messages = Vec::new();
 
     for line in lines {
@@ -924,7 +924,8 @@ mod tests {
         // Current native transcripts have no `progress` entries. An assistant message
         // ending in a text block means the turn finished → Waiting.
         let user = r#"{"type":"user","message":{"content":"do the thing"},"timestamp":"2026-01-29T10:00:00Z"}"#;
-        let thinking = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        let thinking =
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
         let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All done."}]},"timestamp":"2026-01-29T10:00:05Z"}"#;
         let system = r#"{"type":"system","timestamp":"2026-01-29T10:00:06Z"}"#;
         let entries = vec![
@@ -1157,9 +1158,12 @@ mod tests {
     fn test_extract_conversation_messages_max_limit() {
         let lines = vec![
             r#"{"type":"user","message":{"content":[{"type":"text","text":"First"}]}}"#.to_string(),
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reply 1"}]}}"#.to_string(),
-            r#"{"type":"user","message":{"content":[{"type":"text","text":"Second"}]}}"#.to_string(),
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reply 2"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reply 1"}]}}"#
+                .to_string(),
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"Second"}]}}"#
+                .to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reply 2"}]}}"#
+                .to_string(),
         ];
         let msgs = extract_conversation_messages(&lines, 2);
         assert_eq!(msgs.len(), 2);
@@ -1269,8 +1273,14 @@ mod tests {
     #[test]
     fn test_background_summary_multiple_workflows() {
         let tasks = vec![
-            BackgroundTask { kind: BackgroundKind::Workflow, label: "a".into() },
-            BackgroundTask { kind: BackgroundKind::Workflow, label: "b".into() },
+            BackgroundTask {
+                kind: BackgroundKind::Workflow,
+                label: "a".into(),
+            },
+            BackgroundTask {
+                kind: BackgroundKind::Workflow,
+                label: "b".into(),
+            },
         ];
         assert_eq!(background_tasks_summary(&tasks), "2 workflows");
     }

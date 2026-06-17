@@ -138,289 +138,301 @@ pub fn run_tui(
                 ..
             }) = read()?
             {
-                    debug_log(&format!(
-                        "KEY: {:?} (mode={:?}, showing_detail={:?}, showing_help={})",
-                        code,
-                        app.input_mode,
-                        app.showing_detail.is_some(),
-                        app.showing_help,
-                    ));
+                debug_log(&format!(
+                    "KEY: {:?} (mode={:?}, showing_detail={:?}, showing_help={})",
+                    code,
+                    app.input_mode,
+                    app.showing_detail.is_some(),
+                    app.showing_help,
+                ));
 
-                    // Help screen takes priority
-                    if app.showing_help {
-                        match code {
-                            KeyCode::Char('?') | KeyCode::Esc => {
-                                app.showing_help = false;
-                                needs_redraw = true;
+                // Help screen takes priority
+                if app.showing_help {
+                    match code {
+                        KeyCode::Char('?') | KeyCode::Esc => {
+                            app.showing_help = false;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            app.save_restorable();
+                            return Ok(PostAction::None);
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::AddTodo {
+                    match code {
+                        KeyCode::Esc => {
+                            app.cancel_add_todo();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => {
+                            app.input_buffer.push('\n');
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            app.complete_add_todo();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            app.input_buffer.push(c);
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::FreezeWindowPick {
+                    match code {
+                        KeyCode::Esc => {
+                            app.cancel_freeze();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.freeze_pick_up();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.freeze_pick_down();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            app.freeze_pick_confirm();
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::FreezeNote {
+                    match code {
+                        KeyCode::Esc => {
+                            app.cancel_freeze();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            // Freeze (note may be empty); on success the session is gone
+                            // and we drop back to the list.
+                            app.complete_freeze();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            app.input_buffer.push(c);
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::SpreadPrompt {
+                    match code {
+                        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                            let n = c.to_digit(10).unwrap() as usize;
+                            app.save_restorable();
+                            // Return spread count to run after TUI cleanup
+                            return Ok(PostAction::Spread(n));
+                        }
+                        KeyCode::Esc => {
+                            app.input_mode = InputMode::Normal;
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::Hint {
+                    match code {
+                        KeyCode::Esc => {
+                            app.cancel_hint_mode();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            app.hint_buffer.pop();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            if let Some(target) = app.hint_input(c) {
+                                app.cancel_hint_mode();
+                                match target {
+                                    HintTarget::Session(name) => {
+                                        if let Some(info) = app
+                                            .session_infos
+                                            .iter()
+                                            .find(|s| s.name == name)
+                                            .cloned()
+                                        {
+                                            switch_to(&info, &mut app);
+                                        }
+                                        return Ok(PostAction::None);
+                                    }
+                                    HintTarget::Window(name, window) => {
+                                        app.unskip(&name);
+                                        crate::common::tmux::select_window(&name, &window);
+                                        switch_to_session(&name);
+                                        app.save_restorable();
+                                        return Ok(PostAction::None);
+                                    }
+                                }
                             }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::WorktreeBranch {
+                    match code {
+                        KeyCode::Enter => {
+                            app.enter_base_picker();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Esc => {
+                            app.cancel_worktree_wizard();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            app.input_buffer.push(c);
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::WorktreeBase {
+                    match code {
+                        KeyCode::Enter => {
+                            if let (Some(project), Some(branch)) =
+                                (app.wt_project_key.take(), app.wt_branch_name.take())
+                            {
+                                let base = app
+                                    .wt_base_choices
+                                    .get(app.wt_base_selected)
+                                    .cloned()
+                                    .unwrap_or_else(|| "main".to_string());
+                                app.cancel_worktree_wizard();
+                                app.save_restorable();
+                                return Ok(PostAction::CreateWorktree {
+                                    project,
+                                    branch,
+                                    base,
+                                });
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.cancel_worktree_wizard();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.wt_base_selected > 0 {
+                                app.wt_base_selected -= 1;
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if app.wt_base_selected + 1 < app.wt_base_choices.len() {
+                                app.wt_base_selected += 1;
+                            }
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::WorktreeConfirmDelete {
+                    match code {
+                        KeyCode::Enter => {
+                            if let (Some(project), Some(branch)) =
+                                (app.wt_delete_project.take(), app.wt_delete_branch.take())
+                            {
+                                app.cancel_worktree_delete();
+                                app.save_restorable();
+                                return Ok(PostAction::DeleteWorktree { project, branch });
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.cancel_worktree_delete();
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::NewProjectKey {
+                    match code {
+                        KeyCode::Enter => {
+                            app.np_enter_emoji_step();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Esc => {
+                            app.cancel_new_project_wizard();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            app.input_buffer.push(c);
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::NewProjectEmoji {
+                    match code {
+                        KeyCode::Enter => {
+                            if let Some(session_name) = app.np_complete() {
+                                if connect_session(&session_name) {
+                                    app.unskip(&session_name);
+                                    switch_to_session(&session_name);
+                                    app.save_restorable();
+                                    return Ok(PostAction::None);
+                                } else {
+                                    app.error_message = Some((
+                                        format!("Failed to connect to '{}'", session_name),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::Esc => {
+                            app.cancel_new_project_wizard();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            app.input_buffer.push(c);
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.input_mode == InputMode::Search {
+                    match code {
+                        KeyCode::Esc => {
+                            if app.auto_picker {
                                 app.save_restorable();
                                 return Ok(PostAction::None);
                             }
-                            _ => {}
+                            app.input_mode = InputMode::Normal;
+                            app.search_query.clear();
+                            app.search_results.clear();
+                            needs_redraw = true;
                         }
-                    } else if app.input_mode == InputMode::AddTodo {
-                        match code {
-                            KeyCode::Esc => {
-                                app.cancel_add_todo();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => {
-                                app.input_buffer.push('\n');
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter => {
-                                app.complete_add_todo();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.input_buffer.pop();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                app.input_buffer.push(c);
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::FreezeWindowPick {
-                        match code {
-                            KeyCode::Esc => {
-                                app.cancel_freeze();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                app.freeze_pick_up();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                app.freeze_pick_down();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter => {
-                                app.freeze_pick_confirm();
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::FreezeNote {
-                        match code {
-                            KeyCode::Esc => {
-                                app.cancel_freeze();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter => {
-                                // Freeze (note may be empty); on success the session is gone
-                                // and we drop back to the list.
-                                app.complete_freeze();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.input_buffer.pop();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                app.input_buffer.push(c);
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::SpreadPrompt {
-                        match code {
-                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                                let n = c.to_digit(10).unwrap() as usize;
-                                app.save_restorable();
-                                // Return spread count to run after TUI cleanup
-                                return Ok(PostAction::Spread(n));
-                            }
-                            KeyCode::Esc => {
-                                app.input_mode = InputMode::Normal;
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::Hint {
-                        match code {
-                            KeyCode::Esc => {
-                                app.cancel_hint_mode();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.hint_buffer.pop();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                if let Some(target) = app.hint_input(c) {
-                                    app.cancel_hint_mode();
-                                    match target {
-                                        HintTarget::Session(name) => {
-                                            if let Some(info) = app
-                                                .session_infos
-                                                .iter()
-                                                .find(|s| s.name == name)
-                                                .cloned()
-                                            {
-                                                switch_to(&info, &mut app);
-                                            }
-                                            return Ok(PostAction::None);
-                                        }
-                                        HintTarget::Window(name, window) => {
-                                            app.unskip(&name);
-                                            crate::common::tmux::select_window(&name, &window);
-                                            switch_to_session(&name);
-                                            app.save_restorable();
-                                            return Ok(PostAction::None);
-                                        }
-                                    }
-                                }
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::WorktreeBranch {
-                        match code {
-                            KeyCode::Enter => {
-                                app.enter_base_picker();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Esc => {
-                                app.cancel_worktree_wizard();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.input_buffer.pop();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                app.input_buffer.push(c);
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::WorktreeBase {
-                        match code {
-                            KeyCode::Enter => {
-                                if let (Some(project), Some(branch)) =
-                                    (app.wt_project_key.take(), app.wt_branch_name.take())
-                                {
-                                    let base = app
-                                        .wt_base_choices
-                                        .get(app.wt_base_selected)
-                                        .cloned()
-                                        .unwrap_or_else(|| "main".to_string());
-                                    app.cancel_worktree_wizard();
-                                    app.save_restorable();
-                                    return Ok(PostAction::CreateWorktree {
-                                        project,
-                                        branch,
-                                        base,
-                                    });
-                                }
-                            }
-                            KeyCode::Esc => {
-                                app.cancel_worktree_wizard();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if app.wt_base_selected > 0 {
-                                    app.wt_base_selected -= 1;
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if app.wt_base_selected + 1 < app.wt_base_choices.len() {
-                                    app.wt_base_selected += 1;
-                                }
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::WorktreeConfirmDelete {
-                        match code {
-                            KeyCode::Enter => {
-                                if let (Some(project), Some(branch)) =
-                                    (app.wt_delete_project.take(), app.wt_delete_branch.take())
-                                {
-                                    app.cancel_worktree_delete();
-                                    app.save_restorable();
-                                    return Ok(PostAction::DeleteWorktree { project, branch });
-                                }
-                            }
-                            KeyCode::Esc => {
-                                app.cancel_worktree_delete();
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::NewProjectKey {
-                        match code {
-                            KeyCode::Enter => {
-                                app.np_enter_emoji_step();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Esc => {
-                                app.cancel_new_project_wizard();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.input_buffer.pop();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                app.input_buffer.push(c);
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::NewProjectEmoji {
-                        match code {
-                            KeyCode::Enter => {
-                                if let Some(session_name) = app.np_complete() {
-                                    if connect_session(&session_name) {
-                                        app.unskip(&session_name);
-                                        switch_to_session(&session_name);
+                        KeyCode::Enter => {
+                            if let Some(result) = app.search_results.get(app.selected).cloned() {
+                                match result {
+                                    SearchResult::Active(name) => {
+                                        app.unskip(&name);
                                         app.save_restorable();
+                                        if app.auto_picker {
+                                            return Ok(PostAction::Attach(name));
+                                        }
+                                        switch_to_session(&name);
                                         return Ok(PostAction::None);
-                                    } else {
-                                        app.error_message = Some((
-                                            format!("Failed to connect to '{}'", session_name),
-                                            std::time::Instant::now(),
-                                        ));
                                     }
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Esc => {
-                                app.cancel_new_project_wizard();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.input_buffer.pop();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                app.input_buffer.push(c);
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        }
-                    } else if app.input_mode == InputMode::Search {
-                        match code {
-                            KeyCode::Esc => {
-                                if app.auto_picker {
-                                    app.save_restorable();
-                                    return Ok(PostAction::None);
-                                }
-                                app.input_mode = InputMode::Normal;
-                                app.search_query.clear();
-                                app.search_results.clear();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter => {
-                                if let Some(result) = app.search_results.get(app.selected).cloned()
-                                {
-                                    match result {
-                                        SearchResult::Active(name) => {
+                                    SearchResult::Project(name) | SearchResult::Worktree(name) => {
+                                        app.input_mode = InputMode::Normal;
+                                        app.search_query.clear();
+                                        app.search_results.clear();
+                                        if connect_session(&name) {
                                             app.unskip(&name);
                                             app.save_restorable();
                                             if app.auto_picker {
@@ -428,388 +440,368 @@ pub fn run_tui(
                                             }
                                             switch_to_session(&name);
                                             return Ok(PostAction::None);
+                                        } else {
+                                            app.error_message = Some((
+                                                format!("Failed to connect to '{}'", name),
+                                                std::time::Instant::now(),
+                                            ));
+                                            needs_redraw = true;
                                         }
-                                        SearchResult::Project(name)
-                                        | SearchResult::Worktree(name) => {
-                                            app.input_mode = InputMode::Normal;
-                                            app.search_query.clear();
-                                            app.search_results.clear();
-                                            if connect_session(&name) {
-                                                app.unskip(&name);
+                                    }
+                                    SearchResult::Frozen(key) => {
+                                        // Thaw: re-add the window to its session (or recreate
+                                        // the session) and `claude --resume` the conversation.
+                                        app.input_mode = InputMode::Normal;
+                                        app.search_query.clear();
+                                        app.search_results.clear();
+                                        match crate::common::frozen::thaw_window(&key) {
+                                            Ok(session_name) => {
+                                                app.reload_frozen();
+                                                app.unskip(&session_name);
                                                 app.save_restorable();
                                                 if app.auto_picker {
-                                                    return Ok(PostAction::Attach(name));
+                                                    return Ok(PostAction::Attach(session_name));
                                                 }
-                                                switch_to_session(&name);
+                                                switch_to_session(&session_name);
                                                 return Ok(PostAction::None);
-                                            } else {
+                                            }
+                                            Err(e) => {
                                                 app.error_message = Some((
-                                                    format!("Failed to connect to '{}'", name),
+                                                    format!("Failed to thaw: {}", e),
                                                     std::time::Instant::now(),
                                                 ));
                                                 needs_redraw = true;
                                             }
                                         }
-                                        SearchResult::Frozen(key) => {
-                                            // Thaw: re-add the window to its session (or recreate
-                                            // the session) and `claude --resume` the conversation.
-                                            app.input_mode = InputMode::Normal;
-                                            app.search_query.clear();
-                                            app.search_results.clear();
-                                            match crate::common::frozen::thaw_window(&key) {
-                                                Ok(session_name) => {
-                                                    app.reload_frozen();
-                                                    app.unskip(&session_name);
-                                                    app.save_restorable();
-                                                    if app.auto_picker {
-                                                        return Ok(PostAction::Attach(session_name));
-                                                    }
-                                                    switch_to_session(&session_name);
-                                                    return Ok(PostAction::None);
-                                                }
-                                                Err(e) => {
-                                                    app.error_message = Some((
-                                                        format!("Failed to thaw: {}", e),
-                                                        std::time::Instant::now(),
-                                                    ));
-                                                    needs_redraw = true;
-                                                }
-                                            }
-                                        }
                                     }
-                                } else {
-                                    app.input_mode = InputMode::Normal;
-                                    app.search_query.clear();
-                                    app.search_results.clear();
-                                    needs_redraw = true;
                                 }
-                            }
-                            KeyCode::Backspace => {
-                                app.search_query.pop();
-                                app.update_search_results();
+                            } else {
+                                app.input_mode = InputMode::Normal;
+                                app.search_query.clear();
+                                app.search_results.clear();
                                 needs_redraw = true;
                             }
-                            KeyCode::Up => {
-                                if app.selected > 0 {
-                                    app.selected -= 1;
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Down => {
-                                if app.selected + 1 < app.search_results.len() {
-                                    app.selected += 1;
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Delete => {
-                                // On a frozen row, discard it; otherwise archive a project.
-                                if matches!(
-                                    app.search_results.get(app.selected),
-                                    Some(SearchResult::Frozen(_))
-                                ) {
-                                    app.discard_selected_frozen();
-                                } else {
-                                    app.toggle_archive_selected_project();
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('r') | KeyCode::Char('R')
-                                if modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                app.toggle_show_archived();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) => {
-                                app.search_query.push(c);
-                                app.update_search_results();
-                                needs_redraw = true;
-                            }
-                            _ => {}
                         }
-                    } else if app.showing_detail.is_some() {
-                        match code {
-                            KeyCode::Esc => {
-                                if app.detail_selected.is_some() {
-                                    app.detail_selected = None;
-                                    needs_redraw = true;
-                                } else {
-                                    app.save_restorable();
-                                    return Ok(PostAction::None);
-                                }
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                            app.update_search_results();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Up => {
+                            if app.selected > 0 {
+                                app.selected -= 1;
                             }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down => {
+                            if app.selected + 1 < app.search_results.len() {
+                                app.selected += 1;
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::Delete => {
+                            // On a frozen row, discard it; otherwise archive a project.
+                            if matches!(
+                                app.search_results.get(app.selected),
+                                Some(SearchResult::Frozen(_))
+                            ) {
+                                app.discard_selected_frozen();
+                            } else {
+                                app.toggle_archive_selected_project();
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R')
+                            if modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            app.toggle_show_archived();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                            app.update_search_results();
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                } else if app.showing_detail.is_some() {
+                    match code {
+                        KeyCode::Esc => {
+                            if app.detail_selected.is_some() {
+                                app.detail_selected = None;
+                                needs_redraw = true;
+                            } else {
                                 app.save_restorable();
                                 return Ok(PostAction::None);
                             }
-                            KeyCode::Char('?') => {
-                                app.showing_help = true;
-                                needs_redraw = true;
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            app.save_restorable();
+                            return Ok(PostAction::None);
+                        }
+                        KeyCode::Char('?') => {
+                            app.showing_help = true;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            app.start_add_todo();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Backspace => {
+                            if app.detail_selected.is_some() {
+                                app.delete_selected_todo();
                             }
-                            KeyCode::Char('a') | KeyCode::Char('A') => {
-                                app.start_add_todo();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Backspace => {
-                                if app.detail_selected.is_some() {
-                                    app.delete_selected_todo();
-                                }
-                                needs_redraw = true;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                let todo_count = app.detail_todos().len();
-                                let port_count = app
-                                    .detail_session_info()
-                                    .map(|s| s.listening_ports.len())
-                                    .unwrap_or(0);
-                                let total = todo_count + port_count;
-                                match app.detail_selected {
-                                    None => {
-                                        if app.detail_scroll_offset > 0 {
-                                            app.detail_scroll_offset -= 1;
-                                        } else if total > 0 {
-                                            app.detail_selected = Some(total - 1);
-                                        }
-                                    }
-                                    Some(0) => {
-                                        if app.detail_scroll_offset > 0 {
-                                            app.detail_scroll_offset -= 1;
-                                        }
-                                        app.detail_selected = None;
-                                    }
-                                    Some(sel) => {
-                                        app.detail_selected = Some(sel - 1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let todo_count = app.detail_todos().len();
+                            let port_count = app
+                                .detail_session_info()
+                                .map(|s| s.listening_ports.len())
+                                .unwrap_or(0);
+                            let total = todo_count + port_count;
+                            match app.detail_selected {
+                                None => {
+                                    if app.detail_scroll_offset > 0 {
+                                        app.detail_scroll_offset -= 1;
+                                    } else if total > 0 {
+                                        app.detail_selected = Some(total - 1);
                                     }
                                 }
-                                needs_redraw = true;
+                                Some(0) => {
+                                    if app.detail_scroll_offset > 0 {
+                                        app.detail_scroll_offset -= 1;
+                                    }
+                                    app.detail_selected = None;
+                                }
+                                Some(sel) => {
+                                    app.detail_selected = Some(sel - 1);
+                                }
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                let todo_count = app.detail_todos().len();
-                                let port_count = app
-                                    .detail_session_info()
-                                    .map(|s| s.listening_ports.len())
-                                    .unwrap_or(0);
-                                let total = todo_count + port_count;
-                                match app.detail_selected {
-                                    None => {
-                                        if total > 0 {
-                                            app.detail_selected = Some(0);
-                                        } else {
-                                            app.detail_scroll_offset += 1;
-                                        }
-                                    }
-                                    Some(sel) if total > 0 && sel < total - 1 => {
-                                        app.detail_selected = Some(sel + 1);
-                                    }
-                                    _ => {
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let todo_count = app.detail_todos().len();
+                            let port_count = app
+                                .detail_session_info()
+                                .map(|s| s.listening_ports.len())
+                                .unwrap_or(0);
+                            let total = todo_count + port_count;
+                            match app.detail_selected {
+                                None => {
+                                    if total > 0 {
+                                        app.detail_selected = Some(0);
+                                    } else {
                                         app.detail_scroll_offset += 1;
                                     }
                                 }
-                                needs_redraw = true;
+                                Some(sel) if total > 0 && sel < total - 1 => {
+                                    app.detail_selected = Some(sel + 1);
+                                }
+                                _ => {
+                                    app.detail_scroll_offset += 1;
+                                }
                             }
-                            KeyCode::Enter => {
-                                if let Some(sel) = app.detail_selected {
-                                    let todo_count = app.detail_todos().len();
-                                    let port_count = app
-                                        .detail_session_info()
-                                        .map(|s| s.listening_ports.len())
-                                        .unwrap_or(0);
-                                    if sel >= todo_count && port_count > 0 {
-                                        let port_idx = sel - todo_count;
-                                        app.refresh_chrome_tabs();
-                                        if let Some(session) = app.detail_session_info() {
-                                            if let Some(port_info) =
-                                                session.listening_ports.get(port_idx)
-                                            {
-                                                let matched_tab = app
-                                                    .detail_chrome_tabs
-                                                    .iter()
-                                                    .find(|(_, p)| *p == port_info.port);
-                                                if let Some((tab, _)) = matched_tab {
-                                                    crate::common::chrome::focus_chrome_tab(tab);
-                                                } else {
-                                                    let url = format!(
-                                                        "http://localhost:{}",
-                                                        port_info.port
-                                                    );
-                                                    crate::common::chrome::open_chrome_tab(&url);
-                                                }
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            if let Some(sel) = app.detail_selected {
+                                let todo_count = app.detail_todos().len();
+                                let port_count = app
+                                    .detail_session_info()
+                                    .map(|s| s.listening_ports.len())
+                                    .unwrap_or(0);
+                                if sel >= todo_count && port_count > 0 {
+                                    let port_idx = sel - todo_count;
+                                    app.refresh_chrome_tabs();
+                                    if let Some(session) = app.detail_session_info() {
+                                        if let Some(port_info) =
+                                            session.listening_ports.get(port_idx)
+                                        {
+                                            let matched_tab = app
+                                                .detail_chrome_tabs
+                                                .iter()
+                                                .find(|(_, p)| *p == port_info.port);
+                                            if let Some((tab, _)) = matched_tab {
+                                                crate::common::chrome::focus_chrome_tab(tab);
+                                            } else {
+                                                let url =
+                                                    format!("http://localhost:{}", port_info.port);
+                                                crate::common::chrome::open_chrome_tab(&url);
                                             }
                                         }
-                                        needs_redraw = true;
-                                    } else if let Some(info) = app.detail_session_info().cloned() {
-                                        switch_to(&info, &mut app);
-                                        return Ok(PostAction::None);
                                     }
+                                    needs_redraw = true;
                                 } else if let Some(info) = app.detail_session_info().cloned() {
                                     switch_to(&info, &mut app);
                                     return Ok(PostAction::None);
                                 }
+                            } else if let Some(info) = app.detail_session_info().cloned() {
+                                switch_to(&info, &mut app);
+                                return Ok(PostAction::None);
                             }
-                            KeyCode::Char('f') | KeyCode::Char('F') => {
-                                if let Some(name) = app.detail_session_name() {
-                                    app.toggle_favorite(&name);
-                                    needs_redraw = true;
-                                }
-                            }
-                            KeyCode::Char('!') => {
-                                if let Some(name) = app.detail_session_name() {
-                                    app.toggle_auto_approve(&name);
-                                    needs_redraw = true;
-                                }
-                            }
-                            KeyCode::Char('m') | KeyCode::Char('M') => {
-                                if let Some(name) = app.detail_session_name() {
-                                    app.toggle_mute(&name);
-                                    needs_redraw = true;
-                                }
-                            }
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
-                                if let Some(name) = app.detail_session_name() {
-                                    app.toggle_skip(&name);
-                                    needs_redraw = true;
-                                }
-                            }
-                            KeyCode::Char('z') | KeyCode::Char('Z') => {
-                                // Freeze a Claude window: kill just that window, keep it
-                                // resumable. Picks the window first if the session has several.
-                                app.start_freeze_from_detail();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('o') | KeyCode::Char('O') => {
-                                app.refresh_chrome_tabs();
-                                crate::common::chrome::focus_all_matched_tabs(
-                                    &app.detail_chrome_tabs,
-                                );
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('w') | KeyCode::Char('W') => {
-                                app.start_worktree_wizard();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('x') | KeyCode::Char('X') => {
-                                app.start_worktree_delete();
-                                needs_redraw = true;
-                            }
-                            _ => {}
                         }
-                    } else {
-                        // Normal mode input
-                        match code {
-                            KeyCode::Char('?') => {
-                                app.showing_help = true;
+                        KeyCode::Char('f') | KeyCode::Char('F') => {
+                            if let Some(name) = app.detail_session_name() {
+                                app.toggle_favorite(&name);
                                 needs_redraw = true;
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                app.move_selection_up();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                app.move_selection_down();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Enter => {
-                                if app.show_selection {
-                                    app.open_detail(app.selected);
-                                    needs_redraw = true;
-                                }
-                            }
-                            KeyCode::Char('r') | KeyCode::Char('R') => {
-                                // Background thread refreshes on its own timer;
-                                // R just triggers a redraw with current data
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('m') | KeyCode::Char('M') => {
-                                app.toggle_global_mute();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('l') | KeyCode::Char('L') => {
-                                let pane_count = crate::common::iterm::get_iterm_pane_count();
-                                if pane_count > 1 {
-                                    app.save_restorable();
-                                    return Ok(PostAction::Collapse);
-                                } else {
-                                    app.input_mode = InputMode::SpreadPrompt;
-                                    needs_redraw = true;
-                                }
-                            }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                app.save_restorable();
-                                return Ok(PostAction::None);
-                            }
-                            KeyCode::Esc => {
-                                app.save_restorable();
-                                return Ok(PostAction::None);
-                            }
-                            KeyCode::Char('c') if cfg!(unix) => {
-                                app.save_restorable();
-                                return Ok(PostAction::None);
-                            }
-                            KeyCode::Char('n') | KeyCode::Char('N') => {
-                                app.start_new_project_wizard();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('/') => {
-                                app.input_mode = InputMode::Search;
-                                app.search_query.clear();
-                                app.search_scroll_offset = 0;
-                                app.load_project_names();
-                                app.update_search_results();
-                                app.selected = 0;
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('f') | KeyCode::Char('F') => {
-                                app.enter_hint_mode();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                                let idx = c.to_digit(10).unwrap() as usize - 1;
-                                if let Some(session_info) = app.session_infos.get(idx).cloned() {
-                                    switch_to(&session_info, &mut app);
-                                    return Ok(PostAction::None);
-                                }
-                            }
-                            KeyCode::Char(c)
-                                if PERMISSION_KEYS.contains(&c.to_ascii_lowercase()) =>
-                            {
-                                let is_uppercase = c.is_ascii_uppercase();
-                                if let Some(session_info) =
-                                    find_session_by_permission_key(&app.session_infos, c)
-                                {
-                                    if let Some((ref sess, ref win, ref pane)) =
-                                        session_info.claude_pane
-                                    {
-                                        use crate::common::types::ClaudeStatus;
-                                        let has_approve_always = matches!(
-                                            session_info.claude_status,
-                                            Some(ClaudeStatus::NeedsPermission(_, _))
-                                        );
-                                        let keys = if is_uppercase && has_approve_always {
-                                            vec!["2".to_string(), "Enter".to_string()]
-                                        } else {
-                                            vec!["1".to_string(), "Enter".to_string()]
-                                        };
-
-                                        use crate::common::tmux::send_key_to_pane;
-                                        for key in &keys {
-                                            send_key_to_pane(sess, win, pane, key);
-                                        }
-
-                                        app.pending_approvals.insert(session_info.name.clone());
-                                        app.hide_selection();
-                                        needs_redraw = true;
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        KeyCode::Char('!') => {
+                            if let Some(name) = app.detail_session_name() {
+                                app.toggle_auto_approve(&name);
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            if let Some(name) = app.detail_session_name() {
+                                app.toggle_mute(&name);
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            if let Some(name) = app.detail_session_name() {
+                                app.toggle_skip(&name);
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Char('z') | KeyCode::Char('Z') => {
+                            // Freeze a Claude window: kill just that window, keep it
+                            // resumable. Picks the window first if the session has several.
+                            app.start_freeze_from_detail();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('o') | KeyCode::Char('O') => {
+                            app.refresh_chrome_tabs();
+                            crate::common::chrome::focus_all_matched_tabs(&app.detail_chrome_tabs);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('w') | KeyCode::Char('W') => {
+                            app.start_worktree_wizard();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('x') | KeyCode::Char('X') => {
+                            app.start_worktree_delete();
+                            needs_redraw = true;
+                        }
+                        _ => {}
                     }
+                } else {
+                    // Normal mode input
+                    match code {
+                        KeyCode::Char('?') => {
+                            app.showing_help = true;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.move_selection_up();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.move_selection_down();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            if app.show_selection {
+                                app.open_detail(app.selected);
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            // Background thread refreshes on its own timer;
+                            // R just triggers a redraw with current data
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            app.toggle_global_mute();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('l') | KeyCode::Char('L') => {
+                            let pane_count = crate::common::iterm::get_iterm_pane_count();
+                            if pane_count > 1 {
+                                app.save_restorable();
+                                return Ok(PostAction::Collapse);
+                            } else {
+                                app.input_mode = InputMode::SpreadPrompt;
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            app.save_restorable();
+                            return Ok(PostAction::None);
+                        }
+                        KeyCode::Esc => {
+                            app.save_restorable();
+                            return Ok(PostAction::None);
+                        }
+                        KeyCode::Char('c') if cfg!(unix) => {
+                            app.save_restorable();
+                            return Ok(PostAction::None);
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            app.start_new_project_wizard();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('/') => {
+                            app.input_mode = InputMode::Search;
+                            app.search_query.clear();
+                            app.search_scroll_offset = 0;
+                            app.load_project_names();
+                            app.update_search_results();
+                            app.selected = 0;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('f') | KeyCode::Char('F') => {
+                            app.enter_hint_mode();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                            let idx = c.to_digit(10).unwrap() as usize - 1;
+                            if let Some(session_info) = app.session_infos.get(idx).cloned() {
+                                switch_to(&session_info, &mut app);
+                                return Ok(PostAction::None);
+                            }
+                        }
+                        KeyCode::Char(c) if PERMISSION_KEYS.contains(&c.to_ascii_lowercase()) => {
+                            let is_uppercase = c.is_ascii_uppercase();
+                            if let Some(session_info) =
+                                find_session_by_permission_key(&app.session_infos, c)
+                            {
+                                if let Some((ref sess, ref win, ref pane)) =
+                                    session_info.claude_pane
+                                {
+                                    use crate::common::types::ClaudeStatus;
+                                    let has_approve_always = matches!(
+                                        session_info.claude_status,
+                                        Some(ClaudeStatus::NeedsPermission(_, _))
+                                    );
+                                    let keys = if is_uppercase && has_approve_always {
+                                        vec!["2".to_string(), "Enter".to_string()]
+                                    } else {
+                                        vec!["1".to_string(), "Enter".to_string()]
+                                    };
 
-                    if needs_redraw {
-                        terminal.draw(|frame| ui(frame, &mut app))?;
-                        needs_redraw = false;
+                                    use crate::common::tmux::send_key_to_pane;
+                                    for key in &keys {
+                                        send_key_to_pane(sess, win, pane, key);
+                                    }
+
+                                    app.pending_approvals.insert(session_info.name.clone());
+                                    app.hide_selection();
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
+
+                if needs_redraw {
+                    terminal.draw(|frame| ui(frame, &mut app))?;
+                    needs_redraw = false;
+                }
             }
+        }
     }
 }
 
