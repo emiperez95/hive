@@ -70,6 +70,10 @@ pub enum Command {
     CycleNext,
     /// Cycle to previous tmux session (skipping skipped sessions)
     CyclePrev,
+    /// Cycle to next tmux window in the current session
+    WindowNext,
+    /// Cycle to previous tmux window in the current session
+    WindowPrev,
     /// Create/attach to a tmux session for a registered project
     Connect {
         /// Project key from the registry

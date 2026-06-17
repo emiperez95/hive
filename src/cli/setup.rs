@@ -203,6 +203,9 @@ pub fn run_setup(yes: bool) -> Result<()> {
     let tmux_cp_bound = tmux_keys
         .lines()
         .any(|line| line.contains("C-p") && line.contains("hive") && line.contains("cycle-prev"));
+    let tmux_wn_bound = tmux_keys.lines().any(|line| {
+        line.contains("C-\\") && line.contains("hive") && line.contains("window-next")
+    });
 
     // Report status
     println!("hive setup status:");
@@ -243,6 +246,11 @@ pub fn run_setup(yes: bool) -> Result<()> {
         println!("  [ok]      tmux Ctrl+p keybinding (cycle prev)");
     } else {
         println!("  [missing] tmux Ctrl+p keybinding (cycle prev)");
+    }
+    if tmux_wn_bound {
+        println!("  [ok]      tmux Ctrl+\\ keybinding (window next)");
+    } else {
+        println!("  [missing] tmux Ctrl+\\ keybinding (window next)");
     }
 
     // Check janus-wt-portal agent
@@ -291,7 +299,8 @@ pub fn run_setup(yes: bool) -> Result<()> {
     }
 
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();
-    let all_tmux_bound = tmux_s_bound && tmux_d_bound && tmux_cn_bound && tmux_cp_bound;
+    let all_tmux_bound =
+        tmux_s_bound && tmux_d_bound && tmux_cn_bound && tmux_cp_bound && tmux_wn_bound;
     let agent_needs_install = agent_status != "ok";
     let cmd_needs_install = cmd_status != "ok";
 
@@ -418,12 +427,14 @@ pub fn run_setup(yes: bool) -> Result<()> {
         let tmux_d_cmd = format!("display-popup -E -w 80% -h 70% \"{} --detail\"", binary_str);
         let tmux_cn_cmd = format!("run-shell \"{} cycle-next\"", binary_str);
         let tmux_cp_cmd = format!("run-shell \"{} cycle-prev\"", binary_str);
+        let tmux_wn_cmd = format!("run-shell \"{} window-next\"", binary_str);
 
         let bindings: Vec<(&str, &str, &str, bool)> = vec![
             ("prefix", "s", &tmux_s_cmd, tmux_s_bound),
             ("prefix", "d", &tmux_d_cmd, tmux_d_bound),
             ("root", "C-n", &tmux_cn_cmd, tmux_cn_bound),
             ("root", "C-p", &tmux_cp_cmd, tmux_cp_bound),
+            ("root", "C-\\", &tmux_wn_cmd, tmux_wn_bound),
         ];
 
         let missing: Vec<_> = bindings.iter().filter(|(_, _, _, bound)| !bound).collect();
@@ -636,7 +647,7 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
 
     // --- Tmux keybindings -------------------------------------------
     println!();
-    print!("Unbind tmux keybindings (prefix+s, prefix+d, Ctrl+n, Ctrl+p)? [Y/n] ");
+    print!("Unbind tmux keybindings (prefix+s, prefix+d, Ctrl+n, Ctrl+p, Ctrl+\\)? [Y/n] ");
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
     if read_yn(yes)? {
@@ -646,7 +657,7 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
                 .stderr(std::process::Stdio::null())
                 .status();
         }
-        for key in &["C-n", "C-p"] {
+        for key in &["C-n", "C-p", "C-\\"] {
             let _ = std::process::Command::new("tmux")
                 .args(["unbind-key", "-n", key])
                 .stderr(std::process::Stdio::null())

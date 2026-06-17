@@ -35,6 +35,8 @@ fn main() -> Result<()> {
         Some(Command::Uninstall { yes }) => cli::setup::run_uninstall(yes),
         Some(Command::CycleNext) => cli::session::run_cycle(true),
         Some(Command::CyclePrev) => cli::session::run_cycle(false),
+        Some(Command::WindowNext) => cli::session::run_window_cycle(true),
+        Some(Command::WindowPrev) => cli::session::run_window_cycle(false),
         Some(Command::Connect { key }) => cli::session::run_connect(&key),
         Some(Command::Project { command }) => match *command {
             cmd @ ProjectCommand::Add { .. } => cli::project::run_project_add(cmd),
