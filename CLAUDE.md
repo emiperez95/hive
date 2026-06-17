@@ -36,6 +36,8 @@ hive update             # update to latest version from GitHub + re-run setup
 hive --version          # print current version
 hive cycle-next         # switch to next tmux session (skipping skipped)
 hive cycle-prev         # switch to previous tmux session
+hive window-next        # switch to next tmux window in the current session
+hive window-prev        # switch to previous tmux window in the current session
 hive connect <key>      # create/attach tmux session for a registered project
 hive project add <key>  # add a project to the registry (supports all config flags)
 hive project remove <key> # remove a project from the registry
@@ -407,6 +409,7 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 - `prefix + s` — hive popup (list view)
 - `prefix + d` — hive popup (detail view for current session)
 - `Ctrl+n` / `Ctrl+p` — cycle next/prev session
+- `Ctrl+\` — cycle to next window in the current session (`window-prev` is CLI-only)
 - Configured in `~/.tmux.conf`, also set by `hive setup`
 
 ## Testing

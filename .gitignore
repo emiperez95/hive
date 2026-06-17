@@ -3,3 +3,4 @@
 CLAUDE.local.md
 .claude/settings.local.json
 .claude/commands/hive/
+.claude/scheduled_tasks.lock
