@@ -54,6 +54,9 @@ pub enum ClaudeStatus {
     PlanReview,
     /// Claude asked a question via AskUserQuestion
     QuestionAsked,
+    /// A background task (workflow / background agent) is running while the main
+    /// thread is idle. Carries a short summary for display.
+    RunningWorkflow(String),
     /// Working or unknown state
     Unknown,
 }
@@ -66,6 +69,7 @@ impl std::fmt::Display for ClaudeStatus {
             ClaudeStatus::EditApproval(file) => write!(f, "edit: {}", file),
             ClaudeStatus::PlanReview => write!(f, "plan ready"),
             ClaudeStatus::QuestionAsked => write!(f, "question asked"),
+            ClaudeStatus::RunningWorkflow(summary) => write!(f, "{}", summary),
             ClaudeStatus::Unknown => write!(f, "working"),
         }
     }

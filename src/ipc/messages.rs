@@ -85,6 +85,10 @@ pub enum SessionStatus {
     PlanReview,
     /// Question asked via AskUserQuestion
     QuestionAsked,
+    /// A background task (workflow / background agent) is running while the main
+    /// thread is idle. Carries a short summary for display. Not emitted by hooks —
+    /// derived from the transcript when an otherwise-idle session has work in flight.
+    RunningWorkflow { summary: String },
     /// Working/processing
     Working,
     /// Unknown state
@@ -448,6 +452,9 @@ mod tests {
             },
             SessionStatus::EditApproval {
                 filename: "main.rs".into(),
+            },
+            SessionStatus::RunningWorkflow {
+                summary: "workflow: audit".into(),
             },
         ];
 

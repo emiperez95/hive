@@ -1414,6 +1414,15 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
                         } else {
                             claude_status = Some(ClaudeStatus::Unknown);
                         }
+                        // An idle main thread may still have a workflow / background
+                        // agent running. Override Waiting with the in-flight summary.
+                        if matches!(claude_status, Some(ClaudeStatus::Waiting)) {
+                            if let Some(summary) =
+                                crate::common::jsonl::background_running_summary(&pane.cwd, None)
+                            {
+                                claude_status = Some(ClaudeStatus::RunningWorkflow(summary));
+                            }
+                        }
                         claude_pane = Some((
                             session.name.clone(),
                             window.index.clone(),
@@ -1465,6 +1474,17 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
                         Some(js.status)
                     } else {
                         Some(ClaudeStatus::Unknown)
+                    };
+                    // Surface a running workflow / background agent on an idle window.
+                    let status = if matches!(status, Some(ClaudeStatus::Waiting)) {
+                        crate::common::jsonl::background_running_summary(
+                            &inst.cwd,
+                            inst.session_id.as_deref(),
+                        )
+                        .map(ClaudeStatus::RunningWorkflow)
+                        .or(status)
+                    } else {
+                        status
                     };
                     let cpu = inst
                         .pids
@@ -1560,6 +1580,9 @@ fn convert_hook_status(status: &SessionStatus) -> ClaudeStatus {
         SessionStatus::EditApproval { filename } => ClaudeStatus::EditApproval(filename.clone()),
         SessionStatus::PlanReview => ClaudeStatus::PlanReview,
         SessionStatus::QuestionAsked => ClaudeStatus::QuestionAsked,
+        SessionStatus::RunningWorkflow { summary } => {
+            ClaudeStatus::RunningWorkflow(summary.clone())
+        }
         SessionStatus::Working => ClaudeStatus::Unknown,
         SessionStatus::Unknown => ClaudeStatus::Unknown,
     }

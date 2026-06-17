@@ -145,6 +145,16 @@ fn build_window_view(
         (Some(SessionStatus::Unknown), None)
     };
 
+    // An idle main thread may still have a workflow / background agent running.
+    // Override Waiting with the in-flight summary so the dashboard shows it as busy.
+    let status = if matches!(status, Some(SessionStatus::Waiting)) {
+        crate::common::jsonl::background_running_summary(&inst.cwd, inst.session_id.as_deref())
+            .map(|summary| SessionStatus::RunningWorkflow { summary })
+            .or(status)
+    } else {
+        status
+    };
+
     let status = mask_auto_approve(status, is_auto_approve);
 
     let mut cpu = 0.0f32;
@@ -217,6 +227,13 @@ fn aggregate_status(windows: &[WindowView]) -> Option<SessionStatus> {
     {
         return Some(SessionStatus::Working);
     }
+    // A running workflow on any window is busy — surface it above an idle window.
+    if let Some(w) = windows
+        .iter()
+        .find(|w| matches!(w.status, Some(SessionStatus::RunningWorkflow { .. })))
+    {
+        return w.status.clone();
+    }
     if windows
         .iter()
         .any(|w| matches!(w.status, Some(SessionStatus::Waiting)))
@@ -240,6 +257,9 @@ fn convert_claude_to_session_status(status: &crate::common::types::ClaudeStatus)
         },
         ClaudeStatus::PlanReview => SessionStatus::PlanReview,
         ClaudeStatus::QuestionAsked => SessionStatus::QuestionAsked,
+        ClaudeStatus::RunningWorkflow(summary) => SessionStatus::RunningWorkflow {
+            summary: summary.clone(),
+        },
         ClaudeStatus::Unknown => SessionStatus::Working,
     }
 }

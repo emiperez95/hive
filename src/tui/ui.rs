@@ -374,6 +374,7 @@ fn short_status(status: &Option<ClaudeStatus>) -> (&'static str, Color) {
         Some(ClaudeStatus::QuestionAsked) => ("ask?", Color::Magenta),
         Some(ClaudeStatus::NeedsPermission(_, _)) => ("perm", Color::Yellow),
         Some(ClaudeStatus::EditApproval(_)) => ("edit", Color::Yellow),
+        Some(ClaudeStatus::RunningWorkflow(_)) => ("flow", Color::Blue),
         Some(ClaudeStatus::Unknown) => ("work", Color::DarkGray),
         None => ("—", Color::DarkGray),
     }
@@ -649,6 +650,7 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         ClaudeStatus::Waiting => ("idle", Color::Cyan),
                         ClaudeStatus::PlanReview => ("plan", Color::Magenta),
                         ClaudeStatus::QuestionAsked => ("ask?", Color::Magenta),
+                        ClaudeStatus::RunningWorkflow(_) => ("flow", Color::Blue),
                         _ => ("work", Color::DarkGray),
                     };
 
@@ -786,6 +788,19 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                                 Span::styled(
                                     format!("   → {}", status),
                                     Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(
+                                    ago_text.clone(),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                            lines.push(Line::raw(""));
+                        }
+                        ClaudeStatus::RunningWorkflow(summary) => {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("   → ⚙ {}", summary),
+                                    Style::default().fg(Color::Blue),
                                 ),
                                 Span::styled(
                                     ago_text.clone(),
@@ -947,6 +962,7 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                         Some(ClaudeStatus::Waiting) => " [waiting]",
                         Some(ClaudeStatus::PlanReview) => " [plan]",
                         Some(ClaudeStatus::QuestionAsked) => " [question]",
+                        Some(ClaudeStatus::RunningWorkflow(_)) => " [workflow]",
                         Some(ClaudeStatus::Unknown) => " [working]",
                         None => "",
                     };
@@ -1108,6 +1124,7 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             ClaudeStatus::PlanReview => ("plan ready for review".to_string(), Color::Magenta),
             ClaudeStatus::QuestionAsked => ("question asked".to_string(), Color::Magenta),
+            ClaudeStatus::RunningWorkflow(summary) => (summary.clone(), Color::Blue),
             ClaudeStatus::Unknown => ("working".to_string(), Color::White),
         };
         lines.push(Line::from(vec![

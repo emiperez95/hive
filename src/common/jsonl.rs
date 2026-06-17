@@ -43,6 +43,10 @@ pub struct ToolUse {
     pub content_type: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// The tool_use block id (e.g. "toolu_…"). Used to correlate a background launch
+    /// with its later `<task-notification>` (whose `<tool-use-id>` is this same id).
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub input: Option<serde_json::Value>,
 }
@@ -653,6 +657,235 @@ pub fn get_claude_status_from_jsonl_for(
     Some(JsonlStatus { status, timestamp })
 }
 
+// ---------------------------------------------------------------------------
+// Background task detection (workflows / background agents / background bash)
+//
+// Claude can launch work that runs in the background while the main thread goes
+// idle (a `Workflow`, or an `Agent`/`Bash` tool call with `run_in_background`).
+// When that happens the main transcript's last entries are the launch followed by
+// a `Stop`, so naive status detection reports the session as idle even though work
+// is in flight. The harness re-injects a `<task-notification>` into the main
+// transcript when the task finishes.
+//
+// We pair each background launch (a `tool_use` whose name is `Workflow`, or whose
+// input carries `run_in_background: true`) with its completion notification using
+// the tool-use id: every `<task-notification>` carries a `<tool-use-id>` equal to
+// the launching tool_use's id. A launch with no matching notification is still
+// running. This is windowing-safe: a completion always follows its launch, so if a
+// launch is present in the tail, its completion (if any) is too.
+// ---------------------------------------------------------------------------
+
+/// What kind of background work was launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundKind {
+    Workflow,
+    Agent,
+    Bash,
+}
+
+/// A background task launched from the main thread that has not yet reported completion.
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    pub kind: BackgroundKind,
+    /// Human-friendly label (workflow name / agent description / bash command).
+    pub label: String,
+}
+
+/// Pull `<tag>…</tag>` inner values out of a text blob (all occurrences).
+fn extract_tagged(text: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(&open) {
+        let after = &rest[i + open.len()..];
+        match after.find(&close) {
+            Some(j) => {
+                out.push(after[..j].trim().to_string());
+                rest = &after[j + close.len()..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Best-effort searchable text for a message `content` value (string or block array).
+fn content_search_text(content: &serde_json::Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    serde_json::to_string(content).unwrap_or_default()
+}
+
+/// Extract a workflow's `meta.name` from its script source (best effort).
+fn extract_js_meta_name(script: &str) -> Option<String> {
+    let idx = script.find("name:")?;
+    let after = script[idx + "name:".len()..].trim_start();
+    let q = after.chars().next()?;
+    if q != '\'' && q != '"' && q != '`' {
+        return None;
+    }
+    let rest = &after[q.len_utf8()..];
+    let end = rest.find(q)?;
+    let name = rest[..end].trim();
+    if name.is_empty() || name.len() > 80 {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn input_str<'a>(input: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    input.and_then(|i| i.get(key)).and_then(|v| v.as_str())
+}
+
+/// Classify a `tool_use` block as a background launch, returning the task if so.
+fn background_task_from_tool_use(tool: &ToolUse) -> Option<BackgroundTask> {
+    if tool.content_type != "tool_use" {
+        return None;
+    }
+    let name = tool.name.as_deref().unwrap_or("");
+    let run_in_background = tool
+        .input
+        .as_ref()
+        .and_then(|i| i.get("run_in_background"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if name == "Workflow" {
+        let label = input_str(tool.input.as_ref(), "script")
+            .and_then(extract_js_meta_name)
+            .unwrap_or_else(|| "workflow".to_string());
+        Some(BackgroundTask {
+            kind: BackgroundKind::Workflow,
+            label,
+        })
+    } else if run_in_background && name == "Bash" {
+        let label = input_str(tool.input.as_ref(), "description")
+            .or_else(|| input_str(tool.input.as_ref(), "command"))
+            .map(|s| truncate_str(s, 50))
+            .unwrap_or_else(|| "command".to_string());
+        Some(BackgroundTask {
+            kind: BackgroundKind::Bash,
+            label,
+        })
+    } else if run_in_background {
+        // Agent (the common case) or any other backgrounded tool.
+        let label = input_str(tool.input.as_ref(), "description")
+            .or_else(|| input_str(tool.input.as_ref(), "subagent_type"))
+            .map(|s| truncate_str(s, 50))
+            .unwrap_or_else(|| "agent".to_string());
+        Some(BackgroundTask {
+            kind: BackgroundKind::Agent,
+            label,
+        })
+    } else {
+        None
+    }
+}
+
+/// Detect background tasks that are still running, given transcript entries in
+/// chronological order. Pure (no IO) for testability.
+pub fn detect_active_background_tasks(entries: &[JsonlEntry]) -> Vec<BackgroundTask> {
+    use std::collections::HashSet;
+
+    let mut launched: Vec<(String, BackgroundTask)> = Vec::new();
+    let mut done: HashSet<String> = HashSet::new();
+
+    for entry in entries {
+        match entry.entry_type.as_str() {
+            "assistant" => {
+                let Some(blocks) = entry
+                    .message
+                    .as_ref()
+                    .and_then(|m| m.content.as_ref())
+                    .and_then(|c| c.as_array())
+                else {
+                    continue;
+                };
+                for block in blocks {
+                    let Ok(tool) = serde_json::from_value::<ToolUse>(block.clone()) else {
+                        continue;
+                    };
+                    if let (Some(id), Some(task)) =
+                        (tool.id.clone(), background_task_from_tool_use(&tool))
+                    {
+                        launched.push((id, task));
+                    }
+                }
+            }
+            "user" => {
+                let Some(content) = entry.message.as_ref().and_then(|m| m.content.as_ref()) else {
+                    continue;
+                };
+                let text = content_search_text(content);
+                if text.contains("<task-notification>") {
+                    for id in extract_tagged(&text, "tool-use-id") {
+                        done.insert(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    launched
+        .into_iter()
+        .filter(|(id, _)| !done.contains(id))
+        .map(|(_, task)| task)
+        .collect()
+}
+
+/// One-line summary of in-flight background tasks (for status display).
+pub fn background_tasks_summary(tasks: &[BackgroundTask]) -> String {
+    match tasks {
+        [] => String::new(),
+        [t] => match t.kind {
+            BackgroundKind::Workflow => format!("workflow: {}", t.label),
+            BackgroundKind::Agent => format!("agent: {}", t.label),
+            BackgroundKind::Bash => format!("bg: {}", t.label),
+        },
+        many => {
+            if many.iter().all(|t| t.kind == BackgroundKind::Workflow) {
+                format!("{} workflows", many.len())
+            } else {
+                format!("{} background tasks", many.len())
+            }
+        }
+    }
+}
+
+/// Read the transcript tail and return in-flight background tasks for a conversation.
+/// Resolves the jsonl by `session_id` when known, else the latest jsonl for `cwd`.
+pub fn get_active_background_tasks_for(cwd: &str, session_id: Option<&str>) -> Vec<BackgroundTask> {
+    let Some(path) = resolve_jsonl_path(cwd, session_id) else {
+        return Vec::new();
+    };
+    // A running task's launch sits at the tail (main thread idle after it), so a
+    // bounded byte-tail is sufficient and avoids reading huge transcripts in full.
+    let lines = read_tail_lines(&path, 256 * 1024);
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let entries: Vec<JsonlEntry> = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    detect_active_background_tasks(&entries)
+}
+
+/// Convenience: a status summary string if a conversation has in-flight background
+/// work, else `None`. Used to override an otherwise-idle status with a busy one.
+pub fn background_running_summary(cwd: &str, session_id: Option<&str>) -> Option<String> {
+    let tasks = get_active_background_tasks_for(cwd, session_id);
+    if tasks.is_empty() {
+        None
+    } else {
+        Some(background_tasks_summary(&tasks))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,6 +1190,89 @@ mod tests {
         ];
         let msgs = extract_conversation_messages(&lines, 50);
         assert_eq!(msgs[0].tools[0].summary, "ls -la /tmp");
+    }
+
+    // --- background task detection ---
+
+    fn lines_to_entries(lines: &[&str]) -> Vec<JsonlEntry> {
+        lines.iter().map(|l| parse_entry(l)).collect()
+    }
+
+    #[test]
+    fn test_background_workflow_running() {
+        let launch = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf1","name":"Workflow","input":{"script":"export const meta = {\n  name: 'audit-flows',\n}\n"}}]}}"#;
+        let stop = r#"{"type":"user","message":{"content":"Workflow launched in background. Task ID: w5fpwhv2l\nSummary: audit"}}"#;
+        let entries = lines_to_entries(&[launch, stop]);
+        let tasks = detect_active_background_tasks(&entries);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].kind, BackgroundKind::Workflow);
+        assert_eq!(tasks[0].label, "audit-flows");
+        assert_eq!(background_tasks_summary(&tasks), "workflow: audit-flows");
+    }
+
+    #[test]
+    fn test_background_workflow_completed_not_flagged() {
+        let launch = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf1","name":"Workflow","input":{"script":"name: 'audit'"}}]}}"#;
+        let notif = r#"{"type":"user","message":{"content":"<task-notification>\n<task-id>w5fpwhv2l</task-id>\n<tool-use-id>toolu_wf1</tool-use-id>\n<status>completed</status>\n</task-notification>"}}"#;
+        let entries = lines_to_entries(&[launch, notif]);
+        assert!(detect_active_background_tasks(&entries).is_empty());
+    }
+
+    #[test]
+    fn test_background_agent_running() {
+        let launch = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_ag1","name":"Agent","input":{"description":"Fix the build","run_in_background":true}}]}}"#;
+        let entries = lines_to_entries(&[launch]);
+        let tasks = detect_active_background_tasks(&entries);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].kind, BackgroundKind::Agent);
+        assert_eq!(tasks[0].label, "Fix the build");
+    }
+
+    #[test]
+    fn test_background_failed_status_marks_done() {
+        // Any terminal status (failed/killed/completed) means the task is no longer running.
+        let launch = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_ag1","name":"Agent","input":{"description":"x","run_in_background":true}}]}}"#;
+        let notif = r#"{"type":"user","message":{"content":"<task-notification>\n<tool-use-id>toolu_ag1</tool-use-id>\n<status>failed</status>\n</task-notification>"}}"#;
+        let entries = lines_to_entries(&[launch, notif]);
+        assert!(detect_active_background_tasks(&entries).is_empty());
+    }
+
+    #[test]
+    fn test_background_mixed_one_done_one_running() {
+        let wf_done = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf1","name":"Workflow","input":{"script":"name: 'first'"}}]}}"#;
+        let notif = r#"{"type":"user","message":{"content":"<task-notification><tool-use-id>toolu_wf1</tool-use-id><status>completed</status></task-notification>"}}"#;
+        let wf_running = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf2","name":"Workflow","input":{"script":"name: 'second'"}}]}}"#;
+        let entries = lines_to_entries(&[wf_done, notif, wf_running]);
+        let tasks = detect_active_background_tasks(&entries);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].label, "second");
+    }
+
+    #[test]
+    fn test_foreground_bash_ignored() {
+        // A Bash call without run_in_background is foreground work, not a background task.
+        let bash = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let entries = lines_to_entries(&[bash]);
+        assert!(detect_active_background_tasks(&entries).is_empty());
+    }
+
+    #[test]
+    fn test_background_bash_running() {
+        let bash = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b1","name":"Bash","input":{"command":"npm run dev","description":"dev server","run_in_background":true}}]}}"#;
+        let entries = lines_to_entries(&[bash]);
+        let tasks = detect_active_background_tasks(&entries);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].kind, BackgroundKind::Bash);
+        assert_eq!(background_tasks_summary(&tasks), "bg: dev server");
+    }
+
+    #[test]
+    fn test_background_summary_multiple_workflows() {
+        let tasks = vec![
+            BackgroundTask { kind: BackgroundKind::Workflow, label: "a".into() },
+            BackgroundTask { kind: BackgroundKind::Workflow, label: "b".into() },
+        ];
+        assert_eq!(background_tasks_summary(&tasks), "2 workflows");
     }
 
     #[test]

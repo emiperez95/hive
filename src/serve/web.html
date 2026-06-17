@@ -2208,6 +2208,7 @@ function statusInfo(s) {
   if (typeof st === 'object') {
     if (st.NeedsPermission) return { label: 'Permission', cls: 'attention', color: 'var(--tertiary-container)', dotColor: 'var(--tertiary-container)', needsAction: true };
     if (st.EditApproval) return { label: 'Edit Approval', cls: 'attention', color: 'var(--tertiary)', dotColor: 'var(--tertiary)', needsAction: true };
+    if (st.RunningWorkflow) return { label: 'Workflow', cls: 'busy', color: 'var(--primary)', dotColor: 'var(--primary)', needsAction: false };
   }
   return { label: 'Busy', cls: 'busy', color: 'var(--error)', dotColor: 'var(--error)', needsAction: false };
 }
@@ -2222,6 +2223,7 @@ function statusDetail(s) {
       return d;
     }
     if (st.EditApproval) return 'File: ' + st.EditApproval.filename;
+    if (st.RunningWorkflow) return st.RunningWorkflow.summary || '';
   }
   return '';
 }

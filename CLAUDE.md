@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 171 tests (150 unit + 21 CLI smoke)
+cargo test                # 204 tests (183 unit + 21 CLI smoke)
 cargo build               # dev build
 cargo clippy -- -D warnings
 cargo install --path . --root ~/.local  # install binary
@@ -126,7 +126,7 @@ src/
 
 - `HookState` (ipc/messages.rs) — `HashMap<session_id, SessionState>`, serialized to state.json
 - `SessionState` — session_id, cwd, status, needs_attention, last_activity
-- `SessionStatus` — Working, Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked
+- `SessionStatus` — Working, Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked, RunningWorkflow (derived; see Background Tasks)
 - `App` (tui/app.rs) — all TUI state: sessions, selection, input mode, favorites, todos, flags
 - `SessionInfo` (common/types.rs) — enriched session data for display (processes, ports, status)
 - `ClaudeStatus` (common/types.rs) — TUI-side status enum mapped from SessionStatus
@@ -228,6 +228,31 @@ in place of it.
 `/api/discard-frozen`. The info modal shows a per-window Freeze button (the window identity
 comes from the live `/api/sessions` `windows` array); a `FROZEN` section in the session list
 thaws on tap and discards via a trash icon.
+
+## Background Tasks (workflow detection)
+
+Claude can launch work that runs **in the background** while the main thread goes idle:
+a `Workflow`, or an `Agent`/`Bash` tool call with `run_in_background`. When that happens the
+main transcript's last entries are the launch followed by a `Stop`, so naive status detection
+(hook state *or* jsonl) reports the session as **idle** even though work is in flight — the
+session looks free when it's actually busy.
+
+`jsonl.rs::detect_active_background_tasks` recovers the real state from the transcript. Every
+background launch is a `tool_use` (name `Workflow`, or input `run_in_background: true`), and
+when the task finishes the harness injects a `<task-notification>` whose `<tool-use-id>` equals
+the launching tool_use's id. Pairing launches with notifications by that id yields the tasks
+still running. This is windowing-safe (a completion always follows its launch), so reading a
+bounded transcript tail is sufficient.
+
+When a session's resolved status is otherwise **Waiting**, the call sites overlay it with
+`RunningWorkflow(summary)` if `background_running_summary()` reports in-flight work. The overlay
+fires only on an idle base status (so it never masks a permission/plan/question prompt) and is
+applied at every status site: TUI single-window + multi-window (`tui/app.rs`) and the web
+per-window builder (`serve/server.rs`). Display: TUI shows `flow` (blue) in the list / `⚙ <summary>`
+in detail; the web shows a blue **Workflow** badge (falls back to a generic Busy if the JS is
+older). Known limitation: a task that dies without a completion notification (e.g. Claude killed
+mid-workflow) leaves an unmatched launch; it only mis-reports while the session is idle, and a
+new turn clears it.
 
 ## `hive start`
 
@@ -386,9 +411,9 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 ## Testing
 
-171 tests total. Run with `cargo test`.
+204 tests total. Run with `cargo test`.
 
-**Unit tests (150)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (183)** — in-module `#[cfg(test)]` blocks:
 - `common/` modules: types, projects, worktree, jsonl, chrome, process, persistence (escape/unescape, set/todo file roundtrips)
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
