@@ -1469,8 +1469,16 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
             session_instances
                 .iter()
                 .map(|inst| {
-                    let status = if let Some(h) = hook_index.resolve(&inst.pane_id, &inst.cwd) {
+                    // Status comes from THIS window's own pane. With no pane-bound hook
+                    // session we fall back to the cwd's jsonl only when the cwd is unique;
+                    // a shared cwd can't tell sibling windows apart, so we report idle
+                    // rather than borrow whichever sibling is currently busy.
+                    let pane_hook = hook_index.resolve_pane(&inst.pane_id);
+                    let identified = pane_hook.is_some() || !inst.cwd_shared;
+                    let status = if let Some(h) = pane_hook {
                         Some(convert_hook_status(&h.status))
+                    } else if inst.cwd_shared {
+                        Some(ClaudeStatus::Waiting)
                     } else if let Some(js) = crate::common::jsonl::get_claude_status_from_jsonl_for(
                         &inst.cwd,
                         inst.session_id.as_deref(),
@@ -1479,8 +1487,10 @@ pub fn gather_sessions(sys: &mut System, filter: &Option<String>) -> Vec<Session
                     } else {
                         Some(ClaudeStatus::Unknown)
                     };
-                    // Surface a running workflow / background agent on an idle window.
-                    let status = if matches!(status, Some(ClaudeStatus::Waiting)) {
+                    // Surface a running workflow / background agent on an idle window — but
+                    // only for windows we can identify (a shared-cwd unhooked window has no
+                    // reliable transcript, so its background summary would be borrowed too).
+                    let status = if identified && matches!(status, Some(ClaudeStatus::Waiting)) {
                         crate::common::jsonl::background_running_summary(
                             &inst.cwd,
                             inst.session_id.as_deref(),

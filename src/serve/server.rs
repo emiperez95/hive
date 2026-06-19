@@ -132,10 +132,15 @@ fn build_window_view(
     hook_index: &HookIndex,
     is_auto_approve: bool,
 ) -> WindowView {
-    // Status: prefer the hook session bound to this pane; fall back to the instance's
-    // own jsonl transcript (by session_id when known); else Unknown.
-    let (status, last_activity) = if let Some(hook) = hook_index.resolve(&inst.pane_id, &inst.cwd) {
+    // Status comes from THIS window's own pane. With no pane-bound hook session we fall back
+    // to the instance's own jsonl only when its cwd is unique; a shared cwd can't tell sibling
+    // windows apart, so we report idle rather than borrow whichever sibling is currently busy.
+    let pane_hook = hook_index.resolve_pane(&inst.pane_id);
+    let identified = pane_hook.is_some() || !inst.cwd_shared;
+    let (status, last_activity) = if let Some(hook) = pane_hook {
         (Some(hook.status.clone()), hook.last_activity.clone())
+    } else if inst.cwd_shared {
+        (Some(SessionStatus::Waiting), None)
     } else if let Some(jsonl) = crate::common::jsonl::get_claude_status_from_jsonl_for(
         &inst.cwd,
         inst.session_id.as_deref(),
@@ -148,9 +153,10 @@ fn build_window_view(
         (Some(SessionStatus::Unknown), None)
     };
 
-    // An idle main thread may still have a workflow / background agent running.
-    // Override Waiting with the in-flight summary so the dashboard shows it as busy.
-    let status = if matches!(status, Some(SessionStatus::Waiting)) {
+    // An idle main thread may still have a workflow / background agent running. Override
+    // Waiting with the in-flight summary so the dashboard shows it as busy — but only for
+    // windows we can identify (a shared-cwd unhooked window has no reliable transcript).
+    let status = if identified && matches!(status, Some(SessionStatus::Waiting)) {
         crate::common::jsonl::background_running_summary(&inst.cwd, inst.session_id.as_deref())
             .map(|summary| SessionStatus::RunningWorkflow { summary })
             .or(status)

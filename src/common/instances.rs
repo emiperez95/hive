@@ -43,6 +43,10 @@ pub struct ClaudeInstance {
     pub cwd: String,
     /// Resolved Claude session id (the `<session_id>.jsonl` basename), when known.
     pub session_id: Option<String>,
+    /// True when this cwd hosts more than one Claude window. A window with no pane-bound
+    /// hook session can't be told apart from its siblings by cwd alone, so callers must not
+    /// borrow a sibling's session/status via the cwd fallback when this is set.
+    pub cwd_shared: bool,
     /// PIDs of the Claude pane's process tree (the pane pid + descendants).
     pub pids: Vec<u32>,
 }
@@ -101,11 +105,22 @@ impl<'a> HookIndex<'a> {
             .copied()
             .or_else(|| self.by_cwd.get(cwd).copied())
     }
+
+    /// Resolve strictly by tmux pane id — the precise link, with no cwd fallback. Use when a
+    /// cwd may host several Claude windows, where the cwd fallback would borrow whichever
+    /// sibling happens to be most recently active.
+    pub fn resolve_pane(&self, pane_id: &str) -> Option<&'a SessionState> {
+        self.by_pane.get(pane_id).copied()
+    }
 }
 
 /// Walk every pane of every tmux session and return one [`ClaudeInstance`] per pane that is
-/// running a Claude process. Each instance's `session_id` is resolved via `hook_index`
-/// (pane-id match preferred, cwd fallback).
+/// running a Claude process.
+///
+/// `session_id` is resolved from the pane's own hook session first; the cwd fallback is
+/// applied afterwards and *only* for cwds hosting a single Claude window — a shared cwd can't
+/// disambiguate sibling windows, so such a window is left with `session_id == None` and
+/// `cwd_shared == true` rather than borrowing a neighbour's identity.
 ///
 /// `children_map` should be built once per gather pass (see
 /// [`crate::common::process::build_children_map`]) so the descendant walk is in-memory.
@@ -132,8 +147,10 @@ pub fn detect_claude_instances(
                     continue;
                 }
 
+                // Pane-bound match only here; the cwd fallback is resolved below, where we
+                // know whether the cwd is shared by multiple Claude windows.
                 let session_id = hook_index
-                    .resolve(&pane.id, &pane.cwd)
+                    .resolve_pane(&pane.id)
                     .map(|s| s.session_id.clone());
 
                 instances.push(ClaudeInstance {
@@ -144,9 +161,25 @@ pub fn detect_claude_instances(
                     pane_id: pane.id.clone(),
                     cwd: pane.cwd.clone(),
                     session_id,
+                    cwd_shared: false,
                     pids,
                 });
             }
+        }
+    }
+
+    // Flag cwds hosting more than one Claude window, then fill in session ids from the cwd
+    // fallback only where it's unambiguous (a single Claude window for that cwd).
+    let mut cwd_counts: HashMap<String, usize> = HashMap::new();
+    for inst in &instances {
+        *cwd_counts.entry(inst.cwd.clone()).or_default() += 1;
+    }
+    for inst in &mut instances {
+        inst.cwd_shared = cwd_counts.get(&inst.cwd).copied().unwrap_or(0) > 1;
+        if inst.session_id.is_none() && !inst.cwd_shared {
+            inst.session_id = hook_index
+                .resolve(&inst.pane_id, &inst.cwd)
+                .map(|s| s.session_id.clone());
         }
     }
 
@@ -234,6 +267,24 @@ mod tests {
         let index = HookIndex::build(&state);
 
         assert!(index.resolve("%99", "/other").is_none());
+    }
+
+    #[test]
+    fn test_resolve_pane_never_falls_back_to_cwd() {
+        // Two windows share a cwd; only %1 reported a hook. resolve_pane must NOT hand %2's
+        // (or %99's) lookup the cwd-indexed sibling — that's the status-borrowing bug.
+        let state = state_with(vec![session(
+            "a",
+            "/proj",
+            Some("%1"),
+            "2025-01-01T00:00:01Z",
+        )]);
+        let index = HookIndex::build(&state);
+
+        assert_eq!(index.resolve_pane("%1").unwrap().session_id, "a");
+        // No pane match → None, even though the cwd is known (unlike `resolve`).
+        assert!(index.resolve_pane("%2").is_none());
+        assert!(index.resolve_pane("%99").is_none());
     }
 
     #[test]
