@@ -349,3 +349,131 @@ pub fn kill_tmux_session(name: &str) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+/// Mirror a Claude pane's title into its tmux window name.
+///
+/// Claude Code writes the conversation title (set by `/rename` or auto-generated) to the
+/// pane title, but tmux's `automatic-rename` keeps naming the *window* after the running
+/// process (the version-named `claude` binary), so window lists show useless `2.1.x`.
+/// This takes the pane title, strips Claude's leading status glyph, and renames the window
+/// to match — turning off `automatic-rename` so the name sticks.
+///
+/// Called from the hook handler, which runs inside the Claude pane (so `pane` is its
+/// `$TMUX_PANE`). Event-driven: every hook fire keeps the window name current, no polling.
+/// Cheap when nothing changed — a single `display-message` query and an early return if the
+/// cleaned title already equals the current window name.
+pub fn sync_window_name_for_pane(pane: &str) {
+    // One query: the pane's title plus the window it lives in and that window's current name.
+    let output = match Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "-F",
+            "#{pane_title}\t#{window_id}\t#{window_name}",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+
+    let line = String::from_utf8_lossy(&output.stdout);
+    let line = line.trim_end_matches('\n');
+    let mut parts = line.splitn(3, '\t');
+    let (Some(title), Some(window_id), Some(current_name)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return;
+    };
+
+    let clean = clean_claude_title(title);
+    // Nothing usable, or already correct — leave tmux alone (no churn from the spinner glyph,
+    // which animates every frame but cleans to the same stable text).
+    if clean.is_empty() || clean == current_name {
+        return;
+    }
+
+    // Take ownership of the window name so tmux's automatic-rename doesn't revert it.
+    let _ = Command::new("tmux")
+        .args([
+            "set-window-option",
+            "-t",
+            window_id,
+            "automatic-rename",
+            "off",
+        ])
+        .output();
+    let _ = Command::new("tmux")
+        .args(["rename-window", "-t", window_id, &clean])
+        .output();
+}
+
+/// Strip Claude's leading status glyph from a pane title and cap its length, producing a
+/// clean tmux window name. Returns empty when there's nothing usable.
+///
+/// Claude prefixes the title with a status glyph (`✳`, `✻`, or an animating braille spinner
+/// frame like `⠂`) followed by a space. The glyph is only stripped when the first character
+/// isn't part of a normal word, so a plainly-titled pane is left intact.
+pub fn clean_claude_title(title: &str) -> String {
+    /// Longest window name we'll set, in characters (keeps the tmux status line tidy).
+    const MAX_LEN: usize = 60;
+
+    let trimmed = title.trim();
+    let first = match trimmed.chars().next() {
+        Some(c) => c,
+        None => return String::new(),
+    };
+
+    let stripped = if first.is_alphanumeric() {
+        trimmed
+    } else {
+        // Drop the leading glyph token (up to the first whitespace) and the spaces after it.
+        // A lone glyph with nothing after it cleans to empty (so we skip the rename).
+        trimmed
+            .split_once(char::is_whitespace)
+            .map(|(_, rest)| rest.trim_start())
+            .unwrap_or("")
+    };
+
+    stripped.chars().take(MAX_LEN).collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_claude_title;
+
+    #[test]
+    fn strips_leading_glyph() {
+        assert_eq!(clean_claude_title("✳ Session preview"), "Session preview");
+        assert_eq!(clean_claude_title("⠂ Rename tmux"), "Rename tmux");
+        assert_eq!(
+            clean_claude_title("✻ Cycle to next active"),
+            "Cycle to next active"
+        );
+    }
+
+    #[test]
+    fn leaves_plain_titles_intact() {
+        assert_eq!(
+            clean_claude_title("Refactor session handling"),
+            "Refactor session handling"
+        );
+        assert_eq!(clean_claude_title("  padded title  "), "padded title");
+    }
+
+    #[test]
+    fn empty_or_glyph_only() {
+        assert_eq!(clean_claude_title(""), "");
+        assert_eq!(clean_claude_title("   "), "");
+        // A lone glyph with no following text strips to empty.
+        assert_eq!(clean_claude_title("✳ "), "");
+    }
+
+    #[test]
+    fn caps_length() {
+        let long = format!("✳ {}", "a".repeat(100));
+        assert_eq!(clean_claude_title(&long).chars().count(), 60);
+    }
+}

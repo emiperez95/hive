@@ -145,6 +145,10 @@ pub fn run_hook(event_type: &str) -> Result<()> {
         if let Some(session) = state.sessions.get_mut(&session_id_for_pane) {
             session.tmux_pane = Some(pane.clone());
         }
+        // Mirror the Claude conversation title (set by `/rename` or auto-generated) into the
+        // tmux window name. The hook runs inside the Claude pane, so this is event-driven —
+        // every hook fire keeps the window name current without polling.
+        crate::common::tmux::sync_window_name_for_pane(pane);
     }
 
     if let Some(updated_session) = updated {
