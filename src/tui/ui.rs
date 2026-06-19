@@ -383,12 +383,35 @@ fn short_status(status: &Option<ClaudeStatus>) -> (&'static str, Color) {
     }
 }
 
+/// A window's conversation title for the list (mirrored from the Claude pane into the tmux
+/// window name), or `None` when tmux still shows an auto-generated name that carries no
+/// useful information — a bare Claude version like `2.1.183`, `[tmux]`, or empty.
+fn window_title_for_list(name: &str) -> Option<String> {
+    const MAX: usize = 40;
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "[tmux]"
+        || trimmed.chars().all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return None;
+    }
+    if trimmed.chars().count() > MAX {
+        Some(format!(
+            "{}…",
+            trimmed.chars().take(MAX).collect::<String>()
+        ))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Build one status line per window for a multi-window session, e.g.
 /// ```text
-///    → 1: idle
-///    → 2: work
+///    → 1: Faction Warfare  idle
+///    → 2: Refactor status handling  work
 ///    → 3: ask?
 /// ```
+/// The conversation title is shown before the status when tmux has a meaningful window name.
 fn window_status_lines(
     windows: &[ClaudeWindowInfo],
     is_auto: bool,
@@ -416,6 +439,11 @@ fn window_status_lines(
                 spans.push(Span::styled(format!("→ {}: ", w.window_index), dim));
             } else {
                 spans.push(Span::styled(format!("   → {}: ", w.window_index), dim));
+            }
+            // Conversation title (when set), then the colored status label after it.
+            if let Some(title) = window_title_for_list(&w.window_name) {
+                spans.push(Span::raw(title));
+                spans.push(Span::raw("  "));
             }
             spans.push(Span::styled(label, Style::default().fg(color)));
             Line::from(spans)
@@ -1707,4 +1735,43 @@ fn render_delete_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
     ]));
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_title_for_list;
+
+    #[test]
+    fn shows_real_titles() {
+        assert_eq!(
+            window_title_for_list("Faction Warfare").as_deref(),
+            Some("Faction Warfare")
+        );
+        assert_eq!(
+            window_title_for_list("  Market watcher  ").as_deref(),
+            Some("Market watcher")
+        );
+    }
+
+    #[test]
+    fn hides_auto_generated_names() {
+        // Bare claude version, the tmux command placeholder, and empty carry no info.
+        assert_eq!(window_title_for_list("2.1.183"), None);
+        assert_eq!(
+            window_title_for_list("2.1.183-rc"),
+            Some("2.1.183-rc".to_string())
+        );
+        assert_eq!(window_title_for_list("[tmux]"), None);
+        assert_eq!(window_title_for_list(""), None);
+        assert_eq!(window_title_for_list("   "), None);
+    }
+
+    #[test]
+    fn truncates_long_titles() {
+        let long = "a".repeat(80);
+        let out = window_title_for_list(&long).unwrap();
+        // 40 kept + the ellipsis.
+        assert_eq!(out.chars().count(), 41);
+        assert!(out.ends_with('…'));
+    }
 }
