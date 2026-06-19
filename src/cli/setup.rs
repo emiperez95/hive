@@ -199,15 +199,32 @@ pub fn run_setup(yes: bool) -> Result<()> {
             && line.contains("hive")
             && line.contains("--detail")
     });
-    let tmux_cn_bound = tmux_keys
-        .lines()
-        .any(|line| line.contains("C-n") && line.contains("hive") && line.contains("cycle-next"));
-    let tmux_cp_bound = tmux_keys
-        .lines()
-        .any(|line| line.contains("C-p") && line.contains("hive") && line.contains("cycle-prev"));
-    let tmux_wn_bound = tmux_keys
-        .lines()
-        .any(|line| line.contains("C-\\") && line.contains("hive") && line.contains("window-next"));
+    // The cycle bindings require `--pane` so stale, pre-`--pane` bindings are
+    // treated as unbound and get upgraded on the next `hive setup`.
+    let tmux_cn_bound = tmux_keys.lines().any(|line| {
+        line.contains("C-n")
+            && line.contains("hive")
+            && line.contains("cycle-next")
+            && line.contains("--pane")
+    });
+    let tmux_cp_bound = tmux_keys.lines().any(|line| {
+        line.contains("C-p")
+            && line.contains("hive")
+            && line.contains("cycle-prev")
+            && line.contains("--pane")
+    });
+    let tmux_wn_bound = tmux_keys.lines().any(|line| {
+        line.contains("C-\\")
+            && line.contains("hive")
+            && line.contains("window-next")
+            && line.contains("--pane")
+    });
+    let tmux_cf_bound = tmux_keys.lines().any(|line| {
+        line.contains("C-g")
+            && line.contains("hive")
+            && line.contains("cycle-free")
+            && line.contains("--pane")
+    });
 
     // Report status
     println!("hive setup status:");
@@ -253,6 +270,11 @@ pub fn run_setup(yes: bool) -> Result<()> {
         println!("  [ok]      tmux Ctrl+\\ keybinding (window next)");
     } else {
         println!("  [missing] tmux Ctrl+\\ keybinding (window next)");
+    }
+    if tmux_cf_bound {
+        println!("  [ok]      tmux Ctrl+g keybinding (cycle free)");
+    } else {
+        println!("  [missing] tmux Ctrl+g keybinding (cycle free)");
     }
 
     // Check janus-wt-portal agent
@@ -301,8 +323,12 @@ pub fn run_setup(yes: bool) -> Result<()> {
     }
 
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();
-    let all_tmux_bound =
-        tmux_s_bound && tmux_d_bound && tmux_cn_bound && tmux_cp_bound && tmux_wn_bound;
+    let all_tmux_bound = tmux_s_bound
+        && tmux_d_bound
+        && tmux_cn_bound
+        && tmux_cp_bound
+        && tmux_wn_bound
+        && tmux_cf_bound;
     let agent_needs_install = agent_status != "ok";
     let cmd_needs_install = cmd_status != "ok";
 
@@ -427,9 +453,25 @@ pub fn run_setup(yes: bool) -> Result<()> {
     if !all_tmux_bound {
         let tmux_s_cmd = format!("display-popup -E -w 80% -h 70% \"{}\"", binary_str);
         let tmux_d_cmd = format!("display-popup -E -w 80% -h 70% \"{} --detail\"", binary_str);
-        let tmux_cn_cmd = format!("run-shell \"{} cycle-next\"", binary_str);
-        let tmux_cp_cmd = format!("run-shell \"{} cycle-prev\"", binary_str);
-        let tmux_wn_cmd = format!("run-shell \"{} window-next\"", binary_str);
+        // `#{pane_id}` is expanded by tmux to the pane that triggered the key, so
+        // hive can resolve the real current session/window (a run-shell child can't
+        // determine it from the environment — see common::tmux::display_message_for_pane).
+        let tmux_cn_cmd = format!(
+            "run-shell \"{} cycle-next --pane #{{pane_id}}\"",
+            binary_str
+        );
+        let tmux_cp_cmd = format!(
+            "run-shell \"{} cycle-prev --pane #{{pane_id}}\"",
+            binary_str
+        );
+        let tmux_wn_cmd = format!(
+            "run-shell \"{} window-next --pane #{{pane_id}}\"",
+            binary_str
+        );
+        let tmux_cf_cmd = format!(
+            "run-shell \"{} cycle-free --pane #{{pane_id}}\"",
+            binary_str
+        );
 
         let bindings: Vec<(&str, &str, &str, bool)> = vec![
             ("prefix", "s", &tmux_s_cmd, tmux_s_bound),
@@ -437,6 +479,7 @@ pub fn run_setup(yes: bool) -> Result<()> {
             ("root", "C-n", &tmux_cn_cmd, tmux_cn_bound),
             ("root", "C-p", &tmux_cp_cmd, tmux_cp_bound),
             ("root", "C-\\", &tmux_wn_cmd, tmux_wn_bound),
+            ("root", "C-g", &tmux_cf_cmd, tmux_cf_bound),
         ];
 
         let missing: Vec<_> = bindings.iter().filter(|(_, _, _, bound)| !bound).collect();
@@ -648,7 +691,7 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
 
     // --- Tmux keybindings -------------------------------------------
     println!();
-    print!("Unbind tmux keybindings (prefix+s, prefix+d, Ctrl+n, Ctrl+p, Ctrl+\\)? [Y/n] ");
+    print!("Unbind tmux keybindings (prefix+s, prefix+d, Ctrl+n, Ctrl+p, Ctrl+\\, Ctrl+g)? [Y/n] ");
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
     if read_yn(yes)? {
@@ -658,7 +701,7 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
                 .stderr(std::process::Stdio::null())
                 .status();
         }
-        for key in &["C-n", "C-p", "C-\\"] {
+        for key in &["C-n", "C-p", "C-\\", "C-g"] {
             let _ = std::process::Command::new("tmux")
                 .args(["unbind-key", "-n", key])
                 .stderr(std::process::Stdio::null())

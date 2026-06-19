@@ -156,6 +156,42 @@ pub fn get_current_tmux_session() -> Option<String> {
         })
 }
 
+/// Get the current active tmux window index (matches `WindowView.window_index`).
+pub fn get_current_tmux_window() -> Option<String> {
+    Command::new("tmux")
+        .args(["display-message", "-p", "#{window_index}"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let idx = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if idx.is_empty() {
+                None
+            } else {
+                Some(idx)
+            }
+        })
+}
+
+/// Resolve a format string against a specific pane (e.g. the pane that triggered
+/// a key binding, passed in as `#{pane_id}`). The unscoped `display-message`
+/// helpers above are unreliable from a `run-shell` child — the child has no
+/// `TMUX_PANE`, so tmux falls back to a server-global "current" that may not be
+/// the pane the user is actually on. Pass the pane explicitly to avoid that.
+pub fn display_message_for_pane(pane_id: &str, format: &str) -> Option<String> {
+    Command::new("tmux")
+        .args(["display-message", "-t", pane_id, "-p", format])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
+}
+
 /// Get the session name attached to the caller's tmux client.
 pub fn get_current_session() -> Option<String> {
     Command::new("tmux")

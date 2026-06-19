@@ -67,13 +67,35 @@ pub enum Command {
         yes: bool,
     },
     /// Cycle to next tmux session (skipping skipped sessions)
-    CycleNext,
+    CycleNext {
+        /// Triggering pane id (#{pane_id}) used to locate the current session
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Cycle to previous tmux session (skipping skipped sessions)
-    CyclePrev,
+    CyclePrev {
+        /// Triggering pane id (#{pane_id}) used to locate the current session
+        #[arg(long)]
+        pane: Option<String>,
+    },
+    /// Jump to the next non-busy Claude window (current session first, then others)
+    CycleFree {
+        /// Triggering pane id (#{pane_id}) used to locate the current window
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Cycle to next tmux window in the current session
-    WindowNext,
+    WindowNext {
+        /// Triggering pane id (#{pane_id}) used to locate the current session
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Cycle to previous tmux window in the current session
-    WindowPrev,
+    WindowPrev {
+        /// Triggering pane id (#{pane_id}) used to locate the current session
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Create/attach to a tmux session for a registered project
     Connect {
         /// Project key from the registry

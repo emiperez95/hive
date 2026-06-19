@@ -33,10 +33,13 @@ fn main() -> Result<()> {
         Some(Command::Setup { yes }) => cli::setup::run_setup(yes),
         Some(Command::Update) => cli::update::run_update(),
         Some(Command::Uninstall { yes }) => cli::setup::run_uninstall(yes),
-        Some(Command::CycleNext) => cli::session::run_cycle(true),
-        Some(Command::CyclePrev) => cli::session::run_cycle(false),
-        Some(Command::WindowNext) => cli::session::run_window_cycle(true),
-        Some(Command::WindowPrev) => cli::session::run_window_cycle(false),
+        Some(Command::CycleNext { pane }) => cli::session::run_cycle(true, pane.as_deref()),
+        Some(Command::CyclePrev { pane }) => cli::session::run_cycle(false, pane.as_deref()),
+        Some(Command::CycleFree { pane }) => cli::session::run_cycle_free(pane.as_deref()),
+        Some(Command::WindowNext { pane }) => cli::session::run_window_cycle(true, pane.as_deref()),
+        Some(Command::WindowPrev { pane }) => {
+            cli::session::run_window_cycle(false, pane.as_deref())
+        }
         Some(Command::Connect { key }) => cli::session::run_connect(&key),
         Some(Command::Project { command }) => match *command {
             cmd @ ProjectCommand::Add { .. } => cli::project::run_project_add(cmd),
