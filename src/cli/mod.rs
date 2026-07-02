@@ -7,6 +7,7 @@ pub mod hook;
 pub mod project;
 pub mod session;
 pub mod setup;
+pub mod stats;
 pub mod todo;
 pub mod update;
 pub mod worktree;
@@ -51,7 +52,7 @@ pub enum Command {
     Tui,
     /// Process a Claude Code hook event (reads JSON from stdin)
     Hook {
-        /// Hook event type (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
+        /// Hook event type (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification, SessionEnd)
         event: String,
     },
     /// Register hooks in ~/.claude/settings.json and tmux keybinding
@@ -127,6 +128,22 @@ pub enum Command {
     Collapse,
     /// Auto-attach to the first available tmux session
     Start,
+    /// Show usage stats from the activity log
+    Stats {
+        /// How many days back to summarize (default: 7)
+        #[arg(long, default_value = "7")]
+        days: i64,
+    },
+    /// Append an activity event (invoked by tmux focus hooks). Hidden from help.
+    #[command(hide = true)]
+    Event {
+        /// Event kind: focus | blur
+        kind: String,
+        /// Session name (for focus events)
+        session: Option<String>,
+        /// Window index (for focus events)
+        window: Option<String>,
+    },
     /// Start web dashboard for mobile access
     Web {
         /// Port to listen on

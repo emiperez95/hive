@@ -191,6 +191,13 @@ pub fn freeze_window(target: &FreezeTarget, note: &str) -> Result<String> {
     state.frozen.insert(key.clone(), entry);
     state.save()?;
 
+    // This window now lives in frozen.json; drop it from the "currently open" recovery
+    // snapshot so it isn't double-listed, and log the freeze.
+    if let Some(sid) = &target.claude_session_id {
+        crate::common::activity::remove_window(sid);
+        crate::common::activity::log_window_freeze(sid, &target.session_name);
+    }
+
     // Kill just this window — frees the Claude process. The conversation JSONL on disk is
     // untouched, so it stays resumable.
     let win_target = format!("{}:{}", target.session_name, target.window_index);
@@ -269,6 +276,9 @@ pub fn thaw_window(key: &str) -> Result<String> {
 
     state.frozen.remove(key);
     state.save()?;
+    if let Some(sid) = &entry.claude_session_id {
+        crate::common::activity::log_window_thaw(sid, &entry.session_name);
+    }
     Ok(entry.session_name)
 }
 

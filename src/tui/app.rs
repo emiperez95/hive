@@ -49,6 +49,7 @@ pub enum SearchResult {
     Project(String),  // Project name from registry (not active)
     Worktree(String), // Worktree session name from worktrees.json (not active)
     Frozen(String),   // Frozen (hibernated) session name from frozen.json (not live)
+    Recover(String),  // Recoverable open window (claude_session_id) from open-windows.json
 }
 
 /// A quick-jump target in hint mode: either a whole session or a specific
@@ -158,6 +159,12 @@ pub struct App {
     // Window picker (multi-Claude session): candidate windows + highlighted index
     pub freeze_choices: Vec<crate::common::frozen::FreezeTarget>,
     pub freeze_choice_selected: usize,
+    // "Currently open" snapshot — Claude windows recoverable after a restart, reloaded each
+    // refresh. Surfaced as a 🕘 group in the picker when no sessions are live.
+    pub open_windows: crate::common::activity::OpenWindowsState,
+    // One-shot: on the first refresh, if no sessions are live but windows were recorded, open
+    // the picker so the recovery list is shown straight away.
+    pub auto_recover: bool,
 }
 
 impl App {
@@ -214,6 +221,8 @@ impl App {
             pending_freeze: None,
             freeze_choices: Vec::new(),
             freeze_choice_selected: 0,
+            open_windows: crate::common::activity::OpenWindowsState::load(),
+            auto_recover: true,
         }
     }
 
@@ -236,6 +245,22 @@ impl App {
                 || entry.note.to_lowercase().contains(&query);
             if matches {
                 self.search_results.push(SearchResult::Frozen(entry.key()));
+            }
+        }
+
+        // Recoverable windows from the last run, pinned right after the frozen group. Only
+        // surfaced when no sessions are live (the post-restart case) — during normal use the
+        // live sessions and their project/worktree rows cover everything, so a ghost list
+        // would just be clutter. Each row resolves by claude_session_id.
+        if self.session_infos.is_empty() {
+            for win in self.open_windows.sorted() {
+                let matches = query.is_empty()
+                    || win.session_name.to_lowercase().contains(&query)
+                    || win.window_name.to_lowercase().contains(&query);
+                if matches {
+                    self.search_results
+                        .push(SearchResult::Recover(win.claude_session_id.clone()));
+                }
             }
         }
 
@@ -346,11 +371,16 @@ impl App {
         }
 
         // Sort the non-pinned results (projects/worktrees): favorites first, preserving
-        // relative order. The pinned prefix is the leading run of Frozen then Active rows.
+        // relative order. The pinned prefix is the leading run of Frozen, Recover, then Active.
         let pinned_count = self
             .search_results
             .iter()
-            .take_while(|r| matches!(r, SearchResult::Frozen(_) | SearchResult::Active(_)))
+            .take_while(|r| {
+                matches!(
+                    r,
+                    SearchResult::Frozen(_) | SearchResult::Recover(_) | SearchResult::Active(_)
+                )
+            })
             .count();
         if pinned_count < self.search_results.len() {
             let non_active = self.search_results.split_off(pinned_count);
@@ -359,7 +389,11 @@ impl App {
             for r in non_active {
                 let name = match &r {
                     SearchResult::Project(n) | SearchResult::Worktree(n) => n,
-                    SearchResult::Active(_) | SearchResult::Frozen(_) => unreachable!(),
+                    SearchResult::Active(_)
+                    | SearchResult::Frozen(_)
+                    | SearchResult::Recover(_) => {
+                        unreachable!()
+                    }
                 };
                 if self.favorite_sessions.contains(name) {
                     fav_results.push(r);
@@ -468,7 +502,8 @@ impl App {
             SearchResult::Active(_)
             | SearchResult::Project(_)
             | SearchResult::Worktree(_)
-            | SearchResult::Frozen(_) => 1,
+            | SearchResult::Frozen(_)
+            | SearchResult::Recover(_) => 1,
         }
     }
 
@@ -501,8 +536,9 @@ impl App {
     /// Apply gathered session data to app state (cheap — runs on main thread).
     /// Handles sorting, permission key assignment, and selection stabilization.
     pub fn apply_refresh(&mut self, mut session_infos: Vec<SessionInfo>) {
-        // Keep frozen state current so the picker group and footer count stay fresh.
+        // Keep frozen + recovery state current so the picker groups and footer counts stay fresh.
         self.reload_frozen();
+        self.reload_open_windows();
 
         // Sort: skipped last, Claude before non-Claude, favorites first
         session_infos.sort_by_key(|s| {
@@ -895,6 +931,11 @@ impl App {
         self.frozen_state = crate::common::frozen::FrozenState::load();
     }
 
+    /// Reload the "currently open" snapshot from disk (on refresh / after discard).
+    pub fn reload_open_windows(&mut self) {
+        self.open_windows = crate::common::activity::OpenWindowsState::load();
+    }
+
     /// Discard the highlighted frozen entry in the picker without restoring it.
     pub fn discard_selected_frozen(&mut self) {
         let Some(SearchResult::Frozen(name)) = self.search_results.get(self.selected).cloned()
@@ -905,6 +946,17 @@ impl App {
             self.reload_frozen();
             self.update_search_results();
         }
+    }
+
+    /// Drop the highlighted recoverable window from the log (conversation stays on disk).
+    pub fn discard_selected_recover(&mut self) {
+        let Some(SearchResult::Recover(sid)) = self.search_results.get(self.selected).cloned()
+        else {
+            return;
+        };
+        crate::common::activity::remove_window(&sid);
+        self.reload_open_windows();
+        self.update_search_results();
     }
 
     pub fn delete_selected_todo(&mut self) {
@@ -1002,14 +1054,17 @@ impl App {
     }
 
     pub fn toggle_skip(&mut self, name: &str) {
-        if self.skipped_sessions.contains(name) {
+        let skipped = if self.skipped_sessions.contains(name) {
             self.skipped_sessions.remove(name);
             self.error_message = Some((format!("Cycling ON for '{}'", name), Instant::now()));
+            false
         } else {
             self.skipped_sessions.insert(name.to_string());
             self.error_message = Some((format!("Cycling OFF for '{}'", name), Instant::now()));
-        }
+            true
+        };
         save_skipped_sessions(&self.skipped_sessions);
+        crate::common::activity::log_skip(name, skipped);
     }
 
     /// Remove a session from the skipped set if it's there (no-op otherwise).

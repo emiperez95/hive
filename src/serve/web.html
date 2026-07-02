@@ -432,6 +432,8 @@
   .chat-empty {
     flex: 1;
     display: flex;
+    flex-direction: column;
+    gap: 12px;
     align-items: center;
     justify-content: center;
     color: var(--outline);
@@ -1382,6 +1384,54 @@
 
   .info-overlay.active { display: flex; }
 
+  /* Usage/stats view */
+  .stats-tabs {
+    display: flex; gap: 6px; margin-bottom: 16px;
+    background: var(--surface-container); border-radius: 10px; padding: 4px;
+  }
+  .stats-tab {
+    flex: 1; border: none; background: none; cursor: pointer;
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    color: #5b6168;
+  }
+  .stats-tab.active { background: var(--surface-container-lowest); color: var(--primary); }
+  .stats-pane.hidden { display: none; }
+  .stats-note { font-size: 12px; color: #5b6168; margin-top: 4px; line-height: 1.4; }
+  .header-right { display: flex; align-items: center; gap: 10px; }
+  .hdr-btn {
+    background: none; border: none; padding: 4px; cursor: pointer;
+    color: var(--primary); display: flex; align-items: center;
+  }
+  .hdr-btn .material-symbols-outlined { font-size: 24px; }
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px;
+  }
+  .stat-cell {
+    background: var(--surface-container-low); border-radius: 12px;
+    padding: 12px 8px; text-align: center;
+  }
+  .stat-num { font-size: 26px; font-weight: 700; color: var(--primary); line-height: 1.1; }
+  .stat-label { font-size: 11px; color: #5b6168; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .stats-section-title { font-size: 13px; font-weight: 600; color: #3a4046; margin: 4px 0 10px; }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+  .bar-row .bar-day { width: 78px; color: #5b6168; flex-shrink: 0; }
+  .bar-track { flex: 1; background: var(--surface-container-high); border-radius: 6px; height: 14px; overflow: hidden; }
+  .bar-fill { background: var(--primary-container); height: 100%; border-radius: 6px; min-width: 2px; }
+  .bar-row .bar-num { width: 22px; text-align: right; color: #3a4046; font-weight: 600; flex-shrink: 0; }
+  .recent-row {
+    display: flex; align-items: baseline; gap: 8px; padding: 7px 0;
+    border-top: 1px solid var(--surface-container-high); font-size: 12.5px;
+  }
+  .recent-when { width: 66px; color: #8a9098; flex-shrink: 0; }
+  .recent-ev {
+    font-weight: 600; text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.03em;
+    width: 52px; flex-shrink: 0;
+  }
+  .recent-ev.open { color: var(--secondary); }
+  .recent-ev.close, .recent-ev.kill { color: #b3261e; }
+  .recent-ev.freeze, .recent-ev.thaw { color: var(--primary); }
+  .recent-who { color: #3a4046; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   .info-sheet {
     background: var(--surface-container-lowest);
     border-radius: 2rem 2rem 0 0;
@@ -1714,9 +1764,14 @@
         <span class="material-symbols-outlined header-icon">sensors</span>
         <h1>SESSIONS</h1>
       </div>
-      <div class="conn-pill">
-        <span id="connDot" class="conn-dot" style="background:var(--secondary)"></span>
-        <span class="conn-label">Connected</span>
+      <div class="header-right">
+        <button class="hdr-btn" onclick="openStats()" aria-label="Usage">
+          <span class="material-symbols-outlined">insights</span>
+        </button>
+        <div class="conn-pill">
+          <span id="connDot" class="conn-dot" style="background:var(--secondary)"></span>
+          <span class="conn-label">Connected</span>
+        </div>
       </div>
     </div>
     <div class="session-list" id="sessionList">
@@ -1800,6 +1855,20 @@
       </button>
     </div>
     <div class="modal-body" id="infoModalContent"></div>
+  </div>
+</div>
+
+<!-- Usage/stats modal (bottom sheet) -->
+<div class="info-overlay" id="statsModal" onclick="closeStatsModal(event)">
+  <div class="info-sheet">
+    <div class="modal-handle"><div class="modal-handle-bar"></div></div>
+    <div class="modal-header">
+      <span class="modal-title">Usage · last 7 days</span>
+      <button class="modal-close" onclick="closeStatsModal()">
+        <span class="material-symbols-outlined">close</span>
+      </button>
+    </div>
+    <div class="modal-body" id="statsContent"></div>
   </div>
 </div>
 
@@ -2411,7 +2480,16 @@ function renderMessages() {
   const isAtBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 40;
 
   if (currentMessages.length === 0) {
-    chatArea.innerHTML = '<div class="chat-empty">No messages yet</div>';
+    const s = sessions.find(x => x.name === selectedSession);
+    if (s && s.claude_continue_failed) {
+      chatArea.innerHTML =
+        '<div class="chat-empty">' +
+          '<div>No conversation to continue in this session.</div>' +
+          '<button class="quick-btn" onclick="startClaude()">Start new Claude session</button>' +
+        '</div>';
+    } else {
+      chatArea.innerHTML = '<div class="chat-empty">No messages yet</div>';
+    }
   } else {
     let prevRole = '';
     chatArea.innerHTML = currentMessages.map((m, idx) => {
@@ -2447,10 +2525,25 @@ function renderMessages() {
   if (window.Prism) Prism.highlightAllUnder(chatArea);
 }
 
+// --- Web viewing telemetry (a stream separate from tmux focus) ---
+// web_view = now looking at a session (or the list, when session is null);
+// web_blur = tab hidden or page closing → stop counting. Beacon survives unload.
+function postWebEvent(event, session, useBeacon) {
+  try {
+    const payload = JSON.stringify({ event: event, session: session || null });
+    if (useBeacon && navigator.sendBeacon) {
+      navigator.sendBeacon('/api/web-event', payload);
+    } else {
+      fetch('/api/web-event', { method: 'POST', body: payload, keepalive: true }).catch(() => {});
+    }
+  } catch (e) {}
+}
+
 // --- Navigation (uses History API so iOS back gesture works) ---
 function openConversation(name, paneId) {
   stopTts();
   selectedSession = name;
+  postWebEvent('web_view', name);
   selectedWindow = paneId || null;
   currentMessages = [];
   lastMessagesJson = '';
@@ -2489,6 +2582,7 @@ function selectWindow(encodedName, encodedPaneId) {
 function showList() {
   selectedSession = null;
   selectedWindow = null;
+  postWebEvent('web_view', null);
   currentMessages = [];
   stopMessagePolling();
   stopTts();
@@ -2552,11 +2646,25 @@ window.addEventListener('popstate', (e) => {
     document.getElementById('pickerModal').classList.remove('active');
     return;
   }
+  // Close usage/stats modal
+  if (document.getElementById('statsModal').classList.contains('active')) {
+    document.getElementById('statsModal').classList.remove('active');
+    return;
+  }
   showList();
 });
 
 // Push initial state so first back doesn't leave the page
 history.replaceState({ view: 'list' }, '');
+
+// Web viewing telemetry: page load starts a view; tab hide/show and page close bound it so we
+// stop counting when the browser loses focus or is closed.
+postWebEvent('web_view', selectedSession);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) postWebEvent('web_blur', null, true);
+  else postWebEvent('web_view', selectedSession);
+});
+window.addEventListener('pagehide', () => postWebEvent('web_blur', null, true));
 
 // --- Sending ---
 async function sendQuick(text) {
@@ -2581,6 +2689,13 @@ async function sendMessage() {
   input.value = '';
   wasAtBottom = true;
   await sendQuick(text);
+}
+
+// Launch a fresh `claude` in a session whose `claude -c` exited (no conversation).
+async function startClaude() {
+  if (!selectedSession) return;
+  await sendQuick('claude');
+  wasAtBottom = true;
 }
 
 // --- Polling ---
@@ -2973,6 +3088,118 @@ async function connectProject(sessionName) {
 // --- Session Info Modal ---
 let currentInfoSession = null;
 let currentInfoData = null;
+
+function relativeTime(ts) {
+  const t = Date.parse(ts);
+  if (isNaN(t)) return '';
+  const secs = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+  return Math.floor(secs / 86400) + 'd ago';
+}
+
+async function openStats() {
+  history.pushState({ view: 'stats' }, '');
+  document.getElementById('statsModal').classList.add('active');
+  document.getElementById('statsContent').innerHTML = '<div class="loading"><span class="dot-pulse">Loading...</span></div>';
+  try {
+    const res = await fetch('/api/stats?days=7');
+    renderStats(await res.json());
+  } catch (e) {
+    document.getElementById('statsContent').innerHTML = '<div class="loading">Failed to load usage</div>';
+  }
+}
+
+function closeStatsModal(event) {
+  if (event && event.target !== document.getElementById('statsModal') && !event.target.classList.contains('modal-close') && !event.target.closest('.modal-close')) return;
+  if (document.getElementById('statsModal').classList.contains('active')) {
+    document.getElementById('statsModal').classList.remove('active');
+    history.back();
+  }
+}
+
+function switchStatsTab(tab) {
+  for (const el of document.querySelectorAll('.stats-tab')) {
+    el.classList.toggle('active', el.dataset.tab === tab);
+  }
+  for (const el of document.querySelectorAll('.stats-pane')) {
+    el.classList.toggle('hidden', el.dataset.pane !== tab);
+  }
+}
+
+function renderStats(d) {
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const cell = (num, label) => '<div class="stat-cell"><div class="stat-num">' + (num || 0) + '</div><div class="stat-label">' + label + '</div></div>';
+  const label = (ev) => ({ window_open: 'open', window_close: 'close', window_freeze: 'freeze', window_thaw: 'thaw', session_kill: 'kill', focus: 'focus', blur: 'blur', skip: 'skip', unskip: 'unskip', spread: 'spread', collapse: 'collapse', web_view: 'view', web_blur: 'away' }[ev] || ev);
+  const cls = (ev) => ({ window_open: 'open', window_close: 'close', window_freeze: 'freeze', window_thaw: 'thaw', session_kill: 'kill' }[ev] || '');
+  const fmtDur = (secs) => { const m = Math.floor(secs / 60); return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : (m >= 1 ? m + 'm' : secs + 's'); };
+  const timeRows = (list, total) => {
+    if (!list || !list.length) return '';
+    const max = Math.max(1, ...list.map((x) => x.secs));
+    let h = '<div class="stats-section-title">Active time · ' + fmtDur(total) + ' total</div>';
+    for (const x of list.slice(0, 8)) {
+      const pct = Math.round((x.secs / max) * 100);
+      h += '<div class="bar-row"><span class="bar-day" style="width:auto;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(x.session) + '</span>'
+        + '<span class="bar-track" style="max-width:120px"><span class="bar-fill" style="width:' + pct + '%"></span></span>'
+        + '<span class="bar-num" style="width:auto;min-width:44px">' + fmtDur(x.secs) + '</span></div>';
+    }
+    return h;
+  };
+  const recentRows = (events) => {
+    if (!events || !events.length) return '<div class="loading" style="padding:16px">Nothing yet.</div>';
+    let h = '';
+    for (const e of events) {
+      const who = esc(e.session || '') + (e.window ? ' · ' + esc(e.window) : '');
+      h += '<div class="recent-row"><span class="recent-when">' + esc(relativeTime(e.ts)) + '</span>'
+        + '<span class="recent-ev ' + cls(e.event) + '">' + label(e.event) + '</span>'
+        + '<span class="recent-who">' + who + '</span></div>';
+    }
+    return h;
+  };
+
+  // --- Sessions tab (tmux lifecycle + switches) ---
+  let sessions = '<div class="stats-grid">';
+  sessions += cell(d.opened, 'opened');
+  sessions += cell(d.closed, 'closed');
+  sessions += cell(d.open_now, 'open now');
+  sessions += cell(d.frozen, 'frozen');
+  sessions += cell(d.thawed, 'thawed');
+  sessions += cell(d.killed, 'killed');
+  sessions += cell(d.switches, 'switches');
+  sessions += '</div>';
+  const byDay = d.opens_by_day || [];
+  if (byDay.length) {
+    const max = Math.max(1, ...byDay.map((x) => x.count));
+    sessions += '<div class="stats-section-title">Windows opened by day</div>';
+    for (const x of byDay) {
+      const pct = Math.round((x.count / max) * 100);
+      sessions += '<div class="bar-row"><span class="bar-day">' + esc(x.day) + '</span>'
+        + '<span class="bar-track"><span class="bar-fill" style="width:' + pct + '%"></span></span>'
+        + '<span class="bar-num">' + x.count + '</span></div>';
+    }
+  }
+  sessions += timeRows(d.active_by_session, d.active_total_secs);
+  if (d.slept_secs) sessions += '<div class="stats-note">' + fmtDur(d.slept_secs) + ' of machine sleep subtracted (from the OS power log).</div>';
+  sessions += '<div class="stats-section-title" style="margin-top:20px">Recent</div>' + recentRows(d.recent_sessions);
+
+  // --- Web tab (dashboard viewing) ---
+  let web = '<div class="stats-grid">';
+  web += cell(d.web_views, 'views');
+  web += cell(d.web_sessions, 'sessions seen');
+  web += '</div>';
+  web += '<div class="stats-note">Time you spent viewing sessions in this dashboard — a separate stream from the tmux "switches" above.</div>';
+  web += timeRows(d.web_by_session, d.web_total_secs);
+  web += '<div class="stats-section-title" style="margin-top:20px">Recent</div>' + recentRows(d.recent_web);
+
+  const html = '<div class="stats-tabs">'
+    + '<button class="stats-tab active" data-tab="sessions" onclick="switchStatsTab(\'sessions\')">Sessions</button>'
+    + '<button class="stats-tab" data-tab="web" onclick="switchStatsTab(\'web\')">Web</button>'
+    + '</div>'
+    + '<div class="stats-pane" data-pane="sessions">' + sessions + '</div>'
+    + '<div class="stats-pane hidden" data-pane="web">' + web + '</div>';
+  document.getElementById('statsContent').innerHTML = html;
+}
 
 async function openSessionInfo() {
   if (!selectedSession) return;

@@ -16,7 +16,8 @@ pub(crate) fn is_hive_hook_command(cmd: &str) -> bool {
         || cmd.ends_with(" hook PostToolUse")
         || cmd.ends_with(" hook UserPromptSubmit")
         || cmd.ends_with(" hook PermissionRequest")
-        || cmd.ends_with(" hook Notification");
+        || cmd.ends_with(" hook Notification")
+        || cmd.ends_with(" hook SessionEnd");
     is_hive_event && (cmd.contains("/hive hook ") || cmd.starts_with("hive hook "))
 }
 
@@ -113,6 +114,105 @@ fn save_settings(path: &std::path::Path, settings: &serde_json::Value) -> Result
     Ok(())
 }
 
+/// The tmux focus/blur hooks that feed the activity log. Sourced from a generated file so the
+/// nested `run-shell` quoting (single-quoted `#{format}` args) survives `~/.tmux.conf`; the
+/// brace form `{ … }` avoids escaping the double-quoted shell command. Fires `hive event`.
+fn focus_hooks_conf(binary_str: &str) -> String {
+    let template = r#"# hive focus/blur hooks — feed the session activity log. Managed by `hive setup`.
+# Persist across tmux restarts by adding to ~/.tmux.conf:  source-file ~/.hive/focus-hooks.tmux
+set -g focus-events on
+set-hook -g client-session-changed { run-shell -b "'BIN' event focus '#{session_name}' '#{window_index}'" }
+set-hook -g after-select-window { run-shell -b "'BIN' event focus '#{session_name}' '#{window_index}'" }
+set-hook -g client-attached { run-shell -b "'BIN' event focus '#{session_name}' '#{window_index}'" }
+set-hook -g client-focus-in { run-shell -b "'BIN' event focus '#{session_name}' '#{window_index}'" }
+set-hook -g client-detached { run-shell -b "'BIN' event blur" }
+set-hook -g client-focus-out { run-shell -b "'BIN' event blur" }
+"#;
+    template.replace("BIN", binary_str)
+}
+
+/// Distinctive substring marking hive's `~/.tmux.conf` source-file line.
+const TMUX_CONF_MARKER: &str = "focus-hooks.tmux";
+
+/// Outcome of ensuring the source-file line is present in `~/.tmux.conf`.
+enum ConfStatus {
+    Present,
+    Added,
+    Failed,
+}
+
+/// Ensure `~/.tmux.conf` contains a line matching `marker`; append `block` if missing. Creates
+/// the file if absent. Preserves existing content.
+fn ensure_line_in_file(path: &std::path::Path, marker: &str, block: &str) -> ConfStatus {
+    use std::fs;
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing.contains(marker) {
+        return ConfStatus::Present;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(block);
+    match fs::write(path, updated) {
+        Ok(_) => ConfStatus::Added,
+        Err(_) => ConfStatus::Failed,
+    }
+}
+
+/// Write `~/.hive/focus-hooks.tmux`, make `~/.tmux.conf` `source-file` it (so the hooks survive
+/// tmux/machine restarts), and source it into the running server. Fully idempotent — safe to
+/// run on every `hive setup`. Prints a status line.
+fn ensure_tmux_focus_hooks(binary_str: &str, home: &std::path::Path) {
+    use std::fs;
+    let conf_path = home.join(".hive").join("focus-hooks.tmux");
+    let desired = focus_hooks_conf(binary_str);
+    if !fs::read_to_string(&conf_path)
+        .map(|c| c == desired)
+        .unwrap_or(false)
+    {
+        if let Some(parent) = conf_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&conf_path, &desired);
+    }
+
+    // Persistence: make ~/.tmux.conf source the hook file on every tmux server start.
+    let tmux_conf = home.join(".tmux.conf");
+    let block = format!(
+        "\n# hive activity tracking — focus/blur hooks (managed by `hive setup`)\nsource-file {}\n",
+        conf_path.display()
+    );
+    let persisted = ensure_line_in_file(&tmux_conf, TMUX_CONF_MARKER, &block);
+
+    // Apply to the running server immediately.
+    let live = std::process::Command::new("tmux")
+        .args(["source-file", &conf_path.to_string_lossy()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let when = if live {
+        "active now"
+    } else {
+        "applies on next tmux start"
+    };
+    match persisted {
+        ConfStatus::Present => {
+            println!("  [ok]      tmux focus hooks ({when}; persisted in ~/.tmux.conf)")
+        }
+        ConfStatus::Added => {
+            println!("  [set]     tmux focus hooks ({when}; added source-file to ~/.tmux.conf)")
+        }
+        ConfStatus::Failed => println!(
+            "  [warn]    tmux focus hooks {when}, but couldn't update ~/.tmux.conf — add \
+             `source-file {}` manually",
+            conf_path.display()
+        ),
+    }
+}
+
 /// Setup hooks in ~/.claude/settings.json
 pub fn run_setup(yes: bool) -> Result<()> {
     use std::fs;
@@ -141,6 +241,7 @@ pub fn run_setup(yes: bool) -> Result<()> {
         "PostToolUse",
         "UserPromptSubmit",
         "PermissionRequest",
+        "SessionEnd",
     ];
 
     // Check which hooks are already installed (with correct binary path)
@@ -229,6 +330,10 @@ pub fn run_setup(yes: bool) -> Result<()> {
     // Report status
     println!("hive setup status:");
     println!();
+
+    // tmux focus/blur hooks (activity tracking) — self-contained + idempotent, so it runs
+    // regardless of the hook/keybinding flow below (and even on the "already set up" path).
+    ensure_tmux_focus_hooks(&binary_str, &home);
 
     if !hooks_ok.is_empty() {
         for event in &hooks_ok {
@@ -711,6 +816,43 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
         println!("Remove from ~/.tmux.conf manually if present.");
     } else {
         println!("Skipped tmux keybinding removal.");
+    }
+
+    // --- Tmux focus hooks (activity tracking) -----------------------
+    println!();
+    print!("Remove tmux focus/blur hooks (activity tracking)? [Y/n] ");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    if read_yn(yes)? {
+        for hook in &[
+            "client-session-changed",
+            "after-select-window",
+            "client-attached",
+            "client-focus-in",
+            "client-detached",
+            "client-focus-out",
+        ] {
+            let _ = std::process::Command::new("tmux")
+                .args(["set-hook", "-gu", hook])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        // Drop the source-file line (and its comment) from ~/.tmux.conf.
+        let tmux_conf = home.join(".tmux.conf");
+        if let Ok(content) = fs::read_to_string(&tmux_conf) {
+            let mut filtered: String = content
+                .lines()
+                .filter(|l| !l.contains(TMUX_CONF_MARKER) && !l.contains("hive activity tracking"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if content.ends_with('\n') && !filtered.is_empty() {
+                filtered.push('\n');
+            }
+            let _ = fs::write(&tmux_conf, filtered);
+        }
+        let _ = fs::remove_file(home.join(".hive").join("focus-hooks.tmux"));
+        println!("Tmux focus hooks removed (live hooks, ~/.tmux.conf line, and hook file).");
+    } else {
+        println!("Skipped focus-hook removal.");
     }
 
     // --- janus-wt-portal agent --------------------------------------

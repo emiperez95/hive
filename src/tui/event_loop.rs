@@ -120,6 +120,21 @@ pub fn run_tui(
                         ));
                     }
                 }
+
+                // After the first refresh, if nothing is live but we recorded windows last
+                // run (the post-restart case), open the picker so the 🕘 recovery list shows.
+                if app.auto_recover {
+                    app.auto_recover = false;
+                    if app.input_mode == InputMode::Normal
+                        && app.showing_detail.is_none()
+                        && app.session_infos.is_empty()
+                        && !app.open_windows.windows.is_empty()
+                    {
+                        app.input_mode = InputMode::Search;
+                        app.load_project_names();
+                        app.update_search_results();
+                    }
+                }
             }
         }
 
@@ -474,6 +489,24 @@ pub fn run_tui(
                                             }
                                         }
                                     }
+                                    SearchResult::Recover(sid) => {
+                                        // Phase 1 is read-only: one-tap restore lands later.
+                                        // Surface the conversation + the manual resume command
+                                        // so it can still be recovered by hand. `Del` discards.
+                                        if let Some(win) = app.open_windows.windows.get(&sid) {
+                                            app.error_message = Some((
+                                                format!(
+                                                    "Last session: {} · {} — resume: cd {} && claude --resume {}",
+                                                    win.session_name,
+                                                    win.window_label(),
+                                                    win.cwd,
+                                                    win.claude_session_id
+                                                ),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        needs_redraw = true;
+                                    }
                                 }
                             } else {
                                 app.input_mode = InputMode::Normal;
@@ -500,14 +533,12 @@ pub fn run_tui(
                             needs_redraw = true;
                         }
                         KeyCode::Delete => {
-                            // On a frozen row, discard it; otherwise archive a project.
-                            if matches!(
-                                app.search_results.get(app.selected),
-                                Some(SearchResult::Frozen(_))
-                            ) {
-                                app.discard_selected_frozen();
-                            } else {
-                                app.toggle_archive_selected_project();
+                            // On a frozen row discard it; on a recovery row drop it from the
+                            // log; otherwise archive/unarchive the highlighted project.
+                            match app.search_results.get(app.selected) {
+                                Some(SearchResult::Frozen(_)) => app.discard_selected_frozen(),
+                                Some(SearchResult::Recover(_)) => app.discard_selected_recover(),
+                                _ => app.toggle_archive_selected_project(),
                             }
                             needs_redraw = true;
                         }

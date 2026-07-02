@@ -78,8 +78,28 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<S
         ports.sort_unstable();
         ports.dedup();
         let last_activity = windows.iter().filter_map(|w| w.last_activity.clone()).max();
-        let pane = windows.first().and_then(|w| w.pane.clone());
         let status = aggregate_status(&windows);
+
+        // When no Claude is running, check whether the pane is a shell where `claude -c`
+        // failed with "No conversation found to continue". Only then do we expose the pane
+        // for send-keys and flag it startable — a pane running a server or another CLI tool
+        // must stay untargetable.
+        let mut pane = windows.first().and_then(|w| w.pane.clone());
+        let mut claude_continue_failed = false;
+        if pane.is_none() {
+            if let Some((s, w, p)) = session.windows.first().and_then(|win| {
+                win.panes
+                    .first()
+                    .map(|p| (session.name.clone(), win.index.clone(), p.index.clone()))
+            }) {
+                if crate::common::tmux::capture_pane(&s, &w, &p)
+                    .is_some_and(|t| t.contains("No conversation found to continue"))
+                {
+                    claude_continue_failed = true;
+                    pane = Some((s, w, p));
+                }
+            }
+        }
 
         // Resources are counted from the Claude panes' process trees only.
         let mut processes: Vec<ProcessView> = session_instances
@@ -112,6 +132,7 @@ pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<S
             last_activity,
             attached: other_client_sessions.contains(&session.name),
             pane,
+            claude_continue_failed,
             skipped: skipped_sessions.contains(&session.name),
             todo_count: session_todos
                 .get(&session.name)

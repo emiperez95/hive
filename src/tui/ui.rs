@@ -72,6 +72,18 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Blue),
         ));
     }
+    // Show the recoverable-window count only when nothing is live — that's when the picker
+    // surfaces the 🕘 group (and typically right after a restart).
+    if app.session_infos.is_empty() {
+        let recover_count = app.open_windows.windows.len();
+        if recover_count > 0 {
+            header_spans.push(Span::raw("  "));
+            header_spans.push(Span::styled(
+                format!("🕘 {recover_count} from last session (/)"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
     let header = Line::from(header_spans);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -1095,6 +1107,37 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                         ));
                     }
                     let rel = crate::common::frozen::relative_time(&entry.frozen_at);
+                    if !rel.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · {rel}"),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                    lines_remaining -= 1;
+                }
+                SearchResult::Recover(sid) => {
+                    let Some(win) = app.open_windows.windows.get(sid) else {
+                        idx += 1;
+                        continue;
+                    };
+                    let mut spans = vec![
+                        prefix,
+                        Span::styled("🕘 ", style),
+                        Span::styled(win.session_name.clone(), style.add_modifier(Modifier::BOLD)),
+                    ];
+                    let win_label = win.window_label();
+                    if !win_label.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · {win_label}"),
+                            Style::default().fg(Color::Cyan),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        " [last session]",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    let rel = crate::common::frozen::relative_time(&win.last_seen);
                     if !rel.is_empty() {
                         spans.push(Span::styled(
                             format!(" · {rel}"),

@@ -1,5 +1,6 @@
 //! Common types and utilities shared between TUI and hook command.
 
+pub mod activity;
 pub mod chrome;
 pub mod debug;
 pub mod frozen;
@@ -8,6 +9,7 @@ pub mod instances;
 pub mod iterm;
 #[allow(dead_code)]
 pub mod jsonl;
+pub mod machine;
 pub mod persistence;
 pub mod ports;
 pub mod process;

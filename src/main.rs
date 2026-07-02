@@ -54,6 +54,12 @@ fn main() -> Result<()> {
         Some(Command::Todo { command }) => cli::todo::run_todo(command),
         Some(Command::Spread { count }) => cli::session::run_spread(count),
         Some(Command::Collapse) => cli::session::run_collapse(),
+        Some(Command::Stats { days }) => cli::stats::run_stats(days),
+        Some(Command::Event {
+            kind,
+            session,
+            window,
+        }) => cli::session::run_event(&kind, session.as_deref(), window.as_deref()),
         Some(Command::Web {
             port,
             dev,

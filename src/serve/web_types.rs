@@ -34,6 +34,10 @@ pub struct SessionView {
     pub attached: bool,
     /// (session, window, pane) for routing send-keys
     pub pane: Option<(String, String, String)>,
+    /// No Claude is running AND the pane shows `claude -c`'s "No conversation found to
+    /// continue" error — i.e. it's safe to offer starting a fresh Claude. False otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_continue_failed: bool,
     /// Session is in the skipped list
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,

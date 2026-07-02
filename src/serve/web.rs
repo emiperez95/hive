@@ -205,6 +205,40 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(response);
             }
 
+            (Method::Get, url) if url == "/api/stats" || url.starts_with("/api/stats?") => {
+                // Usage summary from the activity log (same aggregation as `hive stats`).
+                let days = query_param(url, "days")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(7);
+                let summary = crate::common::activity::compute_stats(days);
+                let json = serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/web-event") => {
+                // Web dashboard viewing/focus telemetry — a stream separate from tmux focus.
+                // Accepts normal fetch and `navigator.sendBeacon` (fired on tab-hide/close).
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                if let Ok(req) = serde_json::from_str::<serde_json::Value>(&body) {
+                    match req.get("event").and_then(|v| v.as_str()) {
+                        Some("web_view") => {
+                            let session = req
+                                .get("session")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty());
+                            crate::common::activity::log_web_view(session);
+                        }
+                        Some("web_blur") => crate::common::activity::log_web_blur(),
+                        _ => {}
+                    }
+                }
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ =
+                    request.respond(Response::from_string(r#"{"ok":true}"#).with_header(header));
+            }
+
             (Method::Post, "/api/tts-hls") => {
                 if let Some(ref host) = tts_host {
                     let mut body = String::new();
@@ -389,6 +423,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                 true
                             };
                             save_skipped_sessions(&set);
+                            crate::common::activity::log_skip(session, v);
                             v
                         }
                         _ => return Some(r#"{"error":"unknown flag"}"#.to_string()),

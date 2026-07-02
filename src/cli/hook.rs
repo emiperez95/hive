@@ -46,7 +46,24 @@ pub fn run_hook(event_type: &str) -> Result<()> {
     // this session_id lives in. Recording it lets the TUI/web tell apart multiple
     // Claude instances that share a working directory (one per window/pane).
     let session_id_for_pane = session_id.clone();
+    let cwd_for_record = cwd.clone();
     let tmux_pane = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty());
+
+    // SessionEnd is a lifecycle event, not a status change: drop the window from the recovery
+    // snapshot and log a clean close. Handled here since it has no HookEvent variant.
+    if event_type == "SessionEnd" {
+        let mut open = crate::common::activity::OpenWindowsState::load();
+        let session_name = open
+            .windows
+            .get(&session_id)
+            .map(|w| w.session_name.clone())
+            .unwrap_or_default();
+        if open.remove(&session_id) {
+            let _ = open.save();
+        }
+        crate::common::activity::log_window_close(&session_id, &session_name);
+        return Ok(());
+    }
 
     // Build HookEvent based on event type
     let hook_event = match event_type {
@@ -149,6 +166,31 @@ pub fn run_hook(event_type: &str) -> Result<()> {
         // tmux window name. The hook runs inside the Claude pane, so this is event-driven —
         // every hook fire keeps the window name current without polling.
         crate::common::tmux::sync_window_name_for_pane(pane);
+
+        // Record this window into the "currently open" snapshot so it can be recovered after
+        // a machine restart. Query the pane (post-sync, so #{window_name} carries the latest
+        // Claude title) for its session + window identity; the auth profile comes from this
+        // hook process's own env (inherited from the Claude pane).
+        if let Some(info) = crate::common::tmux::display_message_for_pane(
+            pane,
+            "#{session_name}\t#{window_index}\t#{window_name}",
+        ) {
+            let mut parts = info.splitn(3, '\t');
+            if let (Some(session_name), Some(window_index), Some(window_name)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                crate::common::activity::record_window_seen(&crate::common::activity::WindowSeen {
+                    claude_session_id: session_id_for_pane.clone(),
+                    session_name: session_name.to_string(),
+                    window_index: window_index.to_string(),
+                    window_name: window_name.to_string(),
+                    cwd: cwd_for_record.clone(),
+                    claude_config_dir: std::env::var("CLAUDE_CONFIG_DIR")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                });
+            }
+        }
     }
 
     if let Some(updated_session) = updated {

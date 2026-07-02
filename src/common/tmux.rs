@@ -104,6 +104,9 @@ pub fn get_tmux_panes(session: &str, window_index: &str) -> Result<Vec<TmuxPane>
 
 /// Switch to a tmux session
 pub fn switch_to_session(session_name: &str) {
+    // Focus is logged by the tmux `client-session-changed` hook, which fires for this
+    // `switch-client` and for native switches (`prefix s`, click, `switch-client` elsewhere)
+    // alike — so no explicit focus log here.
     let _ = Command::new("tmux")
         .args(["switch-client", "-t", session_name])
         .output();
@@ -341,13 +344,32 @@ pub fn send_text_to_pane(session: &str, window: &str, pane: &str, text: &str) {
         .output();
 }
 
+/// Capture the visible text of a pane (`tmux capture-pane -p`). None on failure.
+pub fn capture_pane(session: &str, window: &str, pane: &str) -> Option<String> {
+    let target = format!("{}:{}.{}", session, window, pane);
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", &target])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Kill a tmux session
 pub fn kill_tmux_session(name: &str) -> bool {
-    Command::new("tmux")
+    let killed = Command::new("tmux")
         .args(["kill-session", "-t", name])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if killed {
+        // The session is gone for good — drop its windows from the recovery snapshot and
+        // log the kill.
+        crate::common::activity::remove_windows_for_session(name);
+        crate::common::activity::log_session_kill(name);
+    }
+    killed
 }
 
 /// Mirror a Claude pane's title into its tmux window name.

@@ -191,12 +191,30 @@ pub fn run_window_cycle(forward: bool, pane: Option<&str>) -> Result<()> {
     } else {
         "previous-window"
     };
+    let session = current_session(pane);
     let mut command = std::process::Command::new(tmux);
     command.arg(cmd);
-    if let Some(session) = current_session(pane) {
-        command.args(["-t", &session]);
+    if let Some(ref session) = session {
+        command.args(["-t", session]);
     }
     command.status().ok();
+    // Focus is logged by the tmux `after-select-window` hook (covers this and native
+    // `prefix n`/`p`), so no explicit log here.
+    Ok(())
+}
+
+/// Append an activity event on behalf of a tmux focus hook (`hive event <kind> …`).
+pub fn run_event(kind: &str, session: Option<&str>, window: Option<&str>) -> Result<()> {
+    use crate::common::activity;
+    match kind {
+        "focus" => {
+            if let Some(s) = session.filter(|s| !s.is_empty()) {
+                activity::log_focus(s, window.filter(|w| !w.is_empty()));
+            }
+        }
+        "blur" => activity::log_blur(),
+        _ => {}
+    }
     Ok(())
 }
 
@@ -207,6 +225,7 @@ pub fn run_spread(count: usize) -> Result<()> {
     }
     crate::common::tmux::set_all_sessions_layout("spread");
     crate::common::iterm::spread_panes(count - 1);
+    crate::common::activity::log_spread(count);
     Ok(())
 }
 
@@ -214,6 +233,7 @@ pub fn run_spread(count: usize) -> Result<()> {
 pub fn run_collapse() -> Result<()> {
     crate::common::iterm::collapse_panes();
     crate::common::tmux::set_all_sessions_layout("collapse");
+    crate::common::activity::log_collapse();
     Ok(())
 }
 
