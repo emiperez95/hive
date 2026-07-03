@@ -14,6 +14,9 @@ pub mod persistence;
 pub mod ports;
 pub mod process;
 pub mod projects;
+// Read-only shadow model (Increment 0); wired into views in a later increment.
+#[allow(dead_code)]
+pub mod registry;
 pub mod tmux;
 pub mod types;
 pub mod worktree;
