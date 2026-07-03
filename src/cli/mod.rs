@@ -6,6 +6,7 @@
 pub mod hook;
 pub mod project;
 pub mod session;
+pub mod sessions;
 pub mod setup;
 pub mod stats;
 pub mod todo;
@@ -134,6 +135,8 @@ pub enum Command {
         #[arg(long, default_value = "7")]
         days: i64,
     },
+    /// List all known Claude sessions (live + closed), grouped by project/worktree.
+    Sessions,
     /// Append an activity event (invoked by tmux focus hooks). Hidden from help.
     #[command(hide = true)]
     Event {

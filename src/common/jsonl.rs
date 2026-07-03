@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Partial structure for parsing jsonl entries - we only need specific fields
 #[derive(Debug, Deserialize)]
@@ -118,10 +118,8 @@ pub fn scan_session_ids_in(dirs: &[PathBuf]) -> Vec<String> {
     ids.into_iter().collect()
 }
 
-/// Enumerate every Claude conversation id on disk across all auth profiles
-/// (`~/.claude/projects/<slug>/<uuid>.jsonl` + `~/.claude-*/projects/...`).
-/// On-disk existence is the source of truth for Closed/remote sessions.
-pub fn scan_all_session_ids() -> Vec<String> {
+/// All `~/.claude*/projects/<slug>` directories across every auth profile.
+fn claude_slug_dirs() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
@@ -143,7 +141,84 @@ pub fn scan_all_session_ids() -> Vec<String> {
             }
         }
     }
-    scan_session_ids_in(&slug_dirs)
+    slug_dirs
+}
+
+/// Enumerate every Claude conversation id on disk across all auth profiles
+/// (`~/.claude/projects/<slug>/<uuid>.jsonl` + `~/.claude-*/projects/...`).
+/// On-disk existence is the source of truth for Closed/remote sessions.
+pub fn scan_all_session_ids() -> Vec<String> {
+    scan_session_ids_in(&claude_slug_dirs())
+}
+
+/// A conversation discovered on disk, enriched with the cwd (read from the
+/// transcript) and last-activity (the jsonl file mtime) needed to place + bound
+/// a Closed session.
+pub struct DiskSession {
+    pub id: String,
+    pub cwd: Option<String>,
+    pub last_activity: Option<String>,
+}
+
+/// Read the first `cwd` field recorded in a jsonl transcript (Claude stamps it on
+/// entries). Bounded to the first lines so it stays cheap.
+pub fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(30).map_while(Result::ok) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Scan the given dirs for `<id>.jsonl` transcripts, capturing id + cwd + mtime.
+pub fn scan_disk_sessions_in(dirs: &[PathBuf]) -> Vec<DiskSession> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let last_activity = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+            let cwd = read_cwd_from_jsonl(&path);
+            out.push(DiskSession {
+                id,
+                cwd,
+                last_activity,
+            });
+        }
+    }
+    out
+}
+
+/// Like [`scan_all_session_ids`] but with cwd + mtime for each conversation.
+pub fn scan_all_disk_sessions() -> Vec<DiskSession> {
+    scan_disk_sessions_in(&claude_slug_dirs())
 }
 
 /// Find the most recently modified jsonl file in a Claude projects directory
@@ -967,7 +1042,7 @@ mod tests {
         std::fs::write(dir.join("22222222-bbbb.jsonl"), "{}").unwrap();
         std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
 
-        let ids = scan_session_ids_in(&[dir.clone()]);
+        let ids = scan_session_ids_in(std::slice::from_ref(&dir));
         std::fs::remove_dir_all(&dir).ok();
 
         // Only the two .jsonl basenames, sorted; the .txt file is ignored.
@@ -975,6 +1050,25 @@ mod tests {
             ids,
             vec!["11111111-aaaa".to_string(), "22222222-bbbb".to_string()]
         );
+    }
+
+    #[test]
+    fn test_scan_disk_sessions_reads_cwd_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("hive-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("abc-123.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"/home/u/hive\"}\n",
+        )
+        .unwrap();
+
+        let sessions = scan_disk_sessions_in(std::slice::from_ref(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "abc-123");
+        assert_eq!(sessions[0].cwd.as_deref(), Some("/home/u/hive"));
+        assert!(sessions[0].last_activity.is_some()); // file mtime → RFC3339
     }
 
     #[test]

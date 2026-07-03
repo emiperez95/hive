@@ -205,6 +205,20 @@ pub fn instances_for_session(session_name: &str) -> Vec<ClaudeInstance> {
         .collect()
 }
 
+/// Detect every live Claude instance across all tmux sessions, building the heavy
+/// inputs on demand. One-shot (like [`instances_for_session`]) — not for per-refresh
+/// use. Returns empty if tmux isn't running.
+pub fn detect_all_instances() -> Vec<ClaudeInstance> {
+    let Ok(sessions) = crate::common::tmux::get_tmux_sessions() else {
+        return Vec::new();
+    };
+    let sys = System::new_all();
+    let children_map = build_children_map();
+    let hook_state = HookState::load();
+    let hook_index = HookIndex::build(&hook_state);
+    detect_claude_instances(&sessions, &sys, &children_map, &hook_index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

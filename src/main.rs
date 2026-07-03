@@ -55,6 +55,7 @@ fn main() -> Result<()> {
         Some(Command::Spread { count }) => cli::session::run_spread(count),
         Some(Command::Collapse) => cli::session::run_collapse(),
         Some(Command::Stats { days }) => cli::stats::run_stats(days),
+        Some(Command::Sessions) => cli::sessions::run_sessions(),
         Some(Command::Event {
             kind,
             session,
