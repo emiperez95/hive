@@ -158,24 +158,46 @@ pub struct DiskSession {
     pub id: String,
     pub cwd: Option<String>,
     pub last_activity: Option<String>,
+    /// User-assigned conversation title (`custom-title` entry), if any.
+    pub title: Option<String>,
 }
 
-/// Read the first `cwd` field recorded in a jsonl transcript (Claude stamps it on
-/// entries). Bounded to the first lines so it stays cheap.
-pub fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
+/// Read (cwd, custom title) from a transcript's first lines in a single pass.
+/// cwd = the first entry carrying one; title = the latest `custom-title` seen in
+/// that window (the user's name for the conversation). Bounded so it stays cheap.
+pub fn read_session_meta(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(file) = fs::File::open(path) else {
+        return (None, None);
+    };
     let reader = BufReader::new(file);
-    for line in reader.lines().take(30).map_while(Result::ok) {
+    let mut cwd = None;
+    let mut title = None;
+    for line in reader.lines().take(40).map_while(Result::ok) {
         if line.is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
-                return Some(cwd.to_string());
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if cwd.is_none() {
+            if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                cwd = Some(c.to_string());
+            }
+        }
+        if v.get("type").and_then(|t| t.as_str()) == Some("custom-title") {
+            if let Some(t) = v.get("customTitle").and_then(|t| t.as_str()) {
+                if !t.is_empty() {
+                    title = Some(t.to_string()); // latest within the window wins
+                }
             }
         }
     }
-    None
+    (cwd, title)
+}
+
+/// Read just the cwd from a transcript (see [`read_session_meta`]).
+pub fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
+    read_session_meta(path).0
 }
 
 /// Scan the given dirs for `<id>.jsonl` transcripts, capturing id + cwd + mtime.
@@ -205,11 +227,12 @@ pub fn scan_disk_sessions_in(dirs: &[PathBuf]) -> Vec<DiskSession> {
                 .and_then(|m| m.modified())
                 .ok()
                 .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-            let cwd = read_cwd_from_jsonl(&path);
+            let (cwd, title) = read_session_meta(&path);
             out.push(DiskSession {
                 id,
                 cwd,
                 last_activity,
+                title,
             });
         }
     }
@@ -1058,7 +1081,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("abc-123.jsonl"),
-            "{\"type\":\"user\",\"cwd\":\"/home/u/hive\"}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":\"My Task\"}\n{\"type\":\"user\",\"cwd\":\"/home/u/hive\"}\n",
         )
         .unwrap();
 
@@ -1068,6 +1091,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "abc-123");
         assert_eq!(sessions[0].cwd.as_deref(), Some("/home/u/hive"));
+        assert_eq!(sessions[0].title.as_deref(), Some("My Task"));
         assert!(sessions[0].last_activity.is_some()); // file mtime → RFC3339
     }
 

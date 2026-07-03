@@ -60,6 +60,9 @@ pub fn run_sessions() -> Result<()> {
             if s.last_activity.is_none() {
                 s.last_activity = d.last_activity.clone();
             }
+            if s.title.is_none() {
+                s.title = d.title.clone();
+            }
         }
     }
 
@@ -155,10 +158,16 @@ pub fn render_registry(reg: &SessionRegistry) -> String {
                 .as_deref()
                 .map(|t| t.chars().take(10).collect::<String>())
                 .unwrap_or_default();
+            let title = s
+                .title
+                .as_deref()
+                .map(|t| t.chars().take(28).collect::<String>())
+                .unwrap_or_default();
             out.push_str(&format!(
-                "  {} {:8}  {:<13}  {}  {}\n",
+                "  {} {:8}  {:<28}  {:<13}  {}  {}\n",
                 marker,
                 short_id(s.id.as_str()),
+                title,
                 status_label(s),
                 s.cwd,
                 last,
@@ -186,21 +195,21 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            title: None,
         }
     }
 
     #[test]
     fn test_render_groups_and_counts() {
         let mut reg = SessionRegistry::default();
-        reg.sessions.insert(
-            "live1".to_string(),
-            mk(
-                "live1",
-                Lifecycle::Live,
-                Some("hive"),
-                Some("2026-07-02T00:00:00Z"),
-            ),
+        let mut live = mk(
+            "live1",
+            Lifecycle::Live,
+            Some("hive"),
+            Some("2026-07-02T00:00:00Z"),
         );
+        live.title = Some("My Task".to_string());
+        reg.sessions.insert("live1".to_string(), live);
         reg.sessions.insert(
             "closed1".to_string(),
             mk(
@@ -222,6 +231,7 @@ mod tests {
         assert!(out.contains("(unassigned)"));
         assert!(out.contains('●')); // a live marker
         assert!(out.contains('○')); // a closed marker
+        assert!(out.contains("My Task")); // named session's title is shown
     }
 
     #[test]

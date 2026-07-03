@@ -118,6 +118,9 @@ pub struct ClaudeSession {
     /// Hive overlay: hidden from default listings.
     #[serde(default)]
     pub archived: bool,
+    /// User-assigned conversation title (from the transcript's `custom-title`).
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 impl ClaudeSession {
@@ -282,6 +285,7 @@ impl SessionRegistry {
                     note,
                     pinned,
                     archived,
+                    title: None,
                 },
             );
         }
@@ -414,6 +418,7 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            title: None,
         }
     }
 
@@ -755,6 +760,7 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            title: None,
         }
     }
 
