@@ -97,6 +97,55 @@ pub fn candidate_projects_paths(cwd: &str) -> Vec<PathBuf> {
     paths.into_iter().filter(|p| p.exists()).collect()
 }
 
+/// Scan the given directories for `<session_id>.jsonl` files and return their
+/// basenames (session ids), deduplicated and sorted. Path-injectable so the
+/// registry's existence scan is unit-testable without touching a real home dir.
+pub fn scan_session_ids_in(dirs: &[PathBuf]) -> Vec<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    ids.insert(stem.to_string());
+                }
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+/// Enumerate every Claude conversation id on disk across all auth profiles
+/// (`~/.claude/projects/<slug>/<uuid>.jsonl` + `~/.claude-*/projects/...`).
+/// On-disk existence is the source of truth for Closed/remote sessions.
+pub fn scan_all_session_ids() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let mut slug_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&home) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let is_profile = name_str == ".claude" || name_str.starts_with(".claude-");
+            if is_profile && entry.path().is_dir() {
+                let projects = entry.path().join("projects");
+                if let Ok(slugs) = fs::read_dir(&projects) {
+                    for slug in slugs.filter_map(|e| e.ok()) {
+                        if slug.path().is_dir() {
+                            slug_dirs.push(slug.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    scan_session_ids_in(&slug_dirs)
+}
+
 /// Find the most recently modified jsonl file in a Claude projects directory
 pub fn find_latest_jsonl(projects_path: &PathBuf) -> Option<PathBuf> {
     let entries = fs::read_dir(projects_path).ok()?;
@@ -908,6 +957,24 @@ mod tests {
         // (the primary path doesn't exist either). This verifies the .exists() filter works.
         let paths = candidate_projects_paths("/definitely/does/not/exist/42");
         assert!(paths.is_empty(), "expected no candidates, got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_scan_returns_session_ids() {
+        let dir = std::env::temp_dir().join(format!("hive-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("11111111-aaaa.jsonl"), "{}").unwrap();
+        std::fs::write(dir.join("22222222-bbbb.jsonl"), "{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+
+        let ids = scan_session_ids_in(&[dir.clone()]);
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Only the two .jsonl basenames, sorted; the .txt file is ignored.
+        assert_eq!(
+            ids,
+            vec!["11111111-aaaa".to_string(), "22222222-bbbb".to_string()]
+        );
     }
 
     #[test]

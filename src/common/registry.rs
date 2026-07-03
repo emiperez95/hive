@@ -161,10 +161,73 @@ pub struct SessionOverlay {
     pub frozen_at: Option<String>,
 }
 
+/// The in-memory joined view: every known `ClaudeSession` keyed by its UUID.
+/// Built READ-ONLY from the existing hook state (status), a disk scan
+/// (existence — the source of truth for Closed/remote sessions), the live tmux
+/// placements (the SOLE Live-vs-Closed discriminator), and the overlay sidecar.
+/// I/O-free — all inputs are pre-loaded — so it is unit-testable without tmux.
+#[derive(Debug, Clone, Default)]
+pub struct SessionRegistry {
+    pub sessions: HashMap<String, ClaudeSession>,
+}
+
+impl SessionRegistry {
+    pub fn from_shadow(
+        hook: &crate::ipc::messages::HookState,
+        disk_ids: &[String],
+        live_placements: &HashMap<String, TmuxPlacement>,
+        sidecar: &SessionSidecar,
+    ) -> Self {
+        use std::collections::BTreeSet;
+        // Union of every id we know about: hook status entries + on-disk transcripts.
+        let mut ids: BTreeSet<&str> = BTreeSet::new();
+        for k in hook.sessions.keys() {
+            ids.insert(k.as_str());
+        }
+        for d in disk_ids {
+            ids.insert(d.as_str());
+        }
+
+        let mut sessions = HashMap::new();
+        for id in ids {
+            let hook_entry = hook.sessions.get(id);
+            // Single liveness rule: Live iff a live placement exists for this id.
+            let placement = live_placements.get(id).cloned();
+            let lifecycle = if placement.is_some() {
+                Lifecycle::Live
+            } else {
+                Lifecycle::Closed
+            };
+            let status = hook_entry.map(|e| SessionStatusState {
+                status: e.status.clone(),
+                needs_attention: e.needs_attention,
+            });
+            let cwd = hook_entry.map(|e| e.cwd.clone()).unwrap_or_default();
+            let last_activity = hook_entry.and_then(|e| e.last_activity.clone());
+            // Overlay: a persisted logical parent is authoritative when present.
+            let parent = sidecar.sessions.get(id).and_then(|o| o.parent.clone());
+            sessions.insert(
+                id.to_string(),
+                ClaudeSession {
+                    id: ClaudeSessionId::from(id),
+                    cwd,
+                    lifecycle,
+                    status,
+                    last_activity,
+                    placement,
+                    parent,
+                    frozen: None,
+                },
+            );
+        }
+        SessionRegistry { sessions }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::messages::SessionStatus;
+    use crate::ipc::messages::{HookState, SessionState, SessionStatus};
 
     fn sample(id: &str) -> ClaudeSession {
         ClaudeSession {
@@ -325,5 +388,106 @@ mod tests {
         assert!(!ov.archived);
         assert_eq!(ov.parent, None);
         assert_eq!(ov.frozen_at, None);
+    }
+
+    // ---- Increment 1: from_shadow left-join + single liveness rule + coexistence ----
+
+    fn state_entry(id: &str, cwd: &str, status: SessionStatus) -> SessionState {
+        SessionState {
+            session_id: id.to_string(),
+            cwd: cwd.to_string(),
+            status,
+            needs_attention: false,
+            last_activity: None,
+            tmux_pane: None,
+        }
+    }
+
+    fn placement(name: &str) -> TmuxPlacement {
+        TmuxPlacement {
+            session_name: name.to_string(),
+            window_index: "0".to_string(),
+            window_name: "claude".to_string(),
+            pane_id: Some("%1".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_live_iff_placement_present() {
+        let mut hook = HookState::default();
+        hook.sessions.insert(
+            "abc".to_string(),
+            state_entry("abc", "/x", SessionStatus::Working),
+        );
+
+        // Same hook entry, WITH a live placement → Live.
+        let mut placements = HashMap::new();
+        placements.insert("abc".to_string(), placement("🐝 hive"));
+        let reg = SessionRegistry::from_shadow(&hook, &[], &placements, &SessionSidecar::default());
+        assert_eq!(reg.sessions["abc"].lifecycle, Lifecycle::Live);
+        assert!(reg.sessions["abc"].placement.is_some());
+
+        // Same hook entry, WITHOUT a placement → Closed. (the sole discriminator)
+        let reg2 =
+            SessionRegistry::from_shadow(&hook, &[], &HashMap::new(), &SessionSidecar::default());
+        assert_eq!(reg2.sessions["abc"].lifecycle, Lifecycle::Closed);
+        assert_eq!(reg2.sessions["abc"].placement, None);
+    }
+
+    #[test]
+    fn test_disk_only_session_is_closed() {
+        // A conversation known only from a disk scan (no hook entry, no placement)
+        // is Closed with no status — this is exactly the "remote session" shape (I3).
+        let hook = HookState::default();
+        let disk = vec!["disk-only".to_string()];
+        let reg =
+            SessionRegistry::from_shadow(&hook, &disk, &HashMap::new(), &SessionSidecar::default());
+        let s = &reg.sessions["disk-only"];
+        assert_eq!(s.lifecycle, Lifecycle::Closed);
+        assert!(s.status.is_none());
+        assert_eq!(s.placement, None);
+    }
+
+    #[test]
+    fn test_hook_and_disk_left_join() {
+        let mut hook = HookState::default();
+        hook.sessions.insert(
+            "both".to_string(),
+            state_entry("both", "/x", SessionStatus::Waiting),
+        );
+        let disk = vec!["both".to_string()];
+        let reg =
+            SessionRegistry::from_shadow(&hook, &disk, &HashMap::new(), &SessionSidecar::default());
+        assert_eq!(reg.sessions.len(), 1); // present in both → one row, no duplicate
+        let s = &reg.sessions["both"];
+        assert!(s.status.is_some()); // status from the hook side
+        assert_eq!(s.cwd, "/x");
+    }
+
+    #[test]
+    fn test_old_format_state_json_deserializes() {
+        // The EXACT current on-disk schema written by the installed hook binary.
+        // Safe-direction coexistence: old state.json must build the new model.
+        let json = r#"{"sessions":{"abc-123":{"session_id":"abc-123","cwd":"/x","status":"Working","needs_attention":false,"last_activity":"2026-07-01T00:00:00Z","tmux_pane":"%1"}}}"#;
+        let hook: HookState = serde_json::from_str(json).unwrap();
+        let reg =
+            SessionRegistry::from_shadow(&hook, &[], &HashMap::new(), &SessionSidecar::default());
+        let s = &reg.sessions["abc-123"];
+        assert_eq!(s.cwd, "/x");
+        assert_eq!(s.lifecycle, Lifecycle::Closed); // no live placement supplied
+        assert_eq!(s.status.as_ref().unwrap().status, SessionStatus::Working);
+        assert_eq!(s.last_activity.as_deref(), Some("2026-07-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_new_state_json_still_reads_under_hookstate() {
+        // Dangerous-direction coexistence: prove SessionState carries no
+        // deny_unknown_fields, so an UNKNOWN future field is ignored and an older
+        // installed binary never chokes on a newer state.json (HookState::load is
+        // all-or-nothing — one parse error would drop the ENTIRE map to default).
+        let json = r#"{"sessions":{"abc-123":{"session_id":"abc-123","cwd":"/x","status":"Working","needs_attention":false,"last_activity":null,"tmux_pane":null,"future_unknown_field":"whatever"}}}"#;
+        let hook: HookState = serde_json::from_str(json).unwrap();
+        assert!(hook.sessions.contains_key("abc-123"));
+        assert_eq!(hook.sessions["abc-123"].cwd, "/x");
     }
 }
