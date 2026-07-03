@@ -3,10 +3,10 @@
 //! This module defines the CLI interface (via clap) and re-exports all
 //! subcommand handlers. `main.rs` parses args and dispatches here.
 
+pub mod conversations;
 pub mod hook;
 pub mod project;
 pub mod session;
-pub mod sessions;
 pub mod setup;
 pub mod stats;
 pub mod todo;
@@ -135,8 +135,8 @@ pub enum Command {
         #[arg(long, default_value = "7")]
         days: i64,
     },
-    /// List all known Claude sessions (live + closed), grouped by project/worktree.
-    Sessions,
+    /// List all known Claude conversations (live + closed), grouped by project/worktree.
+    Conversations,
     /// Append an activity event (invoked by tmux focus hooks). Hidden from help.
     #[command(hide = true)]
     Event {

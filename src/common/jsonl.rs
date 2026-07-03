@@ -100,7 +100,7 @@ pub fn candidate_projects_paths(cwd: &str) -> Vec<PathBuf> {
 /// Scan the given directories for `<session_id>.jsonl` files and return their
 /// basenames (session ids), deduplicated and sorted. Path-injectable so the
 /// registry's existence scan is unit-testable without touching a real home dir.
-pub fn scan_session_ids_in(dirs: &[PathBuf]) -> Vec<String> {
+pub fn scan_conversation_ids_in(dirs: &[PathBuf]) -> Vec<String> {
     let mut ids = std::collections::BTreeSet::new();
     for dir in dirs {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -147,14 +147,14 @@ fn claude_slug_dirs() -> Vec<PathBuf> {
 /// Enumerate every Claude conversation id on disk across all auth profiles
 /// (`~/.claude/projects/<slug>/<uuid>.jsonl` + `~/.claude-*/projects/...`).
 /// On-disk existence is the source of truth for Closed/remote sessions.
-pub fn scan_all_session_ids() -> Vec<String> {
-    scan_session_ids_in(&claude_slug_dirs())
+pub fn scan_all_conversation_ids() -> Vec<String> {
+    scan_conversation_ids_in(&claude_slug_dirs())
 }
 
 /// A conversation discovered on disk, enriched with the cwd (read from the
 /// transcript) and last-activity (the jsonl file mtime) needed to place + bound
 /// a Closed session.
-pub struct DiskSession {
+pub struct DiskConversation {
     pub id: String,
     pub cwd: Option<String>,
     pub last_activity: Option<String>,
@@ -165,7 +165,7 @@ pub struct DiskSession {
 /// Read (cwd, custom title) from a transcript's first lines in a single pass.
 /// cwd = the first entry carrying one; title = the latest `custom-title` seen in
 /// that window (the user's name for the conversation). Bounded so it stays cheap.
-pub fn read_session_meta(path: &Path) -> (Option<String>, Option<String>) {
+pub fn read_conversation_meta(path: &Path) -> (Option<String>, Option<String>) {
     let Ok(file) = fs::File::open(path) else {
         return (None, None);
     };
@@ -195,13 +195,13 @@ pub fn read_session_meta(path: &Path) -> (Option<String>, Option<String>) {
     (cwd, title)
 }
 
-/// Read just the cwd from a transcript (see [`read_session_meta`]).
+/// Read just the cwd from a transcript (see [`read_conversation_meta`]).
 pub fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
-    read_session_meta(path).0
+    read_conversation_meta(path).0
 }
 
 /// Scan the given dirs for `<id>.jsonl` transcripts, capturing id + cwd + mtime.
-pub fn scan_disk_sessions_in(dirs: &[PathBuf]) -> Vec<DiskSession> {
+pub fn scan_disk_conversations_in(dirs: &[PathBuf]) -> Vec<DiskConversation> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in dirs {
@@ -227,8 +227,8 @@ pub fn scan_disk_sessions_in(dirs: &[PathBuf]) -> Vec<DiskSession> {
                 .and_then(|m| m.modified())
                 .ok()
                 .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-            let (cwd, title) = read_session_meta(&path);
-            out.push(DiskSession {
+            let (cwd, title) = read_conversation_meta(&path);
+            out.push(DiskConversation {
                 id,
                 cwd,
                 last_activity,
@@ -239,9 +239,9 @@ pub fn scan_disk_sessions_in(dirs: &[PathBuf]) -> Vec<DiskSession> {
     out
 }
 
-/// Like [`scan_all_session_ids`] but with cwd + mtime for each conversation.
-pub fn scan_all_disk_sessions() -> Vec<DiskSession> {
-    scan_disk_sessions_in(&claude_slug_dirs())
+/// Like [`scan_all_conversation_ids`] but with cwd + mtime for each conversation.
+pub fn scan_all_disk_conversations() -> Vec<DiskConversation> {
+    scan_disk_conversations_in(&claude_slug_dirs())
 }
 
 /// Find the most recently modified jsonl file in a Claude projects directory
@@ -1065,7 +1065,7 @@ mod tests {
         std::fs::write(dir.join("22222222-bbbb.jsonl"), "{}").unwrap();
         std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
 
-        let ids = scan_session_ids_in(std::slice::from_ref(&dir));
+        let ids = scan_conversation_ids_in(std::slice::from_ref(&dir));
         std::fs::remove_dir_all(&dir).ok();
 
         // Only the two .jsonl basenames, sorted; the .txt file is ignored.
@@ -1085,7 +1085,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = scan_disk_sessions_in(std::slice::from_ref(&dir));
+        let sessions = scan_disk_conversations_in(std::slice::from_ref(&dir));
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(sessions.len(), 1);

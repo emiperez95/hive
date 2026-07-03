@@ -1,9 +1,9 @@
 //! `hive sessions` — a read-only listing of every known Claude session (live AND
 //! closed), grouped by its resolved parent (project / worktree).
 //!
-//! This is the first surface onto the re-rooted [`SessionRegistry`] model: it does
+//! This is the first surface onto the re-rooted [`ConversationRegistry`] model: it does
 //! NOT touch the TUI, the web view, or the hook writer. It builds the registry as a
-//! shadow (existing `state.json` + a disk scan + the `sessions.json` overlay +
+//! shadow (existing `state.json` + a disk scan + the `conversations.json` overlay +
 //! live tmux placements), resolves parents, and prints the grouping — so the
 //! closed/resumable sessions the current views can't show become visible.
 
@@ -14,17 +14,17 @@ use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::projects::ProjectRegistry;
 use crate::common::registry::{
-    self, ClaudeSession, SessionRegistry, SessionSidecar, TmuxPlacement,
+    self, Conversation, ConversationRegistry, ConversationSidecar, TmuxPlacement,
 };
 use crate::common::worktree::WorktreeState;
 use crate::ipc::messages::{HookState, SessionStatus};
 
 /// Build the registry from live state (read-only) and print the grouped listing.
-pub fn run_sessions() -> Result<()> {
+pub fn run_conversations() -> Result<()> {
     let hook = HookState::load();
-    let disk = jsonl::scan_all_disk_sessions();
+    let disk = jsonl::scan_all_disk_conversations();
     let disk_ids: Vec<String> = disk.iter().map(|d| d.id.clone()).collect();
-    let sidecar = SessionSidecar::load();
+    let sidecar = ConversationSidecar::load();
 
     // Live placements: every currently-running Claude instance we can tie to a
     // conversation id becomes the SOLE Live discriminator for that id.
@@ -43,14 +43,14 @@ pub fn run_sessions() -> Result<()> {
         }
     }
 
-    let mut reg = SessionRegistry::from_shadow(&hook, &disk_ids, &live_placements, &sidecar);
+    let mut reg = ConversationRegistry::from_shadow(&hook, &disk_ids, &live_placements, &sidecar);
 
     // Enrich disk-only (Closed) sessions with cwd + last-activity from the
     // transcript — the hook side had neither, so without this they can't be
     // placed or bounded.
-    let disk_map: HashMap<&str, &jsonl::DiskSession> =
+    let disk_map: HashMap<&str, &jsonl::DiskConversation> =
         disk.iter().map(|d| (d.id.as_str(), d)).collect();
-    for (id, s) in reg.sessions.iter_mut() {
+    for (id, s) in reg.conversations.iter_mut() {
         if let Some(d) = disk_map.get(id.as_str()) {
             if s.cwd.is_empty() {
                 if let Some(cwd) = &d.cwd {
@@ -69,7 +69,7 @@ pub fn run_sessions() -> Result<()> {
     // Resolve a logical parent for any session that doesn't already have one cached.
     let worktrees = WorktreeState::load();
     let projects = ProjectRegistry::load();
-    for s in reg.sessions.values_mut() {
+    for s in reg.conversations.values_mut() {
         if s.parent.is_none() {
             s.parent = registry::resolve_parent(&s.cwd, &worktrees, &projects);
         }
@@ -79,11 +79,11 @@ pub fn run_sessions() -> Result<()> {
     // session is kept only if recently active, parented, or a pinned freeze.
     let now = chrono::Utc::now();
     let cfg = registry::BoundingCfg { max_age_days: 14 };
-    reg.sessions.retain(|_, s| {
+    reg.conversations.retain(|_, s| {
         s.lifecycle.is_actionable_here() || registry::should_surface_closed(s, now, &cfg)
     });
 
-    print!("{}", render_registry(&reg));
+    print!("{}", render_conversations(&reg));
     Ok(())
 }
 
@@ -91,7 +91,7 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-fn status_label(session: &ClaudeSession) -> &'static str {
+fn status_label(session: &Conversation) -> &'static str {
     match session.status.as_ref().map(|s| &s.status) {
         None => "-",
         Some(SessionStatus::Working) => "working",
@@ -107,20 +107,20 @@ fn status_label(session: &ClaudeSession) -> &'static str {
 
 /// Render the registry grouped by parent key (deterministic ordering) — pure, so
 /// it is unit-testable without tmux/disk.
-pub fn render_registry(reg: &SessionRegistry) -> String {
+pub fn render_conversations(reg: &ConversationRegistry) -> String {
     use std::collections::BTreeMap;
 
-    let total = reg.sessions.len();
+    let total = reg.conversations.len();
     let live = reg
-        .sessions
+        .conversations
         .values()
         .filter(|s| s.lifecycle.is_actionable_here())
         .count();
     let closed = total - live;
 
     // Group by parent; None → "(unassigned)". BTreeMap gives stable ordering.
-    let mut groups: BTreeMap<String, Vec<&ClaudeSession>> = BTreeMap::new();
-    for s in reg.sessions.values() {
+    let mut groups: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
+    for s in reg.conversations.values() {
         let key = s
             .parent
             .clone()
@@ -130,7 +130,7 @@ pub fn render_registry(reg: &SessionRegistry) -> String {
 
     let mut out = String::new();
     out.push_str(&format!(
-        "hive sessions — {total} known ({live} live · {closed} closed) across {} groups\n",
+        "hive conversations — {total} known ({live} live · {closed} closed) across {} groups\n",
         groups.len()
     ));
 
@@ -180,11 +180,11 @@ pub fn render_registry(reg: &SessionRegistry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::registry::{ClaudeSessionId, Lifecycle};
+    use crate::common::registry::{ConversationId, Lifecycle};
 
-    fn mk(id: &str, lc: Lifecycle, parent: Option<&str>, last: Option<&str>) -> ClaudeSession {
-        ClaudeSession {
-            id: ClaudeSessionId::from(id),
+    fn mk(id: &str, lc: Lifecycle, parent: Option<&str>, last: Option<&str>) -> Conversation {
+        Conversation {
+            id: ConversationId::from(id),
             cwd: "/home/u/hive".to_string(),
             lifecycle: lc,
             status: None,
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_render_groups_and_counts() {
-        let mut reg = SessionRegistry::default();
+        let mut reg = ConversationRegistry::default();
         let mut live = mk(
             "live1",
             Lifecycle::Live,
@@ -209,8 +209,8 @@ mod tests {
             Some("2026-07-02T00:00:00Z"),
         );
         live.title = Some("My Task".to_string());
-        reg.sessions.insert("live1".to_string(), live);
-        reg.sessions.insert(
+        reg.conversations.insert("live1".to_string(), live);
+        reg.conversations.insert(
             "closed1".to_string(),
             mk(
                 "closed1",
@@ -219,12 +219,12 @@ mod tests {
                 Some("2026-07-01T00:00:00Z"),
             ),
         );
-        reg.sessions.insert(
+        reg.conversations.insert(
             "orphan".to_string(),
             mk("orphan", Lifecycle::Closed, None, None),
         );
 
-        let out = render_registry(&reg);
+        let out = render_conversations(&reg);
 
         assert!(out.contains("3 known (1 live · 2 closed) across 2 groups"));
         assert!(out.contains("hive\n"));
@@ -236,8 +236,8 @@ mod tests {
 
     #[test]
     fn test_render_empty_registry() {
-        let reg = SessionRegistry::default();
-        let out = render_registry(&reg);
+        let reg = ConversationRegistry::default();
+        let out = render_conversations(&reg);
         assert!(out.contains("0 known (0 live · 0 closed) across 0 groups"));
     }
 }

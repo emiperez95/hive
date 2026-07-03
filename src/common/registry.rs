@@ -1,6 +1,6 @@
-//! Re-rooted session model, keyed by the Claude conversation UUID (the
+//! Re-rooted conversation model, keyed by the Claude conversation UUID (the
 //! `<uuid>.jsonl` basename). Built read-only as a shadow over the existing
-//! `state.json` + a disk scan + a `sessions.json` overlay sidecar. Nothing here
+//! `state.json` + a disk scan + a `conversations.json` overlay sidecar. Nothing here
 //! is wired into a writer or a view yet (Increment 0).
 
 use anyhow::{anyhow, Result};
@@ -16,19 +16,19 @@ use crate::common::worktree::WorktreeState;
 /// Invariant #1: identity is the Claude session UUID, never a tmux name or path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ClaudeSessionId(pub String);
+pub struct ConversationId(pub String);
 
-impl ClaudeSessionId {
+impl ConversationId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
-impl From<&str> for ClaudeSessionId {
+impl From<&str> for ConversationId {
     fn from(s: &str) -> Self {
-        ClaudeSessionId(s.to_string())
+        ConversationId(s.to_string())
     }
 }
-impl std::fmt::Display for ClaudeSessionId {
+impl std::fmt::Display for ConversationId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -37,7 +37,7 @@ impl std::fmt::Display for ClaudeSessionId {
 /// Invariant #3: "known but not running here" (Closed) is first-class and equals
 /// "remote". This axis is ORTHOGONAL to `SessionStatus` (activity) — never overload
 /// `SessionStatus`. Frozen is NOT a variant here — it is a facet of Closed (see
-/// `ClaudeSession.frozen`), so every "closed == remote" check includes frozen.
+/// `Conversation.frozen`), so every "closed == remote" check includes frozen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lifecycle {
     Live,
@@ -72,7 +72,7 @@ pub struct TmuxPlacement {
 /// Activity status overlay — wraps the existing hook status enum on a separate
 /// axis from `Lifecycle` (never add lifecycle variants to `SessionStatus`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionStatusState {
+pub struct ConversationStatus {
     pub status: crate::ipc::messages::SessionStatus,
     pub needs_attention: bool,
 }
@@ -88,14 +88,14 @@ pub struct FrozenInfo {
     pub frozen_at: String,
 }
 
-/// The re-rooted base entity. Keyed by `ClaudeSessionId` everywhere.
+/// The re-rooted base entity. Keyed by `ConversationId` everywhere.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ClaudeSession {
-    pub id: ClaudeSessionId,
+pub struct Conversation {
+    pub id: ConversationId,
     pub cwd: String,
     pub lifecycle: Lifecycle,
     #[serde(default)]
-    pub status: Option<SessionStatusState>,
+    pub status: Option<ConversationStatus>,
     /// RFC3339; feeds `Project.last_session = max(..)` and Closed-set bounding.
     #[serde(default)]
     pub last_activity: Option<String>,
@@ -123,7 +123,7 @@ pub struct ClaudeSession {
     pub title: Option<String>,
 }
 
-impl ClaudeSession {
+impl Conversation {
     pub fn is_frozen(&self) -> bool {
         self.frozen.is_some()
     }
@@ -156,17 +156,17 @@ impl ClaudeSession {
     }
 }
 
-/// The persisted overlay sidecar (NEW file `~/.hive/cache/sessions.json`; does not
+/// The persisted overlay sidecar (NEW file `~/.hive/cache/conversations.json`; does not
 /// repurpose existing state). Same shape/role as `FrozenState` — keyed by UUID.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SessionSidecar {
+pub struct ConversationSidecar {
     #[serde(default)]
-    pub sessions: HashMap<String, SessionOverlay>,
+    pub conversations: HashMap<String, ConversationOverlay>,
 }
 
 /// Only hive's overlay lives here; existence/status come from disk + state.json.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct SessionOverlay {
+pub struct ConversationOverlay {
     #[serde(default)]
     pub note: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -180,11 +180,11 @@ pub struct SessionOverlay {
     pub frozen_at: Option<String>,
 }
 
-impl SessionSidecar {
-    /// New derived file `~/.hive/cache/sessions.json`. Never repurposes existing
+impl ConversationSidecar {
+    /// New derived file `~/.hive/cache/conversations.json`. Never repurposes existing
     /// state (state.json / frozen.json / worktrees.json stay authoritative).
     fn file_path() -> Option<PathBuf> {
-        cache_dir().map(|p| p.join("sessions.json"))
+        cache_dir().map(|p| p.join("conversations.json"))
     }
 
     /// Load the overlay from disk. Returns an empty sidecar on any error.
@@ -222,22 +222,22 @@ impl SessionSidecar {
     }
 }
 
-/// The in-memory joined view: every known `ClaudeSession` keyed by its UUID.
+/// The in-memory joined view: every known `Conversation` keyed by its UUID.
 /// Built READ-ONLY from the existing hook state (status), a disk scan
 /// (existence — the source of truth for Closed/remote sessions), the live tmux
 /// placements (the SOLE Live-vs-Closed discriminator), and the overlay sidecar.
 /// I/O-free — all inputs are pre-loaded — so it is unit-testable without tmux.
 #[derive(Debug, Clone, Default)]
-pub struct SessionRegistry {
-    pub sessions: HashMap<String, ClaudeSession>,
+pub struct ConversationRegistry {
+    pub conversations: HashMap<String, Conversation>,
 }
 
-impl SessionRegistry {
+impl ConversationRegistry {
     pub fn from_shadow(
         hook: &crate::ipc::messages::HookState,
         disk_ids: &[String],
         live_placements: &HashMap<String, TmuxPlacement>,
-        sidecar: &SessionSidecar,
+        sidecar: &ConversationSidecar,
     ) -> Self {
         use std::collections::BTreeSet;
         // Union of every id we know about: hook status entries + on-disk transcripts.
@@ -249,7 +249,7 @@ impl SessionRegistry {
             ids.insert(d.as_str());
         }
 
-        let mut sessions = HashMap::new();
+        let mut conversations = HashMap::new();
         for id in ids {
             let hook_entry = hook.sessions.get(id);
             // Single liveness rule: Live iff a live placement exists for this id.
@@ -259,22 +259,22 @@ impl SessionRegistry {
             } else {
                 Lifecycle::Closed
             };
-            let status = hook_entry.map(|e| SessionStatusState {
+            let status = hook_entry.map(|e| ConversationStatus {
                 status: e.status.clone(),
                 needs_attention: e.needs_attention,
             });
             let cwd = hook_entry.map(|e| e.cwd.clone()).unwrap_or_default();
             let last_activity = hook_entry.and_then(|e| e.last_activity.clone());
             // Overlay from the sidecar: parent (authoritative), note, pinned, archived.
-            let overlay = sidecar.sessions.get(id);
+            let overlay = sidecar.conversations.get(id);
             let parent = overlay.and_then(|o| o.parent.clone());
             let note = overlay.map(|o| o.note.clone()).unwrap_or_default();
             let pinned = overlay.map(|o| o.pinned).unwrap_or(false);
             let archived = overlay.map(|o| o.archived).unwrap_or(false);
-            sessions.insert(
+            conversations.insert(
                 id.to_string(),
-                ClaudeSession {
-                    id: ClaudeSessionId::from(id),
+                Conversation {
+                    id: ConversationId::from(id),
                     cwd,
                     lifecycle,
                     status,
@@ -289,7 +289,7 @@ impl SessionRegistry {
                 },
             );
         }
-        SessionRegistry { sessions }
+        ConversationRegistry { conversations }
     }
 }
 
@@ -344,7 +344,7 @@ pub fn resolve_parent(
 /// The persisted parent is authoritative; the local resolver is a fallback only,
 /// so a session's parent, once cached, is never re-derived from a shifting cwd.
 pub fn effective_parent(
-    session: &ClaudeSession,
+    session: &Conversation,
     worktrees: &WorktreeState,
     projects: &ProjectRegistry,
 ) -> Option<String> {
@@ -362,7 +362,7 @@ pub struct BoundingCfg {
 /// Surface a Closed session iff it is not archived AND (recently active OR it has
 /// a resolved parent OR it is a pinned freeze). Keeps the Closed list bounded.
 pub fn should_surface_closed(
-    session: &ClaudeSession,
+    session: &Conversation,
     now: DateTime<Utc>,
     cfg: &BoundingCfg,
 ) -> bool {
@@ -397,12 +397,12 @@ mod tests {
     use super::*;
     use crate::ipc::messages::{HookState, SessionState, SessionStatus};
 
-    fn sample(id: &str) -> ClaudeSession {
-        ClaudeSession {
-            id: ClaudeSessionId::from(id),
+    fn sample(id: &str) -> Conversation {
+        Conversation {
+            id: ConversationId::from(id),
             cwd: "/home/u/hive".to_string(),
             lifecycle: Lifecycle::Live,
-            status: Some(SessionStatusState {
+            status: Some(ConversationStatus {
                 status: SessionStatus::Working,
                 needs_attention: false,
             }),
@@ -424,12 +424,12 @@ mod tests {
 
     #[test]
     fn test_claude_session_id_roundtrip() {
-        let id = ClaudeSessionId::from("abc-123");
+        let id = ConversationId::from("abc-123");
         assert_eq!(id.as_str(), "abc-123");
         assert_eq!(id.to_string(), "abc-123");
         // transparent newtype serializes as a bare JSON string
         assert_eq!(serde_json::to_string(&id).unwrap(), "\"abc-123\"");
-        let back: ClaudeSessionId = serde_json::from_str("\"abc-123\"").unwrap();
+        let back: ConversationId = serde_json::from_str("\"abc-123\"").unwrap();
         assert_eq!(back, id);
     }
 
@@ -454,7 +454,7 @@ mod tests {
     fn test_claude_session_serde_roundtrip() {
         let s = sample("abc-123");
         let json = serde_json::to_string(&s).unwrap();
-        let back: ClaudeSession = serde_json::from_str(&json).unwrap();
+        let back: Conversation = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
     }
 
@@ -467,7 +467,7 @@ mod tests {
         s.frozen = None;
         s.lifecycle = Lifecycle::Closed;
         let json = serde_json::to_string(&s).unwrap();
-        let back: ClaudeSession = serde_json::from_str(&json).unwrap();
+        let back: Conversation = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
     }
 
@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(s.lifecycle, Lifecycle::Closed);
         assert_eq!(s.placement, None);
         // identity / cwd / history retained (keep-record contract)
-        assert_eq!(s.id, ClaudeSessionId::from("abc-123"));
+        assert_eq!(s.id, ConversationId::from("abc-123"));
         assert_eq!(s.cwd, "/home/u/hive");
         assert_eq!(s.last_activity.as_deref(), Some("2026-07-01T00:00:00Z"));
     }
@@ -524,16 +524,19 @@ mod tests {
 
     #[test]
     fn test_sidecar_default_empty() {
-        let sc = SessionSidecar::default();
-        assert_eq!(serde_json::to_string(&sc).unwrap(), r#"{"sessions":{}}"#);
+        let sc = ConversationSidecar::default();
+        assert_eq!(
+            serde_json::to_string(&sc).unwrap(),
+            r#"{"conversations":{}}"#
+        );
     }
 
     #[test]
     fn test_sidecar_serde_roundtrip() {
-        let mut sc = SessionSidecar::default();
-        sc.sessions.insert(
+        let mut sc = ConversationSidecar::default();
+        sc.conversations.insert(
             "abc-123".to_string(),
-            SessionOverlay {
+            ConversationOverlay {
                 note: "wip".to_string(),
                 pinned: true,
                 archived: false,
@@ -542,10 +545,10 @@ mod tests {
             },
         );
         let json = serde_json::to_string(&sc).unwrap();
-        let back: SessionSidecar = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.sessions.len(), 1);
+        let back: ConversationSidecar = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.conversations.len(), 1);
         assert_eq!(
-            back.sessions["abc-123"].parent.as_deref(),
+            back.conversations["abc-123"].parent.as_deref(),
             Some("hive/CSD-1")
         );
     }
@@ -554,7 +557,7 @@ mod tests {
     fn test_sidecar_entry_backward_compat() {
         // A legacy-shaped overlay entry with only `note`; all other fields absent.
         let legacy = r#"{"note":"just a note"}"#;
-        let ov: SessionOverlay = serde_json::from_str(legacy).unwrap();
+        let ov: ConversationOverlay = serde_json::from_str(legacy).unwrap();
         assert_eq!(ov.note, "just a note");
         assert!(!ov.pinned); // #[serde(default)]
         assert!(!ov.archived);
@@ -595,15 +598,24 @@ mod tests {
         // Same hook entry, WITH a live placement → Live.
         let mut placements = HashMap::new();
         placements.insert("abc".to_string(), placement("🐝 hive"));
-        let reg = SessionRegistry::from_shadow(&hook, &[], &placements, &SessionSidecar::default());
-        assert_eq!(reg.sessions["abc"].lifecycle, Lifecycle::Live);
-        assert!(reg.sessions["abc"].placement.is_some());
+        let reg = ConversationRegistry::from_shadow(
+            &hook,
+            &[],
+            &placements,
+            &ConversationSidecar::default(),
+        );
+        assert_eq!(reg.conversations["abc"].lifecycle, Lifecycle::Live);
+        assert!(reg.conversations["abc"].placement.is_some());
 
         // Same hook entry, WITHOUT a placement → Closed. (the sole discriminator)
-        let reg2 =
-            SessionRegistry::from_shadow(&hook, &[], &HashMap::new(), &SessionSidecar::default());
-        assert_eq!(reg2.sessions["abc"].lifecycle, Lifecycle::Closed);
-        assert_eq!(reg2.sessions["abc"].placement, None);
+        let reg2 = ConversationRegistry::from_shadow(
+            &hook,
+            &[],
+            &HashMap::new(),
+            &ConversationSidecar::default(),
+        );
+        assert_eq!(reg2.conversations["abc"].lifecycle, Lifecycle::Closed);
+        assert_eq!(reg2.conversations["abc"].placement, None);
     }
 
     #[test]
@@ -612,9 +624,13 @@ mod tests {
         // is Closed with no status — this is exactly the "remote session" shape (I3).
         let hook = HookState::default();
         let disk = vec!["disk-only".to_string()];
-        let reg =
-            SessionRegistry::from_shadow(&hook, &disk, &HashMap::new(), &SessionSidecar::default());
-        let s = &reg.sessions["disk-only"];
+        let reg = ConversationRegistry::from_shadow(
+            &hook,
+            &disk,
+            &HashMap::new(),
+            &ConversationSidecar::default(),
+        );
+        let s = &reg.conversations["disk-only"];
         assert_eq!(s.lifecycle, Lifecycle::Closed);
         assert!(s.status.is_none());
         assert_eq!(s.placement, None);
@@ -628,10 +644,14 @@ mod tests {
             state_entry("both", "/x", SessionStatus::Waiting),
         );
         let disk = vec!["both".to_string()];
-        let reg =
-            SessionRegistry::from_shadow(&hook, &disk, &HashMap::new(), &SessionSidecar::default());
-        assert_eq!(reg.sessions.len(), 1); // present in both → one row, no duplicate
-        let s = &reg.sessions["both"];
+        let reg = ConversationRegistry::from_shadow(
+            &hook,
+            &disk,
+            &HashMap::new(),
+            &ConversationSidecar::default(),
+        );
+        assert_eq!(reg.conversations.len(), 1); // present in both → one row, no duplicate
+        let s = &reg.conversations["both"];
         assert!(s.status.is_some()); // status from the hook side
         assert_eq!(s.cwd, "/x");
     }
@@ -642,9 +662,13 @@ mod tests {
         // Safe-direction coexistence: old state.json must build the new model.
         let json = r#"{"sessions":{"abc-123":{"session_id":"abc-123","cwd":"/x","status":"Working","needs_attention":false,"last_activity":"2026-07-01T00:00:00Z","tmux_pane":"%1"}}}"#;
         let hook: HookState = serde_json::from_str(json).unwrap();
-        let reg =
-            SessionRegistry::from_shadow(&hook, &[], &HashMap::new(), &SessionSidecar::default());
-        let s = &reg.sessions["abc-123"];
+        let reg = ConversationRegistry::from_shadow(
+            &hook,
+            &[],
+            &HashMap::new(),
+            &ConversationSidecar::default(),
+        );
+        let s = &reg.conversations["abc-123"];
         assert_eq!(s.cwd, "/x");
         assert_eq!(s.lifecycle, Lifecycle::Closed); // no live placement supplied
         assert_eq!(s.status.as_ref().unwrap().status, SessionStatus::Working);
@@ -663,10 +687,10 @@ mod tests {
         assert_eq!(hook.sessions["abc-123"].cwd, "/x");
     }
 
-    // ---- Increment 2: sessions.json sidecar persistence + overlay application ----
+    // ---- Increment 2: conversations.json sidecar persistence + overlay application ----
 
-    fn overlay(note: &str, pinned: bool, parent: Option<&str>) -> SessionOverlay {
-        SessionOverlay {
+    fn overlay(note: &str, pinned: bool, parent: Option<&str>) -> ConversationOverlay {
+        ConversationOverlay {
             note: note.to_string(),
             pinned,
             archived: false,
@@ -680,13 +704,13 @@ mod tests {
         // A disk-only session gets its note/pinned/parent from the sidecar overlay.
         let hook = HookState::default();
         let disk = vec!["abc-123".to_string()];
-        let mut sidecar = SessionSidecar::default();
-        sidecar.sessions.insert(
+        let mut sidecar = ConversationSidecar::default();
+        sidecar.conversations.insert(
             "abc-123".to_string(),
             overlay("wip", true, Some("hive/CSD-1")),
         );
-        let reg = SessionRegistry::from_shadow(&hook, &disk, &HashMap::new(), &sidecar);
-        let s = &reg.sessions["abc-123"];
+        let reg = ConversationRegistry::from_shadow(&hook, &disk, &HashMap::new(), &sidecar);
+        let s = &reg.conversations["abc-123"];
         assert_eq!(s.note, "wip");
         assert!(s.pinned);
         assert_eq!(s.parent.as_deref(), Some("hive/CSD-1"));
@@ -696,50 +720,50 @@ mod tests {
     fn test_sidecar_save_load_roundtrip() {
         let dir = std::env::temp_dir().join(format!("hive-reg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sessions.json");
-        let mut sc = SessionSidecar::default();
-        sc.sessions.insert(
+        let path = dir.join("conversations.json");
+        let mut sc = ConversationSidecar::default();
+        sc.conversations.insert(
             "abc-123".to_string(),
             overlay("wip", true, Some("hive/CSD-1")),
         );
         sc.save_to(&path).unwrap();
 
-        let back = SessionSidecar::load_from(&path);
+        let back = ConversationSidecar::load_from(&path);
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.conversations.len(), 1);
         assert_eq!(
-            back.sessions["abc-123"].parent.as_deref(),
+            back.conversations["abc-123"].parent.as_deref(),
             Some("hive/CSD-1")
         );
-        assert!(back.sessions["abc-123"].pinned);
+        assert!(back.conversations["abc-123"].pinned);
     }
 
     #[test]
     fn test_sidecar_load_missing_is_default() {
         let path = std::env::temp_dir().join(format!("hive-missing-{}.json", std::process::id()));
         std::fs::remove_file(&path).ok();
-        let sc = SessionSidecar::load_from(&path);
-        assert!(sc.sessions.is_empty());
+        let sc = ConversationSidecar::load_from(&path);
+        assert!(sc.conversations.is_empty());
     }
 
     #[test]
     fn test_sidecar_load_corrupt_is_default() {
         let dir = std::env::temp_dir().join(format!("hive-corrupt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sessions.json");
+        let path = dir.join("conversations.json");
         std::fs::write(&path, "{not valid json").unwrap();
-        let sc = SessionSidecar::load_from(&path);
+        let sc = ConversationSidecar::load_from(&path);
         std::fs::remove_dir_all(&dir).ok();
-        assert!(sc.sessions.is_empty());
+        assert!(sc.conversations.is_empty());
     }
 
     #[test]
     fn test_sidecar_file_path_basename() {
-        // Pins the derived-file contract: the sidecar is sessions.json, never one
+        // Pins the derived-file contract: the sidecar is conversations.json, never one
         // of the authoritative files. (No-op if there is no cache dir in the env.)
-        if let Some(p) = SessionSidecar::file_path() {
-            assert!(p.ends_with("sessions.json"));
+        if let Some(p) = ConversationSidecar::file_path() {
+            assert!(p.ends_with("conversations.json"));
             assert!(!p.ends_with("state.json"));
             assert!(!p.ends_with("frozen.json"));
         }
@@ -747,9 +771,9 @@ mod tests {
 
     // ---- Increment 3: parent resolution + Closed-set bounding + scan cache ----
 
-    fn closed(id: &str, last_activity: Option<&str>) -> ClaudeSession {
-        ClaudeSession {
-            id: ClaudeSessionId::from(id),
+    fn closed(id: &str, last_activity: Option<&str>) -> Conversation {
+        Conversation {
+            id: ConversationId::from(id),
             cwd: "/x".to_string(),
             lifecycle: Lifecycle::Closed,
             status: None,

@@ -30,20 +30,20 @@ fn help_exits_zero() {
 }
 
 #[test]
-fn sessions_command_exits_zero() {
+fn conversations_command_exits_zero() {
     // Read-only registry listing. With an isolated empty HOME there is no state
     // to read, so it must still exit 0 and print its header.
     let home = std::env::temp_dir().join(format!("hive-smoke-sessions-{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
     let output = hive_cmd()
-        .arg("sessions")
+        .arg("conversations")
         .env("HOME", &home)
         .output()
         .unwrap();
     std::fs::remove_dir_all(&home).ok();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("hive sessions —"));
+    assert!(stdout.contains("hive conversations —"));
 }
 
 #[test]
