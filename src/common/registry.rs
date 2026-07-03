@@ -3,8 +3,12 @@
 //! `state.json` + a disk scan + a `sessions.json` overlay sidecar. Nothing here
 //! is wired into a writer or a view yet (Increment 0).
 
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::common::persistence::cache_dir;
 
 /// Invariant #1: identity is the Claude session UUID, never a tmux name or path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,6 +106,15 @@ pub struct ClaudeSession {
     /// Frozen facet: `Some` ⇒ this Closed session is a pinned/noted freeze.
     #[serde(default)]
     pub frozen: Option<FrozenInfo>,
+    /// Hive overlay (from the sidecar): free-text note.
+    #[serde(default)]
+    pub note: String,
+    /// Hive overlay: user-pinned (surfaced regardless of recency bounding).
+    #[serde(default)]
+    pub pinned: bool,
+    /// Hive overlay: hidden from default listings.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl ClaudeSession {
@@ -161,6 +174,48 @@ pub struct SessionOverlay {
     pub frozen_at: Option<String>,
 }
 
+impl SessionSidecar {
+    /// New derived file `~/.hive/cache/sessions.json`. Never repurposes existing
+    /// state (state.json / frozen.json / worktrees.json stay authoritative).
+    fn file_path() -> Option<PathBuf> {
+        cache_dir().map(|p| p.join("sessions.json"))
+    }
+
+    /// Load the overlay from disk. Returns an empty sidecar on any error.
+    pub fn load() -> Self {
+        match Self::file_path() {
+            Some(path) => Self::load_from(&path),
+            None => Self::default(),
+        }
+    }
+
+    /// Injectable load (for tests): missing or corrupt → default, never panics.
+    pub fn load_from(path: &Path) -> Self {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&content).unwrap_or_default()
+    }
+
+    /// Save atomically (write .tmp, rename), cloning the `FrozenState` idiom.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::file_path().ok_or_else(|| anyhow!("Cannot determine cache directory"))?;
+        self.save_to(&path)
+    }
+
+    /// Injectable save (for tests).
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &content)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
 /// The in-memory joined view: every known `ClaudeSession` keyed by its UUID.
 /// Built READ-ONLY from the existing hook state (status), a disk scan
 /// (existence — the source of truth for Closed/remote sessions), the live tmux
@@ -204,8 +259,12 @@ impl SessionRegistry {
             });
             let cwd = hook_entry.map(|e| e.cwd.clone()).unwrap_or_default();
             let last_activity = hook_entry.and_then(|e| e.last_activity.clone());
-            // Overlay: a persisted logical parent is authoritative when present.
-            let parent = sidecar.sessions.get(id).and_then(|o| o.parent.clone());
+            // Overlay from the sidecar: parent (authoritative), note, pinned, archived.
+            let overlay = sidecar.sessions.get(id);
+            let parent = overlay.and_then(|o| o.parent.clone());
+            let note = overlay.map(|o| o.note.clone()).unwrap_or_default();
+            let pinned = overlay.map(|o| o.pinned).unwrap_or(false);
+            let archived = overlay.map(|o| o.archived).unwrap_or(false);
             sessions.insert(
                 id.to_string(),
                 ClaudeSession {
@@ -217,6 +276,9 @@ impl SessionRegistry {
                     placement,
                     parent,
                     frozen: None,
+                    note,
+                    pinned,
+                    archived,
                 },
             );
         }
@@ -247,6 +309,9 @@ mod tests {
             }),
             parent: Some("hive".to_string()),
             frozen: None,
+            note: String::new(),
+            pinned: false,
+            archived: false,
         }
     }
 
@@ -489,5 +554,87 @@ mod tests {
         let hook: HookState = serde_json::from_str(json).unwrap();
         assert!(hook.sessions.contains_key("abc-123"));
         assert_eq!(hook.sessions["abc-123"].cwd, "/x");
+    }
+
+    // ---- Increment 2: sessions.json sidecar persistence + overlay application ----
+
+    fn overlay(note: &str, pinned: bool, parent: Option<&str>) -> SessionOverlay {
+        SessionOverlay {
+            note: note.to_string(),
+            pinned,
+            archived: false,
+            parent: parent.map(|s| s.to_string()),
+            frozen_at: None,
+        }
+    }
+
+    #[test]
+    fn test_from_shadow_applies_overlay() {
+        // A disk-only session gets its note/pinned/parent from the sidecar overlay.
+        let hook = HookState::default();
+        let disk = vec!["abc-123".to_string()];
+        let mut sidecar = SessionSidecar::default();
+        sidecar.sessions.insert(
+            "abc-123".to_string(),
+            overlay("wip", true, Some("hive/CSD-1")),
+        );
+        let reg = SessionRegistry::from_shadow(&hook, &disk, &HashMap::new(), &sidecar);
+        let s = &reg.sessions["abc-123"];
+        assert_eq!(s.note, "wip");
+        assert!(s.pinned);
+        assert_eq!(s.parent.as_deref(), Some("hive/CSD-1"));
+    }
+
+    #[test]
+    fn test_sidecar_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("hive-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let mut sc = SessionSidecar::default();
+        sc.sessions.insert(
+            "abc-123".to_string(),
+            overlay("wip", true, Some("hive/CSD-1")),
+        );
+        sc.save_to(&path).unwrap();
+
+        let back = SessionSidecar::load_from(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(
+            back.sessions["abc-123"].parent.as_deref(),
+            Some("hive/CSD-1")
+        );
+        assert!(back.sessions["abc-123"].pinned);
+    }
+
+    #[test]
+    fn test_sidecar_load_missing_is_default() {
+        let path = std::env::temp_dir().join(format!("hive-missing-{}.json", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let sc = SessionSidecar::load_from(&path);
+        assert!(sc.sessions.is_empty());
+    }
+
+    #[test]
+    fn test_sidecar_load_corrupt_is_default() {
+        let dir = std::env::temp_dir().join(format!("hive-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        std::fs::write(&path, "{not valid json").unwrap();
+        let sc = SessionSidecar::load_from(&path);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(sc.sessions.is_empty());
+    }
+
+    #[test]
+    fn test_sidecar_file_path_basename() {
+        // Pins the derived-file contract: the sidecar is sessions.json, never one
+        // of the authoritative files. (No-op if there is no cache dir in the env.)
+        if let Some(p) = SessionSidecar::file_path() {
+            assert!(p.ends_with("sessions.json"));
+            assert!(!p.ends_with("state.json"));
+            assert!(!p.ends_with("frozen.json"));
+        }
     }
 }
