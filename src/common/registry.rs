@@ -4,11 +4,14 @@
 //! is wired into a writer or a view yet (Increment 0).
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::common::persistence::cache_dir;
+use crate::common::projects::{expand_tilde, ProjectRegistry};
+use crate::common::worktree::WorktreeState;
 
 /// Invariant #1: identity is the Claude session UUID, never a tmux name or path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -283,6 +286,105 @@ impl SessionRegistry {
             );
         }
         SessionRegistry { sessions }
+    }
+}
+
+// ── Increment 3: parent resolution (host-local best-effort) + bounding + cache ──
+
+/// Number of leading path components of `candidate` that match `cwd`, IF
+/// `candidate` is a full component-wise prefix of `cwd`; else `None`. Component-
+/// wise (not raw `starts_with`) so `/home/u/hive` does NOT match `/home/u/hivefoo`.
+fn component_prefix_len(cwd: &Path, candidate: &Path) -> Option<usize> {
+    let mut cwd_it = cwd.components();
+    let mut matched = 0usize;
+    for cand in candidate.components() {
+        match cwd_it.next() {
+            Some(w) if w == cand => matched += 1,
+            _ => return None,
+        }
+    }
+    Some(matched)
+}
+
+/// Resolve a cwd to its logical parent key (Invariant #2) by longest component-
+/// wise path prefix: the deepest matching worktree wins, else the project root,
+/// else `None` (a foreign/remote cwd must not false-match). Host-local best-effort.
+pub fn resolve_parent(
+    cwd: &str,
+    worktrees: &WorktreeState,
+    projects: &ProjectRegistry,
+) -> Option<String> {
+    let cwd_path = expand_tilde(cwd);
+    // Projects first, then worktrees: on an equal-length tie `max_by_key` keeps the
+    // LAST maximum, so the more-specific worktree key wins.
+    let mut candidates: Vec<(usize, String)> = Vec::new();
+    for (key, config) in &projects.projects {
+        if let Some(len) = component_prefix_len(&cwd_path, &expand_tilde(&config.project_root)) {
+            candidates.push((len, key.clone()));
+        }
+    }
+    for entry in worktrees.worktrees.values() {
+        if let Some(len) = component_prefix_len(&cwd_path, &expand_tilde(&entry.path)) {
+            candidates.push((
+                len,
+                WorktreeState::make_key(&entry.project_key, &entry.branch),
+            ));
+        }
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, key)| key)
+}
+
+/// The persisted parent is authoritative; the local resolver is a fallback only,
+/// so a session's parent, once cached, is never re-derived from a shifting cwd.
+pub fn effective_parent(
+    session: &ClaudeSession,
+    worktrees: &WorktreeState,
+    projects: &ProjectRegistry,
+) -> Option<String> {
+    if session.parent.is_some() {
+        return session.parent.clone();
+    }
+    resolve_parent(&session.cwd, worktrees, projects)
+}
+
+/// Policy bounding which Closed sessions to surface (the on-disk set is unbounded).
+pub struct BoundingCfg {
+    pub max_age_days: i64,
+}
+
+/// Surface a Closed session iff it is not archived AND (recently active OR it has
+/// a resolved parent OR it is a pinned freeze). Keeps the Closed list bounded.
+pub fn should_surface_closed(
+    session: &ClaudeSession,
+    now: DateTime<Utc>,
+    cfg: &BoundingCfg,
+) -> bool {
+    if session.archived {
+        return false;
+    }
+    let recent = match &session.last_activity {
+        Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+            Ok(dt) => (now - dt.with_timezone(&Utc)).num_days() <= cfg.max_age_days,
+            Err(_) => false,
+        },
+        None => false,
+    };
+    recent || session.parent.is_some() || session.frozen.as_ref().is_some_and(|f| f.pinned)
+}
+
+/// Cached disk scan so the ~1-1.5s refresh never does a full FS walk each tick.
+pub struct ScanCache {
+    pub ids: Vec<String>,
+    pub scanned_at: DateTime<Utc>,
+}
+
+impl ScanCache {
+    /// True while still within the rescan interval (inject `now` for testing).
+    pub fn is_fresh(&self, now: DateTime<Utc>, interval_secs: i64) -> bool {
+        (now - self.scanned_at).num_seconds() < interval_secs
     }
 }
 
@@ -636,5 +738,194 @@ mod tests {
             assert!(!p.ends_with("state.json"));
             assert!(!p.ends_with("frozen.json"));
         }
+    }
+
+    // ---- Increment 3: parent resolution + Closed-set bounding + scan cache ----
+
+    fn closed(id: &str, last_activity: Option<&str>) -> ClaudeSession {
+        ClaudeSession {
+            id: ClaudeSessionId::from(id),
+            cwd: "/x".to_string(),
+            lifecycle: Lifecycle::Closed,
+            status: None,
+            last_activity: last_activity.map(|s| s.to_string()),
+            placement: None,
+            parent: None,
+            frozen: None,
+            note: String::new(),
+            pinned: false,
+            archived: false,
+        }
+    }
+
+    fn project(root: &str) -> crate::common::projects::ProjectConfig {
+        serde_json::from_str(&format!(r#"{{"emoji":"🐝","project_root":"{root}"}}"#)).unwrap()
+    }
+
+    fn worktree(pk: &str, branch: &str, path: &str) -> crate::common::worktree::WorktreeEntry {
+        serde_json::from_str(&format!(
+            r#"{{"project_key":"{pk}","branch":"{branch}","worktree_type":"worktree","path":"{path}","session_name":"s","created_at":""}}"#
+        ))
+        .unwrap()
+    }
+
+    fn wts_with(entries: &[(&str, &str, &str)]) -> WorktreeState {
+        let mut w = WorktreeState::default();
+        for (pk, br, path) in entries {
+            w.worktrees
+                .insert(WorktreeState::make_key(pk, br), worktree(pk, br, path));
+        }
+        w
+    }
+
+    fn projs_with(entries: &[(&str, &str)]) -> ProjectRegistry {
+        let mut r = ProjectRegistry::default();
+        for (key, root) in entries {
+            r.projects.insert(key.to_string(), project(root));
+        }
+        r
+    }
+
+    #[test]
+    fn test_resolve_parent_exact_worktree_prefix() {
+        let wts = wts_with(&[("hive", "CSD-1", "/home/u/wt/CSD-1")]);
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            resolve_parent("/home/u/wt/CSD-1/src", &wts, &projs),
+            Some("hive/CSD-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_parent_falls_back_to_project_root() {
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            resolve_parent("/home/u/hive/src", &WorktreeState::default(), &projs),
+            Some("hive".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_longest_prefix_wins() {
+        // Worktree lives INSIDE the project root; the deeper worktree wins.
+        let wts = wts_with(&[("hive", "CSD-1", "/home/u/hive/wt/CSD-1")]);
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            resolve_parent("/home/u/hive/wt/CSD-1/src", &wts, &projs),
+            Some("hive/CSD-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_component_boundary_no_false_prefix() {
+        // /home/u/hivefoo must NOT match candidate /home/u/hive.
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            resolve_parent("/home/u/hivefoo/src", &WorktreeState::default(), &projs),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_tilde_expansion() {
+        let home = dirs::home_dir().expect("home dir");
+        let cwd = home.join("hive").join("src");
+        let projs = projs_with(&[("hive", "~/hive")]);
+        assert_eq!(
+            resolve_parent(&cwd.to_string_lossy(), &WorktreeState::default(), &projs),
+            Some("hive".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_foreign_cwd_is_none() {
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            resolve_parent("/totally/foreign/path", &WorktreeState::default(), &projs),
+            None
+        );
+    }
+
+    #[test]
+    fn test_persisted_parent_not_reresolved() {
+        // A session with a cached parent is NOT re-derived from its cwd, even
+        // though that cwd would resolve to a different local key.
+        let mut s = closed("abc", None);
+        s.cwd = "/home/u/hive/src".to_string();
+        s.parent = Some("preset/CSD-9".to_string());
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            effective_parent(&s, &WorktreeState::default(), &projs),
+            Some("preset/CSD-9".to_string())
+        );
+    }
+
+    #[test]
+    fn test_bounding_predicate() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cfg = BoundingCfg { max_age_days: 7 };
+
+        // Archived → never surfaced, even if recent.
+        let mut arch = closed("a", Some("2026-07-02T00:00:00Z"));
+        arch.archived = true;
+        assert!(!should_surface_closed(&arch, now, &cfg));
+
+        // Recently active → surfaced.
+        assert!(should_surface_closed(
+            &closed("b", Some("2026-07-02T00:00:00Z")),
+            now,
+            &cfg
+        ));
+
+        // Old but has a resolved parent → surfaced.
+        let mut with_parent = closed("c", Some("2026-01-01T00:00:00Z"));
+        with_parent.parent = Some("hive".to_string());
+        assert!(should_surface_closed(&with_parent, now, &cfg));
+
+        // Old, no parent, but a pinned freeze → surfaced.
+        let mut frozen = closed("d", Some("2026-01-01T00:00:00Z"));
+        frozen.frozen = Some(FrozenInfo {
+            note: String::new(),
+            pinned: true,
+            frozen_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        assert!(should_surface_closed(&frozen, now, &cfg));
+
+        // Old, no parent, not frozen → dropped.
+        assert!(!should_surface_closed(
+            &closed("e", Some("2026-01-01T00:00:00Z")),
+            now,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn test_scan_cache_reuses_within_interval() {
+        let cache = ScanCache {
+            ids: vec!["x".to_string()],
+            scanned_at: chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let within = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(cache.is_fresh(within, 30));
+    }
+
+    #[test]
+    fn test_scan_cache_refreshes_after_interval() {
+        let cache = ScanCache {
+            ids: vec!["x".to_string()],
+            scanned_at: chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let after = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!cache.is_fresh(after, 30));
     }
 }
