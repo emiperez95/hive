@@ -117,6 +117,14 @@ enum Action {
     Reopen(Box<Conversation>),
 }
 
+/// Which list the TUI is showing.
+enum View {
+    /// Live conversations grouped by the tmux session running them (like `prefix + s`).
+    Active,
+    /// Every conversation (live + closed) grouped by project/worktree.
+    Browse,
+}
+
 /// A group of conversations sharing a parent (project/worktree), in display order.
 struct Group {
     key: String,
@@ -179,6 +187,45 @@ fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
         }
     }
     rows
+}
+
+/// Active view: only LIVE conversations, grouped by the tmux session running
+/// them — the conversation-aware analog of the classic `prefix + s` session list.
+fn build_active(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
+    for c in reg.conversations.values() {
+        if !c.lifecycle.is_actionable_here() {
+            continue;
+        }
+        let key = c
+            .placement
+            .as_ref()
+            .map(|p| p.session_name.clone())
+            .unwrap_or_else(|| "(detached)".to_string());
+        grouped.entry(key).or_default().push(c);
+    }
+    let mut groups = Vec::new();
+    let mut convs = Vec::new();
+    for (key, mut group) in grouped {
+        group.sort_by(|a, b| {
+            b.last_activity
+                .cmp(&a.last_activity)
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
+        let path = common_prefix(&group.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
+        let mut idxs = Vec::new();
+        for c in group {
+            idxs.push(convs.len());
+            convs.push(c.clone());
+        }
+        groups.push(Group {
+            key,
+            convs: idxs,
+            path,
+        });
+    }
+    (groups, convs)
 }
 
 /// Longest common absolute-directory prefix (component-wise) of the given cwds.
@@ -251,18 +298,36 @@ fn run_conversations_tui() -> Result<()> {
 }
 
 fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action> {
-    let reg = gather_conversations();
-    let (mut groups, mut convs) = build_groups(&reg);
-    // Start with every group collapsed — just the project/worktree headers.
-    let mut collapsed: HashSet<String> = groups.iter().map(|g| g.key.clone()).collect();
+    let mut reg = gather_conversations();
+    // Default to the Active view (live conversations by session); `/` browses all.
+    let mut view = View::Active;
+    let (mut groups, mut convs) = build_active(&reg);
+    let mut collapsed: HashSet<String> = HashSet::new(); // Active: everything expanded
     let mut sel: usize = 0;
+
+    // Switch the current view, rebuilding groups + collapse state.
+    let rebuild = |view: &View,
+                   reg: &ConversationRegistry|
+     -> (Vec<Group>, Vec<Conversation>, HashSet<String>) {
+        match view {
+            View::Active => {
+                let (g, c) = build_active(reg);
+                (g, c, HashSet::new())
+            }
+            View::Browse => {
+                let (g, c) = build_groups(reg);
+                let collapsed = g.iter().map(|g| g.key.clone()).collect();
+                (g, c, collapsed)
+            }
+        }
+    };
 
     loop {
         let rows = visible_rows(&groups, &collapsed);
         if sel >= rows.len() {
             sel = rows.len().saturating_sub(1);
         }
-        terminal.draw(|frame| draw(frame, &groups, &convs, &rows, &collapsed, sel))?;
+        terminal.draw(|frame| draw(frame, &view, &groups, &convs, &rows, &collapsed, sel))?;
 
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -274,7 +339,24 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             continue;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(Action::Quit),
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
+            // Esc backs out of Browse to Active; from Active it quits.
+            KeyCode::Esc => match view {
+                View::Browse => {
+                    view = View::Active;
+                    (groups, convs, collapsed) = rebuild(&view, &reg);
+                    sel = 0;
+                }
+                View::Active => return Ok(Action::Quit),
+            },
+            // `/` opens the full browse-everything list.
+            KeyCode::Char('/') => {
+                if matches!(view, View::Active) {
+                    view = View::Browse;
+                    (groups, convs, collapsed) = rebuild(&view, &reg);
+                    sel = 0;
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 if sel + 1 < rows.len() {
                     sel += 1;
@@ -323,11 +405,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 None => {}
             },
             KeyCode::Char('r') => {
-                let reg = gather_conversations();
-                let (g, c) = build_groups(&reg);
-                groups = g;
-                convs = c;
-                collapsed = groups.iter().map(|g| g.key.clone()).collect();
+                reg = gather_conversations();
+                (groups, convs, collapsed) = rebuild(&view, &reg);
                 sel = 0;
             }
             _ => {}
@@ -337,6 +416,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
 
 fn draw(
     frame: &mut ratatui::Frame,
+    view: &View,
     groups: &[Group],
     convs: &[Conversation],
     rows: &[Row],
@@ -356,11 +436,23 @@ fn draw(
         .iter()
         .filter(|c| c.lifecycle.is_actionable_here())
         .count();
-    let header = format!(
-        " hive conversations — {total} known · {live} live · {} closed · {} groups",
-        total - live,
-        groups.len()
-    );
+    let (header, footer): (String, &str) = match view {
+        View::Active => (
+            format!(
+                " hive · active — {live} running in {} sessions   ( / browse all )",
+                groups.len()
+            ),
+            " ↑/↓ move · Enter switch · / browse all · r refresh · q quit",
+        ),
+        View::Browse => (
+            format!(
+                " hive conversations — {total} · {live} live · {} closed · {} groups   ( Esc back )",
+                total - live,
+                groups.len()
+            ),
+            " ←/→ collapse · ↑/↓ move · Enter open/resume · Esc active · r refresh · q quit",
+        ),
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             header,
@@ -387,7 +479,6 @@ fn draw(
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let footer = " ←/→ collapse/expand · ↑/↓ move · Enter open/resume · r refresh · q quit";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             footer,
