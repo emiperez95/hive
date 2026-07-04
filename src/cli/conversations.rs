@@ -146,38 +146,62 @@ enum Row {
     Conv { ci: usize, gi: usize }, // conversation index + its group index
 }
 
-/// Flatten the registry into grouped, sorted display order.
+/// Header key for the pinned group that enumerates all frozen conversations.
+const FROZEN_GROUP: &str = "💤 frozen";
+
+fn sort_convs(group: &mut [&Conversation]) {
+    group.sort_by(|a, b| {
+        b.lifecycle
+            .is_actionable_here()
+            .cmp(&a.lifecycle.is_actionable_here())
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+    });
+}
+
+/// Push a group (its conversations cloned into `convs`) and return it.
+fn push_group(key: String, group: Vec<&Conversation>, convs: &mut Vec<Conversation>) -> Group {
+    let path = common_prefix(&group.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
+    let mut idxs = Vec::new();
+    for c in group {
+        idxs.push(convs.len());
+        convs.push(c.clone());
+    }
+    Group {
+        key,
+        convs: idxs,
+        path,
+    }
+}
+
+/// Flatten the registry into grouped, sorted display order: a pinned "💤 frozen"
+/// group first (all frozen conversations, enumerated), then the rest by parent.
 fn build_groups(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
     use std::collections::BTreeMap;
+    let mut frozen: Vec<&Conversation> = Vec::new();
     let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
     for c in reg.conversations.values() {
+        if c.is_frozen() {
+            frozen.push(c);
+            continue;
+        }
         let key = c
             .parent
             .clone()
             .unwrap_or_else(|| "(unassigned)".to_string());
         grouped.entry(key).or_default().push(c);
     }
+
     let mut groups = Vec::new();
     let mut convs = Vec::new();
+    // Frozen pinned first so they're always enumerated at the top of Browse.
+    if !frozen.is_empty() {
+        sort_convs(&mut frozen);
+        groups.push(push_group(FROZEN_GROUP.to_string(), frozen, &mut convs));
+    }
     for (key, mut group) in grouped {
-        group.sort_by(|a, b| {
-            b.lifecycle
-                .is_actionable_here()
-                .cmp(&a.lifecycle.is_actionable_here())
-                .then_with(|| b.last_activity.cmp(&a.last_activity))
-                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
-        });
-        let path = common_prefix(&group.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
-        let mut idxs = Vec::new();
-        for c in group {
-            idxs.push(convs.len());
-            convs.push(c.clone());
-        }
-        groups.push(Group {
-            key,
-            convs: idxs,
-            path,
-        });
+        sort_convs(&mut group);
+        groups.push(push_group(key, group, &mut convs));
     }
     (groups, convs)
 }
@@ -324,18 +348,46 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             }
             View::Browse => {
                 let (g, c) = build_groups(reg);
-                let collapsed = g.iter().map(|g| g.key.clone()).collect();
+                // Collapse every group except the pinned frozen one, so frozen
+                // conversations stay enumerated at the top.
+                let collapsed = g
+                    .iter()
+                    .map(|g| g.key.clone())
+                    .filter(|k| k != FROZEN_GROUP)
+                    .collect();
                 (g, c, collapsed)
             }
         }
     };
+
+    // Enter/number activation: switch to a live conversation, else reopen it.
+    let activate = |c: &Conversation| -> Action {
+        if c.lifecycle.is_actionable_here() {
+            Action::Switch(Box::new(c.clone()))
+        } else {
+            Action::Reopen(Box::new(c.clone()))
+        }
+    };
+
+    let mut showing_help = false;
 
     loop {
         let rows = visible_rows(&groups, &collapsed);
         if sel >= rows.len() {
             sel = rows.len().saturating_sub(1);
         }
-        terminal.draw(|frame| draw(frame, &view, &groups, &convs, &rows, &collapsed, sel))?;
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                &view,
+                &groups,
+                &convs,
+                &rows,
+                &collapsed,
+                sel,
+                showing_help,
+            )
+        })?;
 
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -346,8 +398,25 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         if key.kind != KeyEventKind::Press {
             continue;
         }
+
+        // Help overlay: any key dismisses it (? / Esc / q explicitly).
+        if showing_help {
+            showing_help = false;
+            continue;
+        }
+
         match key.code {
+            KeyCode::Char('?') => showing_help = true,
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
+            // Number keys 1-9 jump to the Nth visible conversation (like classic hive).
+            KeyCode::Char(d @ '1'..='9') => {
+                let n = d as usize - '1' as usize;
+                if let Some(Row::Conv { ci, .. }) =
+                    rows.iter().filter(|r| matches!(r, Row::Conv { .. })).nth(n)
+                {
+                    return Ok(activate(&convs[*ci]));
+                }
+            }
             // Esc backs out of Browse to Active; from Active it quits.
             KeyCode::Esc => match view {
                 View::Browse => {
@@ -395,14 +464,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 None => {}
             },
             KeyCode::Enter => match rows.get(sel) {
-                Some(Row::Conv { ci, .. }) => {
-                    let c = &convs[*ci];
-                    return Ok(if c.lifecycle.is_actionable_here() {
-                        Action::Switch(Box::new(c.clone()))
-                    } else {
-                        Action::Reopen(Box::new(c.clone()))
-                    });
-                }
+                Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
                 // Enter on a header toggles it.
                 Some(Row::Header(gi)) => {
                     let key = groups[*gi].key.clone();
@@ -422,6 +484,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut ratatui::Frame,
     view: &View,
@@ -430,6 +493,7 @@ fn draw(
     rows: &[Row],
     collapsed: &HashSet<String>,
     sel: usize,
+    showing_help: bool,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -444,21 +508,27 @@ fn draw(
         .iter()
         .filter(|c| c.lifecycle.is_actionable_here())
         .count();
+    let frozen = convs.iter().filter(|c| c.is_frozen()).count();
+    let frozen_tag = if frozen > 0 {
+        format!(" · 💤 {frozen} frozen")
+    } else {
+        String::new()
+    };
     let (header, footer): (String, &str) = match view {
         View::Active => (
             format!(
-                " hive · active — {live} running in {} sessions   ( / browse all )",
+                " hive · active — {live} running in {} sessions{frozen_tag}   ( / browse all )",
                 groups.len()
             ),
-            " ↑/↓ move · Enter switch · / browse all · r refresh · q quit",
+            " 1-9 jump · ↑/↓ move · Enter switch · / browse · r refresh · ? help · q quit",
         ),
         View::Browse => (
             format!(
-                " hive conversations — {total} · {live} live · {} closed · {} groups   ( Esc back )",
+                " hive conversations — {total} · {live} live · {} closed{frozen_tag} · {} groups   ( Esc back )",
                 total - live,
                 groups.len()
             ),
-            " ←/→ collapse · ↑/↓ move · Enter open/resume · Esc active · r refresh · q quit",
+            " 1-9 jump · ←/→ fold · ↑/↓ move · Enter open/resume · Esc active · ? help · q quit",
         ),
     };
     frame.render_widget(
@@ -469,22 +539,40 @@ fn draw(
         chunks[0],
     );
 
-    // Scroll so the selected row stays visible.
+    if showing_help {
+        frame.render_widget(Paragraph::new(help_lines()), chunks[1]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " any key to dismiss",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            chunks[2],
+        );
+        return;
+    }
+
+    // Number the visible conversation rows 1..9 for quick-jump.
+    let mut conv_seen = 0usize;
     let h = chunks[1].height as usize;
+    // Scroll so the selected row stays visible.
     let offset = if sel >= h { sel + 1 - h } else { 0 };
-    let lines: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(h)
-        .map(|(ri, row)| {
-            let selected = ri == sel;
-            match row {
-                Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
-                Row::Conv { ci, gi } => conv_line(&convs[*ci], &groups[*gi].path, selected),
-            }
-        })
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    for (ri, row) in rows.iter().enumerate() {
+        let num = if let Row::Conv { .. } = row {
+            conv_seen += 1;
+            (conv_seen <= 9).then_some(conv_seen)
+        } else {
+            None
+        };
+        if ri < offset || ri >= offset + h {
+            continue;
+        }
+        let selected = ri == sel;
+        lines.push(match row {
+            Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
+            Row::Conv { ci, gi } => conv_line(&convs[*ci], &groups[*gi].path, selected, num),
+        });
+    }
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 
     frame.render_widget(
@@ -494,6 +582,43 @@ fn draw(
         ))),
         chunks[2],
     );
+}
+
+/// The help overlay lines.
+fn help_lines() -> Vec<Line<'static>> {
+    let key = |k: &str, d: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {k:<10}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(d.to_string()),
+        ])
+    };
+    vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  hive conversations — keys",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        key("1-9", "Jump to / switch the Nth conversation"),
+        key("↑/↓ j/k", "Move selection"),
+        key("Enter", "Switch (live) or reopen/resume (closed/frozen)"),
+        key("/", "Browse all conversations (live + closed + frozen)"),
+        key("Esc", "Browse → Active · Active → quit"),
+        key("←/→ h/l", "Collapse / expand a group (Browse)"),
+        key("r", "Refresh"),
+        key("?", "This help"),
+        key("q", "Quit"),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  ● live   ○ closed (resumable)   💤 frozen",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
 }
 
 /// A group header row: a disclosure triangle, the parent key, and counts.
@@ -537,7 +662,17 @@ fn frozen_note(c: &Conversation) -> String {
     }
 }
 
-fn conv_line(c: &Conversation, group_path: &str, selected: bool) -> Line<'static> {
+fn conv_line(
+    c: &Conversation,
+    group_path: &str,
+    selected: bool,
+    num: Option<usize>,
+) -> Line<'static> {
+    // Quick-jump number (1-9) or two spaces, mirroring the classic list.
+    let num_prefix = match num {
+        Some(n) => format!("{n} "),
+        None => "  ".to_string(),
+    };
     let marker = if c.is_frozen() {
         "💤"
     } else if c.lifecycle.is_actionable_here() {
@@ -559,7 +694,8 @@ fn conv_line(c: &Conversation, group_path: &str, selected: bool) -> Line<'static
     // shared path (empty for the common case — the whole group shares one dir).
     let sub = rel_below(&c.cwd, group_path);
     let text = format!(
-        "    {} {:8}  {:<36}  {:<12}  {}  {}{}",
+        "  {} {} {:8}  {:<36}  {:<12}  {}  {}{}",
+        num_prefix,
         marker,
         short_id(c.id.as_str()),
         title,
@@ -675,10 +811,17 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
         .filter(|s| s.lifecycle.is_actionable_here())
         .count();
     let closed = total - live;
+    let frozen = reg.conversations.values().filter(|c| c.is_frozen()).count();
 
-    // Group by parent; None → "(unassigned)". BTreeMap gives stable ordering.
+    // Frozen conversations are enumerated first under a pinned "💤 frozen" header;
+    // the rest are grouped by parent (BTreeMap gives stable ordering).
     let mut groups: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
+    let mut frozen_group: Vec<&Conversation> = Vec::new();
     for s in reg.conversations.values() {
+        if s.is_frozen() {
+            frozen_group.push(s);
+            continue;
+        }
         let key = s
             .parent
             .clone()
@@ -687,12 +830,21 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
     }
 
     let mut out = String::new();
+    let frozen_tag = if frozen > 0 {
+        format!(", {frozen} frozen")
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "hive conversations — {total} known ({live} live · {closed} closed) across {} groups\n",
+        "hive conversations — {total} known ({live} live · {closed} closed{frozen_tag}) across {} groups\n",
         groups.len()
     ));
 
-    for (parent, mut sessions) in groups {
+    // Emit the pinned frozen group first, then the parent groups.
+    let ordered = std::iter::once((FROZEN_GROUP.to_string(), frozen_group))
+        .filter(|(_, g)| !g.is_empty())
+        .chain(groups);
+    for (parent, mut sessions) in ordered {
         // Live first, then most-recently-active, then id for stability.
         sessions.sort_by(|a, b| {
             b.lifecycle
