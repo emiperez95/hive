@@ -415,13 +415,7 @@ fn header_line(
         .iter()
         .filter(|&&ci| convs[ci].lifecycle.is_actionable_here())
         .count();
-    let path = abbrev_home(&g.path);
-    let path_part = if path.len() > 1 {
-        format!("  {path}")
-    } else {
-        String::new()
-    };
-    let text = format!("{tri} {}{path_part}  ({n}, {live} live)", g.key);
+    let text = format!("{tri} {}  ({n}, {live} live)", g.key);
     let mut style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -554,14 +548,10 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
                 .then_with(|| a.id.as_str().cmp(b.id.as_str()))
         });
         out.push('\n');
-        // Path belongs to the project/worktree, so show it once on the header.
+        out.push_str(&format!("{parent}\n"));
+        // The path belongs to the project/worktree (implied by the group name), so
+        // it's not shown; only a distinguishing subpath is kept for rows below.
         let path = common_prefix(&sessions.iter().map(|s| s.cwd.as_str()).collect::<Vec<_>>());
-        let ph = abbrev_home(&path);
-        if ph.len() > 1 {
-            out.push_str(&format!("{parent}  {ph}\n"));
-        } else {
-            out.push_str(&format!("{parent}\n"));
-        }
         for s in sessions {
             let marker = if s.is_frozen() {
                 "💤"

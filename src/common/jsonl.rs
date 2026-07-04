@@ -158,24 +158,23 @@ pub struct DiskConversation {
     pub id: String,
     pub cwd: Option<String>,
     pub last_activity: Option<String>,
-    /// User-assigned conversation title (`custom-title` entry), if any.
+    /// Conversation title: the user's `custom-title`, else Claude's `ai-title`.
     pub title: Option<String>,
 }
 
-/// Read (cwd, custom title) from a transcript's first lines in a single pass.
-/// cwd = the first entry carrying one; title = the latest `custom-title` seen in
-/// that window (the user's name for the conversation). Bounded so it stays cheap.
+/// Read `(cwd, title)` from a transcript, scanning both the head (cwd + early
+/// titles) and the tail (titles set deep in a long conversation), so the most
+/// recent title wins. Title prefers the user's `custom-title`, falling back to
+/// Claude's auto-generated `ai-title`. Bounded reads keep it cheap.
 pub fn read_conversation_meta(path: &Path) -> (Option<String>, Option<String>) {
     let mut cwd = None;
-    let mut title = None;
+    let mut custom = None; // user-set `custom-title`
+    let mut ai = None; // Claude's auto-generated `ai-title`
 
-    // Head: cwd (stamped on early entries) + any title set near the start
+    // Head: cwd (stamped on early entries) + any titles set near the start
     // (resumed sessions re-stamp their title at the top of the transcript).
     if let Ok(file) = fs::File::open(path) {
         for line in BufReader::new(file).lines().take(40).map_while(Result::ok) {
-            if line.is_empty() {
-                continue;
-            }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
@@ -184,38 +183,43 @@ pub fn read_conversation_meta(path: &Path) -> (Option<String>, Option<String>) {
                     cwd = Some(c.to_string());
                 }
             }
-            if let Some(t) = custom_title(&v) {
-                title = Some(t);
+            if let Some(t) = title_field(&v, "custom-title", "customTitle") {
+                custom = Some(t);
+            }
+            if let Some(t) = title_field(&v, "ai-title", "aiTitle") {
+                ai = Some(t);
             }
         }
     }
 
-    // Tail: a rename made deep into a long conversation appends a `custom-title`
-    // entry near the END, well past the head window — so scan the tail and let
-    // it win over any earlier title.
+    // Tail: a title set/updated deep in a long conversation lands well past the
+    // head window — scan the tail so the most recent one wins.
     for line in read_tail_lines(&path.to_path_buf(), 65_536) {
-        if line.is_empty() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
+        };
+        if let Some(t) = title_field(&v, "custom-title", "customTitle") {
+            custom = Some(t);
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(t) = custom_title(&v) {
-                title = Some(t);
-            }
+        if let Some(t) = title_field(&v, "ai-title", "aiTitle") {
+            ai = Some(t);
         }
     }
 
-    (cwd, title)
+    // Prefer the user's title; fall back to Claude's auto-generated one.
+    (cwd, custom.or(ai))
 }
 
-/// The non-empty `customTitle` of a `custom-title` entry, if `v` is one.
-fn custom_title(v: &serde_json::Value) -> Option<String> {
-    if v.get("type").and_then(|t| t.as_str()) != Some("custom-title") {
+/// The non-empty title string carried by an entry of the given `entry_type`
+/// (e.g. `("custom-title", "customTitle")` or `("ai-title", "aiTitle")`).
+fn title_field(v: &serde_json::Value, entry_type: &str, field: &str) -> Option<String> {
+    if v.get("type").and_then(|t| t.as_str()) != Some(entry_type) {
         return None;
     }
-    v.get("customTitle")
+    v.get(field)
         .and_then(|t| t.as_str())
         .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
+        .map(str::to_string)
 }
 
 /// Read just the cwd from a transcript (see [`read_conversation_meta`]).
@@ -1137,6 +1141,35 @@ mod tests {
 
         assert_eq!(cwd.as_deref(), Some("/home/u/eve"));
         assert_eq!(title.as_deref(), Some("Market watcher"));
+    }
+
+    #[test]
+    fn test_ai_title_fallback_and_custom_precedence() {
+        let dir = std::env::temp_dir().join(format!("hive-aititle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Only an ai-title → used as the fallback.
+        let ai_only = dir.join("ai.jsonl");
+        std::fs::write(
+            &ai_only,
+            "{\"type\":\"user\",\"cwd\":\"/x\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"Repo structure\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_conversation_meta(&ai_only).1.as_deref(),
+            Some("Repo structure")
+        );
+
+        // Both present → the user's custom title wins.
+        let both = dir.join("both.jsonl");
+        std::fs::write(
+            &both,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Auto name\"}\n{\"type\":\"custom-title\",\"customTitle\":\"My name\"}\n",
+        )
+        .unwrap();
+        assert_eq!(read_conversation_meta(&both).1.as_deref(), Some("My name"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
