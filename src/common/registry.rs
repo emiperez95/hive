@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::common::frozen::FrozenState;
 use crate::common::persistence::cache_dir;
 use crate::common::projects::{expand_tilde, ProjectRegistry};
 use crate::common::worktree::WorktreeState;
@@ -294,6 +295,29 @@ impl ConversationRegistry {
             );
         }
         ConversationRegistry { conversations }
+    }
+
+    /// Overlay the frozen facet (note + timestamp) onto Closed conversations from a
+    /// `FrozenState`. Freeze == a pinned, noted subset of Closed. Only session-id-
+    /// keyed entries map to a conversation; composite `session#window` entries (no
+    /// conversation id) are ignored — Invariant #1: never fabricate an id. A live
+    /// conversation is left alone (a stale freeze entry for something now running is
+    /// not "frozen").
+    pub fn apply_frozen(&mut self, frozen: &FrozenState) {
+        for entry in frozen.frozen.values() {
+            let Some(id) = entry.claude_session_id.as_ref() else {
+                continue;
+            };
+            if let Some(c) = self.conversations.get_mut(id) {
+                if c.lifecycle.is_closed_like() {
+                    c.frozen = Some(FrozenInfo {
+                        note: entry.note.clone(),
+                        pinned: true,
+                        frozen_at: entry.frozen_at.clone(),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -949,6 +973,69 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         assert!(cache.is_fresh(within, 30));
+    }
+
+    fn frozen_entry(id: Option<&str>, note: &str) -> crate::common::frozen::FrozenEntry {
+        let idj = match id {
+            Some(i) => format!("\"{i}\""),
+            None => "null".to_string(),
+        };
+        serde_json::from_str(&format!(
+            r#"{{"session_name":"s","cwd":"/x","frozen_at":"2026-07-01T00:00:00Z","claude_session_id":{idj},"note":"{note}"}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_frozen_entry_maps_to_closed_facet() {
+        let mut reg = ConversationRegistry::default();
+        reg.conversations
+            .insert("abc".to_string(), closed("abc", None));
+        let mut fs = FrozenState::default();
+        fs.frozen
+            .insert("abc".to_string(), frozen_entry(Some("abc"), "postpone"));
+
+        reg.apply_frozen(&fs);
+
+        let c = &reg.conversations["abc"];
+        assert!(c.is_frozen());
+        assert!(c.is_known_not_here()); // still Closed
+        let f = c.frozen.as_ref().unwrap();
+        assert_eq!(f.note, "postpone");
+        assert!(f.pinned);
+    }
+
+    #[test]
+    fn test_composite_key_frozen_excluded() {
+        // A frozen entry with no conversation id (composite "session#window" key)
+        // must not create or touch any conversation.
+        let mut reg = ConversationRegistry::default();
+        reg.conversations
+            .insert("abc".to_string(), closed("abc", None));
+        let mut fs = FrozenState::default();
+        fs.frozen
+            .insert("s#1".to_string(), frozen_entry(None, "no id"));
+
+        reg.apply_frozen(&fs);
+
+        assert!(!reg.conversations["abc"].is_frozen());
+        assert_eq!(reg.conversations.len(), 1);
+    }
+
+    #[test]
+    fn test_frozen_not_applied_to_live() {
+        // A stale freeze entry for a now-running conversation is ignored.
+        let mut reg = ConversationRegistry::default();
+        let mut live = closed("live1", None);
+        live.lifecycle = Lifecycle::Live;
+        reg.conversations.insert("live1".to_string(), live);
+        let mut fs = FrozenState::default();
+        fs.frozen
+            .insert("live1".to_string(), frozen_entry(Some("live1"), "stale"));
+
+        reg.apply_frozen(&fs);
+
+        assert!(!reg.conversations["live1"].is_frozen());
     }
 
     #[test]

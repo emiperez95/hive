@@ -100,6 +100,11 @@ pub fn gather_conversations() -> ConversationRegistry {
         }
     }
 
+    // Overlay the frozen facet (note + timestamp) so frozen windows read as
+    // Closed+frozen (💤). Must run BEFORE bounding, since a pinned freeze is one
+    // of the reasons a Closed conversation is surfaced.
+    reg.apply_frozen(&crate::common::frozen::FrozenState::load());
+
     // Bound the (unbounded) on-disk Closed set: Live is always shown; a Closed
     // conversation is kept only if recently active, parented, or a pinned freeze.
     let now = chrono::Utc::now();
@@ -519,6 +524,19 @@ fn header_line(
     Line::from(Span::styled(text, style))
 }
 
+/// The freeze note (why it was parked) for a frozen conversation, else empty.
+fn frozen_note(c: &Conversation) -> String {
+    match &c.frozen {
+        Some(f) if !f.note.trim().is_empty() => {
+            format!(
+                "  📝 {}",
+                f.note.trim().chars().take(40).collect::<String>()
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 fn conv_line(c: &Conversation, group_path: &str, selected: bool) -> Line<'static> {
     let marker = if c.is_frozen() {
         "💤"
@@ -541,13 +559,14 @@ fn conv_line(c: &Conversation, group_path: &str, selected: bool) -> Line<'static
     // shared path (empty for the common case — the whole group shares one dir).
     let sub = rel_below(&c.cwd, group_path);
     let text = format!(
-        "    {} {:8}  {:<36}  {:<12}  {}  {}",
+        "    {} {:8}  {:<36}  {:<12}  {}  {}{}",
         marker,
         short_id(c.id.as_str()),
         title,
         status_label(c),
         last,
         sub,
+        frozen_note(c),
     );
     let style = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
@@ -708,13 +727,14 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
             // Only the subpath that distinguishes this conversation from its group.
             let sub = rel_below(&s.cwd, &path);
             out.push_str(&format!(
-                "  {} {:8}  {:<28}  {:<13}  {}  {}\n",
+                "  {} {:8}  {:<28}  {:<13}  {}  {}{}\n",
                 marker,
                 short_id(s.id.as_str()),
                 title,
                 status_label(s),
                 last,
                 sub,
+                frozen_note(s),
             ));
         }
     }
