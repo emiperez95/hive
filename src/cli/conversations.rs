@@ -239,7 +239,11 @@ fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
 
 /// Active view: only LIVE conversations, grouped by the tmux session running
 /// them — the conversation-aware analog of the classic `prefix + s` session list.
-fn build_active(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
+/// Skipped sessions are ordered last so they form a separate section.
+fn build_active(
+    reg: &ConversationRegistry,
+    skipped: &HashSet<String>,
+) -> (Vec<Group>, Vec<Conversation>) {
     use std::collections::BTreeMap;
     let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
     for c in reg.conversations.values() {
@@ -253,25 +257,25 @@ fn build_active(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
             .unwrap_or_else(|| "(detached)".to_string());
         grouped.entry(key).or_default().push(c);
     }
-    let mut groups = Vec::new();
-    let mut convs = Vec::new();
+    // Partition into normal (first) and skipped (last) session groups.
+    let mut normal = Vec::new();
+    let mut skip = Vec::new();
     for (key, mut group) in grouped {
         group.sort_by(|a, b| {
             b.last_activity
                 .cmp(&a.last_activity)
                 .then_with(|| a.id.as_str().cmp(b.id.as_str()))
         });
-        let path = common_prefix(&group.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
-        let mut idxs = Vec::new();
-        for c in group {
-            idxs.push(convs.len());
-            convs.push(c.clone());
+        if skipped.contains(&key) {
+            skip.push((key, group));
+        } else {
+            normal.push((key, group));
         }
-        groups.push(Group {
-            key,
-            convs: idxs,
-            path,
-        });
+    }
+    let mut groups = Vec::new();
+    let mut convs = Vec::new();
+    for (key, group) in normal.into_iter().chain(skip) {
+        groups.push(push_group(key, group, &mut convs));
     }
     (groups, convs)
 }
@@ -347,19 +351,18 @@ fn run_conversations_tui() -> Result<()> {
 
 fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action> {
     let mut reg = gather_conversations();
+    let mut skipped = load_skipped_sessions();
     // Default to the Active view (live conversations by session); `/` browses all.
     let mut view = View::Active;
-    let (mut groups, mut convs) = build_active(&reg);
-    let mut collapsed: HashSet<String> = HashSet::new(); // Active: everything expanded
-    let mut sel: usize = 0;
 
     // Switch the current view, rebuilding groups + collapse state.
     let rebuild = |view: &View,
-                   reg: &ConversationRegistry|
+                   reg: &ConversationRegistry,
+                   skipped: &HashSet<String>|
      -> (Vec<Group>, Vec<Conversation>, HashSet<String>) {
         match view {
             View::Active => {
-                let (g, c) = build_active(reg);
+                let (g, c) = build_active(reg, skipped);
                 (g, c, HashSet::new())
             }
             View::Browse => {
@@ -376,6 +379,9 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         }
     };
 
+    let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &skipped);
+    let mut sel: usize = 0;
+
     // Enter/number activation: switch to a live conversation, else reopen it.
     let activate = |c: &Conversation| -> Action {
         if c.lifecycle.is_actionable_here() {
@@ -386,7 +392,6 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     };
 
     let mut showing_help = false;
-    let mut skipped = load_skipped_sessions();
 
     loop {
         let rows = visible_rows(&groups, &collapsed);
@@ -439,7 +444,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             KeyCode::Esc => match view {
                 View::Browse => {
                     view = View::Active;
-                    (groups, convs, collapsed) = rebuild(&view, &reg);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped);
                     sel = 0;
                 }
                 View::Active => return Ok(Action::Quit),
@@ -448,7 +453,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             KeyCode::Char('/') => {
                 if matches!(view, View::Active) {
                     view = View::Browse;
-                    (groups, convs, collapsed) = rebuild(&view, &reg);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped);
                     sel = 0;
                 }
             }
@@ -494,8 +499,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             },
             KeyCode::Char('r') => {
                 reg = gather_conversations();
-                (groups, convs, collapsed) = rebuild(&view, &reg);
                 skipped = load_skipped_sessions();
+                (groups, convs, collapsed) = rebuild(&view, &reg, &skipped);
                 sel = 0;
             }
             _ => {}
@@ -590,30 +595,61 @@ fn draw(
     // Blank line above the list, mirroring the classic view's top padding.
     let body = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(chunks[1]);
 
-    // Number the visible conversation rows 1..9 for quick-jump.
+    // Build the full display line list: a blank line before each group (spacing),
+    // a "── skipped ──" divider before the first skipped session (Active), and
+    // one line per row. Blanks/dividers aren't navigable rows, so we track where
+    // the selected row lands (`sel_display`) to window the scroll around it.
+    let divider = |label: &str| {
+        Line::from(Span::styled(
+            format!("  ── {label} ──"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ))
+    };
+    let mut display: Vec<Line> = Vec::new();
+    let mut sel_display = 0usize;
     let mut conv_seen = 0usize;
-    let h = body[1].height as usize;
-    // Scroll so the selected row stays visible.
-    let offset = if sel >= h { sel + 1 - h } else { 0 };
-    let mut lines: Vec<Line> = Vec::new();
+    let mut shown_skip = false;
     for (ri, row) in rows.iter().enumerate() {
+        if let Row::Header(gi) = row {
+            let is_skip_group = skipped.contains(&groups[*gi].key);
+            if is_skip_group && !shown_skip {
+                shown_skip = true;
+                if !display.is_empty() {
+                    display.push(Line::raw(""));
+                }
+                display.push(divider("skipped"));
+            } else if !display.is_empty() {
+                display.push(Line::raw("")); // spacing between groups
+            }
+        }
         let num = if let Row::Conv { .. } = row {
             conv_seen += 1;
             (conv_seen <= 9).then_some(conv_seen)
         } else {
             None
         };
-        if ri < offset || ri >= offset + h {
-            continue;
+        if ri == sel {
+            sel_display = display.len();
         }
         let selected = ri == sel;
-        lines.push(match row {
+        display.push(match row {
             Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
             Row::Conv { ci, gi } => {
                 conv_line(&convs[*ci], &groups[*gi].path, selected, num, skipped)
             }
         });
     }
+
+    // Scroll so the selected row stays visible.
+    let h = body[1].height as usize;
+    let offset = if sel_display >= h {
+        sel_display + 1 - h
+    } else {
+        0
+    };
+    let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), body[1]);
 
     frame.render_widget(
