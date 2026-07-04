@@ -121,6 +121,9 @@ pub struct Conversation {
     /// User-assigned conversation title (from the transcript's `custom-title`).
     #[serde(default)]
     pub title: Option<String>,
+    /// CLAUDE_CONFIG_DIR (auth profile) to resume under; None = default `~/.claude`.
+    #[serde(default)]
+    pub auth_config_dir: Option<String>,
 }
 
 impl Conversation {
@@ -286,6 +289,7 @@ impl ConversationRegistry {
                     pinned,
                     archived,
                     title: None,
+                    auth_config_dir: None,
                 },
             );
         }
@@ -419,6 +423,7 @@ mod tests {
             pinned: false,
             archived: false,
             title: None,
+            auth_config_dir: None,
         }
     }
 
@@ -785,6 +790,7 @@ mod tests {
             pinned: false,
             archived: false,
             title: None,
+            auth_config_dir: None,
         }
     }
 

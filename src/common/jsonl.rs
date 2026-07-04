@@ -160,6 +160,21 @@ pub struct DiskConversation {
     pub last_activity: Option<String>,
     /// Conversation title: the user's `custom-title`, else Claude's `ai-title`.
     pub title: Option<String>,
+    /// CLAUDE_CONFIG_DIR (auth profile) the transcript lives under; None = default `~/.claude`.
+    pub config_dir: Option<String>,
+}
+
+/// The `CLAUDE_CONFIG_DIR` for a slug dir `<profile>/projects/<slug>`, or None for
+/// the default `~/.claude` (which needs no explicit env). This is how we resume a
+/// conversation under the same auth profile it was created in.
+fn profile_config_dir(slug_dir: &Path) -> Option<String> {
+    let profile_root = slug_dir.parent()?.parent()?; // <slug> → projects → <profile>
+    let name = profile_root.file_name()?.to_str()?;
+    if name == ".claude" {
+        None
+    } else {
+        Some(profile_root.to_string_lossy().into_owned())
+    }
 }
 
 /// Read `(cwd, title)` from a transcript, scanning both the head (cwd + early
@@ -235,6 +250,8 @@ pub fn scan_disk_conversations_in(dirs: &[PathBuf]) -> Vec<DiskConversation> {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
+        // Every conversation in this slug dir shares the dir's auth profile.
+        let config_dir = profile_config_dir(dir);
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -260,6 +277,7 @@ pub fn scan_disk_conversations_in(dirs: &[PathBuf]) -> Vec<DiskConversation> {
                 cwd,
                 last_activity,
                 title,
+                config_dir: config_dir.clone(),
             });
         }
     }
@@ -1141,6 +1159,39 @@ mod tests {
 
         assert_eq!(cwd.as_deref(), Some("/home/u/eve"));
         assert_eq!(title.as_deref(), Some("Market watcher"));
+    }
+
+    #[test]
+    fn test_scan_captures_auth_profile_config_dir() {
+        let base = std::env::temp_dir().join(format!("hive-cfg-{}", std::process::id()));
+        // Alt profile: <base>/.claude-work/projects/<slug>/<id>.jsonl
+        let work_slug = base.join(".claude-work").join("projects").join("slugw");
+        std::fs::create_dir_all(&work_slug).unwrap();
+        std::fs::write(
+            work_slug.join("w1.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"/x\"}\n",
+        )
+        .unwrap();
+        // Default profile: <base>/.claude/projects/<slug>/<id>.jsonl
+        let def_slug = base.join(".claude").join("projects").join("slugd");
+        std::fs::create_dir_all(&def_slug).unwrap();
+        std::fs::write(
+            def_slug.join("d1.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"/y\"}\n",
+        )
+        .unwrap();
+
+        let work = scan_disk_conversations_in(std::slice::from_ref(&work_slug));
+        let def = scan_disk_conversations_in(std::slice::from_ref(&def_slug));
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(work.len(), 1);
+        assert_eq!(
+            work[0].config_dir.as_deref(),
+            Some(base.join(".claude-work").to_string_lossy().as_ref())
+        );
+        assert_eq!(def.len(), 1);
+        assert_eq!(def[0].config_dir, None); // default profile → no CLAUDE_CONFIG_DIR
     }
 
     #[test]
