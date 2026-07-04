@@ -19,6 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::common::frozen::relative_time;
 use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::persistence::load_skipped_sessions;
@@ -528,35 +529,51 @@ fn draw(
         .filter(|c| c.lifecycle.is_actionable_here())
         .count();
     let frozen = convs.iter().filter(|c| c.is_frozen()).count();
-    let frozen_tag = if frozen > 0 {
-        format!(" · 💤 {frozen} frozen")
-    } else {
-        String::new()
-    };
-    let (header, footer): (String, &str) = match view {
+    // Classic-style header bar: bold `hive`, view label, then dim metadata + a
+    // blue frozen count (matching the main list's header composition).
+    let (view_label, counts, footer): (&str, String, &str) = match view {
         View::Active => (
-            format!(
-                " hive · active — {live} running in {} sessions{frozen_tag}   ( / browse all )",
-                groups.len()
-            ),
+            "active",
+            format!("{live} running · {} sessions", groups.len()),
             " 1-9 jump · ↑/↓ move · Enter switch · / browse · r refresh · ? help · q quit",
         ),
         View::Browse => (
+            "conversations",
             format!(
-                " hive conversations — {total} · {live} live · {} closed{frozen_tag} · {} groups   ( Esc back )",
+                "{total} · {live} live · {} closed · {} groups",
                 total - live,
                 groups.len()
             ),
             " 1-9 jump · ←/→ fold · ↑/↓ move · Enter open/resume · Esc active · ? help · q quit",
         ),
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            header,
-            Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        chunks[0],
-    );
+    let mut header_spans = vec![
+        Span::styled(" hive", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" · {view_label}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(counts, Style::default().add_modifier(Modifier::DIM)),
+    ];
+    if frozen > 0 {
+        header_spans.push(Span::raw("   "));
+        header_spans.push(Span::styled(
+            format!("💤 {frozen} frozen"),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+    let hint = match view {
+        View::Active => "  ( / browse )",
+        View::Browse => "  ( Esc back )",
+    };
+    header_spans.push(Span::styled(
+        hint,
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
     if showing_help {
         frame.render_widget(Paragraph::new(help_lines()), chunks[1]);
@@ -570,9 +587,12 @@ fn draw(
         return;
     }
 
+    // Blank line above the list, mirroring the classic view's top padding.
+    let body = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(chunks[1]);
+
     // Number the visible conversation rows 1..9 for quick-jump.
     let mut conv_seen = 0usize;
-    let h = chunks[1].height as usize;
+    let h = body[1].height as usize;
     // Scroll so the selected row stays visible.
     let offset = if sel >= h { sel + 1 - h } else { 0 };
     let mut lines: Vec<Line> = Vec::new();
@@ -594,7 +614,7 @@ fn draw(
             }
         });
     }
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    frame.render_widget(Paragraph::new(lines), body[1]);
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -726,25 +746,20 @@ fn conv_line(
         .as_deref()
         .map(|t| t.chars().take(36).collect::<String>())
         .unwrap_or_default();
-    let last = c
+    // "(3m ago)" relative time, mirroring classic's activity suffix.
+    let ago = c
         .last_activity
         .as_deref()
-        .map(|t| t.chars().take(10).collect::<String>())
+        .map(|t| format!("  ({})", relative_time(t)))
         .unwrap_or_default();
     // Only the subpath that distinguishes this conversation from its group's
     // shared path (empty for the common case — the whole group shares one dir).
     let sub = rel_below(&c.cwd, group_path);
-    let text = format!(
-        "  {} {} {:8}  {:<36}  {:<12}  {}  {}{}",
-        num_prefix,
-        marker,
-        short_id(c.id.as_str()),
-        title,
-        status_label(c),
-        last,
-        sub,
-        frozen_note(c),
-    );
+    let sub_part = if sub.is_empty() {
+        String::new()
+    } else {
+        format!("  {sub}")
+    };
 
     let skip = is_skipped(c, skipped);
     // Skipped rows are grayed out; otherwise green live / gray closed.
@@ -759,22 +774,62 @@ fn conv_line(
     } else {
         Style::default().fg(Color::Gray)
     };
+    let dim = |base: Style| {
+        if selected {
+            base
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        }
+    };
 
-    let mut spans = vec![Span::styled(text, base)];
-    // Auth profile tag (work convs stand out; personal is untagged).
+    // Line 1 fragment: number · marker · id · title (classic name column).
+    let mut spans = vec![Span::styled(
+        format!(
+            "  {} {} {:8}  {:<36}",
+            num_prefix,
+            marker,
+            short_id(c.id.as_str()),
+            title
+        ),
+        base,
+    )];
+
+    // Classic-style colored "→ status  (ago)".
+    let (label, color) = status_span(c);
+    if !label.is_empty() {
+        let sc = if selected {
+            base
+        } else {
+            Style::default().fg(color)
+        };
+        spans.push(Span::styled(format!("  → {label}"), sc));
+    }
+    if !ago.is_empty() {
+        spans.push(Span::styled(ago, dim(base)));
+    }
+    // Frozen note, distinguishing subpath, and tags.
+    let fnote = frozen_note(c);
+    if !fnote.is_empty() {
+        spans.push(Span::styled(fnote, dim(base)));
+    }
+    if !sub_part.is_empty() {
+        spans.push(Span::styled(sub_part, dim(base)));
+    }
     if let Some(env) = env_label(c) {
         let col = if selected {
-            Color::White
+            base
         } else {
-            Color::Magenta
+            Style::default().fg(Color::Magenta)
         };
-        spans.push(Span::styled(format!("  [{env}]"), Style::default().fg(col)));
+        spans.push(Span::styled(format!("  [{env}]"), col));
     }
     if skip {
-        spans.push(Span::styled(
-            "  [skip]",
-            Style::default().fg(Color::DarkGray),
-        ));
+        let col = if selected {
+            base
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled("  [skip]", col));
     }
     Line::from(spans)
 }
@@ -861,6 +916,22 @@ fn status_label(session: &Conversation) -> &'static str {
         Some(SessionStatus::QuestionAsked) => "question",
         Some(SessionStatus::RunningWorkflow { .. }) => "workflow",
         Some(SessionStatus::Unknown) => "unknown",
+    }
+}
+
+/// Short status label + classic-hive color (idle=cyan, plan/ask=magenta,
+/// perm/edit=yellow, flow=blue, work=darkgray). Empty label ⇒ closed (no status).
+fn status_span(c: &Conversation) -> (&'static str, Color) {
+    match c.status.as_ref().map(|s| &s.status) {
+        None => ("", Color::DarkGray),
+        Some(SessionStatus::Waiting) => ("idle", Color::Cyan),
+        Some(SessionStatus::PlanReview) => ("plan", Color::Magenta),
+        Some(SessionStatus::QuestionAsked) => ("ask?", Color::Magenta),
+        Some(SessionStatus::NeedsPermission { .. }) => ("needs-perm", Color::Yellow),
+        Some(SessionStatus::EditApproval { .. }) => ("edit", Color::Yellow),
+        Some(SessionStatus::RunningWorkflow { .. }) => ("flow", Color::Blue),
+        Some(SessionStatus::Working) => ("work", Color::DarkGray),
+        Some(SessionStatus::Unknown) => ("…", Color::DarkGray),
     }
 }
 
