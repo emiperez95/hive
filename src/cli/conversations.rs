@@ -21,6 +21,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::common::instances;
 use crate::common::jsonl;
+use crate::common::persistence::load_skipped_sessions;
 use crate::common::projects::{ensure_tmux_session, ProjectRegistry};
 use crate::common::registry::{
     self, Conversation, ConversationRegistry, ConversationSidecar, TmuxPlacement,
@@ -384,6 +385,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     };
 
     let mut showing_help = false;
+    let mut skipped = load_skipped_sessions();
 
     loop {
         let rows = visible_rows(&groups, &collapsed);
@@ -400,6 +402,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 &collapsed,
                 sel,
                 showing_help,
+                &skipped,
             )
         })?;
 
@@ -491,6 +494,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             KeyCode::Char('r') => {
                 reg = gather_conversations();
                 (groups, convs, collapsed) = rebuild(&view, &reg);
+                skipped = load_skipped_sessions();
                 sel = 0;
             }
             _ => {}
@@ -508,6 +512,7 @@ fn draw(
     collapsed: &HashSet<String>,
     sel: usize,
     showing_help: bool,
+    skipped: &HashSet<String>,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -584,7 +589,9 @@ fn draw(
         let selected = ri == sel;
         lines.push(match row {
             Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
-            Row::Conv { ci, gi } => conv_line(&convs[*ci], &groups[*gi].path, selected, num),
+            Row::Conv { ci, gi } => {
+                conv_line(&convs[*ci], &groups[*gi].path, selected, num, skipped)
+            }
         });
     }
     frame.render_widget(Paragraph::new(lines), chunks[1]);
@@ -676,11 +683,31 @@ fn frozen_note(c: &Conversation) -> String {
     }
 }
 
+/// The auth-profile label for a conversation: `~/.claude-work` → "work". None ⇒
+/// the default `~/.claude` (personal), which is left untagged.
+fn env_label(c: &Conversation) -> Option<String> {
+    let dir = c.auth_config_dir.as_ref()?;
+    std::path::Path::new(dir)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|b| b.strip_prefix(".claude-"))
+        .map(|s| s.to_string())
+}
+
+/// Whether the conversation's tmux session is skipped (from cycling).
+fn is_skipped(c: &Conversation, skipped: &HashSet<String>) -> bool {
+    c.placement
+        .as_ref()
+        .map(|p| skipped.contains(&p.session_name))
+        .unwrap_or(false)
+}
+
 fn conv_line(
     c: &Conversation,
     group_path: &str,
     selected: bool,
     num: Option<usize>,
+    skipped: &HashSet<String>,
 ) -> Line<'static> {
     // Quick-jump number (1-9) or two spaces, mirroring the classic list.
     let num_prefix = match num {
@@ -718,14 +745,38 @@ fn conv_line(
         sub,
         frozen_note(c),
     );
-    let style = if selected {
+
+    let skip = is_skipped(c, skipped);
+    // Skipped rows are grayed out; otherwise green live / gray closed.
+    let base = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
+    } else if skip {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
     } else if c.lifecycle.is_actionable_here() {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::Gray)
     };
-    Line::from(Span::styled(text, style))
+
+    let mut spans = vec![Span::styled(text, base)];
+    // Auth profile tag (work convs stand out; personal is untagged).
+    if let Some(env) = env_label(c) {
+        let col = if selected {
+            Color::White
+        } else {
+            Color::Magenta
+        };
+        spans.push(Span::styled(format!("  [{env}]"), Style::default().fg(col)));
+    }
+    if skip {
+        spans.push(Span::styled(
+            "  [skip]",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The tmux session that owns this conversation's project/worktree, if resolvable
@@ -818,6 +869,7 @@ fn status_label(session: &Conversation) -> &'static str {
 pub fn render_conversations(reg: &ConversationRegistry) -> String {
     use std::collections::BTreeMap;
 
+    let skipped = load_skipped_sessions();
     let total = reg.conversations.len();
     let live = reg
         .conversations
@@ -892,8 +944,14 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
                 .unwrap_or_default();
             // Only the subpath that distinguishes this conversation from its group.
             let sub = rel_below(&s.cwd, &path);
+            let env = env_label(s).map(|e| format!("  [{e}]")).unwrap_or_default();
+            let skip = if is_skipped(s, &skipped) {
+                "  [skip]"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "  {} {:8}  {:<28}  {:<13}  {}  {}{}\n",
+                "  {} {:8}  {:<28}  {:<13}  {}  {}{}{}{}\n",
                 marker,
                 short_id(s.id.as_str()),
                 title,
@@ -901,6 +959,8 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
                 last,
                 sub,
                 frozen_note(s),
+                env,
+                skip,
             ));
         }
     }
