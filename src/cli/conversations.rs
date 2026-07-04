@@ -121,12 +121,13 @@ enum Action {
 struct Group {
     key: String,
     convs: Vec<usize>, // indices into the `convs` vec
+    path: String,      // common directory prefix of the group's conversations
 }
 
 /// A visible row: a group header, or a conversation under an expanded group.
 enum Row {
-    Header(usize), // index into `groups`
-    Conv(usize),   // index into `convs`
+    Header(usize),                 // index into `groups`
+    Conv { ci: usize, gi: usize }, // conversation index + its group index
 }
 
 /// Flatten the registry into grouped, sorted display order.
@@ -150,12 +151,17 @@ fn build_groups(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
                 .then_with(|| b.last_activity.cmp(&a.last_activity))
                 .then_with(|| a.id.as_str().cmp(b.id.as_str()))
         });
+        let path = common_prefix(&group.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
         let mut idxs = Vec::new();
         for c in group {
             idxs.push(convs.len());
             convs.push(c.clone());
         }
-        groups.push(Group { key, convs: idxs });
+        groups.push(Group {
+            key,
+            convs: idxs,
+            path,
+        });
     }
     (groups, convs)
 }
@@ -168,11 +174,59 @@ fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
         rows.push(Row::Header(gi));
         if !collapsed.contains(&g.key) {
             for &ci in &g.convs {
-                rows.push(Row::Conv(ci));
+                rows.push(Row::Conv { ci, gi });
             }
         }
     }
     rows
+}
+
+/// Longest common absolute-directory prefix (component-wise) of the given cwds.
+/// The path is a property of the project/worktree, not the individual
+/// conversation, so it's shown once on the group header.
+fn common_prefix(paths: &[&str]) -> String {
+    let split = |s: &str| {
+        s.split('/')
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    let Some((first, rest)) = paths.split_first() else {
+        return String::new();
+    };
+    let mut prefix = split(first);
+    for p in rest {
+        let comps = split(p);
+        let n = prefix
+            .iter()
+            .zip(comps.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(n);
+    }
+    format!("/{}", prefix.join("/"))
+}
+
+/// Replace the home-dir prefix with `~`.
+fn abbrev_home(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
+/// The part of `cwd` below the group's common `base` (empty when identical) —
+/// the only path info that distinguishes a conversation from its group.
+fn rel_below(cwd: &str, base: &str) -> String {
+    // No meaningful common dir (root) → show the full path so it stays readable.
+    if base.len() <= 1 {
+        return abbrev_home(cwd);
+    }
+    cwd.strip_prefix(base)
+        .map(|r| r.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| abbrev_home(cwd))
 }
 
 fn run_conversations_tui() -> Result<()> {
@@ -239,20 +293,19 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 Some(Row::Header(gi)) => {
                     collapsed.insert(groups[*gi].key.clone());
                 }
-                Some(Row::Conv(ci)) => {
-                    if let Some(gi) = groups.iter().position(|g| g.convs.contains(ci)) {
-                        collapsed.insert(groups[gi].key.clone());
-                        let new_rows = visible_rows(&groups, &collapsed);
-                        sel = new_rows
-                            .iter()
-                            .position(|r| matches!(r, Row::Header(g) if *g == gi))
-                            .unwrap_or(0);
-                    }
+                Some(Row::Conv { gi, .. }) => {
+                    let gi = *gi;
+                    collapsed.insert(groups[gi].key.clone());
+                    let new_rows = visible_rows(&groups, &collapsed);
+                    sel = new_rows
+                        .iter()
+                        .position(|r| matches!(r, Row::Header(g) if *g == gi))
+                        .unwrap_or(0);
                 }
                 None => {}
             },
             KeyCode::Enter => match rows.get(sel) {
-                Some(Row::Conv(ci)) => {
+                Some(Row::Conv { ci, .. }) => {
                     let c = &convs[*ci];
                     return Ok(if c.lifecycle.is_actionable_here() {
                         Action::Switch(Box::new(c.clone()))
@@ -328,7 +381,7 @@ fn draw(
             let selected = ri == sel;
             match row {
                 Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
-                Row::Conv(ci) => conv_line(&convs[*ci], selected),
+                Row::Conv { ci, gi } => conv_line(&convs[*ci], &groups[*gi].path, selected),
             }
         })
         .collect();
@@ -362,7 +415,13 @@ fn header_line(
         .iter()
         .filter(|&&ci| convs[ci].lifecycle.is_actionable_here())
         .count();
-    let text = format!("{tri} {}  ({n}, {live} live)", g.key);
+    let path = abbrev_home(&g.path);
+    let path_part = if path.len() > 1 {
+        format!("  {path}")
+    } else {
+        String::new()
+    };
+    let text = format!("{tri} {}{path_part}  ({n}, {live} live)", g.key);
     let mut style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -372,7 +431,7 @@ fn header_line(
     Line::from(Span::styled(text, style))
 }
 
-fn conv_line(c: &Conversation, selected: bool) -> Line<'static> {
+fn conv_line(c: &Conversation, group_path: &str, selected: bool) -> Line<'static> {
     let marker = if c.is_frozen() {
         "💤"
     } else if c.lifecycle.is_actionable_here() {
@@ -383,21 +442,24 @@ fn conv_line(c: &Conversation, selected: bool) -> Line<'static> {
     let title = c
         .title
         .as_deref()
-        .map(|t| t.chars().take(26).collect::<String>())
+        .map(|t| t.chars().take(36).collect::<String>())
         .unwrap_or_default();
     let last = c
         .last_activity
         .as_deref()
         .map(|t| t.chars().take(10).collect::<String>())
         .unwrap_or_default();
+    // Only the subpath that distinguishes this conversation from its group's
+    // shared path (empty for the common case — the whole group shares one dir).
+    let sub = rel_below(&c.cwd, group_path);
     let text = format!(
-        "    {} {:8}  {:<26}  {:<12}  {}  {}",
+        "    {} {:8}  {:<36}  {:<12}  {}  {}",
         marker,
         short_id(c.id.as_str()),
         title,
         status_label(c),
-        shorten_tail(&c.cwd, 44),
         last,
+        sub,
     );
     let style = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
@@ -407,16 +469,6 @@ fn conv_line(c: &Conversation, selected: bool) -> Line<'static> {
         Style::default().fg(Color::Gray)
     };
     Line::from(Span::styled(text, style))
-}
-
-/// Keep the tail of a path when it's longer than `max` chars (UTF-8 safe).
-fn shorten_tail(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        return s.to_string();
-    }
-    let tail: String = chars[chars.len() - (max - 1)..].iter().collect();
-    format!("…{tail}")
 }
 
 /// Reopen a closed conversation: add a window to the current tmux session at the
@@ -502,7 +554,14 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
                 .then_with(|| a.id.as_str().cmp(b.id.as_str()))
         });
         out.push('\n');
-        out.push_str(&format!("{parent}\n"));
+        // Path belongs to the project/worktree, so show it once on the header.
+        let path = common_prefix(&sessions.iter().map(|s| s.cwd.as_str()).collect::<Vec<_>>());
+        let ph = abbrev_home(&path);
+        if ph.len() > 1 {
+            out.push_str(&format!("{parent}  {ph}\n"));
+        } else {
+            out.push_str(&format!("{parent}\n"));
+        }
         for s in sessions {
             let marker = if s.is_frozen() {
                 "💤"
@@ -521,14 +580,16 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
                 .as_deref()
                 .map(|t| t.chars().take(28).collect::<String>())
                 .unwrap_or_default();
+            // Only the subpath that distinguishes this conversation from its group.
+            let sub = rel_below(&s.cwd, &path);
             out.push_str(&format!(
                 "  {} {:8}  {:<28}  {:<13}  {}  {}\n",
                 marker,
                 short_id(s.id.as_str()),
                 title,
                 status_label(s),
-                s.cwd,
                 last,
+                sub,
             ));
         }
     }
