@@ -135,8 +135,13 @@ pub enum Command {
         #[arg(long, default_value = "7")]
         days: i64,
     },
-    /// List all known Claude conversations (live + closed), grouped by project/worktree.
-    Conversations,
+    /// Browse Claude conversations (live + closed) grouped by project/worktree;
+    /// interactive TUI, or `--list` for a plain listing.
+    Conversations {
+        /// Print a plain listing instead of the interactive TUI
+        #[arg(long)]
+        list: bool,
+    },
     /// Append an activity event (invoked by tmux focus hooks). Hidden from help.
     #[command(hide = true)]
     Event {
