@@ -222,6 +222,33 @@ fn build_groups(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
     (groups, convs)
 }
 
+/// Case-insensitive match of a query against a conversation's title, id, parent
+/// key, cwd, and frozen note — the fields a user would search by.
+fn matches_query(c: &Conversation, q: &str) -> bool {
+    let q = q.to_lowercase();
+    let hay = |s: &str| s.to_lowercase().contains(&q);
+    hay(c.id.as_str())
+        || c.title.as_deref().map(hay).unwrap_or(false)
+        || c.parent.as_deref().map(hay).unwrap_or(false)
+        || hay(&c.cwd)
+        || c.frozen.as_ref().map(|f| hay(&f.note)).unwrap_or(false)
+}
+
+/// A registry containing only the conversations matching `query` (all, if empty).
+fn filter_registry(reg: &ConversationRegistry, query: &str) -> ConversationRegistry {
+    if query.is_empty() {
+        return reg.clone();
+    }
+    ConversationRegistry {
+        conversations: reg
+            .conversations
+            .iter()
+            .filter(|(_, c)| matches_query(c, query))
+            .map(|(k, c)| (k.clone(), c.clone()))
+            .collect(),
+    }
+}
+
 /// The currently-visible rows: every header, plus the conversations of expanded
 /// groups. Recomputed whenever the collapsed set changes.
 fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
@@ -358,28 +385,36 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     // Switch the current view, rebuilding groups + collapse state.
     let rebuild = |view: &View,
                    reg: &ConversationRegistry,
-                   skipped: &HashSet<String>|
+                   skipped: &HashSet<String>,
+                   query: &str|
      -> (Vec<Group>, Vec<Conversation>, HashSet<String>) {
+        let filtered = filter_registry(reg, query);
+        let src = &filtered;
         match view {
             View::Active => {
-                let (g, c) = build_active(reg, skipped);
+                let (g, c) = build_active(src, skipped);
                 (g, c, HashSet::new())
             }
             View::Browse => {
-                let (g, c) = build_groups(reg);
-                // Collapse every group except the pinned frozen one, so frozen
-                // conversations stay enumerated at the top.
-                let collapsed = g
-                    .iter()
-                    .map(|g| g.key.clone())
-                    .filter(|k| k != FROZEN_GROUP)
-                    .collect();
+                let (g, c) = build_groups(src);
+                // When searching, expand everything so matches are visible;
+                // otherwise collapse all but the pinned frozen group.
+                let collapsed = if query.is_empty() {
+                    g.iter()
+                        .map(|g| g.key.clone())
+                        .filter(|k| k != FROZEN_GROUP)
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
                 (g, c, collapsed)
             }
         }
     };
 
-    let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &skipped);
+    let mut query = String::new();
+    let mut searching = false;
+    let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &skipped, &query);
     let mut sel: usize = 0;
 
     // Enter/number activation: switch to a live conversation, else reopen it.
@@ -398,6 +433,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         if sel >= rows.len() {
             sel = rows.len().saturating_sub(1);
         }
+        let search = searching.then(|| query.clone());
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -409,6 +445,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 sel,
                 showing_help,
                 &skipped,
+                search.as_deref(),
             )
         })?;
 
@@ -428,6 +465,41 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             continue;
         }
 
+        // Search input mode: type to filter; Esc exits, Enter opens the selection.
+        if searching {
+            match key.code {
+                KeyCode::Esc => {
+                    searching = false;
+                    query.clear();
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    sel = 0;
+                }
+                KeyCode::Enter => {
+                    if let Some(Row::Conv { ci, .. }) = rows.get(sel) {
+                        return Ok(activate(&convs[*ci]));
+                    }
+                }
+                KeyCode::Down => {
+                    if sel + 1 < rows.len() {
+                        sel += 1;
+                    }
+                }
+                KeyCode::Up => sel = sel.saturating_sub(1),
+                KeyCode::Backspace => {
+                    query.pop();
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    sel = 0;
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    sel = 0;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match key.code {
             KeyCode::Char('?') => showing_help = true,
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
@@ -444,19 +516,24 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             KeyCode::Esc => match view {
                 View::Browse => {
                     view = View::Active;
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
                     sel = 0;
                 }
                 View::Active => return Ok(Action::Quit),
             },
-            // `/` opens the full browse-everything list.
-            KeyCode::Char('/') => {
-                if matches!(view, View::Active) {
+            // `/` opens Browse from Active; in Browse it starts a search filter.
+            KeyCode::Char('/') => match view {
+                View::Active => {
                     view = View::Browse;
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
                     sel = 0;
                 }
-            }
+                View::Browse => {
+                    searching = true;
+                    query.clear();
+                    sel = 0;
+                }
+            },
             KeyCode::Down | KeyCode::Char('j') => {
                 if sel + 1 < rows.len() {
                     sel += 1;
@@ -500,7 +577,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             KeyCode::Char('r') => {
                 reg = gather_conversations();
                 skipped = load_skipped_sessions();
-                (groups, convs, collapsed) = rebuild(&view, &reg, &skipped);
+                (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
                 sel = 0;
             }
             _ => {}
@@ -519,6 +596,7 @@ fn draw(
     sel: usize,
     showing_help: bool,
     skipped: &HashSet<String>,
+    search: Option<&str>,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -549,7 +627,7 @@ fn draw(
                 total - live,
                 groups.len()
             ),
-            " 1-9 jump · ←/→ fold · ↑/↓ move · Enter open/resume · Esc active · ? help · q quit",
+            " 1-9 jump · / search · ←/→ fold · ↑/↓ move · Enter open · Esc active · ? help · q",
         ),
     };
     let mut header_spans = vec![
@@ -620,8 +698,10 @@ fn draw(
                     display.push(Line::raw(""));
                 }
                 display.push(divider("skipped"));
-            } else if !display.is_empty() {
-                display.push(Line::raw("")); // spacing between groups
+            } else if !display.is_empty() && matches!(view, View::Active) {
+                // Blank line between groups only in Active; Browse stays dense so
+                // the many project headers are scannable at a glance.
+                display.push(Line::raw(""));
             }
         }
         let num = if let Row::Conv { .. } = row {
@@ -652,13 +732,21 @@ fn draw(
     let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), body[1]);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            footer,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        chunks[2],
-    );
+    // Footer: the live search query (classic-style) while searching, else keys.
+    let footer_line = if let Some(q) = search {
+        Line::from(vec![
+            Span::styled(" /", Style::default().fg(Color::Yellow)),
+            Span::styled(q.to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   Enter open · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(footer, Style::default().fg(Color::DarkGray)))
+    };
+    frame.render_widget(Paragraph::new(footer_line), chunks[2]);
 }
 
 /// The help overlay lines.
@@ -684,8 +772,11 @@ fn help_lines() -> Vec<Line<'static>> {
         key("1-9", "Jump to / switch the Nth conversation"),
         key("↑/↓ j/k", "Move selection"),
         key("Enter", "Switch (live) or reopen/resume (closed/frozen)"),
-        key("/", "Browse all conversations (live + closed + frozen)"),
-        key("Esc", "Browse → Active · Active → quit"),
+        key(
+            "/",
+            "Active: browse all · Browse: search/filter (type to match)",
+        ),
+        key("Esc", "Browse → Active · Active → quit · cancel search"),
         key("←/→ h/l", "Collapse / expand a group (Browse)"),
         key("r", "Refresh"),
         key("?", "This help"),
