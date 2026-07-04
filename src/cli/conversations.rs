@@ -691,10 +691,17 @@ fn help_lines() -> Vec<Line<'static>> {
         key("?", "This help"),
         key("q", "Quit"),
         Line::raw(""),
-        Line::from(Span::styled(
-            "  ● live   ○ closed (resumable)   💤 frozen",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("● free", Style::default().fg(Color::Green)),
+            Span::raw("   "),
+            Span::styled("● busy", Style::default().fg(Color::Blue)),
+            Span::styled(
+                "   ○ closed (resumable)   💤 frozen   ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("skipped/archived", Style::default().fg(Color::DarkGray)),
+        ]),
     ]
 }
 
@@ -758,6 +765,25 @@ fn is_skipped(c: &Conversation, skipped: &HashSet<String>) -> bool {
         .unwrap_or(false)
 }
 
+/// Busy = the agent is actively running (working or a background workflow).
+/// Everything else that's live (idle, waiting on you) reads as "free".
+fn is_busy(c: &Conversation) -> bool {
+    matches!(
+        c.status.as_ref().map(|s| &s.status),
+        Some(SessionStatus::Working) | Some(SessionStatus::RunningWorkflow { .. })
+    )
+}
+
+/// At-a-glance row color for a live, non-archived conversation:
+/// blue = busy (working/workflow), green = free (idle / waiting on you).
+fn live_color(c: &Conversation) -> Color {
+    if is_busy(c) {
+        Color::Blue
+    } else {
+        Color::Green
+    }
+}
+
 fn conv_line(
     c: &Conversation,
     group_path: &str,
@@ -798,15 +824,16 @@ fn conv_line(
     };
 
     let skip = is_skipped(c, skipped);
-    // Skipped rows are grayed out; otherwise green live / gray closed.
+    // At-a-glance color: live non-archived → blue (busy) / green (free); skipped
+    // and archived → gray; closed → gray; selected → reversed highlight.
     let base = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
-    } else if skip {
+    } else if skip || c.archived {
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM)
     } else if c.lifecycle.is_actionable_here() {
-        Style::default().fg(Color::Green)
+        Style::default().fg(live_color(c))
     } else {
         Style::default().fg(Color::Gray)
     };
