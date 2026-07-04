@@ -918,6 +918,15 @@ fn target_session(c: &Conversation) -> Option<String> {
 /// session if needed — then switch to it. Falls back to the current session when
 /// the conversation has no resolvable parent (e.g. the "unassigned" group).
 fn reopen(c: &Conversation) -> Result<String> {
+    // Frozen conversations thaw through the existing frozen path, which recreates
+    // the window/session, resumes (`--resume <id>` or `claude -c` for id-less
+    // legacy entries), and removes the frozen.json entry. Then switch to it.
+    if c.is_frozen() {
+        let session = crate::common::frozen::thaw_window(c.id.as_str())?;
+        switch_to_session(&session);
+        return Ok(format!("Thawed {} in {session}", short_id(c.id.as_str())));
+    }
+
     let startup = format!("claude --resume {}", c.id);
     // Resume under the same auth profile the conversation was created in.
     let env: Vec<(String, String)> = match &c.auth_config_dir {
@@ -965,6 +974,11 @@ fn reopen(c: &Conversation) -> Result<String> {
 }
 
 fn short_id(id: &str) -> String {
+    // Synthetic frozen rows are keyed by a composite "session#window" (no real
+    // conversation id) — show a dash rather than a truncated tmux name.
+    if id.contains('#') {
+        return "—".to_string();
+    }
     id.chars().take(8).collect()
 }
 

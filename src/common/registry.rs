@@ -297,24 +297,49 @@ impl ConversationRegistry {
         ConversationRegistry { conversations }
     }
 
-    /// Overlay the frozen facet (note + timestamp) onto Closed conversations from a
-    /// `FrozenState`. Freeze == a pinned, noted subset of Closed. Only session-id-
-    /// keyed entries map to a conversation; composite `session#window` entries (no
-    /// conversation id) are ignored — Invariant #1: never fabricate an id. A live
-    /// conversation is left alone (a stale freeze entry for something now running is
-    /// not "frozen").
+    /// Surface every frozen window from a `FrozenState`. Freeze == a pinned, noted
+    /// subset of Closed. An entry that matches a known Closed conversation overlays
+    /// its frozen facet; an entry we don't otherwise know — a legacy composite
+    /// `session#window` key with no conversation id, or one whose transcript is
+    /// gone — is added as a SYNTHETIC frozen conversation so it's still listed and
+    /// thawable. Synthetic rows may be keyed by the composite key rather than a
+    /// UUID; thaw goes through `frozen::thaw_window`, which handles both. A live
+    /// conversation is never marked frozen (a stale entry for something now
+    /// running isn't "frozen").
     pub fn apply_frozen(&mut self, frozen: &FrozenState) {
         for entry in frozen.frozen.values() {
-            let Some(id) = entry.claude_session_id.as_ref() else {
-                continue;
+            let key = entry.key();
+            let info = FrozenInfo {
+                note: entry.note.clone(),
+                pinned: true,
+                frozen_at: entry.frozen_at.clone(),
             };
-            if let Some(c) = self.conversations.get_mut(id) {
-                if c.lifecycle.is_closed_like() {
-                    c.frozen = Some(FrozenInfo {
-                        note: entry.note.clone(),
-                        pinned: true,
-                        frozen_at: entry.frozen_at.clone(),
-                    });
+            match self.conversations.get_mut(&key) {
+                Some(c) => {
+                    if c.lifecycle.is_closed_like() {
+                        c.frozen = Some(info);
+                    }
+                }
+                None => {
+                    let title = (!entry.window_name.is_empty()).then(|| entry.window_name.clone());
+                    self.conversations.insert(
+                        key.clone(),
+                        Conversation {
+                            id: ConversationId(key),
+                            cwd: entry.cwd.clone(),
+                            lifecycle: Lifecycle::Closed,
+                            status: None,
+                            last_activity: Some(entry.frozen_at.clone()),
+                            placement: None,
+                            parent: None,
+                            frozen: Some(info),
+                            note: String::new(),
+                            pinned: false,
+                            archived: false,
+                            title,
+                            auth_config_dir: entry.claude_config_dir.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -1006,20 +1031,27 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_key_frozen_excluded() {
+    fn test_composite_key_frozen_surfaced_as_synthetic() {
         // A frozen entry with no conversation id (composite "session#window" key)
-        // must not create or touch any conversation.
+        // is surfaced as a synthetic frozen conversation so it's still listed.
         let mut reg = ConversationRegistry::default();
         reg.conversations
             .insert("abc".to_string(), closed("abc", None));
         let mut fs = FrozenState::default();
         fs.frozen
-            .insert("s#1".to_string(), frozen_entry(None, "no id"));
+            .insert("s#1".to_string(), frozen_entry(None, "parked"));
 
         reg.apply_frozen(&fs);
 
-        assert!(!reg.conversations["abc"].is_frozen());
-        assert_eq!(reg.conversations.len(), 1);
+        assert!(!reg.conversations["abc"].is_frozen()); // untouched
+        assert_eq!(reg.conversations.len(), 2); // synthetic one added
+        let synth = reg
+            .conversations
+            .values()
+            .find(|c| c.is_frozen())
+            .expect("synthetic frozen conversation");
+        assert_eq!(synth.frozen.as_ref().unwrap().note, "parked");
+        assert!(synth.lifecycle.is_closed_like());
     }
 
     #[test]
