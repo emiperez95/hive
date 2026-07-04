@@ -8,7 +8,7 @@
 //! live tmux placements). Only the switch/resume actions touch tmux.
 
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::process::Command;
 use std::time::Duration;
@@ -117,27 +117,32 @@ enum Action {
     Reopen(Box<Conversation>),
 }
 
-/// A display row: a group header, or a conversation (index into the `convs` vec).
-enum Item {
-    Header(String),
-    Conv(usize),
+/// A group of conversations sharing a parent (project/worktree), in display order.
+struct Group {
+    key: String,
+    convs: Vec<usize>, // indices into the `convs` vec
 }
 
-/// Flatten the registry into grouped, sorted display order: owned conversations
-/// plus an interleaved header/row item list.
-fn build_items(reg: &ConversationRegistry) -> (Vec<Item>, Vec<Conversation>) {
+/// A visible row: a group header, or a conversation under an expanded group.
+enum Row {
+    Header(usize), // index into `groups`
+    Conv(usize),   // index into `convs`
+}
+
+/// Flatten the registry into grouped, sorted display order.
+fn build_groups(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
     for c in reg.conversations.values() {
         let key = c
             .parent
             .clone()
             .unwrap_or_else(|| "(unassigned)".to_string());
-        groups.entry(key).or_default().push(c);
+        grouped.entry(key).or_default().push(c);
     }
-    let mut items = Vec::new();
+    let mut groups = Vec::new();
     let mut convs = Vec::new();
-    for (parent, mut group) in groups {
+    for (key, mut group) in grouped {
         group.sort_by(|a, b| {
             b.lifecycle
                 .is_actionable_here()
@@ -145,13 +150,29 @@ fn build_items(reg: &ConversationRegistry) -> (Vec<Item>, Vec<Conversation>) {
                 .then_with(|| b.last_activity.cmp(&a.last_activity))
                 .then_with(|| a.id.as_str().cmp(b.id.as_str()))
         });
-        items.push(Item::Header(parent));
+        let mut idxs = Vec::new();
         for c in group {
-            items.push(Item::Conv(convs.len()));
+            idxs.push(convs.len());
             convs.push(c.clone());
         }
+        groups.push(Group { key, convs: idxs });
     }
-    (items, convs)
+    (groups, convs)
+}
+
+/// The currently-visible rows: every header, plus the conversations of expanded
+/// groups. Recomputed whenever the collapsed set changes.
+fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        rows.push(Row::Header(gi));
+        if !collapsed.contains(&g.key) {
+            for &ci in &g.convs {
+                rows.push(Row::Conv(ci));
+            }
+        }
+    }
+    rows
 }
 
 fn run_conversations_tui() -> Result<()> {
@@ -177,11 +198,17 @@ fn run_conversations_tui() -> Result<()> {
 
 fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action> {
     let reg = gather_conversations();
-    let (mut items, mut convs) = build_items(&reg);
+    let (mut groups, mut convs) = build_groups(&reg);
+    // Start with every group collapsed — just the project/worktree headers.
+    let mut collapsed: HashSet<String> = groups.iter().map(|g| g.key.clone()).collect();
     let mut sel: usize = 0;
 
     loop {
-        terminal.draw(|frame| draw(frame, &items, &convs, sel))?;
+        let rows = visible_rows(&groups, &collapsed);
+        if sel >= rows.len() {
+            sel = rows.len().saturating_sub(1);
+        }
+        terminal.draw(|frame| draw(frame, &groups, &convs, &rows, &collapsed, sel))?;
 
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -195,33 +222,74 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(Action::Quit),
             KeyCode::Down | KeyCode::Char('j') => {
-                if sel + 1 < convs.len() {
+                if sel + 1 < rows.len() {
                     sel += 1;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
-            KeyCode::Char('r') => {
-                let reg = gather_conversations();
-                let (i, c) = build_items(&reg);
-                items = i;
-                convs = c;
-                sel = sel.min(convs.len().saturating_sub(1));
+            // Expand the selected group.
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(Row::Header(gi)) = rows.get(sel) {
+                    collapsed.remove(&groups[*gi].key);
+                }
             }
-            KeyCode::Enter => {
-                if let Some(c) = convs.get(sel) {
+            // Collapse: on a header, fold it; on a conversation, fold its group and
+            // move the cursor up to that header.
+            KeyCode::Left | KeyCode::Char('h') => match rows.get(sel) {
+                Some(Row::Header(gi)) => {
+                    collapsed.insert(groups[*gi].key.clone());
+                }
+                Some(Row::Conv(ci)) => {
+                    if let Some(gi) = groups.iter().position(|g| g.convs.contains(ci)) {
+                        collapsed.insert(groups[gi].key.clone());
+                        let new_rows = visible_rows(&groups, &collapsed);
+                        sel = new_rows
+                            .iter()
+                            .position(|r| matches!(r, Row::Header(g) if *g == gi))
+                            .unwrap_or(0);
+                    }
+                }
+                None => {}
+            },
+            KeyCode::Enter => match rows.get(sel) {
+                Some(Row::Conv(ci)) => {
+                    let c = &convs[*ci];
                     return Ok(if c.lifecycle.is_actionable_here() {
                         Action::Switch(Box::new(c.clone()))
                     } else {
                         Action::Reopen(Box::new(c.clone()))
                     });
                 }
+                // Enter on a header toggles it.
+                Some(Row::Header(gi)) => {
+                    let key = groups[*gi].key.clone();
+                    if !collapsed.remove(&key) {
+                        collapsed.insert(key);
+                    }
+                }
+                None => {}
+            },
+            KeyCode::Char('r') => {
+                let reg = gather_conversations();
+                let (g, c) = build_groups(&reg);
+                groups = g;
+                convs = c;
+                collapsed = groups.iter().map(|g| g.key.clone()).collect();
+                sel = 0;
             }
             _ => {}
         }
     }
 }
 
-fn draw(frame: &mut ratatui::Frame, items: &[Item], convs: &[Conversation], sel: usize) {
+fn draw(
+    frame: &mut ratatui::Frame,
+    groups: &[Group],
+    convs: &[Conversation],
+    rows: &[Row],
+    collapsed: &HashSet<String>,
+    sel: usize,
+) {
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -235,13 +303,10 @@ fn draw(frame: &mut ratatui::Frame, items: &[Item], convs: &[Conversation], sel:
         .iter()
         .filter(|c| c.lifecycle.is_actionable_here())
         .count();
-    let groups = items
-        .iter()
-        .filter(|it| matches!(it, Item::Header(_)))
-        .count();
     let header = format!(
-        " hive conversations — {total} known · {live} live · {} closed · {groups} groups",
-        total - live
+        " hive conversations — {total} known · {live} live · {} closed · {} groups",
+        total - live,
+        groups.len()
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -251,31 +316,25 @@ fn draw(frame: &mut ratatui::Frame, items: &[Item], convs: &[Conversation], sel:
         chunks[0],
     );
 
-    // Scroll so the selected conversation stays visible.
+    // Scroll so the selected row stays visible.
     let h = chunks[1].height as usize;
-    let sel_flat = items
+    let offset = if sel >= h { sel + 1 - h } else { 0 };
+    let lines: Vec<Line> = rows
         .iter()
-        .position(|it| matches!(it, Item::Conv(i) if *i == sel))
-        .unwrap_or(0);
-    let offset = if sel_flat >= h { sel_flat + 1 - h } else { 0 };
-
-    let lines: Vec<Line> = items
-        .iter()
+        .enumerate()
         .skip(offset)
         .take(h)
-        .map(|it| match it {
-            Item::Header(parent) => Line::from(Span::styled(
-                parent.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Item::Conv(i) => conv_line(&convs[*i], *i == sel),
+        .map(|(ri, row)| {
+            let selected = ri == sel;
+            match row {
+                Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
+                Row::Conv(ci) => conv_line(&convs[*ci], selected),
+            }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let footer = " ↑/↓ or j/k move · Enter switch/resume · r refresh · q quit";
+    let footer = " ←/→ collapse/expand · ↑/↓ move · Enter open/resume · r refresh · q quit";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             footer,
@@ -283,6 +342,34 @@ fn draw(frame: &mut ratatui::Frame, items: &[Item], convs: &[Conversation], sel:
         ))),
         chunks[2],
     );
+}
+
+/// A group header row: a disclosure triangle, the parent key, and counts.
+fn header_line(
+    g: &Group,
+    convs: &[Conversation],
+    collapsed: &HashSet<String>,
+    selected: bool,
+) -> Line<'static> {
+    let tri = if collapsed.contains(&g.key) {
+        "▸"
+    } else {
+        "▾"
+    };
+    let n = g.convs.len();
+    let live = g
+        .convs
+        .iter()
+        .filter(|&&ci| convs[ci].lifecycle.is_actionable_here())
+        .count();
+    let text = format!("{tri} {}  ({n}, {live} live)", g.key);
+    let mut style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    Line::from(Span::styled(text, style))
 }
 
 fn conv_line(c: &Conversation, selected: bool) -> Line<'static> {
@@ -304,8 +391,7 @@ fn conv_line(c: &Conversation, selected: bool) -> Line<'static> {
         .map(|t| t.chars().take(10).collect::<String>())
         .unwrap_or_default();
     let text = format!(
-        "{} {} {:8}  {:<26}  {:<12}  {}  {}",
-        if selected { "▶" } else { " " },
+        "    {} {:8}  {:<26}  {:<12}  {}  {}",
         marker,
         short_id(c.id.as_str()),
         title,
