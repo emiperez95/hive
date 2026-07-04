@@ -154,6 +154,21 @@ struct Group {
     key: String,
     convs: Vec<usize>, // indices into the `convs` vec
     path: String,      // common directory prefix of the group's conversations
+    emoji: String,     // project icon for the header (empty if none)
+}
+
+/// The project emoji for a Browse group key: a project key ("hive") or a worktree
+/// key ("hive/CSD-1" → the project part). Empty for special/unknown groups.
+fn project_emoji(key: &str, projects: &ProjectRegistry) -> String {
+    if key == FROZEN_GROUP {
+        return String::new(); // already carries 💤
+    }
+    let pkey = key.split('/').next().unwrap_or(key);
+    projects
+        .projects
+        .get(pkey)
+        .map(|c| c.emoji.clone())
+        .unwrap_or_default()
 }
 
 /// A visible row: a group header, or a conversation under an expanded group.
@@ -176,7 +191,12 @@ fn sort_convs(group: &mut [&Conversation]) {
 }
 
 /// Push a group (its conversations cloned into `convs`) and return it.
-fn push_group(key: String, group: Vec<&Conversation>, convs: &mut Vec<Conversation>) -> Group {
+fn push_group(
+    key: String,
+    group: Vec<&Conversation>,
+    convs: &mut Vec<Conversation>,
+    emoji: String,
+) -> Group {
     let path = common_prefix(&group.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
     let mut idxs = Vec::new();
     for c in group {
@@ -187,12 +207,16 @@ fn push_group(key: String, group: Vec<&Conversation>, convs: &mut Vec<Conversati
         key,
         convs: idxs,
         path,
+        emoji,
     }
 }
 
 /// Flatten the registry into grouped, sorted display order: a pinned "💤 frozen"
 /// group first (all frozen conversations, enumerated), then the rest by parent.
-fn build_groups(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
+fn build_groups(
+    reg: &ConversationRegistry,
+    projects: &ProjectRegistry,
+) -> (Vec<Group>, Vec<Conversation>) {
     use std::collections::BTreeMap;
     let mut frozen: Vec<&Conversation> = Vec::new();
     let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
@@ -213,11 +237,17 @@ fn build_groups(reg: &ConversationRegistry) -> (Vec<Group>, Vec<Conversation>) {
     // Frozen pinned first so they're always enumerated at the top of Browse.
     if !frozen.is_empty() {
         sort_convs(&mut frozen);
-        groups.push(push_group(FROZEN_GROUP.to_string(), frozen, &mut convs));
+        groups.push(push_group(
+            FROZEN_GROUP.to_string(),
+            frozen,
+            &mut convs,
+            String::new(),
+        ));
     }
     for (key, mut group) in grouped {
         sort_convs(&mut group);
-        groups.push(push_group(key, group, &mut convs));
+        let emoji = project_emoji(&key, projects);
+        groups.push(push_group(key, group, &mut convs, emoji));
     }
     (groups, convs)
 }
@@ -302,7 +332,8 @@ fn build_active(
     let mut groups = Vec::new();
     let mut convs = Vec::new();
     for (key, group) in normal.into_iter().chain(skip) {
-        groups.push(push_group(key, group, &mut convs));
+        // Session names already carry their project emoji, so no separate icon.
+        groups.push(push_group(key, group, &mut convs, String::new()));
     }
     (groups, convs)
 }
@@ -379,6 +410,7 @@ fn run_conversations_tui() -> Result<()> {
 fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action> {
     let mut reg = gather_conversations();
     let mut skipped = load_skipped_sessions();
+    let projects = ProjectRegistry::load();
     // Default to the Active view (live conversations by session); `/` browses all.
     let mut view = View::Active;
 
@@ -396,7 +428,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 (g, c, HashSet::new())
             }
             View::Browse => {
-                let (g, c) = build_groups(src);
+                let (g, c) = build_groups(src, &projects);
                 // When searching, expand everything so matches are visible;
                 // otherwise collapse all but the pinned frozen group.
                 let collapsed = if query.is_empty() {
@@ -814,7 +846,13 @@ fn header_line(
         .iter()
         .filter(|&&ci| convs[ci].lifecycle.is_actionable_here())
         .count();
-    let text = format!("{tri} {}  ({n}, {live} live)", g.key);
+    // Project icon (Browse groups; Active session names already include it).
+    let icon = if g.emoji.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", g.emoji)
+    };
+    let text = format!("{tri} {icon}{}  ({n}, {live} live)", g.key);
     let mut style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -1109,6 +1147,7 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
     use std::collections::BTreeMap;
 
     let skipped = load_skipped_sessions();
+    let projects = ProjectRegistry::load();
     let total = reg.conversations.len();
     let live = reg
         .conversations
@@ -1159,7 +1198,12 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
                 .then_with(|| a.id.as_str().cmp(b.id.as_str()))
         });
         out.push('\n');
-        out.push_str(&format!("{parent}\n"));
+        let icon = project_emoji(&parent, &projects);
+        if icon.is_empty() {
+            out.push_str(&format!("{parent}\n"));
+        } else {
+            out.push_str(&format!("{icon} {parent}\n"));
+        }
         // The path belongs to the project/worktree (implied by the group name), so
         // it's not shown; only a distinguishing subpath is kept for rows below.
         let path = common_prefix(&sessions.iter().map(|s| s.cwd.as_str()).collect::<Vec<_>>());
