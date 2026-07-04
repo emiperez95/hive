@@ -52,7 +52,21 @@ pub fn gather_conversations() -> ConversationRegistry {
     // conversation id becomes the SOLE Live discriminator for that id.
     let mut live_placements: HashMap<String, TmuxPlacement> = HashMap::new();
     for inst in instances::detect_all_instances() {
-        if let Some(sid) = inst.session_id {
+        // Prefer the hook-resolved conversation id. If a live Claude window has no
+        // hook entry (state.json only tracks recently-active conversations), fall
+        // back to the newest transcript in its cwd — but ONLY when the cwd isn't
+        // shared by multiple windows, where that fallback would be ambiguous
+        // (the S4/S5 seam). Without this, live windows absent from state.json are
+        // invisible in the Active view even though classic `prefix + s` shows them.
+        let sid = inst.session_id.clone().or_else(|| {
+            if inst.cwd_shared {
+                None
+            } else {
+                jsonl::find_latest_jsonl_for_cwd(&inst.cwd)
+                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            }
+        });
+        if let Some(sid) = sid {
             live_placements.insert(
                 sid,
                 TmuxPlacement {
