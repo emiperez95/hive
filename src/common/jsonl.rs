@@ -166,33 +166,56 @@ pub struct DiskConversation {
 /// cwd = the first entry carrying one; title = the latest `custom-title` seen in
 /// that window (the user's name for the conversation). Bounded so it stays cheap.
 pub fn read_conversation_meta(path: &Path) -> (Option<String>, Option<String>) {
-    let Ok(file) = fs::File::open(path) else {
-        return (None, None);
-    };
-    let reader = BufReader::new(file);
     let mut cwd = None;
     let mut title = None;
-    for line in reader.lines().take(40).map_while(Result::ok) {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if cwd.is_none() {
-            if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
-                cwd = Some(c.to_string());
+
+    // Head: cwd (stamped on early entries) + any title set near the start
+    // (resumed sessions re-stamp their title at the top of the transcript).
+    if let Ok(file) = fs::File::open(path) {
+        for line in BufReader::new(file).lines().take(40).map_while(Result::ok) {
+            if line.is_empty() {
+                continue;
             }
-        }
-        if v.get("type").and_then(|t| t.as_str()) == Some("custom-title") {
-            if let Some(t) = v.get("customTitle").and_then(|t| t.as_str()) {
-                if !t.is_empty() {
-                    title = Some(t.to_string()); // latest within the window wins
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if cwd.is_none() {
+                if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                    cwd = Some(c.to_string());
                 }
+            }
+            if let Some(t) = custom_title(&v) {
+                title = Some(t);
             }
         }
     }
+
+    // Tail: a rename made deep into a long conversation appends a `custom-title`
+    // entry near the END, well past the head window — so scan the tail and let
+    // it win over any earlier title.
+    for line in read_tail_lines(&path.to_path_buf(), 65_536) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(t) = custom_title(&v) {
+                title = Some(t);
+            }
+        }
+    }
+
     (cwd, title)
+}
+
+/// The non-empty `customTitle` of a `custom-title` entry, if `v` is one.
+fn custom_title(v: &serde_json::Value) -> Option<String> {
+    if v.get("type").and_then(|t| t.as_str()) != Some("custom-title") {
+        return None;
+    }
+    v.get("customTitle")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
 }
 
 /// Read just the cwd from a transcript (see [`read_conversation_meta`]).
@@ -1093,6 +1116,27 @@ mod tests {
         assert_eq!(sessions[0].cwd.as_deref(), Some("/home/u/hive"));
         assert_eq!(sessions[0].title.as_deref(), Some("My Task"));
         assert!(sessions[0].last_activity.is_some()); // file mtime → RFC3339
+    }
+
+    #[test]
+    fn test_read_conversation_meta_finds_late_title() {
+        // A rename deep in a long conversation lands past the 40-line head window;
+        // the tail scan must still pick it up (the "Market watcher" bug).
+        let dir = std::env::temp_dir().join(format!("hive-latetitle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.jsonl");
+        let mut body = String::new();
+        for _ in 0..60 {
+            body.push_str("{\"type\":\"user\",\"cwd\":\"/home/u/eve\"}\n");
+        }
+        body.push_str("{\"type\":\"custom-title\",\"customTitle\":\"Market watcher\"}\n");
+        std::fs::write(&path, body).unwrap();
+
+        let (cwd, title) = read_conversation_meta(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(cwd.as_deref(), Some("/home/u/eve"));
+        assert_eq!(title.as_deref(), Some("Market watcher"));
     }
 
     #[test]
