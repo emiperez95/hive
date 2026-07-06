@@ -285,30 +285,50 @@ fn push_group(
     }
 }
 
-/// Flatten the registry into grouped, sorted display order: a pinned "💤 frozen"
-/// group first (all frozen conversations, enumerated), then the rest by parent.
-fn build_groups(
+/// Browse grouping: one group per PROJECT (worktrees fold into their project),
+/// preceded by a pinned "💤 frozen" bucket. `include_empty` adds every registered
+/// non-archived project that has no conversations, so Browse doubles as a
+/// launchpad (open any project, start fresh). Projects sort by recent activity
+/// (most-recent first), empty ones last alphabetically.
+fn build_browse(
     reg: &ConversationRegistry,
     projects: &ProjectRegistry,
+    include_empty: bool,
 ) -> (Vec<Group>, Vec<Conversation>) {
-    use std::collections::BTreeMap;
     let mut frozen: Vec<&Conversation> = Vec::new();
-    let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
+    let mut grouped: HashMap<String, Vec<&Conversation>> = HashMap::new();
     for c in reg.conversations.values() {
         if c.is_frozen() {
             frozen.push(c);
             continue;
         }
-        let key = c
-            .parent
-            .clone()
-            .unwrap_or_else(|| "(unassigned)".to_string());
+        // Collapse a worktree key ("proj/branch") to its project ("proj").
+        let key = match c.parent.as_deref() {
+            Some(p) => p.split('/').next().unwrap_or(p).to_string(),
+            None => "(unassigned)".to_string(),
+        };
         grouped.entry(key).or_default().push(c);
     }
+    if include_empty {
+        for (key, cfg) in &projects.projects {
+            if !cfg.archived {
+                grouped.entry(key.clone()).or_default();
+            }
+        }
+    }
+
+    // Order projects by most-recent activity (desc), then name; empties last.
+    let recency = |g: &[&Conversation]| g.iter().filter_map(|c| c.last_activity.clone()).max();
+    let mut keyed: Vec<(String, Vec<&Conversation>)> = grouped.into_iter().collect();
+    keyed.sort_by(|(ka, a), (kb, b)| {
+        recency(b)
+            .cmp(&recency(a))
+            .then_with(|| ka.to_lowercase().cmp(&kb.to_lowercase()))
+    });
 
     let mut groups = Vec::new();
     let mut convs = Vec::new();
-    // Frozen pinned first so they're always enumerated at the top of Browse.
+    // Frozen pinned first so the whole freeze set is one row at the top.
     if !frozen.is_empty() {
         sort_convs(&mut frozen);
         groups.push(push_group(
@@ -318,7 +338,7 @@ fn build_groups(
             String::new(),
         ));
     }
-    for (key, mut group) in grouped {
+    for (key, mut group) in keyed {
         sort_convs(&mut group);
         let emoji = project_emoji(&key, projects);
         groups.push(push_group(key, group, &mut convs, emoji));
@@ -450,13 +470,24 @@ fn conv_in_project(c: &Conversation, key: &str) -> bool {
     }
 }
 
-/// Build the project detail state from the registry (READ-ONLY): gather the
-/// project's conversations, sort them for display, and summarize its worktrees.
-fn build_project_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailState {
+/// Build the detail sub-screen for a Browse group `key` (READ-ONLY): gather its
+/// conversations, sort them for display, and (for a real project) summarize its
+/// worktrees. `key` is a project key, the frozen bucket, or "(unassigned)".
+fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailState {
+    let frozen_bucket = key == FROZEN_GROUP;
+    let unassigned = key == "(unassigned)";
     let mut convs: Vec<Conversation> = reg
         .conversations
         .values()
-        .filter(|c| conv_in_project(c, key))
+        .filter(|c| {
+            if frozen_bucket {
+                c.is_frozen()
+            } else if unassigned {
+                c.parent.is_none()
+            } else {
+                conv_in_project(c, key)
+            }
+        })
         .cloned()
         .collect();
     // Live first, then non-frozen before frozen, then most-recent, then id.
@@ -470,27 +501,32 @@ fn build_project_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailS
     });
     let path = common_prefix(&convs.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
 
-    // Worktree summary rows, with per-worktree live/frozen conversation counts.
-    let wts = WorktreeState::load();
-    let mut worktrees: Vec<WtRow> = wts
-        .worktrees
-        .values()
-        .filter(|e| e.project_key == key)
-        .map(|e| {
-            let pkey = WorktreeState::make_key(&e.project_key, &e.branch);
-            let of = |c: &&Conversation| c.parent.as_deref() == Some(pkey.as_str());
-            WtRow {
-                branch: e.branch.clone(),
-                session: e.session_name.clone(),
-                live: convs
-                    .iter()
-                    .filter(|c| of(c) && c.lifecycle.is_actionable_here())
-                    .count(),
-                frozen: convs.iter().filter(|c| of(c) && c.is_frozen()).count(),
-            }
-        })
-        .collect();
-    worktrees.sort_by(|a, b| a.branch.cmp(&b.branch));
+    // Worktree summary rows (real projects only), with per-worktree counts.
+    let worktrees = if frozen_bucket || unassigned {
+        Vec::new()
+    } else {
+        let wts = WorktreeState::load();
+        let mut rows: Vec<WtRow> = wts
+            .worktrees
+            .values()
+            .filter(|e| e.project_key == key)
+            .map(|e| {
+                let pkey = WorktreeState::make_key(&e.project_key, &e.branch);
+                let of = |c: &&Conversation| c.parent.as_deref() == Some(pkey.as_str());
+                WtRow {
+                    branch: e.branch.clone(),
+                    session: e.session_name.clone(),
+                    live: convs
+                        .iter()
+                        .filter(|c| of(c) && c.lifecycle.is_actionable_here())
+                        .count(),
+                    frozen: convs.iter().filter(|c| of(c) && c.is_frozen()).count(),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.branch.cmp(&b.branch));
+        rows
+    };
 
     ProjectDetailState {
         key: key.to_string(),
@@ -498,6 +534,40 @@ fn build_project_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailS
         convs,
         path,
         sel: 0,
+    }
+}
+
+/// Resolve the selected row to a detail sub-screen: a conversation opens its
+/// project; a Browse header opens its group directly (project / frozen /
+/// unassigned); an Active header (a tmux session) resolves via its conversations.
+fn detail_of_row(
+    row: Option<&Row>,
+    view: &View,
+    groups: &[Group],
+    convs: &[Conversation],
+    reg: &ConversationRegistry,
+    projects: &ProjectRegistry,
+) -> Option<ProjectDetailState> {
+    match row? {
+        Row::Conv { ci, .. } => {
+            let pkey = convs[*ci]
+                .parent
+                .as_deref()
+                .and_then(|p| project_key_of(p, projects))?;
+            Some(build_group_detail(&pkey, reg))
+        }
+        Row::Header(gi) => match view {
+            View::Browse => Some(build_group_detail(&groups[*gi].key, reg)),
+            View::Active => {
+                let pkey = groups[*gi].convs.iter().find_map(|&ci| {
+                    convs[ci]
+                        .parent
+                        .as_deref()
+                        .and_then(|p| project_key_of(p, projects))
+                })?;
+                Some(build_group_detail(&pkey, reg))
+            }
+        },
     }
 }
 
@@ -592,14 +662,12 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 (g, c, HashSet::new())
             }
             View::Browse => {
-                let (g, c) = build_groups(src, &projects);
-                // When searching, expand everything so matches are visible;
-                // otherwise collapse all but the pinned frozen group.
+                // No search → a flat project list (every group collapsed to just
+                // its header, empty projects included). Searching → drop empties and
+                // expand so matching conversations show under their project.
+                let (g, c) = build_browse(src, &projects, query.is_empty());
                 let collapsed = if query.is_empty() {
-                    g.iter()
-                        .map(|g| g.key.clone())
-                        .filter(|k| k != FROZEN_GROUP)
-                        .collect()
+                    g.iter().map(|g| g.key.clone()).collect()
                 } else {
                     HashSet::new()
                 };
@@ -671,9 +739,13 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                         return Ok(activate(c));
                     }
                 }
-                // `n` starts a fresh conversation; `r` resumes the last one.
+                // `n` starts a fresh conversation (real projects only — the frozen
+                // and unassigned buckets have none); `r` resumes the last one.
                 KeyCode::Char('n') => {
-                    return Ok(Action::NewInProject(detail.as_ref().unwrap().key.clone()))
+                    let key = detail.as_ref().unwrap().key.clone();
+                    if projects.projects.contains_key(&key) {
+                        return Ok(Action::NewInProject(key));
+                    }
                 }
                 KeyCode::Char('r') => {
                     if let Some(c) = detail.as_ref().unwrap().most_recent().cloned() {
@@ -698,7 +770,6 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 &groups,
                 &convs,
                 &rows,
-                &collapsed,
                 sel,
                 showing_help,
                 &flags,
@@ -831,62 +902,33 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
-            // Drill into the selected row's project detail — in BOTH views. A
-            // conversation resolves via its parent; a header via its own key
-            // (Browse) or, failing that, a conversation in the group (Active, whose
-            // headers are tmux session names, not project keys). Special Browse
-            // groups with no project (frozen / unassigned) expand inline instead.
+            // Drill into the selected row's detail (both views). A conversation
+            // opens its project; a header opens its group/project.
             KeyCode::Right | KeyCode::Char('l') => {
-                let conv_pkey = |ci: usize| {
-                    convs[ci]
-                        .parent
-                        .as_deref()
-                        .and_then(|p| project_key_of(p, &projects))
-                };
-                let pkey = match rows.get(sel) {
-                    Some(Row::Conv { ci, .. }) => conv_pkey(*ci),
-                    Some(Row::Header(gi)) => project_key_of(&groups[*gi].key, &projects)
-                        .or_else(|| groups[*gi].convs.iter().find_map(|&ci| conv_pkey(ci))),
-                    None => None,
-                };
-                if let Some(pkey) = pkey {
-                    detail = Some(build_project_detail(&pkey, &reg));
-                } else if matches!(view, View::Browse) {
-                    if let Some(Row::Header(gi)) = rows.get(sel) {
-                        collapsed.remove(&groups[*gi].key);
-                    }
+                if let Some(d) =
+                    detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
+                {
+                    detail = Some(d);
                 }
             }
-            // Collapse (Browse only): on a header, fold it; on a conversation, fold
-            // its group and move the cursor up to that header.
+            // ← / h backs out of Browse to Active (Active has no fold to collapse).
             KeyCode::Left | KeyCode::Char('h') if matches!(view, View::Browse) => {
-                match rows.get(sel) {
-                    Some(Row::Header(gi)) => {
-                        collapsed.insert(groups[*gi].key.clone());
-                    }
-                    Some(Row::Conv { gi, .. }) => {
-                        let gi = *gi;
-                        collapsed.insert(groups[gi].key.clone());
-                        let new_rows = visible_rows(&groups, &collapsed);
-                        sel = new_rows
-                            .iter()
-                            .position(|r| matches!(r, Row::Header(g) if *g == gi))
-                            .unwrap_or(0);
-                    }
-                    None => {}
-                }
+                view = View::Active;
+                (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                sel = 0;
             }
             KeyCode::Enter => match rows.get(sel) {
+                // Enter on a conversation switches/resumes it; on a header (a
+                // project), it opens that project's detail.
                 Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
-                // Enter on a header folds/unfolds it inline (Browse only) — a quick
-                // peek; → opens the fuller project detail.
-                Some(Row::Header(gi)) if matches!(view, View::Browse) => {
-                    let key = groups[*gi].key.clone();
-                    if !collapsed.remove(&key) {
-                        collapsed.insert(key);
+                Some(Row::Header(_)) => {
+                    if let Some(d) =
+                        detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
+                    {
+                        detail = Some(d);
                     }
                 }
-                _ => {}
+                None => {}
             },
             KeyCode::Char('r') => {
                 reg = gather_conversations();
@@ -934,7 +976,6 @@ fn draw(
     groups: &[Group],
     convs: &[Conversation],
     rows: &[Row],
-    collapsed: &HashSet<String>,
     sel: usize,
     showing_help: bool,
     flags: &Flags,
@@ -964,13 +1005,13 @@ fn draw(
             " → detail · Enter switch · z freeze · f★ m mute ! auto s skip · / browse · ? · q",
         ),
         View::Browse => (
-            "conversations",
+            "projects",
             format!(
-                "{total} · {live} live · {} closed · {} groups",
-                total - live,
-                groups.len()
+                "{} projects · {live} live · {} closed",
+                groups.len(),
+                total - live
             ),
-            " → detail · Enter fold · z freeze · f★ m mute ! auto s skip · / search · Esc · ? · q",
+            " Enter/→ open project · / search · ←/Esc back · ? · q",
         ),
     };
     let mut header_spans = vec![
@@ -1028,6 +1069,19 @@ fn draw(
                 .add_modifier(Modifier::DIM),
         ))
     };
+    // The most-recently-active conversation of each group is shown in bold — "the
+    // last conversation" (what `r` in its detail would resume).
+    let mut bold_convs: HashSet<usize> = HashSet::new();
+    for g in groups {
+        if let Some(ci) = g
+            .convs
+            .iter()
+            .copied()
+            .max_by(|&a, &b| convs[a].last_activity.cmp(&convs[b].last_activity))
+        {
+            bold_convs.insert(ci);
+        }
+    }
     let mut display: Vec<Line> = Vec::new();
     let mut sel_display = 0usize;
     let mut conv_seen = 0usize;
@@ -1057,10 +1111,18 @@ fn draw(
             sel_display = display.len();
         }
         let selected = ri == sel;
-        let collapsible = matches!(view, View::Browse);
+        // Browse headers are projects → tint green when they have live work.
+        let green_head = matches!(view, View::Browse);
         display.push(match row {
-            Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected, collapsible),
-            Row::Conv { ci, gi } => conv_line(&convs[*ci], &groups[*gi].path, selected, num, flags),
+            Row::Header(gi) => header_line(&groups[*gi], convs, selected, green_head),
+            Row::Conv { ci, gi } => conv_line(
+                &convs[*ci],
+                &groups[*gi].path,
+                selected,
+                num,
+                flags,
+                bold_convs.contains(ci),
+            ),
         });
     }
 
@@ -1250,10 +1312,13 @@ fn draw_project_detail(
             Style::default().add_modifier(Modifier::DIM),
         )));
     } else {
+        // Bold "the last conversation" — the most-recent one (what `r` resumes).
+        let last_id = state.most_recent().map(|c| c.id.clone());
         for (i, c) in state.convs.iter().enumerate() {
             conv_pos.push(display.len());
             let num = (i < 9).then_some(i + 1);
-            display.push(conv_line(c, &state.path, i == state.sel, num, flags));
+            let bold = last_id.as_ref() == Some(&c.id);
+            display.push(conv_line(c, &state.path, i == state.sel, num, flags, bold));
         }
     }
 
@@ -1300,10 +1365,13 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::raw(""),
         key("1-9", "Jump to / switch the Nth conversation"),
         key("↑/↓ j/k", "Move selection"),
-        key("Enter", "Conversation: switch/resume · header: fold group"),
+        key(
+            "Enter",
+            "Conversation: switch/resume · project: open detail",
+        ),
         key(
             "/",
-            "Active: browse all · Browse: search/filter (type to match)",
+            "Active: browse projects · Browse: search projects + conversations",
         ),
         key(
             "z",
@@ -1314,12 +1382,15 @@ fn help_lines() -> Vec<Line<'static>> {
             "! / s",
             "Toggle auto-approve / skip the conversation's session",
         ),
+        key("→ / l", "Open the selected row's project detail"),
+        key(
+            "← / h",
+            "Browse → Active · in a project detail, back to the list",
+        ),
         key(
             "Esc",
             "Browse → Active · Active → quit · cancel search/freeze",
         ),
-        key("→ / l", "Open the selected row's project detail"),
-        key("← / h", "Collapse a group (Browse)"),
         key("r", "Refresh"),
         key("?", "This help"),
         key("q", "Quit"),
@@ -1338,22 +1409,14 @@ fn help_lines() -> Vec<Line<'static>> {
     ]
 }
 
-/// A group header row: a disclosure triangle (Browse only), the parent key, and
-/// counts. In Active, groups can't be collapsed, so the triangle is dropped.
+/// A group header row: the project/session key, an icon, and counts. Tinted green
+/// when it has live work (`green_when_live`, i.e. Browse project rows).
 fn header_line(
     g: &Group,
     convs: &[Conversation],
-    collapsed: &HashSet<String>,
     selected: bool,
-    collapsible: bool,
+    green_when_live: bool,
 ) -> Line<'static> {
-    let tri = if !collapsible {
-        String::new()
-    } else if collapsed.contains(&g.key) {
-        "▸ ".to_string()
-    } else {
-        "▾ ".to_string()
-    };
     let n = g.convs.len();
     let live = g
         .convs
@@ -1366,10 +1429,13 @@ fn header_line(
     } else {
         format!("{} ", g.emoji)
     };
-    let text = format!("{tri}{icon}{}  ({n}, {live} live)", g.key);
-    let mut style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let text = format!("{icon}{}  ({n}, {live} live)", g.key);
+    let color = if green_when_live && live > 0 {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+    let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     if selected {
         style = style.add_modifier(Modifier::REVERSED);
     }
@@ -1433,6 +1499,7 @@ fn conv_line(
     selected: bool,
     num: Option<usize>,
     flags: &Flags,
+    bold: bool,
 ) -> Line<'static> {
     // Session-level flags apply to a live conversation's tmux session.
     let session = c.placement.as_ref().map(|p| p.session_name.as_str());
@@ -1474,8 +1541,9 @@ fn conv_line(
 
     let skip = is_skipped(c, &flags.skipped);
     // At-a-glance color: live non-archived → blue (busy) / green (free); skipped
-    // and archived → gray; closed → gray; selected → reversed highlight.
-    let base = if selected {
+    // and archived → gray; closed → gray; selected → reversed highlight. The
+    // most-recent conversation of a group is bold ("the last conversation").
+    let mut base = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
     } else if skip || c.archived {
         Style::default()
@@ -1486,6 +1554,9 @@ fn conv_line(
     } else {
         Style::default().fg(Color::Gray)
     };
+    if bold && !selected {
+        base = base.add_modifier(Modifier::BOLD);
+    }
     let dim = |base: Style| {
         if selected {
             base
