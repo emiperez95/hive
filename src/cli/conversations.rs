@@ -26,7 +26,7 @@ use crate::common::persistence::{
     load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions, load_skipped_sessions,
     save_auto_approve_sessions, save_favorite_sessions, save_muted_sessions, save_skipped_sessions,
 };
-use crate::common::projects::{ensure_tmux_session, ProjectRegistry};
+use crate::common::projects::{ensure_tmux_session, expand_tilde, ProjectRegistry};
 use crate::common::registry::{
     self, Conversation, ConversationRegistry, ConversationSidecar, TmuxPlacement,
 };
@@ -142,6 +142,8 @@ enum Action {
     Quit,
     Switch(Box<Conversation>),
     Reopen(Box<Conversation>),
+    /// Start a fresh conversation in the given project (key).
+    NewInProject(String),
 }
 
 /// Which list the TUI is showing.
@@ -172,6 +174,20 @@ fn project_emoji(key: &str, projects: &ProjectRegistry) -> String {
         .get(pkey)
         .map(|c| c.emoji.clone())
         .unwrap_or_default()
+}
+
+/// Resolve a Browse group key to a registered project key (the part before `/`
+/// for a worktree key, or the key itself for a project). None for the special
+/// groups (frozen, unassigned) or keys with no matching project.
+fn project_key_of(group_key: &str, projects: &ProjectRegistry) -> Option<String> {
+    if group_key == FROZEN_GROUP {
+        return None;
+    }
+    let pkey = group_key.split('/').next().unwrap_or(group_key);
+    projects
+        .projects
+        .contains_key(pkey)
+        .then(|| pkey.to_string())
 }
 
 /// A visible row: a group header, or a conversation under an expanded group.
@@ -396,6 +412,95 @@ fn build_active(
     (groups, convs)
 }
 
+/// One worktree row in the project detail view: branch, its session name, and how
+/// many of its conversations are live / frozen.
+struct WtRow {
+    branch: String,
+    session: String,
+    live: usize,
+    frozen: usize,
+}
+
+/// The project detail sub-screen: a project's config, its worktrees, and every
+/// conversation under it (live + closed + frozen), from which you can switch,
+/// resume, or start a new one.
+struct ProjectDetailState {
+    key: String,
+    worktrees: Vec<WtRow>,
+    convs: Vec<Conversation>, // display order: live first, frozen last, else recency
+    path: String,             // common cwd prefix (for subpath elision in rows)
+    sel: usize,               // selected conversation index
+}
+
+impl ProjectDetailState {
+    /// The most recently-active conversation — what `r` (resume last) opens.
+    fn most_recent(&self) -> Option<&Conversation> {
+        self.convs
+            .iter()
+            .max_by(|a, b| a.last_activity.cmp(&b.last_activity))
+    }
+}
+
+/// True if a conversation belongs to `key` — either the project root (`parent ==
+/// key`) or one of its worktrees (`parent` starts with `key/`).
+fn conv_in_project(c: &Conversation, key: &str) -> bool {
+    match c.parent.as_deref() {
+        Some(p) => p == key || p.starts_with(&format!("{key}/")),
+        None => false,
+    }
+}
+
+/// Build the project detail state from the registry (READ-ONLY): gather the
+/// project's conversations, sort them for display, and summarize its worktrees.
+fn build_project_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailState {
+    let mut convs: Vec<Conversation> = reg
+        .conversations
+        .values()
+        .filter(|c| conv_in_project(c, key))
+        .cloned()
+        .collect();
+    // Live first, then non-frozen before frozen, then most-recent, then id.
+    convs.sort_by(|a, b| {
+        b.lifecycle
+            .is_actionable_here()
+            .cmp(&a.lifecycle.is_actionable_here())
+            .then_with(|| a.is_frozen().cmp(&b.is_frozen()))
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+    });
+    let path = common_prefix(&convs.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
+
+    // Worktree summary rows, with per-worktree live/frozen conversation counts.
+    let wts = WorktreeState::load();
+    let mut worktrees: Vec<WtRow> = wts
+        .worktrees
+        .values()
+        .filter(|e| e.project_key == key)
+        .map(|e| {
+            let pkey = WorktreeState::make_key(&e.project_key, &e.branch);
+            let of = |c: &&Conversation| c.parent.as_deref() == Some(pkey.as_str());
+            WtRow {
+                branch: e.branch.clone(),
+                session: e.session_name.clone(),
+                live: convs
+                    .iter()
+                    .filter(|c| of(c) && c.lifecycle.is_actionable_here())
+                    .count(),
+                frozen: convs.iter().filter(|c| of(c) && c.is_frozen()).count(),
+            }
+        })
+        .collect();
+    worktrees.sort_by(|a, b| a.branch.cmp(&b.branch));
+
+    ProjectDetailState {
+        key: key.to_string(),
+        worktrees,
+        convs,
+        path,
+        sel: 0,
+    }
+}
+
 /// Longest common absolute-directory prefix (component-wise) of the given cwds.
 /// The path is a property of the project/worktree, not the individual
 /// conversation, so it's shown once on the group header.
@@ -461,6 +566,7 @@ fn run_conversations_tui() -> Result<()> {
             }
         }
         Action::Reopen(c) => println!("{}", reopen(&c)?),
+        Action::NewInProject(key) => println!("{}", new_conversation(&key)?),
     }
     Ok(())
 }
@@ -509,6 +615,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut freeze_note = String::new();
     let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
     let mut sel: usize = 0;
+    // Project detail sub-screen: Some(state) while drilled into a project.
+    let mut detail: Option<ProjectDetailState> = None;
 
     // Enter/number activation: switch to a live conversation, else reopen it.
     let activate = |c: &Conversation| -> Action {
@@ -522,6 +630,61 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut showing_help = false;
 
     loop {
+        // ── Project detail sub-screen ───────────────────────────────────────
+        // When drilled into a project, this fully owns the frame + input; Esc/q
+        // backs out to the list, Enter/n/r return an Action that exits the TUI.
+        if detail.is_some() {
+            {
+                let d = detail.as_mut().unwrap();
+                terminal.draw(|frame| draw_project_detail(frame, d, &projects, &flags))?;
+            }
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => detail = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let d = detail.as_mut().unwrap();
+                    if d.sel + 1 < d.convs.len() {
+                        d.sel += 1;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let d = detail.as_mut().unwrap();
+                    d.sel = d.sel.saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    let d = detail.as_ref().unwrap();
+                    if let Some(c) = d.convs.get(d.sel) {
+                        return Ok(activate(c));
+                    }
+                }
+                KeyCode::Char(dch @ '1'..='9') => {
+                    let d = detail.as_ref().unwrap();
+                    if let Some(c) = d.convs.get(dch as usize - '1' as usize) {
+                        return Ok(activate(c));
+                    }
+                }
+                // `n` starts a fresh conversation; `r` resumes the last one.
+                KeyCode::Char('n') => {
+                    return Ok(Action::NewInProject(detail.as_ref().unwrap().key.clone()))
+                }
+                KeyCode::Char('r') => {
+                    if let Some(c) = detail.as_ref().unwrap().most_recent().cloned() {
+                        return Ok(activate(&c));
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         let rows = visible_rows(&groups, &collapsed);
         if sel >= rows.len() {
             sel = rows.len().saturating_sub(1);
@@ -697,8 +860,12 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
                 // Enter on a header toggles it (Browse only).
                 Some(Row::Header(gi)) if matches!(view, View::Browse) => {
+                    // Drill into the project's detail; special groups (frozen /
+                    // unassigned) have no single project, so fall back to folding.
                     let key = groups[*gi].key.clone();
-                    if !collapsed.remove(&key) {
+                    if let Some(pkey) = project_key_of(&key, &projects) {
+                        detail = Some(build_project_detail(&pkey, &reg));
+                    } else if !collapsed.remove(&key) {
                         collapsed.insert(key);
                     }
                 }
@@ -917,6 +1084,183 @@ fn draw(
     frame.render_widget(Paragraph::new(footer_line), chunks[2]);
 }
 
+/// Render the project detail sub-screen: config, worktrees, and the project's
+/// conversations (the only navigable rows). `n` starts a new one, `r` resumes the
+/// last, Enter switches/resumes the selected one.
+fn draw_project_detail(
+    frame: &mut ratatui::Frame,
+    state: &ProjectDetailState,
+    projects: &ProjectRegistry,
+    flags: &Flags,
+) {
+    let area = frame.area();
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    let config = projects.projects.get(&state.key);
+    let emoji = config.map(|c| c.emoji.clone()).unwrap_or_default();
+    let name = config
+        .and_then(|c| c.display_name.clone())
+        .unwrap_or_else(|| state.key.clone());
+    let live = state
+        .convs
+        .iter()
+        .filter(|c| c.lifecycle.is_actionable_here())
+        .count();
+    let frozen = state.convs.iter().filter(|c| c.is_frozen()).count();
+    let closed = state.convs.len() - live;
+
+    // Title bar: icon + name, counts, profile tag, back hint.
+    let icon = if emoji.is_empty() {
+        String::new()
+    } else {
+        format!("{emoji} ")
+    };
+    let mut title_spans = vec![
+        Span::styled(
+            format!(" {icon}{name}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{live} live · {closed} closed"),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ];
+    if frozen > 0 {
+        title_spans.push(Span::raw("   "));
+        title_spans.push(Span::styled(
+            format!("💤 {frozen} frozen"),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+    if let Some(profile) = config.and_then(|c| c.auth_profile.clone()) {
+        title_spans.push(Span::raw("   "));
+        title_spans.push(Span::styled(
+            format!("[{profile}]"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    title_spans.push(Span::styled(
+        "   ( Esc back )",
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(title_spans)), chunks[0]);
+
+    // Body: config block, worktrees, then the navigable conversation list.
+    let mut display: Vec<Line> = Vec::new();
+    let mut conv_pos: Vec<usize> = Vec::new();
+    display.push(Line::raw(""));
+
+    let field = |label: &str, val: String| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {label:<10}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::raw(val),
+        ])
+    };
+    if let Some(c) = config {
+        display.push(field(
+            "path",
+            abbrev_home(expand_tilde(&c.project_root).to_string_lossy().as_ref()),
+        ));
+        let profile = match &c.auth_profile {
+            Some(p) => format!("{p}  (~/.claude-{p})"),
+            None => "personal  (~/.claude)".to_string(),
+        };
+        display.push(field("profile", profile));
+        if c.ports.enabled {
+            display.push(field(
+                "ports",
+                format!("base {} (+{})", c.ports.base_port, c.ports.increment),
+            ));
+        }
+        if let Some(s) = &c.startup_command {
+            display.push(field("startup", s.clone()));
+        }
+    }
+
+    display.push(Line::raw(""));
+    display.push(Line::from(Span::styled(
+        format!("  Worktrees ({})", state.worktrees.len()),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if state.worktrees.is_empty() {
+        display.push(Line::from(Span::styled(
+            "    none",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for w in &state.worktrees {
+            let mut tail = format!("{} live", w.live);
+            if w.frozen > 0 {
+                tail.push_str(&format!(" · {} frozen", w.frozen));
+            }
+            display.push(Line::from(vec![
+                Span::styled(
+                    format!("    {:<18}", w.branch),
+                    Style::default().fg(if w.live > 0 {
+                        Color::Green
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+                Span::styled(
+                    format!("{:<24}", w.session),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(tail, Style::default().add_modifier(Modifier::DIM)),
+            ]));
+        }
+    }
+
+    display.push(Line::raw(""));
+    display.push(Line::from(Span::styled(
+        "  Conversations",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if state.convs.is_empty() {
+        display.push(Line::from(Span::styled(
+            "    (none — press n to start one)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for (i, c) in state.convs.iter().enumerate() {
+            conv_pos.push(display.len());
+            let num = (i < 9).then_some(i + 1);
+            display.push(conv_line(c, &state.path, i == state.sel, num, flags));
+        }
+    }
+
+    // Scroll so the selected conversation stays visible.
+    let h = chunks[1].height as usize;
+    let sel_display = conv_pos.get(state.sel).copied().unwrap_or(0);
+    let offset = if sel_display >= h {
+        sel_display + 1 - h
+    } else {
+        0
+    };
+    let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    let footer = " ↑/↓ move · Enter switch/resume · n new · r resume last · Esc back · q";
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+}
+
 /// The help overlay lines.
 fn help_lines() -> Vec<Line<'static>> {
     let key = |k: &str, d: &str| -> Line<'static> {
@@ -939,7 +1283,10 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::raw(""),
         key("1-9", "Jump to / switch the Nth conversation"),
         key("↑/↓ j/k", "Move selection"),
-        key("Enter", "Switch (live) or reopen/resume (closed/frozen)"),
+        key(
+            "Enter",
+            "Conversation: switch/resume · project header: detail",
+        ),
         key(
             "/",
             "Active: browse all · Browse: search/filter (type to match)",
@@ -1272,6 +1619,47 @@ fn reopen(c: &Conversation) -> Result<String> {
         "Reopened {} in {target} — {startup}",
         short_id(c.id.as_str())
     ))
+}
+
+/// Start a fresh conversation in a project: if its session is alive, open a new
+/// window running `claude`; otherwise create the session running `claude`. Uses
+/// the project's auth profile (CLAUDE_CONFIG_DIR). Then switch to it.
+fn new_conversation(key: &str) -> Result<String> {
+    let projects = ProjectRegistry::load();
+    let config = projects
+        .projects
+        .get(key)
+        .ok_or_else(|| anyhow!("unknown project '{key}'"))?;
+    let session = ProjectRegistry::session_name(key, config);
+    let root = expand_tilde(&config.project_root)
+        .to_string_lossy()
+        .into_owned();
+    let env = config.tmux_env();
+
+    let alive = Command::new("tmux")
+        .args(["has-session", "-t", &session])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if alive {
+        let mut cmd = Command::new("tmux");
+        cmd.args(["new-window", "-t", &session, "-c", &root]);
+        for (k, v) in &env {
+            cmd.arg("-e").arg(format!("{k}={v}"));
+        }
+        if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+            return Err(anyhow!("failed to open a new window in '{session}'"));
+        }
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &session, "claude", "Enter"])
+            .output();
+    } else if !ensure_tmux_session(&session, &root, Some("claude"), &env) {
+        return Err(anyhow!("failed to create session '{session}'"));
+    }
+
+    switch_to_session(&session);
+    Ok(format!("New conversation in {session}"))
 }
 
 fn short_id(id: &str) -> String {
