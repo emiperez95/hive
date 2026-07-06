@@ -19,10 +19,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::common::frozen::relative_time;
+use crate::common::frozen::{freeze_window, relative_time, FreezeTarget};
 use crate::common::instances;
 use crate::common::jsonl;
-use crate::common::persistence::load_skipped_sessions;
+use crate::common::persistence::{
+    load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions, load_skipped_sessions,
+    save_auto_approve_sessions, save_favorite_sessions, save_muted_sessions, save_skipped_sessions,
+};
 use crate::common::projects::{ensure_tmux_session, ProjectRegistry};
 use crate::common::registry::{
     self, Conversation, ConversationRegistry, ConversationSidecar, TmuxPlacement,
@@ -179,6 +182,61 @@ enum Row {
 
 /// Header key for the pinned group that enumerates all frozen conversations.
 const FROZEN_GROUP: &str = "💤 frozen";
+
+/// The session-level flag sets (all keyed by tmux session name), loaded together
+/// so a conversation row can show ★ / [muted] / [auto] / [skip] and toggle them.
+struct Flags {
+    favorite: HashSet<String>,
+    muted: HashSet<String>,
+    auto_approve: HashSet<String>,
+    skipped: HashSet<String>,
+}
+
+impl Flags {
+    fn load() -> Self {
+        Flags {
+            favorite: load_favorite_sessions(),
+            muted: load_muted_sessions(),
+            auto_approve: load_auto_approve_sessions(),
+            skipped: load_skipped_sessions(),
+        }
+    }
+}
+
+/// Which session-level flag a key toggles.
+#[derive(Clone, Copy)]
+enum Flag {
+    Favorite,
+    Mute,
+    AutoApprove,
+    Skip,
+}
+
+/// Toggle a session flag (add if absent, remove if present) and persist it.
+fn toggle_flag(session: &str, flag: Flag) {
+    let (mut set, save): (HashSet<String>, fn(&HashSet<String>)) = match flag {
+        Flag::Favorite => (load_favorite_sessions(), save_favorite_sessions),
+        Flag::Mute => (load_muted_sessions(), save_muted_sessions),
+        Flag::AutoApprove => (load_auto_approve_sessions(), save_auto_approve_sessions),
+        Flag::Skip => (load_skipped_sessions(), save_skipped_sessions),
+    };
+    if !set.remove(session) {
+        set.insert(session.to_string());
+    }
+    save(&set);
+}
+
+/// Build a freeze target from a live conversation (its window placement + id).
+fn freeze_target_of(c: &Conversation) -> Option<FreezeTarget> {
+    let p = c.placement.as_ref()?;
+    Some(FreezeTarget {
+        session_name: p.session_name.clone(),
+        window_index: p.window_index.clone(),
+        window_name: p.window_name.clone(),
+        cwd: c.cwd.clone(),
+        claude_session_id: Some(c.id.as_str().to_string()),
+    })
+}
 
 fn sort_convs(group: &mut [&Conversation]) {
     group.sort_by(|a, b| {
@@ -409,7 +467,7 @@ fn run_conversations_tui() -> Result<()> {
 
 fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action> {
     let mut reg = gather_conversations();
-    let mut skipped = load_skipped_sessions();
+    let mut flags = Flags::load();
     let projects = ProjectRegistry::load();
     // Default to the Active view (live conversations by session); `/` browses all.
     let mut view = View::Active;
@@ -446,7 +504,10 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
 
     let mut query = String::new();
     let mut searching = false;
-    let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &skipped, &query);
+    // Freeze-note input: Some(target) while typing the note for a pending freeze.
+    let mut freezing: Option<FreezeTarget> = None;
+    let mut freeze_note = String::new();
+    let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
     let mut sel: usize = 0;
 
     // Enter/number activation: switch to a live conversation, else reopen it.
@@ -466,6 +527,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             sel = rows.len().saturating_sub(1);
         }
         let search = searching.then(|| query.clone());
+        let freeze = freezing.as_ref().map(|_| freeze_note.clone());
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -476,8 +538,9 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 &collapsed,
                 sel,
                 showing_help,
-                &skipped,
+                &flags,
                 search.as_deref(),
+                freeze.as_deref(),
             )
         })?;
 
@@ -503,7 +566,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 KeyCode::Esc => {
                     searching = false;
                     query.clear();
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
                 }
                 KeyCode::Enter => {
@@ -519,18 +582,51 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 KeyCode::Up => sel = sel.saturating_sub(1),
                 KeyCode::Backspace => {
                     query.pop();
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
                 }
                 KeyCode::Char(c) => {
                     query.push(c);
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
                 }
                 _ => {}
             }
             continue;
         }
+
+        // Freeze-note input: Enter freezes the pending window (kills it), Esc cancels.
+        if let Some(target) = freezing.clone() {
+            match key.code {
+                KeyCode::Esc => {
+                    freezing = None;
+                    freeze_note.clear();
+                }
+                KeyCode::Enter => {
+                    let _ = freeze_window(&target, &freeze_note);
+                    freezing = None;
+                    freeze_note.clear();
+                    reg = gather_conversations();
+                    flags = Flags::load();
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    sel = 0;
+                }
+                KeyCode::Backspace => {
+                    freeze_note.pop();
+                }
+                KeyCode::Char(c) => freeze_note.push(c),
+                _ => {}
+            }
+            continue;
+        }
+
+        // The conversation under the cursor (for row-scoped actions).
+        let selected_conv = |rows: &[Row], convs: &[Conversation]| -> Option<Conversation> {
+            match rows.get(sel) {
+                Some(Row::Conv { ci, .. }) => convs.get(*ci).cloned(),
+                _ => None,
+            }
+        };
 
         match key.code {
             KeyCode::Char('?') => showing_help = true,
@@ -548,7 +644,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             KeyCode::Esc => match view {
                 View::Browse => {
                     view = View::Active;
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
                 }
                 View::Active => return Ok(Action::Quit),
@@ -557,7 +653,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             KeyCode::Char('/') => match view {
                 View::Active => {
                     view = View::Browse;
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
                 }
                 View::Browse => {
@@ -608,9 +704,37 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             },
             KeyCode::Char('r') => {
                 reg = gather_conversations();
-                skipped = load_skipped_sessions();
-                (groups, convs, collapsed) = rebuild(&view, &reg, &skipped, &query);
+                flags = Flags::load();
+                (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 sel = 0;
+            }
+            // Session-level flag toggles on the selected LIVE conversation's session.
+            KeyCode::Char('f') | KeyCode::Char('m') | KeyCode::Char('s') | KeyCode::Char('!') => {
+                if let Some(c) = selected_conv(&rows, &convs) {
+                    if let Some(p) = &c.placement {
+                        let flag = match key.code {
+                            KeyCode::Char('f') => Flag::Favorite,
+                            KeyCode::Char('m') => Flag::Mute,
+                            KeyCode::Char('!') => Flag::AutoApprove,
+                            _ => Flag::Skip,
+                        };
+                        toggle_flag(&p.session_name, flag);
+                        flags = Flags::load();
+                        // Skip changes grouping/section, so rebuild.
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    }
+                }
+            }
+            // Freeze the selected live conversation's window (prompts for a note).
+            KeyCode::Char('z') | KeyCode::Char('Z') => {
+                if let Some(c) = selected_conv(&rows, &convs) {
+                    if c.lifecycle.is_actionable_here() {
+                        if let Some(t) = freeze_target_of(&c) {
+                            freezing = Some(t);
+                            freeze_note.clear();
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -627,8 +751,9 @@ fn draw(
     collapsed: &HashSet<String>,
     sel: usize,
     showing_help: bool,
-    skipped: &HashSet<String>,
+    flags: &Flags,
     search: Option<&str>,
+    freeze: Option<&str>,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -650,7 +775,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " 1-9 jump · ↑/↓ move · Enter switch · / browse · r refresh · ? help · q quit",
+            " Enter switch · z freeze · f★ m mute ! auto s skip · / browse · r refresh · ? · q",
         ),
         View::Browse => (
             "conversations",
@@ -659,7 +784,7 @@ fn draw(
                 total - live,
                 groups.len()
             ),
-            " 1-9 jump · / search · ←/→ fold · ↑/↓ move · Enter open · Esc active · ? help · q",
+            " Enter open · z freeze · f★ m mute ! auto s skip · / search · ←/→ fold · Esc · ? · q",
         ),
     };
     let mut header_spans = vec![
@@ -723,7 +848,7 @@ fn draw(
     let mut shown_skip = false;
     for (ri, row) in rows.iter().enumerate() {
         if let Row::Header(gi) = row {
-            let is_skip_group = skipped.contains(&groups[*gi].key);
+            let is_skip_group = flags.skipped.contains(&groups[*gi].key);
             if is_skip_group && !shown_skip {
                 shown_skip = true;
                 if !display.is_empty() {
@@ -748,9 +873,7 @@ fn draw(
         let selected = ri == sel;
         display.push(match row {
             Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
-            Row::Conv { ci, gi } => {
-                conv_line(&convs[*ci], &groups[*gi].path, selected, num, skipped)
-            }
+            Row::Conv { ci, gi } => conv_line(&convs[*ci], &groups[*gi].path, selected, num, flags),
         });
     }
 
@@ -764,8 +887,18 @@ fn draw(
     let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), body[1]);
 
-    // Footer: the live search query (classic-style) while searching, else keys.
-    let footer_line = if let Some(q) = search {
+    // Footer: freeze-note prompt, else search query, else the key hints.
+    let footer_line = if let Some(note) = freeze {
+        Line::from(vec![
+            Span::styled(" 💤 freeze note: ", Style::default().fg(Color::Blue)),
+            Span::styled(note.to_string(), Style::default().fg(Color::Blue)),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   Enter freeze · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if let Some(q) = search {
         Line::from(vec![
             Span::styled(" /", Style::default().fg(Color::Yellow)),
             Span::styled(q.to_string(), Style::default().fg(Color::Yellow)),
@@ -808,7 +941,19 @@ fn help_lines() -> Vec<Line<'static>> {
             "/",
             "Active: browse all · Browse: search/filter (type to match)",
         ),
-        key("Esc", "Browse → Active · Active → quit · cancel search"),
+        key(
+            "z",
+            "Freeze the selected live conversation (prompts for a note)",
+        ),
+        key("f / m", "Favorite ★ / mute the conversation's session"),
+        key(
+            "! / s",
+            "Toggle auto-approve / skip the conversation's session",
+        ),
+        key(
+            "Esc",
+            "Browse → Active · Active → quit · cancel search/freeze",
+        ),
         key("←/→ h/l", "Collapse / expand a group (Browse)"),
         key("r", "Refresh"),
         key("?", "This help"),
@@ -918,8 +1063,14 @@ fn conv_line(
     group_path: &str,
     selected: bool,
     num: Option<usize>,
-    skipped: &HashSet<String>,
+    flags: &Flags,
 ) -> Line<'static> {
+    // Session-level flags apply to a live conversation's tmux session.
+    let session = c.placement.as_ref().map(|p| p.session_name.as_str());
+    let has = |set: &HashSet<String>| session.map(|s| set.contains(s)).unwrap_or(false);
+    let favorite = has(&flags.favorite);
+    let muted = has(&flags.muted);
+    let auto = has(&flags.auto_approve);
     // Quick-jump number (1-9) or two spaces, mirroring the classic list.
     let num_prefix = match num {
         Some(n) => format!("{n} "),
@@ -952,7 +1103,7 @@ fn conv_line(
         format!("  {sub}")
     };
 
-    let skip = is_skipped(c, skipped);
+    let skip = is_skipped(c, &flags.skipped);
     // At-a-glance color: live non-archived → blue (busy) / green (free); skipped
     // and archived → gray; closed → gray; selected → reversed highlight.
     let base = if selected {
@@ -974,17 +1125,26 @@ fn conv_line(
         }
     };
 
+    // Leading favorite star (yellow) or a blank in the same 1-char slot.
+    let fav_span = if favorite {
+        Span::styled("★", Style::default().fg(Color::Yellow))
+    } else {
+        Span::styled(" ", base)
+    };
     // Line 1 fragment: number · marker · id · title (classic name column).
-    let mut spans = vec![Span::styled(
-        format!(
-            "  {} {} {:8}  {:<36}",
-            num_prefix,
-            marker,
-            short_id(c.id.as_str()),
-            title
+    let mut spans = vec![
+        fav_span,
+        Span::styled(
+            format!(
+                " {} {} {:8}  {:<36}",
+                num_prefix,
+                marker,
+                short_id(c.id.as_str()),
+                title
+            ),
+            base,
         ),
-        base,
-    )];
+    ];
 
     // Classic-style colored "→ status  (ago)".
     let (label, color) = status_span(c);
@@ -1015,14 +1175,19 @@ fn conv_line(
         };
         spans.push(Span::styled(format!("  [{env}]"), col));
     }
-    if skip {
-        let col = if selected {
-            base
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled("  [skip]", col));
-    }
+    let tag = |on: bool, text: &'static str, fg: Color| -> Option<Span<'static>> {
+        on.then(|| {
+            let col = if selected {
+                base
+            } else {
+                Style::default().fg(fg)
+            };
+            Span::styled(text, col)
+        })
+    };
+    spans.extend(tag(auto, "  [auto]", Color::Green));
+    spans.extend(tag(muted, "  [muted]", Color::DarkGray));
+    spans.extend(tag(skip, "  [skip]", Color::DarkGray));
     Line::from(spans)
 }
 
