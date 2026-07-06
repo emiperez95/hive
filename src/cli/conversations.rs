@@ -831,9 +831,21 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
-            // Expand the selected group (Browse only — Active is always expanded).
+            // Drill into the selected row's project detail (Browse only). Works on
+            // a header or a conversation; special groups with no single project
+            // (frozen / unassigned) just expand inline instead.
             KeyCode::Right | KeyCode::Char('l') if matches!(view, View::Browse) => {
-                if let Some(Row::Header(gi)) = rows.get(sel) {
+                let pkey = match rows.get(sel) {
+                    Some(Row::Header(gi)) => project_key_of(&groups[*gi].key, &projects),
+                    Some(Row::Conv { ci, .. }) => convs[*ci]
+                        .parent
+                        .as_deref()
+                        .and_then(|p| project_key_of(p, &projects)),
+                    None => None,
+                };
+                if let Some(pkey) = pkey {
+                    detail = Some(build_project_detail(&pkey, &reg));
+                } else if let Some(Row::Header(gi)) = rows.get(sel) {
                     collapsed.remove(&groups[*gi].key);
                 }
             }
@@ -858,14 +870,11 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             }
             KeyCode::Enter => match rows.get(sel) {
                 Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
-                // Enter on a header toggles it (Browse only).
+                // Enter on a header folds/unfolds it inline (Browse only) — a quick
+                // peek; → opens the fuller project detail.
                 Some(Row::Header(gi)) if matches!(view, View::Browse) => {
-                    // Drill into the project's detail; special groups (frozen /
-                    // unassigned) have no single project, so fall back to folding.
                     let key = groups[*gi].key.clone();
-                    if let Some(pkey) = project_key_of(&key, &projects) {
-                        detail = Some(build_project_detail(&pkey, &reg));
-                    } else if !collapsed.remove(&key) {
+                    if !collapsed.remove(&key) {
                         collapsed.insert(key);
                     }
                 }
@@ -953,7 +962,7 @@ fn draw(
                 total - live,
                 groups.len()
             ),
-            " Enter open · z freeze · f★ m mute ! auto s skip · / search · ←/→ fold · Esc · ? · q",
+            " → detail · Enter fold · z freeze · f★ m mute ! auto s skip · / search · Esc · ? · q",
         ),
     };
     let mut header_spans = vec![
@@ -1283,10 +1292,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::raw(""),
         key("1-9", "Jump to / switch the Nth conversation"),
         key("↑/↓ j/k", "Move selection"),
-        key(
-            "Enter",
-            "Conversation: switch/resume · project header: detail",
-        ),
+        key("Enter", "Conversation: switch/resume · header: fold group"),
         key(
             "/",
             "Active: browse all · Browse: search/filter (type to match)",
@@ -1304,7 +1310,8 @@ fn help_lines() -> Vec<Line<'static>> {
             "Esc",
             "Browse → Active · Active → quit · cancel search/freeze",
         ),
-        key("←/→ h/l", "Collapse / expand a group (Browse)"),
+        key("→ / l", "Open the selected row's project detail (Browse)"),
+        key("← / h", "Collapse a group (Browse)"),
         key("r", "Refresh"),
         key("?", "This help"),
         key("q", "Quit"),
