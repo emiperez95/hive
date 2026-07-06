@@ -831,22 +831,30 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
-            // Drill into the selected row's project detail (Browse only). Works on
-            // a header or a conversation; special groups with no single project
-            // (frozen / unassigned) just expand inline instead.
-            KeyCode::Right | KeyCode::Char('l') if matches!(view, View::Browse) => {
-                let pkey = match rows.get(sel) {
-                    Some(Row::Header(gi)) => project_key_of(&groups[*gi].key, &projects),
-                    Some(Row::Conv { ci, .. }) => convs[*ci]
+            // Drill into the selected row's project detail — in BOTH views. A
+            // conversation resolves via its parent; a header via its own key
+            // (Browse) or, failing that, a conversation in the group (Active, whose
+            // headers are tmux session names, not project keys). Special Browse
+            // groups with no project (frozen / unassigned) expand inline instead.
+            KeyCode::Right | KeyCode::Char('l') => {
+                let conv_pkey = |ci: usize| {
+                    convs[ci]
                         .parent
                         .as_deref()
-                        .and_then(|p| project_key_of(p, &projects)),
+                        .and_then(|p| project_key_of(p, &projects))
+                };
+                let pkey = match rows.get(sel) {
+                    Some(Row::Conv { ci, .. }) => conv_pkey(*ci),
+                    Some(Row::Header(gi)) => project_key_of(&groups[*gi].key, &projects)
+                        .or_else(|| groups[*gi].convs.iter().find_map(|&ci| conv_pkey(ci))),
                     None => None,
                 };
                 if let Some(pkey) = pkey {
                     detail = Some(build_project_detail(&pkey, &reg));
-                } else if let Some(Row::Header(gi)) = rows.get(sel) {
-                    collapsed.remove(&groups[*gi].key);
+                } else if matches!(view, View::Browse) {
+                    if let Some(Row::Header(gi)) = rows.get(sel) {
+                        collapsed.remove(&groups[*gi].key);
+                    }
                 }
             }
             // Collapse (Browse only): on a header, fold it; on a conversation, fold
@@ -953,7 +961,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " ↑/↓ move · Enter switch · z freeze · f★ m mute ! auto s skip · / browse · ? · q",
+            " → detail · Enter switch · z freeze · f★ m mute ! auto s skip · / browse · ? · q",
         ),
         View::Browse => (
             "conversations",
@@ -1310,7 +1318,7 @@ fn help_lines() -> Vec<Line<'static>> {
             "Esc",
             "Browse → Active · Active → quit · cancel search/freeze",
         ),
-        key("→ / l", "Open the selected row's project detail (Browse)"),
+        key("→ / l", "Open the selected row's project detail"),
         key("← / h", "Collapse a group (Browse)"),
         key("r", "Refresh"),
         key("?", "This help"),
