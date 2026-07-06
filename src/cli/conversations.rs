@@ -668,39 +668,41 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
-            // Expand the selected group.
-            KeyCode::Right | KeyCode::Char('l') => {
+            // Expand the selected group (Browse only — Active is always expanded).
+            KeyCode::Right | KeyCode::Char('l') if matches!(view, View::Browse) => {
                 if let Some(Row::Header(gi)) = rows.get(sel) {
                     collapsed.remove(&groups[*gi].key);
                 }
             }
-            // Collapse: on a header, fold it; on a conversation, fold its group and
-            // move the cursor up to that header.
-            KeyCode::Left | KeyCode::Char('h') => match rows.get(sel) {
-                Some(Row::Header(gi)) => {
-                    collapsed.insert(groups[*gi].key.clone());
+            // Collapse (Browse only): on a header, fold it; on a conversation, fold
+            // its group and move the cursor up to that header.
+            KeyCode::Left | KeyCode::Char('h') if matches!(view, View::Browse) => {
+                match rows.get(sel) {
+                    Some(Row::Header(gi)) => {
+                        collapsed.insert(groups[*gi].key.clone());
+                    }
+                    Some(Row::Conv { gi, .. }) => {
+                        let gi = *gi;
+                        collapsed.insert(groups[gi].key.clone());
+                        let new_rows = visible_rows(&groups, &collapsed);
+                        sel = new_rows
+                            .iter()
+                            .position(|r| matches!(r, Row::Header(g) if *g == gi))
+                            .unwrap_or(0);
+                    }
+                    None => {}
                 }
-                Some(Row::Conv { gi, .. }) => {
-                    let gi = *gi;
-                    collapsed.insert(groups[gi].key.clone());
-                    let new_rows = visible_rows(&groups, &collapsed);
-                    sel = new_rows
-                        .iter()
-                        .position(|r| matches!(r, Row::Header(g) if *g == gi))
-                        .unwrap_or(0);
-                }
-                None => {}
-            },
+            }
             KeyCode::Enter => match rows.get(sel) {
                 Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
-                // Enter on a header toggles it.
-                Some(Row::Header(gi)) => {
+                // Enter on a header toggles it (Browse only).
+                Some(Row::Header(gi)) if matches!(view, View::Browse) => {
                     let key = groups[*gi].key.clone();
                     if !collapsed.remove(&key) {
                         collapsed.insert(key);
                     }
                 }
-                None => {}
+                _ => {}
             },
             KeyCode::Char('r') => {
                 reg = gather_conversations();
@@ -775,7 +777,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " Enter switch · z freeze · f★ m mute ! auto s skip · / browse · r refresh · ? · q",
+            " ↑/↓ move · Enter switch · z freeze · f★ m mute ! auto s skip · / browse · ? · q",
         ),
         View::Browse => (
             "conversations",
@@ -871,8 +873,9 @@ fn draw(
             sel_display = display.len();
         }
         let selected = ri == sel;
+        let collapsible = matches!(view, View::Browse);
         display.push(match row {
-            Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected),
+            Row::Header(gi) => header_line(&groups[*gi], convs, collapsed, selected, collapsible),
             Row::Conv { ci, gi } => conv_line(&convs[*ci], &groups[*gi].path, selected, num, flags),
         });
     }
@@ -973,17 +976,21 @@ fn help_lines() -> Vec<Line<'static>> {
     ]
 }
 
-/// A group header row: a disclosure triangle, the parent key, and counts.
+/// A group header row: a disclosure triangle (Browse only), the parent key, and
+/// counts. In Active, groups can't be collapsed, so the triangle is dropped.
 fn header_line(
     g: &Group,
     convs: &[Conversation],
     collapsed: &HashSet<String>,
     selected: bool,
+    collapsible: bool,
 ) -> Line<'static> {
-    let tri = if collapsed.contains(&g.key) {
-        "▸"
+    let tri = if !collapsible {
+        String::new()
+    } else if collapsed.contains(&g.key) {
+        "▸ ".to_string()
     } else {
-        "▾"
+        "▾ ".to_string()
     };
     let n = g.convs.len();
     let live = g
@@ -997,7 +1004,7 @@ fn header_line(
     } else {
         format!("{} ", g.emoji)
     };
-    let text = format!("{tri} {icon}{}  ({n}, {live} live)", g.key);
+    let text = format!("{tri}{icon}{}  ({n}, {live} live)", g.key);
     let mut style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
