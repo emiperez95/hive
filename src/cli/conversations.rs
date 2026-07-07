@@ -1114,7 +1114,10 @@ fn draw(
         // Browse headers are projects → tint green when they have live work.
         let green_head = matches!(view, View::Browse);
         display.push(match row {
-            Row::Header(gi) => header_line(&groups[*gi], convs, selected, green_head),
+            Row::Header(gi) => {
+                let skipped = flags.skipped.contains(&groups[*gi].key);
+                header_line(&groups[*gi], convs, selected, green_head, skipped)
+            }
             Row::Conv { ci, gi } => conv_line(
                 &convs[*ci],
                 &groups[*gi].path,
@@ -1410,12 +1413,14 @@ fn help_lines() -> Vec<Line<'static>> {
 }
 
 /// A group header row: the project/session key, an icon, and counts. Tinted green
-/// when it has live work (`green_when_live`, i.e. Browse project rows).
+/// when it has live work (`green_when_live`, i.e. Browse project rows); toned down
+/// to a dim gray when its session is `skipped`, so it reads apart from active ones.
 fn header_line(
     g: &Group,
     convs: &[Conversation],
     selected: bool,
     green_when_live: bool,
+    skipped: bool,
 ) -> Line<'static> {
     let n = g.convs.len();
     let live = g
@@ -1430,12 +1435,18 @@ fn header_line(
         format!("{} ", g.emoji)
     };
     let text = format!("{icon}{}  ({n}, {live} live)", g.key);
-    let color = if green_when_live && live > 0 {
-        Color::Green
+    let mut style = if skipped {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
     } else {
-        Color::Cyan
+        let color = if green_when_live && live > 0 {
+            Color::Green
+        } else {
+            Color::Cyan
+        };
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
     };
-    let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     if selected {
         style = style.add_modifier(Modifier::REVERSED);
     }
