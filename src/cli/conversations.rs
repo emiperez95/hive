@@ -1436,9 +1436,8 @@ fn header_line(
     };
     let text = format!("{icon}{}  ({n}, {live} live)", g.key);
     let mut style = if skipped {
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM)
+        // Dim blue: toned down from an active header, but still legible.
+        Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
     } else {
         let color = if green_when_live && live > 0 {
             Color::Green
