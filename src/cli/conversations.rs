@@ -797,15 +797,32 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         // Search input mode: type to filter; Esc exits, Enter opens the selection.
         if searching {
             match key.code {
+                // Esc cancels the search and returns to the Active list.
                 KeyCode::Esc => {
                     searching = false;
                     query.clear();
+                    view = View::Active;
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
                 }
-                KeyCode::Enter => {
-                    if let Some(Row::Conv { ci, .. }) = rows.get(sel) {
-                        return Ok(activate(&convs[*ci]));
+                // Enter opens: a conversation switches/resumes; a project opens detail.
+                KeyCode::Enter => match rows.get(sel) {
+                    Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
+                    Some(Row::Header(_)) => {
+                        if let Some(d) =
+                            detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
+                        {
+                            detail = Some(d);
+                        }
+                    }
+                    None => {}
+                },
+                // → drills into the selected row's project detail (letters type).
+                KeyCode::Right => {
+                    if let Some(d) =
+                        detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
+                    {
+                        detail = Some(d);
                     }
                 }
                 KeyCode::Down => {
@@ -883,19 +900,14 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
                 View::Active => return Ok(Action::Quit),
             },
-            // `/` opens Browse from Active; in Browse it starts a search filter.
-            KeyCode::Char('/') => match view {
-                View::Active => {
-                    view = View::Browse;
-                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
-                    sel = 0;
-                }
-                View::Browse => {
-                    searching = true;
-                    query.clear();
-                    sel = 0;
-                }
-            },
+            // `/` jumps straight into Browse's search box — start typing at once.
+            KeyCode::Char('/') => {
+                view = View::Browse;
+                searching = true;
+                query.clear();
+                (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                sel = 0;
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 if sel + 1 < rows.len() {
                     sel += 1;
@@ -1002,7 +1014,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · z freeze · f★ m mute ! auto s skip · / browse · ? · q",
+            " → detail · Enter switch · z freeze · f★ m mute ! auto s skip · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -1033,7 +1045,7 @@ fn draw(
         ));
     }
     let hint = match view {
-        View::Active => "  ( / browse )",
+        View::Active => "  ( / search )",
         View::Browse => "  ( Esc back )",
     };
     header_spans.push(Span::styled(
@@ -1156,7 +1168,7 @@ fn draw(
             Span::styled(q.to_string(), Style::default().fg(Color::Yellow)),
             Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             Span::styled(
-                "   Enter open · Esc cancel",
+                "   Enter open · → detail · Esc cancel",
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1374,7 +1386,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key(
             "/",
-            "Active: browse projects · Browse: search projects + conversations",
+            "Search projects + conversations (type immediately to filter)",
         ),
         key(
             "z",
