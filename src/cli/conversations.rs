@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::common::frozen::{freeze_window, relative_time, FreezeTarget};
+use crate::common::frozen::{discard_frozen, freeze_window, relative_time, FreezeTarget};
 use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::persistence::{
@@ -819,6 +819,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     // Conversation detail: sits ON TOP of the project detail (so backing out of a
     // conversation returns to the project it was opened from, if any).
     let mut conv_detail: Option<ConvDetailState> = None;
+    // Some(conv) while awaiting y/n to close (kill the window of) a live conversation.
+    let mut confirm: Option<Conversation> = None;
 
     // Enter/number activation: switch to a live conversation, else reopen it.
     let activate = |c: &Conversation| -> Action {
@@ -832,6 +834,39 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut showing_help = false;
 
     loop {
+        // ── Close confirmation ──────────────────────────────────────────────
+        // Closing kills a running Claude process, so it's gated behind y/n. On
+        // confirm we pop any detail screens and refresh the (now-changed) list.
+        if confirm.is_some() {
+            {
+                let c = confirm.as_ref().unwrap();
+                terminal.draw(|frame| draw_confirm_close(frame, c))?;
+            }
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let _ = close_conversation(confirm.as_ref().unwrap());
+                    confirm = None;
+                    conv_detail = None;
+                    detail = None;
+                    reg = gather_conversations();
+                    flags = Flags::load();
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    sel = 0;
+                }
+                _ => confirm = None,
+            }
+            continue;
+        }
+
         // ── Conversation detail sub-screen ──────────────────────────────────
         // Instant static header; resources stream in from a worker thread. The
         // 250ms redraw loop paints them the moment they land. Sits above the
@@ -875,6 +910,20 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     {
                         detail = Some(build_group_detail(&pkey, &reg));
                         conv_detail = None;
+                    }
+                }
+                // Del: discard a frozen conversation, or close a live one (confirm).
+                KeyCode::Delete => {
+                    let c = conv_detail.as_ref().unwrap().conv.clone();
+                    if c.is_frozen() {
+                        let _ = discard_frozen(c.id.as_str());
+                        conv_detail = None;
+                        reg = gather_conversations();
+                        flags = Flags::load();
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                        sel = 0;
+                    } else if c.lifecycle.is_actionable_here() {
+                        confirm = Some(c);
                     }
                 }
                 _ => {}
@@ -922,6 +971,23 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     let d = detail.as_ref().unwrap();
                     if let Some(c) = d.convs.get(d.sel) {
                         conv_detail = Some(spawn_conv_detail(c));
+                    }
+                }
+                // Del: discard a frozen conversation, or close a live one (confirm).
+                KeyCode::Delete => {
+                    let d = detail.as_ref().unwrap();
+                    if let Some(c) = d.convs.get(d.sel).cloned() {
+                        if c.is_frozen() {
+                            let _ = discard_frozen(c.id.as_str());
+                            reg = gather_conversations();
+                            flags = Flags::load();
+                            let key = detail.as_ref().unwrap().key.clone();
+                            detail = Some(build_group_detail(&key, &reg));
+                            (groups, convs, collapsed) =
+                                rebuild(&view, &reg, &flags.skipped, &query);
+                        } else if c.lifecycle.is_actionable_here() {
+                            confirm = Some(c);
+                        }
                     }
                 }
                 KeyCode::Char(dch @ '1'..='9') => {
@@ -1024,6 +1090,21 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     }
                 }
                 KeyCode::Up => sel = sel.saturating_sub(1),
+                // Del: discard a frozen conversation, or close a live one (confirm).
+                KeyCode::Delete => {
+                    if let Some(Row::Conv { ci, .. }) = rows.get(sel) {
+                        let c = convs[*ci].clone();
+                        if c.is_frozen() {
+                            let _ = discard_frozen(c.id.as_str());
+                            reg = gather_conversations();
+                            flags = Flags::load();
+                            (groups, convs, collapsed) =
+                                rebuild(&view, &reg, &flags.skipped, &query);
+                        } else if c.lifecycle.is_actionable_here() {
+                            confirm = Some(c);
+                        }
+                    }
+                }
                 KeyCode::Backspace => {
                     query.pop();
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
@@ -1170,6 +1251,19 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     }
                 }
             }
+            // Del: discard a frozen conversation, or close a live one (confirm).
+            KeyCode::Delete => {
+                if let Some(c) = selected_conv(&rows, &convs) {
+                    if c.is_frozen() {
+                        let _ = discard_frozen(c.id.as_str());
+                        reg = gather_conversations();
+                        flags = Flags::load();
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    } else if c.lifecycle.is_actionable_here() {
+                        confirm = Some(c);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1208,7 +1302,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · z freeze · f★ m mute ! auto s skip · / search · ? · q",
+            " → detail · Enter switch · z freeze · Del close · f★ m ! s · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -1362,7 +1456,7 @@ fn draw(
             Span::styled(q.to_string(), Style::default().fg(Color::Yellow)),
             Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             Span::styled(
-                "   Enter open · → detail · Esc cancel",
+                "   Enter open · → detail · Del close · Esc cancel",
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1542,7 +1636,7 @@ fn draw_project_detail(
     let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let footer = " ↑/↓ move · Enter switch/resume · n new · r resume last · Esc back · q";
+    let footer = " Enter switch · → detail · Del close · n new · r resume last · Esc back · q";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             footer,
@@ -1702,7 +1796,7 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
     let view: Vec<Line> = lines.into_iter().skip(off).take(h).collect();
     frame.render_widget(Paragraph::new(view), chunks[1]);
 
-    let footer = " Enter switch/resume · p project · ↑/↓ scroll · Esc back";
+    let footer = " Enter switch/resume · Del close · p project · ↑/↓ scroll · Esc back";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             footer,
@@ -1812,6 +1906,46 @@ fn render_conv_resources(lines: &mut Vec<Line<'static>>, r: &ConvResources) {
     }
 }
 
+/// Full-screen y/n prompt shown before closing (killing) a live conversation.
+fn draw_confirm_close(frame: &mut ratatui::Frame, c: &Conversation) {
+    let title = c.title.clone().unwrap_or_else(|| short_id(c.id.as_str()));
+    let where_text = match &c.placement {
+        Some(p) => format!("tmux {} · win {}", p.session_name, p.window_index),
+        None => "—".to_string(),
+    };
+    let lines = vec![
+        Line::raw(""),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Close this conversation?",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("    {title}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("    {where_text}"),
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Kills its tmux window (the Claude process). History stays on disk — resumable.",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                "  [y] close   ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[n] cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), frame.area());
+}
+
 /// The help overlay lines.
 fn help_lines() -> Vec<Line<'static>> {
     let key = |k: &str, d: &str| -> Line<'static> {
@@ -1854,6 +1988,10 @@ fn help_lines() -> Vec<Line<'static>> {
         key(
             "→ / l",
             "Detail: a conversation's own, or a project header's",
+        ),
+        key(
+            "Del",
+            "Close a live conversation (kill window) · discard a frozen one",
         ),
         key(
             "← / h",
@@ -2225,6 +2363,32 @@ fn new_conversation(key: &str) -> Result<String> {
 
     switch_to_session(&session);
     Ok(format!("New conversation in {session}"))
+}
+
+/// Close a live conversation: kill its tmux window (freeing the Claude process).
+/// The window's the unit — sibling conversations in the session are untouched;
+/// if it was the last window, tmux drops the session. History stays on disk, so
+/// the conversation becomes Closed and is resumable.
+fn close_conversation(conv: &Conversation) -> Result<String> {
+    let p = conv
+        .placement
+        .as_ref()
+        .ok_or_else(|| anyhow!("not running here"))?;
+    let target = if p.window_index.is_empty() {
+        p.session_name.clone()
+    } else {
+        format!("{}:{}", p.session_name, p.window_index)
+    };
+    let ok = Command::new("tmux")
+        .args(["kill-window", "-t", &target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        Ok(format!("Closed {}", short_id(conv.id.as_str())))
+    } else {
+        Err(anyhow!("failed to close window '{target}'"))
+    }
 }
 
 fn short_id(id: &str) -> String {
