@@ -1645,19 +1645,24 @@ fn draw(
         let green_head = matches!(view, View::Browse);
         display.push(match row {
             Row::Header(gi) => {
-                let skipped = flags.skipped.contains(&groups[*gi].key);
+                let g = &groups[*gi];
+                let skipped = flags.skipped.contains(&g.key);
                 // Browse group keys ARE project keys, so these read the prefs directly.
                 let is_browse = matches!(view, View::Browse);
-                let muted = is_browse && flags.muted_projects.contains(&groups[*gi].key);
-                let archived = is_browse && flags.archived_projects.contains(&groups[*gi].key);
+                let muted = is_browse && flags.muted_projects.contains(&g.key);
+                let archived = is_browse && flags.archived_projects.contains(&g.key);
+                // Summed todo count over the group's DISTINCT sessions (todos are
+                // session-level): one session in Active, possibly several in Browse.
+                let mut seen = HashSet::new();
+                let todos = g
+                    .convs
+                    .iter()
+                    .filter_map(|&ci| convs[ci].placement.as_ref())
+                    .filter(|p| seen.insert(p.session_name.clone()))
+                    .map(|p| flags.todo_counts.get(&p.session_name).copied().unwrap_or(0))
+                    .sum();
                 header_line(
-                    &groups[*gi],
-                    convs,
-                    selected,
-                    green_head,
-                    skipped,
-                    muted,
-                    archived,
+                    g, convs, selected, green_head, skipped, muted, archived, todos,
                 )
             }
             Row::Conv { ci, gi } => conv_line(
@@ -2323,6 +2328,7 @@ fn help_lines() -> Vec<Line<'static>> {
 /// A group header row: the project/session key, an icon, and counts. Tinted green
 /// when it has live work (`green_when_live`, i.e. Browse project rows); toned down
 /// to a dim gray when its session is `skipped`, so it reads apart from active ones.
+#[allow(clippy::too_many_arguments)]
 fn header_line(
     g: &Group,
     convs: &[Conversation],
@@ -2331,6 +2337,7 @@ fn header_line(
     skipped: bool,
     muted: bool,
     archived: bool,
+    todos: usize,
 ) -> Line<'static> {
     let n = g.convs.len();
     let live = g
@@ -2367,7 +2374,18 @@ fn header_line(
     if selected {
         style = style.add_modifier(Modifier::REVERSED);
     }
-    Line::from(Span::styled(text, style))
+    let mut spans = vec![Span::styled(text, style)];
+    // Todo badge on the header — todos are session-level, so every conversation in
+    // the group shares them; showing the summed count once here avoids repeating it.
+    if todos > 0 {
+        let col = if selected {
+            style
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        spans.push(Span::styled(format!("  ☑{todos}"), col));
+    }
+    Line::from(spans)
 }
 
 /// The freeze note (why it was parked) for a frozen conversation, else empty.
@@ -2556,19 +2574,6 @@ fn conv_line(
     spans.extend(tag(auto, "  [auto]", Color::Green));
     spans.extend(tag(muted, "  [muted]", Color::DarkGray));
     spans.extend(tag(skip, "  [skip]", Color::DarkGray));
-    // Todo count badge (☑ N) from the conversation's session todos.
-    let todo_n = session
-        .and_then(|s| flags.todo_counts.get(s))
-        .copied()
-        .unwrap_or(0);
-    if todo_n > 0 {
-        let col = if selected {
-            base
-        } else {
-            Style::default().fg(Color::Yellow)
-        };
-        spans.push(Span::styled(format!("  ☑{todo_n}"), col));
-    }
     Line::from(spans)
 }
 
