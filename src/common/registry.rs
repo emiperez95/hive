@@ -429,7 +429,10 @@ pub fn should_surface_closed(
         },
         None => false,
     };
-    recent || session.parent.is_some() || session.frozen.as_ref().is_some_and(|f| f.pinned)
+    recent
+        || session.parent.is_some()
+        || session.pinned
+        || session.frozen.as_ref().is_some_and(|f| f.pinned)
 }
 
 /// Cached disk scan so the ~1-1.5s refresh never does a full FS walk each tick.

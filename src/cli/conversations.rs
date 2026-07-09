@@ -38,7 +38,8 @@ use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
 use crate::common::process::get_process_info;
 use crate::common::projects::{ensure_tmux_session, expand_tilde, ProjectRegistry};
 use crate::common::registry::{
-    self, Conversation, ConversationRegistry, ConversationSidecar, TmuxPlacement,
+    self, Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
+    TmuxPlacement,
 };
 use crate::common::tmux::{get_current_tmux_session, select_window, switch_to_session};
 use crate::common::types::ProcessInfo;
@@ -266,6 +267,27 @@ fn toggle_archived_project(key: &str) {
     }
 }
 
+/// Mutate one conversation's overlay entry in `conversations.json`, dropping the
+/// entry again if it's been reset to empty (keeps the sidecar tidy).
+fn edit_overlay(id: &str, f: impl FnOnce(&mut ConversationOverlay)) {
+    let mut sc = ConversationSidecar::load();
+    f(sc.conversations.entry(id.to_string()).or_default());
+    if sc.conversations.get(id) == Some(&ConversationOverlay::default()) {
+        sc.conversations.remove(id);
+    }
+    let _ = sc.save();
+}
+
+/// Set (or clear) a conversation's pinned flag (persisted overlay).
+fn set_conversation_pin(id: &str, pinned: bool) {
+    edit_overlay(id, |o| o.pinned = pinned);
+}
+
+/// Set (or clear) a conversation's free-text note (persisted overlay).
+fn set_conversation_note(id: &str, note: &str) {
+    edit_overlay(id, |o| o.note = note.trim().to_string());
+}
+
 /// The active todo list for a tmux session (todos are session-level).
 fn session_todos(session: &str) -> Vec<String> {
     load_session_todos().remove(session).unwrap_or_default()
@@ -340,9 +362,14 @@ fn freeze_target_of(c: &Conversation) -> Option<FreezeTarget> {
 
 fn sort_convs(group: &mut [&Conversation]) {
     group.sort_by(|a, b| {
-        b.lifecycle
-            .is_actionable_here()
-            .cmp(&a.lifecycle.is_actionable_here())
+        // Pinned first, then live, then most-recent, then id for stability.
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| {
+                b.lifecycle
+                    .is_actionable_here()
+                    .cmp(&a.lifecycle.is_actionable_here())
+            })
             .then_with(|| b.last_activity.cmp(&a.last_activity))
             .then_with(|| a.id.as_str().cmp(b.id.as_str()))
     });
@@ -697,6 +724,8 @@ struct ConvDetailState {
     todos: Vec<String>,
     /// True while typing a new todo; `input` holds the text.
     adding: bool,
+    /// True while editing the conversation's note; `input` holds the text.
+    editing_note: bool,
     input: String,
 }
 
@@ -738,6 +767,7 @@ fn spawn_conv_detail(c: &Conversation) -> ConvDetailState {
         scroll: 0,
         todos,
         adding: false,
+        editing_note: false,
         input: String::new(),
     }
 }
@@ -1044,6 +1074,35 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 continue;
             }
 
+            // Note-editing input mode: Enter saves the note (persisted overlay).
+            if conv_detail.as_ref().unwrap().editing_note {
+                let cd = conv_detail.as_mut().unwrap();
+                match key.code {
+                    KeyCode::Esc => {
+                        cd.editing_note = false;
+                        cd.input.clear();
+                    }
+                    KeyCode::Enter => {
+                        let note = cd.input.trim().to_string();
+                        let id = cd.conv.id.as_str().to_string();
+                        cd.editing_note = false;
+                        cd.input.clear();
+                        set_conversation_note(&id, &note);
+                        cd.conv.note = note.clone();
+                        if let Some(c) = reg.conversations.get_mut(&id) {
+                            c.note = note;
+                        }
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    }
+                    KeyCode::Backspace => {
+                        cd.input.pop();
+                    }
+                    KeyCode::Char(c) => cd.input.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                     conv_detail = None
@@ -1084,6 +1143,24 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     } else if c.lifecycle.is_actionable_here() {
                         confirm = Some(c);
                     }
+                }
+                // `P` pins/unpins the conversation (persisted overlay); `e` edits
+                // its note. Both surface a closed conversation regardless of age.
+                KeyCode::Char('P') => {
+                    let cd = conv_detail.as_mut().unwrap();
+                    let id = cd.conv.id.as_str().to_string();
+                    let pinned = !cd.conv.pinned;
+                    set_conversation_pin(&id, pinned);
+                    cd.conv.pinned = pinned;
+                    if let Some(c) = reg.conversations.get_mut(&id) {
+                        c.pinned = pinned;
+                    }
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                }
+                KeyCode::Char('e') => {
+                    let cd = conv_detail.as_mut().unwrap();
+                    cd.editing_note = true;
+                    cd.input = cd.conv.note.clone();
                 }
                 // Todos (session-level): `a` add, `1-9` mark the Nth done.
                 KeyCode::Char('a') => {
@@ -1456,6 +1533,19 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             // per-session `m` above. Persisted as the shared `muted-global` flag the
             // hook notifier checks, so it affects the classic TUI and web too.
             KeyCode::Char('M') => set_global_mute(!is_globally_muted()),
+            // `P` pins/unpins the selected conversation (persisted overlay). A pinned
+            // conversation sorts to the top of its group and survives age-bounding.
+            KeyCode::Char('P') => {
+                if let Some(c) = selected_conv(&rows, &convs) {
+                    let id = c.id.as_str().to_string();
+                    let pinned = !c.pinned;
+                    set_conversation_pin(&id, pinned);
+                    if let Some(cc) = reg.conversations.get_mut(&id) {
+                        cc.pinned = pinned;
+                    }
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                }
+            }
             // Freeze the selected live conversation's window (prompts for a note).
             KeyCode::Char('z') | KeyCode::Char('Z') => {
                 if let Some(c) = selected_conv(&rows, &convs) {
@@ -1528,7 +1618,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · z freeze · Del close · f★ m ! s · M mute-all · / search · ? · q",
+            " → detail · Enter switch · z freeze · P pin · Del close · f★ m ! s · M mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -1950,10 +2040,11 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
     .split(area);
     let c = &cd.conv;
 
-    // Title bar (instant).
+    // Title bar (instant). A leading 📌 marks a pinned conversation.
     let title = c.title.clone().unwrap_or_else(|| short_id(c.id.as_str()));
+    let pin = if c.pinned { "📌 " } else { "" };
     let mut title_spans = vec![Span::styled(
-        format!(" {title}"),
+        format!(" {pin}{title}"),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -2016,6 +2107,15 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
     };
     lines.push(field("where", vec![Span::raw(where_text)]));
     lines.push(field("cwd", vec![Span::raw(abbrev_home(&c.cwd))]));
+    if !c.note.trim().is_empty() {
+        lines.push(field(
+            "note",
+            vec![Span::styled(
+                c.note.clone(),
+                Style::default().fg(Color::Yellow),
+            )],
+        ));
+    }
     if let Some(f) = &c.frozen {
         if !f.note.trim().is_empty() {
             lines.push(field(
@@ -2074,19 +2174,24 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
     let view: Vec<Line> = lines.into_iter().skip(off).take(h).collect();
     frame.render_widget(Paragraph::new(view), chunks[1]);
 
-    let footer_line = if cd.adding {
+    let footer_line = if cd.adding || cd.editing_note {
+        let (label, verb) = if cd.adding {
+            (" + todo: ", "add")
+        } else {
+            (" note: ", "save")
+        };
         Line::from(vec![
-            Span::styled(" + todo: ", Style::default().fg(Color::Yellow)),
+            Span::styled(label, Style::default().fg(Color::Yellow)),
             Span::styled(cd.input.clone(), Style::default().fg(Color::Yellow)),
             Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             Span::styled(
-                "   Enter add · Esc cancel",
+                format!("   Enter {verb} · Esc cancel"),
                 Style::default().fg(Color::DarkGray),
             ),
         ])
     } else {
         Line::from(Span::styled(
-            " Enter switch · Del close · a todo · 1-9 done · o chrome · p project · ↑/↓ scroll · Esc back",
+            " Enter switch · P pin · e note · a todo · 1-9 done · o chrome · Del close · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -2286,6 +2391,11 @@ fn help_lines() -> Vec<Line<'static>> {
             "On a project (Browse/detail): mute the whole project (remembered)",
         ),
         key("M", "Toggle global mute (silence all notifications)"),
+        key(
+            "P",
+            "Pin/unpin a conversation (sorts to top, survives bounding)",
+        ),
+        key("e", "Edit a conversation's note (in its detail)"),
         key(
             "! / s",
             "Toggle auto-approve / skip the conversation's session",
@@ -2574,6 +2684,22 @@ fn conv_line(
     spans.extend(tag(auto, "  [auto]", Color::Green));
     spans.extend(tag(muted, "  [muted]", Color::DarkGray));
     spans.extend(tag(skip, "  [skip]", Color::DarkGray));
+    // Overlay: a pin marker and the free-text note (persisted per-conversation).
+    if c.pinned {
+        let col = if selected {
+            base
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        spans.push(Span::styled("  📌", col));
+    }
+    let ov_note = c.note.trim();
+    if !ov_note.is_empty() {
+        spans.push(Span::styled(
+            format!("  📝 {}", ov_note.chars().take(40).collect::<String>()),
+            dim(base),
+        ));
+    }
     Line::from(spans)
 }
 
