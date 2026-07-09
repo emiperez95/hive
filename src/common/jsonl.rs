@@ -3,7 +3,7 @@
 use crate::common::debug::{debug_log, is_debug_enabled};
 use crate::common::types::{truncate_command, ClaudeStatus};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -154,6 +154,7 @@ pub fn scan_all_conversation_ids() -> Vec<String> {
 /// A conversation discovered on disk, enriched with the cwd (read from the
 /// transcript) and last-activity (the jsonl file mtime) needed to place + bound
 /// a Closed session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskConversation {
     pub id: String,
     pub cwd: Option<String>,
@@ -287,6 +288,108 @@ pub fn scan_disk_conversations_in(dirs: &[PathBuf]) -> Vec<DiskConversation> {
 /// Like [`scan_all_conversation_ids`] but with cwd + mtime for each conversation.
 pub fn scan_all_disk_conversations() -> Vec<DiskConversation> {
     scan_disk_conversations_in(&claude_slug_dirs())
+}
+
+/// The on-disk scan cache: id → last scan result. Keyed reuse hinges on `mtime`
+/// (== `last_activity`), so an unchanged transcript is never re-parsed.
+#[derive(Default, Serialize, Deserialize)]
+struct DiskScanCache {
+    #[serde(default)]
+    entries: std::collections::HashMap<String, DiskConversation>,
+}
+
+fn scan_cache_path() -> Option<PathBuf> {
+    crate::common::persistence::cache_dir().map(|p| p.join("conversation-scan.json"))
+}
+
+fn load_scan_cache() -> DiskScanCache {
+    let Some(path) = scan_cache_path() else {
+        return DiskScanCache::default();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return DiskScanCache::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_scan_cache(cache: &DiskScanCache) {
+    let Some(path) = scan_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string(cache) {
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, &content).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Cached counterpart of [`scan_all_disk_conversations`]: stats every transcript
+/// (cheap) but only re-parses ones whose mtime changed since the last scan, so a
+/// warm scan skips the ~230 head+tail reads. The cache is rebuilt from the current
+/// file set each call, so deleted transcripts drop out (no unbounded growth).
+pub fn scan_all_disk_conversations_cached() -> Vec<DiskConversation> {
+    let dirs = claude_slug_dirs();
+    let cache = load_scan_cache();
+    let mut out = Vec::new();
+    let mut next = DiskScanCache::default();
+    let mut seen = std::collections::HashSet::new();
+
+    for dir in &dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let config_dir = profile_config_dir(dir);
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let mtime = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| DateTime::<Utc>::from(t).to_rfc3339());
+
+            // Reuse the cached parse only when the mtime is present and unchanged.
+            let cached = cache.entries.get(&id).filter(|c| {
+                mtime.is_some() && c.last_activity == mtime && c.config_dir == config_dir
+            });
+            let dc = match cached {
+                Some(c) => DiskConversation {
+                    id: id.clone(),
+                    last_activity: mtime.clone(),
+                    ..c.clone()
+                },
+                None => {
+                    let (cwd, title) = read_conversation_meta(&path);
+                    DiskConversation {
+                        id: id.clone(),
+                        cwd,
+                        last_activity: mtime.clone(),
+                        title,
+                        config_dir: config_dir.clone(),
+                    }
+                }
+            };
+            next.entries.insert(id, dc.clone());
+            out.push(dc);
+        }
+    }
+    save_scan_cache(&next);
+    out
 }
 
 /// Find the most recently modified jsonl file in a Claude projects directory

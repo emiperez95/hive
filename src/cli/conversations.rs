@@ -61,7 +61,9 @@ pub fn run_conversations(list: bool) -> Result<()> {
 /// Closed set bounded.
 pub fn gather_conversations() -> ConversationRegistry {
     let hook = HookState::load();
-    let disk = jsonl::scan_all_disk_conversations();
+    // Cached scan: unchanged transcripts (by mtime) skip the head+tail re-parse,
+    // so repeat refreshes and popup re-opens stay snappy.
+    let disk = jsonl::scan_all_disk_conversations_cached();
     let disk_ids: Vec<String> = disk.iter().map(|d| d.id.clone()).collect();
     let sidecar = ConversationSidecar::load();
 
