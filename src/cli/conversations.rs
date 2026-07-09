@@ -26,8 +26,9 @@ use crate::common::frozen::{discard_frozen, freeze_window, relative_time, Freeze
 use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::persistence::{
-    load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions, load_skipped_sessions,
-    save_auto_approve_sessions, save_favorite_sessions, save_muted_sessions, save_skipped_sessions,
+    is_globally_muted, load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions,
+    load_skipped_sessions, save_auto_approve_sessions, save_favorite_sessions, save_muted_sessions,
+    save_skipped_sessions, set_global_mute,
 };
 use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
 use crate::common::process::get_process_info;
@@ -1240,6 +1241,10 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     }
                 }
             }
+            // Shift-M toggles GLOBAL mute (all notifications), distinct from the
+            // per-session `m` above. Persisted as the shared `muted-global` flag the
+            // hook notifier checks, so it affects the classic TUI and web too.
+            KeyCode::Char('M') => set_global_mute(!is_globally_muted()),
             // Freeze the selected live conversation's window (prompts for a note).
             KeyCode::Char('z') | KeyCode::Char('Z') => {
                 if let Some(c) = selected_conv(&rows, &convs) {
@@ -1302,7 +1307,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · z freeze · Del close · f★ m ! s · / search · ? · q",
+            " → detail · Enter switch · z freeze · Del close · f★ m ! s · M mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -1331,6 +1336,10 @@ fn draw(
             format!("💤 {frozen} frozen"),
             Style::default().fg(Color::Blue),
         ));
+    }
+    if is_globally_muted() {
+        header_spans.push(Span::raw("   "));
+        header_spans.push(Span::styled("🔇 muted", Style::default().fg(Color::Yellow)));
     }
     let hint = match view {
         View::Active => "  ( / search )",
@@ -1981,6 +1990,7 @@ fn help_lines() -> Vec<Line<'static>> {
             "Freeze the selected live conversation (prompts for a note)",
         ),
         key("f / m", "Favorite ★ / mute the conversation's session"),
+        key("M", "Toggle global mute (silence all notifications)"),
         key(
             "! / s",
             "Toggle auto-approve / skip the conversation's session",
