@@ -409,6 +409,7 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 - `prefix + s` — hive popup (list view)
 - `prefix + d` — hive popup (detail view for current session)
+- `prefix + a` — hive conversations popup (conversation-first TUI)
 - `Ctrl+n` / `Ctrl+p` — cycle next/prev session
 - `Ctrl+g` — jump to the next non-busy Claude window (current session first, then others)
 - `Ctrl+\` — cycle to next window in the current session (`window-prev` is CLI-only)
