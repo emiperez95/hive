@@ -372,26 +372,35 @@ pub fn resolve_parent(
     projects: &ProjectRegistry,
 ) -> Option<String> {
     let cwd_path = expand_tilde(cwd);
-    // Projects first, then worktrees: on an equal-length tie `max_by_key` keeps the
-    // LAST maximum, so the more-specific worktree key wins.
-    let mut candidates: Vec<(usize, String)> = Vec::new();
+    // Each candidate is (prefix_len, is_worktree, key). The winner is the DETERMINISTIC
+    // max over that tuple: longest path prefix, then a worktree beats a project at
+    // equal length (more specific), then key breaks any remaining tie. Without the
+    // is_worktree + key ordering, two worktrees whose paths collide (stale
+    // worktrees.json entries at the same dir) would resolve by HashMap iteration
+    // order — flipping a conversation between groups run to run.
+    let mut candidates: Vec<(usize, bool, String)> = Vec::new();
     for (key, config) in &projects.projects {
         if let Some(len) = component_prefix_len(&cwd_path, &expand_tilde(&config.project_root)) {
-            candidates.push((len, key.clone()));
+            candidates.push((len, false, key.clone()));
         }
     }
     for entry in worktrees.worktrees.values() {
         if let Some(len) = component_prefix_len(&cwd_path, &expand_tilde(&entry.path)) {
             candidates.push((
                 len,
+                true,
                 WorktreeState::make_key(&entry.project_key, &entry.branch),
             ));
         }
     }
     candidates
         .into_iter()
-        .max_by_key(|(len, _)| *len)
-        .map(|(_, key)| key)
+        .max_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        })
+        .map(|(_, _, key)| key)
 }
 
 /// The persisted parent is authoritative; the local resolver is a fallback only,
@@ -911,6 +920,28 @@ mod tests {
         assert_eq!(
             resolve_parent("/home/u/hivefoo/src", &WorktreeState::default(), &projs),
             None
+        );
+    }
+
+    #[test]
+    fn test_resolve_parent_deterministic_on_duplicate_paths() {
+        // Two worktrees at the SAME path (stale worktrees.json entries): the winner
+        // must be stable across HashMap iteration orders. Rebuild the map each
+        // iteration so its random seed — and thus its order — varies.
+        let projs = projs_with(&[("clear-session", "/home/u/cs")]);
+        let mut results = std::collections::HashSet::new();
+        for _ in 0..25 {
+            let wts = wts_with(&[
+                ("clear-session", "CSD-2465", "/home/u/wt/dup"),
+                ("clear-session", "pr-2955", "/home/u/wt/dup"),
+            ]);
+            results.insert(resolve_parent("/home/u/wt/dup/src", &wts, &projs));
+        }
+        assert_eq!(results.len(), 1, "resolve_parent must be deterministic");
+        // Tie-break keeps the lexicographically-greater key.
+        assert_eq!(
+            results.into_iter().next().unwrap(),
+            Some("clear-session/pr-2955".to_string())
         );
     }
 
