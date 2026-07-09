@@ -11,7 +11,10 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use sysinfo::System;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
@@ -26,11 +29,14 @@ use crate::common::persistence::{
     load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions, load_skipped_sessions,
     save_auto_approve_sessions, save_favorite_sessions, save_muted_sessions, save_skipped_sessions,
 };
+use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
+use crate::common::process::get_process_info;
 use crate::common::projects::{ensure_tmux_session, expand_tilde, ProjectRegistry};
 use crate::common::registry::{
     self, Conversation, ConversationRegistry, ConversationSidecar, TmuxPlacement,
 };
 use crate::common::tmux::{get_current_tmux_session, select_window, switch_to_session};
+use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
 use crate::ipc::messages::{HookState, SessionStatus};
 
@@ -571,6 +577,131 @@ fn detail_of_row(
     }
 }
 
+// ── Conversation detail (async-enriched) ────────────────────────────────────
+
+/// The heavy, per-conversation data — process tree, ports, commits, transcript
+/// tail — gathered OFF the UI thread so the detail screen paints instantly.
+struct ConvResources {
+    running: bool,
+    cpu: f32,
+    mem_kb: u64,
+    processes: Vec<ProcessInfo>,
+    ports: Vec<ListeningPort>,
+    commits: Vec<String>,
+    preview: Vec<jsonl::ConversationMessage>,
+}
+
+/// The resource load is `Loading` until the worker thread swaps in `Ready`.
+enum ResourceState {
+    Loading,
+    Ready(Box<ConvResources>),
+}
+
+/// The conversation detail sub-screen: instant static header (from the registry) +
+/// resources that stream in behind it.
+struct ConvDetailState {
+    conv: Conversation,
+    res: Arc<Mutex<ResourceState>>,
+    scroll: usize,
+}
+
+/// Open a conversation's detail: keep the instant static data and spawn a detached
+/// worker for the slow bits. The UI polls `res` each redraw and fills in when ready.
+fn spawn_conv_detail(c: &Conversation) -> ConvDetailState {
+    let conv = c.clone();
+    let res = Arc::new(Mutex::new(ResourceState::Loading));
+    let sink = res.clone();
+    let target = conv.clone();
+    std::thread::spawn(move || {
+        let gathered = gather_conv_resources(&target);
+        if let Ok(mut guard) = sink.lock() {
+            *guard = ResourceState::Ready(Box::new(gathered));
+        }
+    });
+    ConvDetailState {
+        conv,
+        res,
+        scroll: 0,
+    }
+}
+
+/// Gather the slow bits. Live conversations get a CPU/mem/process/port sample;
+/// commits and the transcript tail come from disk for live AND closed ones.
+fn gather_conv_resources(conv: &Conversation) -> ConvResources {
+    let (running, cpu, mem_kb, processes, ports) = if conv.lifecycle.is_actionable_here() {
+        gather_live_resources(conv)
+    } else {
+        (false, 0.0, 0, Vec::new(), Vec::new())
+    };
+    let commits = recent_commits(&conv.cwd);
+    let mut preview = jsonl::get_conversation_messages_for(&conv.cwd, Some(conv.id.as_str()));
+    // Keep only the tail — the last handful of turns.
+    if preview.len() > 6 {
+        preview.drain(0..preview.len() - 6);
+    }
+    ConvResources {
+        running,
+        cpu,
+        mem_kb,
+        processes,
+        ports,
+        commits,
+        preview,
+    }
+}
+
+/// Live CPU/mem/process/port sample for the conversation's window. Two sysinfo
+/// refreshes across a short interval give an accurate CPU delta.
+fn gather_live_resources(
+    conv: &Conversation,
+) -> (bool, f32, u64, Vec<ProcessInfo>, Vec<ListeningPort>) {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    std::thread::sleep(Duration::from_millis(300));
+    sys.refresh_all();
+
+    let instances = instances::detect_all_instances();
+    let want_pane = conv.placement.as_ref().and_then(|p| p.pane_id.clone());
+    let Some(inst) = instances.iter().find(|i| {
+        i.session_id.as_deref() == Some(conv.id.as_str())
+            || want_pane.as_deref() == Some(i.pane_id.as_str())
+    }) else {
+        return (false, 0.0, 0, Vec::new(), Vec::new());
+    };
+
+    let mut cpu = 0.0f32;
+    let mut mem_kb = 0u64;
+    let mut processes = Vec::new();
+    for &pid in &inst.pids {
+        if let Some(info) = get_process_info(&sys, pid) {
+            cpu += info.cpu_percent;
+            mem_kb += info.memory_kb;
+            processes.push(info);
+        }
+    }
+    processes.sort_by(|a, b| {
+        b.cpu_percent
+            .partial_cmp(&a.cpu_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let ports = get_listening_ports_for_pids(&inst.pids, &sys);
+    (true, cpu, mem_kb, processes, ports)
+}
+
+/// The last few commits in a repo (`git -C <cwd> log --oneline -10`).
+fn recent_commits(cwd: &str) -> Vec<String> {
+    match Command::new("git")
+        .args(["-C", cwd, "log", "--oneline", "-10"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Longest common absolute-directory prefix (component-wise) of the given cwds.
 /// The path is a property of the project/worktree, not the individual
 /// conversation, so it's shown once on the group header.
@@ -685,6 +816,9 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut sel: usize = 0;
     // Project detail sub-screen: Some(state) while drilled into a project.
     let mut detail: Option<ProjectDetailState> = None;
+    // Conversation detail: sits ON TOP of the project detail (so backing out of a
+    // conversation returns to the project it was opened from, if any).
+    let mut conv_detail: Option<ConvDetailState> = None;
 
     // Enter/number activation: switch to a live conversation, else reopen it.
     let activate = |c: &Conversation| -> Action {
@@ -698,6 +832,56 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut showing_help = false;
 
     loop {
+        // ── Conversation detail sub-screen ──────────────────────────────────
+        // Instant static header; resources stream in from a worker thread. The
+        // 250ms redraw loop paints them the moment they land. Sits above the
+        // project detail: Esc pops back to wherever it was opened from.
+        if conv_detail.is_some() {
+            {
+                let cd = conv_detail.as_ref().unwrap();
+                terminal.draw(|frame| draw_conv_detail(frame, cd))?;
+            }
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
+                    conv_detail = None
+                }
+                KeyCode::Enter => {
+                    let c = conv_detail.as_ref().unwrap().conv.clone();
+                    return Ok(activate(&c));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    conv_detail.as_mut().unwrap().scroll += 1;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let cd = conv_detail.as_mut().unwrap();
+                    cd.scroll = cd.scroll.saturating_sub(1);
+                }
+                // Jump up to the conversation's project detail.
+                KeyCode::Char('p') => {
+                    let c = conv_detail.as_ref().unwrap().conv.clone();
+                    if let Some(pkey) = c
+                        .parent
+                        .as_deref()
+                        .and_then(|p| project_key_of(p, &projects))
+                    {
+                        detail = Some(build_group_detail(&pkey, &reg));
+                        conv_detail = None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         // ── Project detail sub-screen ───────────────────────────────────────
         // When drilled into a project, this fully owns the frame + input; Esc/q
         // backs out to the list, Enter/n/r return an Action that exits the TUI.
@@ -731,6 +915,13 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     let d = detail.as_ref().unwrap();
                     if let Some(c) = d.convs.get(d.sel) {
                         return Ok(activate(c));
+                    }
+                }
+                // → drills into the selected conversation's detail.
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let d = detail.as_ref().unwrap();
+                    if let Some(c) = d.convs.get(d.sel) {
+                        conv_detail = Some(spawn_conv_detail(c));
                     }
                 }
                 KeyCode::Char(dch @ '1'..='9') => {
@@ -817,9 +1008,11 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     }
                     None => {}
                 },
-                // → drills into the selected row's project detail (letters type).
+                // → drills in: a conversation → its detail; a project → its detail.
                 KeyCode::Right => {
-                    if let Some(d) =
+                    if let Some(Row::Conv { ci, .. }) = rows.get(sel) {
+                        conv_detail = Some(spawn_conv_detail(&convs[*ci]));
+                    } else if let Some(d) =
                         detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
                     {
                         detail = Some(d);
@@ -914,10 +1107,11 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
-            // Drill into the selected row's detail (both views). A conversation
-            // opens its project; a header opens its group/project.
+            // Drill in: a conversation → its own detail; a header → the project.
             KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(d) =
+                if let Some(Row::Conv { ci, .. }) = rows.get(sel) {
+                    conv_detail = Some(spawn_conv_detail(&convs[*ci]));
+                } else if let Some(d) =
                     detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
                 {
                     detail = Some(d);
@@ -1358,6 +1552,266 @@ fn draw_project_detail(
     );
 }
 
+fn mem_str(kb: u64) -> String {
+    if kb >= 1024 * 1024 {
+        format!("{:.1}G", kb as f64 / 1024.0 / 1024.0)
+    } else if kb >= 1024 {
+        format!("{:.0}M", kb as f64 / 1024.0)
+    } else {
+        format!("{kb}K")
+    }
+}
+
+fn cpu_color(cpu: f32) -> Color {
+    if cpu < 20.0 {
+        Color::Green
+    } else if cpu < 100.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+fn mem_color(kb: u64) -> Color {
+    if kb < 512_000 {
+        Color::Green
+    } else if kb < 2_048_000 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+fn ellipsize(s: &str, n: usize) -> String {
+    if s.chars().count() > n {
+        format!(
+            "{}…",
+            s.chars().take(n.saturating_sub(1)).collect::<String>()
+        )
+    } else {
+        s.to_string()
+    }
+}
+
+/// Render the conversation detail: an instant static header, then the async
+/// resources (or a loading placeholder while the worker thread runs).
+fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
+    let area = frame.area();
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let c = &cd.conv;
+
+    // Title bar (instant).
+    let title = c.title.clone().unwrap_or_else(|| short_id(c.id.as_str()));
+    let mut title_spans = vec![Span::styled(
+        format!(" {title}"),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(env) = env_label(c) {
+        title_spans.push(Span::styled(
+            format!("   [{env}]"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    title_spans.push(Span::styled(
+        "   ( Esc back )",
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(title_spans)), chunks[0]);
+
+    // Static header fields (instant, from the registry).
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(""));
+    let field = |label: &str, spans: Vec<Span<'static>>| -> Line<'static> {
+        let mut v = vec![Span::styled(
+            format!("  {label:<9}"),
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        v.extend(spans);
+        Line::from(v)
+    };
+    lines.push(field("id", vec![Span::raw(short_id(c.id.as_str()))]));
+    let (slabel, scolor) = status_span(c);
+    let status_text = if slabel.is_empty() {
+        "closed".to_string()
+    } else {
+        slabel.to_string()
+    };
+    let ago = c
+        .last_activity
+        .as_deref()
+        .map(|t| format!("   ({})", relative_time(t)))
+        .unwrap_or_default();
+    lines.push(field(
+        "status",
+        vec![
+            Span::styled(status_text, Style::default().fg(scolor)),
+            Span::styled(ago, Style::default().add_modifier(Modifier::DIM)),
+        ],
+    ));
+    if let Some(parent) = &c.parent {
+        lines.push(field("project", vec![Span::raw(parent.clone())]));
+    }
+    let where_text = match &c.placement {
+        Some(p) => {
+            let wname = if p.window_name.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", p.window_name)
+            };
+            format!("tmux {} · win {}{}", p.session_name, p.window_index, wname)
+        }
+        None => "closed — not running here".to_string(),
+    };
+    lines.push(field("where", vec![Span::raw(where_text)]));
+    lines.push(field("cwd", vec![Span::raw(abbrev_home(&c.cwd))]));
+    if let Some(f) = &c.frozen {
+        if !f.note.trim().is_empty() {
+            lines.push(field(
+                "frozen",
+                vec![Span::styled(
+                    f.note.clone(),
+                    Style::default().fg(Color::Blue),
+                )],
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+
+    // Async resources (or a placeholder while the worker runs).
+    match &*cd.res.lock().unwrap() {
+        ResourceState::Loading => lines.push(Line::from(Span::styled(
+            "  ⋯ loading resources…",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ))),
+        ResourceState::Ready(r) => render_conv_resources(&mut lines, r),
+    }
+
+    // Scroll for overflow.
+    let h = chunks[1].height as usize;
+    let max_off = lines.len().saturating_sub(h);
+    let off = cd.scroll.min(max_off);
+    let view: Vec<Line> = lines.into_iter().skip(off).take(h).collect();
+    frame.render_widget(Paragraph::new(view), chunks[1]);
+
+    let footer = " Enter switch/resume · p project · ↑/↓ scroll · Esc back";
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+}
+
+/// Append the gathered resource sections (CPU/mem, processes, ports, commits,
+/// transcript tail) to the detail body.
+fn render_conv_resources(lines: &mut Vec<Line<'static>>, r: &ConvResources) {
+    let section = |label: String| -> Line<'static> {
+        Line::from(Span::styled(
+            format!("  {label}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    if r.running {
+        lines.push(Line::from(vec![
+            Span::styled("  CPU ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                format!("{:.1}%", r.cpu),
+                Style::default().fg(cpu_color(r.cpu)),
+            ),
+            Span::raw("    "),
+            Span::styled("MEM ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(mem_str(r.mem_kb), Style::default().fg(mem_color(r.mem_kb))),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  not running here — Enter to resume",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+
+    if !r.processes.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section("Processes".to_string()));
+        for p in &r.processes {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    PID {:>6}  ", p.pid),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("{:>5.1}%  ", p.cpu_percent),
+                    Style::default().fg(cpu_color(p.cpu_percent)),
+                ),
+                Span::styled(
+                    format!("{:>6}  ", mem_str(p.memory_kb)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    ellipsize(&p.command, 56),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
+    if !r.ports.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section("Ports".to_string()));
+        for p in &r.ports {
+            lines.push(Line::from(Span::styled(
+                format!("    :{}  {}", p.port, p.process_name),
+                Style::default().fg(Color::Green),
+            )));
+        }
+    }
+
+    if !r.commits.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section(format!("Commits ({})", r.commits.len())));
+        for commit in &r.commits {
+            let (hash, msg) = commit.split_once(' ').unwrap_or(("", commit.as_str()));
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {hash} "), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    msg.to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
+    if !r.preview.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section("Recent".to_string()));
+        for m in &r.preview {
+            let (glyph, col) = if m.role == "user" {
+                ("›", Color::Cyan)
+            } else {
+                ("‹", Color::White)
+            };
+            let text = m.text.replace('\n', " ");
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {glyph} "), Style::default().fg(col)),
+                Span::styled(
+                    ellipsize(&text, 78),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+}
+
 /// The help overlay lines.
 fn help_lines() -> Vec<Line<'static>> {
     let key = |k: &str, d: &str| -> Line<'static> {
@@ -1397,7 +1851,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "! / s",
             "Toggle auto-approve / skip the conversation's session",
         ),
-        key("→ / l", "Open the selected row's project detail"),
+        key(
+            "→ / l",
+            "Detail: a conversation's own, or a project header's",
+        ),
         key(
             "← / h",
             "Browse → Active · in a project detail, back to the list",
