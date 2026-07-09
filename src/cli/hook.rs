@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::common::persistence::{
-    is_globally_muted, load_auto_approve_sessions, load_muted_sessions,
+    is_globally_muted, load_auto_approve_sessions, load_muted_projects, load_muted_sessions,
 };
 use crate::common::tmux::get_current_tmux_session;
 use crate::daemon::hooks::handle_hook_event;
@@ -206,7 +206,23 @@ pub fn run_hook(event_type: &str) -> Result<()> {
                 .next()
                 .unwrap_or(&updated_session.session_id);
 
-            if !global_mute && !muted.contains(session_name) {
+            // Project-level mute (a remembered preference): resolve the cwd's
+            // project and suppress if it's muted. Guarded so the common case (no
+            // muted projects) pays nothing beyond a tiny file read.
+            let project_muted = {
+                let muted_projects = load_muted_projects();
+                !muted_projects.is_empty()
+                    && crate::common::registry::resolve_parent(
+                        &updated_session.cwd,
+                        &crate::common::worktree::WorktreeState::load(),
+                        &crate::common::projects::ProjectRegistry::load(),
+                    )
+                    .map(|p| p.split('/').next().unwrap_or(&p).to_string())
+                    .map(|k| muted_projects.contains(&k))
+                    .unwrap_or(false)
+            };
+
+            if !global_mute && !project_muted && !muted.contains(session_name) {
                 let status_text = match &updated_session.status {
                     SessionStatus::NeedsPermission { tool_name, .. } => {
                         format!("needs permission: {}", tool_name)

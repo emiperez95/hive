@@ -213,6 +213,43 @@ pub fn save_muted_sessions(sessions: &HashSet<String>) {
     }
 }
 
+/// Path to the muted-projects file (project keys whose notifications are silenced).
+/// Unlike per-session mute, this is a remembered per-project preference: every
+/// session of the project — including ones created later — is silenced.
+pub fn get_muted_projects_path() -> Option<PathBuf> {
+    cache_dir().map(|p| p.join("muted-projects.txt"))
+}
+
+/// Load the set of muted project keys.
+pub fn load_muted_projects() -> HashSet<String> {
+    let Some(path) = get_muted_projects_path() else {
+        return HashSet::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return HashSet::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// Persist the set of muted project keys.
+pub fn save_muted_projects(projects: &HashSet<String>) {
+    let Some(path) = get_muted_projects_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for key in projects {
+            let _ = writeln!(file, "{}", key);
+        }
+    }
+}
+
 /// Get the path to the skipped sessions file
 pub fn get_skipped_file_path() -> Option<PathBuf> {
     cache_dir().map(|p| p.join("skipped.txt"))

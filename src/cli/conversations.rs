@@ -26,9 +26,9 @@ use crate::common::frozen::{discard_frozen, freeze_window, relative_time, Freeze
 use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::persistence::{
-    is_globally_muted, load_auto_approve_sessions, load_favorite_sessions, load_muted_sessions,
-    load_skipped_sessions, save_auto_approve_sessions, save_favorite_sessions, save_muted_sessions,
-    save_skipped_sessions, set_global_mute,
+    is_globally_muted, load_auto_approve_sessions, load_favorite_sessions, load_muted_projects,
+    load_muted_sessions, load_skipped_sessions, save_auto_approve_sessions, save_favorite_sessions,
+    save_muted_projects, save_muted_sessions, save_skipped_sessions, set_global_mute,
 };
 use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
 use crate::common::process::get_process_info;
@@ -213,6 +213,8 @@ struct Flags {
     muted: HashSet<String>,
     auto_approve: HashSet<String>,
     skipped: HashSet<String>,
+    /// Muted PROJECT keys (a remembered per-project preference), not session names.
+    muted_projects: HashSet<String>,
 }
 
 impl Flags {
@@ -222,8 +224,18 @@ impl Flags {
             muted: load_muted_sessions(),
             auto_approve: load_auto_approve_sessions(),
             skipped: load_skipped_sessions(),
+            muted_projects: load_muted_projects(),
         }
     }
+}
+
+/// Toggle a project's remembered mute preference and persist it.
+fn toggle_muted_project(key: &str) {
+    let mut set = load_muted_projects();
+    if !set.remove(key) {
+        set.insert(key.to_string());
+    }
+    save_muted_projects(&set);
 }
 
 /// Which session-level flag a key toggles.
@@ -1010,6 +1022,14 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                         return Ok(activate(&c));
                     }
                 }
+                // `m` toggles the project's remembered mute (real projects only).
+                KeyCode::Char('m') => {
+                    let key = detail.as_ref().unwrap().key.clone();
+                    if projects.projects.contains_key(&key) {
+                        toggle_muted_project(&key);
+                        flags = Flags::load();
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -1224,6 +1244,19 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 sel = 0;
             }
+            // `m` on a project header (Browse) toggles that project's remembered
+            // mute — matched before the per-conversation `m` below.
+            KeyCode::Char('m')
+                if matches!(rows.get(sel), Some(Row::Header(_)))
+                    && matches!(view, View::Browse) =>
+            {
+                if let Some(Row::Header(gi)) = rows.get(sel) {
+                    if let Some(pkey) = project_key_of(&groups[*gi].key, &projects) {
+                        toggle_muted_project(&pkey);
+                        flags = Flags::load();
+                    }
+                }
+            }
             // Session-level flag toggles on the selected LIVE conversation's session.
             KeyCode::Char('f') | KeyCode::Char('m') | KeyCode::Char('s') | KeyCode::Char('!') => {
                 if let Some(c) = selected_conv(&rows, &convs) {
@@ -1316,7 +1349,7 @@ fn draw(
                 groups.len(),
                 total - live
             ),
-            " Enter/→ open project · / search · ←/Esc back · ? · q",
+            " Enter/→ open · m mute · / search · ←/Esc back · ? · q",
         ),
     };
     let mut header_spans = vec![
@@ -1425,7 +1458,10 @@ fn draw(
         display.push(match row {
             Row::Header(gi) => {
                 let skipped = flags.skipped.contains(&groups[*gi].key);
-                header_line(&groups[*gi], convs, selected, green_head, skipped)
+                // Browse group keys ARE project keys, so this reads the pref directly.
+                let muted =
+                    matches!(view, View::Browse) && flags.muted_projects.contains(&groups[*gi].key);
+                header_line(&groups[*gi], convs, selected, green_head, skipped, muted)
             }
             Row::Conv { ci, gi } => conv_line(
                 &convs[*ci],
@@ -1538,6 +1574,10 @@ fn draw_project_detail(
             Style::default().fg(Color::Magenta),
         ));
     }
+    if flags.muted_projects.contains(&state.key) {
+        title_spans.push(Span::raw("   "));
+        title_spans.push(Span::styled("🔇 muted", Style::default().fg(Color::Yellow)));
+    }
     title_spans.push(Span::styled(
         "   ( Esc back )",
         Style::default().add_modifier(Modifier::DIM),
@@ -1645,7 +1685,7 @@ fn draw_project_detail(
     let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let footer = " Enter switch · → detail · Del close · n new · r resume last · Esc back · q";
+    let footer = " Enter switch · → detail · Del close · n new · r resume · m mute · Esc back";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             footer,
@@ -1990,6 +2030,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "Freeze the selected live conversation (prompts for a note)",
         ),
         key("f / m", "Favorite ★ / mute the conversation's session"),
+        key(
+            "m",
+            "On a project (Browse/detail): mute the whole project (remembered)",
+        ),
         key("M", "Toggle global mute (silence all notifications)"),
         key(
             "! / s",
@@ -2038,6 +2082,7 @@ fn header_line(
     selected: bool,
     green_when_live: bool,
     skipped: bool,
+    muted: bool,
 ) -> Line<'static> {
     let n = g.convs.len();
     let live = g
@@ -2051,7 +2096,9 @@ fn header_line(
     } else {
         format!("{} ", g.emoji)
     };
-    let text = format!("{icon}{}  ({n}, {live} live)", g.key);
+    // Trailing 🔇 marks a project muted (a remembered preference).
+    let mute_mark = if muted { "  🔇" } else { "" };
+    let text = format!("{icon}{}  ({n}, {live} live){mute_mark}", g.key);
     let mut style = if skipped {
         // Dim blue: toned down from an active header, but still legible.
         Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
