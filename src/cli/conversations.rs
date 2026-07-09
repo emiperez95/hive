@@ -16,19 +16,23 @@ use std::time::Duration;
 
 use sysinfo::System;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::common::chrome::{
+    focus_all_matched_tabs, get_chrome_tabs, match_tabs_to_ports, ChromeTab,
+};
 use crate::common::frozen::{discard_frozen, freeze_window, relative_time, FreezeTarget};
 use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::persistence::{
-    is_globally_muted, load_auto_approve_sessions, load_favorite_sessions, load_muted_projects,
-    load_muted_sessions, load_skipped_sessions, save_auto_approve_sessions, save_favorite_sessions,
-    save_muted_projects, save_muted_sessions, save_skipped_sessions, set_global_mute,
+    is_globally_muted, load_auto_approve_sessions, load_completed_todos, load_favorite_sessions,
+    load_muted_projects, load_muted_sessions, load_session_todos, load_skipped_sessions,
+    save_auto_approve_sessions, save_completed_todos, save_favorite_sessions, save_muted_projects,
+    save_muted_sessions, save_session_todos, save_skipped_sessions, set_global_mute,
 };
 use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
 use crate::common::process::get_process_info;
@@ -215,6 +219,11 @@ struct Flags {
     skipped: HashSet<String>,
     /// Muted PROJECT keys (a remembered per-project preference), not session names.
     muted_projects: HashSet<String>,
+    /// Archived PROJECT keys (hidden from Browse unless revealed).
+    archived_projects: HashSet<String>,
+    /// Active todo count per tmux session — for the row badge (todos stay
+    /// session-level; a conversation just surfaces its session's list).
+    todo_counts: HashMap<String, usize>,
 }
 
 impl Flags {
@@ -225,6 +234,16 @@ impl Flags {
             auto_approve: load_auto_approve_sessions(),
             skipped: load_skipped_sessions(),
             muted_projects: load_muted_projects(),
+            archived_projects: ProjectRegistry::load()
+                .projects
+                .iter()
+                .filter(|(_, c)| c.archived)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            todo_counts: load_session_todos()
+                .into_iter()
+                .map(|(k, v)| (k, v.len()))
+                .collect(),
         }
     }
 }
@@ -236,6 +255,52 @@ fn toggle_muted_project(key: &str) {
         set.insert(key.to_string());
     }
     save_muted_projects(&set);
+}
+
+/// Toggle a project's archived flag in projects.toml.
+fn toggle_archived_project(key: &str) {
+    let mut reg = ProjectRegistry::load();
+    let now = reg.projects.get(key).map(|c| c.archived).unwrap_or(false);
+    if reg.set_archived(key, !now) {
+        let _ = reg.save();
+    }
+}
+
+/// The active todo list for a tmux session (todos are session-level).
+fn session_todos(session: &str) -> Vec<String> {
+    load_session_todos().remove(session).unwrap_or_default()
+}
+
+/// Append a todo to a session's list.
+fn add_session_todo(session: &str, text: &str) {
+    let mut todos = load_session_todos();
+    todos
+        .entry(session.to_string())
+        .or_default()
+        .push(text.to_string());
+    save_session_todos(&todos);
+}
+
+/// Mark the `idx`-th (0-based) todo done: move it from active to completed.
+fn done_session_todo(session: &str, idx: usize) {
+    let mut todos = load_session_todos();
+    let Some(items) = todos.get_mut(session) else {
+        return;
+    };
+    if idx >= items.len() {
+        return;
+    }
+    let removed = items.remove(idx);
+    if items.is_empty() {
+        todos.remove(session);
+    }
+    save_session_todos(&todos);
+    let mut completed = load_completed_todos();
+    completed
+        .entry(session.to_string())
+        .or_default()
+        .push(removed);
+    save_completed_todos(&completed);
 }
 
 /// Which session-level flag a key toggles.
@@ -313,7 +378,15 @@ fn build_browse(
     reg: &ConversationRegistry,
     projects: &ProjectRegistry,
     include_empty: bool,
+    reveal_archived: bool,
 ) -> (Vec<Group>, Vec<Conversation>) {
+    let is_archived = |key: &str| {
+        projects
+            .projects
+            .get(key)
+            .map(|c| c.archived)
+            .unwrap_or(false)
+    };
     let mut frozen: Vec<&Conversation> = Vec::new();
     let mut grouped: HashMap<String, Vec<&Conversation>> = HashMap::new();
     for c in reg.conversations.values() {
@@ -329,11 +402,13 @@ fn build_browse(
         grouped.entry(key).or_default().push(c);
     }
     if include_empty {
-        for (key, cfg) in &projects.projects {
-            if !cfg.archived {
-                grouped.entry(key.clone()).or_default();
-            }
+        for key in projects.projects.keys() {
+            grouped.entry(key.clone()).or_default();
         }
+    }
+    // Hide archived projects (even ones with conversations) unless revealing.
+    if !reveal_archived {
+        grouped.retain(|key, _| !is_archived(key));
     }
 
     // Order projects by most-recent activity (desc), then name; empties last.
@@ -600,6 +675,8 @@ struct ConvResources {
     mem_kb: u64,
     processes: Vec<ProcessInfo>,
     ports: Vec<ListeningPort>,
+    /// Chrome tabs matched to the conversation's listening ports (tab, port).
+    chrome: Vec<(ChromeTab, u16)>,
     commits: Vec<String>,
     preview: Vec<jsonl::ConversationMessage>,
 }
@@ -616,6 +693,25 @@ struct ConvDetailState {
     conv: Conversation,
     res: Arc<Mutex<ResourceState>>,
     scroll: usize,
+    /// The conversation's tmux session's todos (session-level; instant to load).
+    todos: Vec<String>,
+    /// True while typing a new todo; `input` holds the text.
+    adding: bool,
+    input: String,
+}
+
+impl ConvDetailState {
+    /// The tmux session this conversation runs in (todos are keyed by it).
+    fn session(&self) -> Option<&str> {
+        self.conv
+            .placement
+            .as_ref()
+            .map(|p| p.session_name.as_str())
+    }
+    /// Reload the session's todos after an edit.
+    fn reload_todos(&mut self) {
+        self.todos = self.session().map(session_todos).unwrap_or_default();
+    }
 }
 
 /// Open a conversation's detail: keep the instant static data and spawn a detached
@@ -631,10 +727,18 @@ fn spawn_conv_detail(c: &Conversation) -> ConvDetailState {
             *guard = ResourceState::Ready(Box::new(gathered));
         }
     });
+    let todos = conv
+        .placement
+        .as_ref()
+        .map(|p| session_todos(&p.session_name))
+        .unwrap_or_default();
     ConvDetailState {
         conv,
         res,
         scroll: 0,
+        todos,
+        adding: false,
+        input: String::new(),
     }
 }
 
@@ -645,6 +749,13 @@ fn gather_conv_resources(conv: &Conversation) -> ConvResources {
         gather_live_resources(conv)
     } else {
         (false, 0.0, 0, Vec::new(), Vec::new())
+    };
+    // Chrome tabs matched to the ports — the slow JXA call runs here (off-thread),
+    // only when there are ports to match.
+    let chrome = if ports.is_empty() {
+        Vec::new()
+    } else {
+        match_tabs_to_ports(&get_chrome_tabs(), &ports)
     };
     let commits = recent_commits(&conv.cwd);
     let mut preview = jsonl::get_conversation_messages_for(&conv.cwd, Some(conv.id.as_str()));
@@ -658,6 +769,7 @@ fn gather_conv_resources(conv: &Conversation) -> ConvResources {
         mem_kb,
         processes,
         ports,
+        chrome,
         commits,
         preview,
     }
@@ -791,8 +903,12 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let projects = ProjectRegistry::load();
     // Default to the Active view (live conversations by session); `/` browses all.
     let mut view = View::Active;
+    // Reveal archived projects in Browse (Ctrl+R). A Cell so the rebuild closure
+    // can read it by shared ref while other handlers still flip it.
+    let reveal_archived = std::cell::Cell::new(false);
 
-    // Switch the current view, rebuilding groups + collapse state.
+    // Switch the current view, rebuilding groups + collapse state. Loads projects
+    // FRESH each Browse rebuild so archive toggles take effect immediately.
     let rebuild = |view: &View,
                    reg: &ConversationRegistry,
                    skipped: &HashSet<String>,
@@ -809,7 +925,9 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 // No search → a flat project list (every group collapsed to just
                 // its header, empty projects included). Searching → drop empties and
                 // expand so matching conversations show under their project.
-                let (g, c) = build_browse(src, &projects, query.is_empty());
+                let live_projects = ProjectRegistry::load();
+                let (g, c) =
+                    build_browse(src, &live_projects, query.is_empty(), reveal_archived.get());
                 let collapsed = if query.is_empty() {
                     g.iter().map(|g| g.key.clone()).collect()
                 } else {
@@ -898,6 +1016,34 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // Add-todo input mode takes every key while active.
+            if conv_detail.as_ref().unwrap().adding {
+                let cd = conv_detail.as_mut().unwrap();
+                match key.code {
+                    KeyCode::Esc => {
+                        cd.adding = false;
+                        cd.input.clear();
+                    }
+                    KeyCode::Enter => {
+                        let text = cd.input.trim().to_string();
+                        let session = cd.session().map(|s| s.to_string());
+                        cd.adding = false;
+                        cd.input.clear();
+                        if let (false, Some(s)) = (text.is_empty(), session) {
+                            add_session_todo(&s, &text);
+                            cd.reload_todos();
+                            flags = Flags::load();
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        cd.input.pop();
+                    }
+                    KeyCode::Char(c) => cd.input.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                     conv_detail = None
@@ -937,6 +1083,32 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                         sel = 0;
                     } else if c.lifecycle.is_actionable_here() {
                         confirm = Some(c);
+                    }
+                }
+                // Todos (session-level): `a` add, `1-9` mark the Nth done.
+                KeyCode::Char('a') => {
+                    let cd = conv_detail.as_mut().unwrap();
+                    if cd.session().is_some() {
+                        cd.adding = true;
+                        cd.input.clear();
+                    }
+                }
+                KeyCode::Char(d @ '1'..='9') => {
+                    let cd = conv_detail.as_mut().unwrap();
+                    if let Some(s) = cd.session().map(|s| s.to_string()) {
+                        done_session_todo(&s, d as usize - '1' as usize);
+                        cd.reload_todos();
+                        flags = Flags::load();
+                    }
+                }
+                // `o` focuses the browser tabs matching this conversation's ports.
+                KeyCode::Char('o') => {
+                    let matched = match &*conv_detail.as_ref().unwrap().res.lock().unwrap() {
+                        ResourceState::Ready(r) => r.chrome.clone(),
+                        ResourceState::Loading => Vec::new(),
+                    };
+                    if !matched.is_empty() {
+                        let _ = focus_all_matched_tabs(&matched);
                     }
                 }
                 _ => {}
@@ -1176,6 +1348,12 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
 
         match key.code {
             KeyCode::Char('?') => showing_help = true,
+            // Ctrl+R reveals/hides archived projects (Browse).
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reveal_archived.set(!reveal_archived.get());
+                (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                sel = 0;
+            }
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
             // Number keys 1-9 jump to the Nth visible conversation (like classic hive).
             KeyCode::Char(d @ '1'..='9') => {
@@ -1289,9 +1467,19 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     }
                 }
             }
-            // Del: discard a frozen conversation, or close a live one (confirm).
+            // Del: on a Browse project header → archive/unarchive it; on a
+            // conversation → discard (frozen) or close (live, confirm).
             KeyCode::Delete => {
-                if let Some(c) = selected_conv(&rows, &convs) {
+                if matches!(view, View::Browse) && matches!(rows.get(sel), Some(Row::Header(_))) {
+                    if let Some(Row::Header(gi)) = rows.get(sel) {
+                        if let Some(pkey) = project_key_of(&groups[*gi].key, &projects) {
+                            toggle_archived_project(&pkey);
+                            flags = Flags::load();
+                            (groups, convs, collapsed) =
+                                rebuild(&view, &reg, &flags.skipped, &query);
+                        }
+                    }
+                } else if let Some(c) = selected_conv(&rows, &convs) {
                     if c.is_frozen() {
                         let _ = discard_frozen(c.id.as_str());
                         reg = gather_conversations();
@@ -1349,7 +1537,7 @@ fn draw(
                 groups.len(),
                 total - live
             ),
-            " Enter/→ open · m mute · / search · ←/Esc back · ? · q",
+            " Enter/→ open · m mute · Del archive · ^R reveal · / search · Esc back · q",
         ),
     };
     let mut header_spans = vec![
@@ -1458,10 +1646,19 @@ fn draw(
         display.push(match row {
             Row::Header(gi) => {
                 let skipped = flags.skipped.contains(&groups[*gi].key);
-                // Browse group keys ARE project keys, so this reads the pref directly.
-                let muted =
-                    matches!(view, View::Browse) && flags.muted_projects.contains(&groups[*gi].key);
-                header_line(&groups[*gi], convs, selected, green_head, skipped, muted)
+                // Browse group keys ARE project keys, so these read the prefs directly.
+                let is_browse = matches!(view, View::Browse);
+                let muted = is_browse && flags.muted_projects.contains(&groups[*gi].key);
+                let archived = is_browse && flags.archived_projects.contains(&groups[*gi].key);
+                header_line(
+                    &groups[*gi],
+                    convs,
+                    selected,
+                    green_head,
+                    skipped,
+                    muted,
+                    archived,
+                )
             }
             Row::Conv { ci, gi } => conv_line(
                 &convs[*ci],
@@ -1825,6 +2022,33 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
             ));
         }
     }
+
+    // Todos — session-level, surfaced here (only for a conversation with a session).
+    if cd.session().is_some() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  Todos",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        if cd.todos.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    (none — press a to add)",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        } else {
+            for (i, t) in cd.todos.iter().enumerate() {
+                let num = if i < 9 {
+                    format!("{}", i + 1)
+                } else {
+                    "·".to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {num}. "), Style::default().fg(Color::Yellow)),
+                    Span::raw(t.clone()),
+                ]));
+            }
+        }
+    }
     lines.push(Line::raw(""));
 
     // Async resources (or a placeholder while the worker runs).
@@ -1845,14 +2069,23 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
     let view: Vec<Line> = lines.into_iter().skip(off).take(h).collect();
     frame.render_widget(Paragraph::new(view), chunks[1]);
 
-    let footer = " Enter switch/resume · Del close · p project · ↑/↓ scroll · Esc back";
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            footer,
+    let footer_line = if cd.adding {
+        Line::from(vec![
+            Span::styled(" + todo: ", Style::default().fg(Color::Yellow)),
+            Span::styled(cd.input.clone(), Style::default().fg(Color::Yellow)),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   Enter add · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " Enter switch · Del close · a todo · 1-9 done · o chrome · p project · ↑/↓ scroll · Esc back",
             Style::default().fg(Color::DarkGray),
-        ))),
-        chunks[2],
-    );
+        ))
+    };
+    frame.render_widget(Paragraph::new(footer_line), chunks[2]);
 }
 
 /// Append the gathered resource sections (CPU/mem, processes, ports, commits,
@@ -1910,12 +2143,25 @@ fn render_conv_resources(lines: &mut Vec<Line<'static>>, r: &ConvResources) {
 
     if !r.ports.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(section("Ports".to_string()));
+        let label = if r.chrome.is_empty() {
+            "Ports".to_string()
+        } else {
+            "Ports  (o focuses tabs)".to_string()
+        };
+        lines.push(section(label));
         for p in &r.ports {
-            lines.push(Line::from(Span::styled(
+            let mut spans = vec![Span::styled(
                 format!("    :{}  {}", p.port, p.process_name),
                 Style::default().fg(Color::Green),
-            )));
+            )];
+            // A matching Chrome tab title, if any.
+            if let Some((tab, _)) = r.chrome.iter().find(|(_, port)| *port == p.port) {
+                spans.push(Span::styled(
+                    format!("  → {}", ellipsize(&tab.title, 50)),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
     }
 
@@ -2045,8 +2291,9 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key(
             "Del",
-            "Close a live conversation (kill window) · discard a frozen one",
+            "Close a live conv (kill window) · discard a frozen · archive a project",
         ),
+        key("Ctrl+R", "Browse: reveal / hide archived projects"),
         key(
             "← / h",
             "Browse → Active · in a project detail, back to the list",
@@ -2083,6 +2330,7 @@ fn header_line(
     green_when_live: bool,
     skipped: bool,
     muted: bool,
+    archived: bool,
 ) -> Line<'static> {
     let n = g.convs.len();
     let live = g
@@ -2096,10 +2344,16 @@ fn header_line(
     } else {
         format!("{} ", g.emoji)
     };
-    // Trailing 🔇 marks a project muted (a remembered preference).
+    // Trailing 🔇 marks a project muted; [archived] marks a revealed archived one.
     let mute_mark = if muted { "  🔇" } else { "" };
-    let text = format!("{icon}{}  ({n}, {live} live){mute_mark}", g.key);
-    let mut style = if skipped {
+    let arch_mark = if archived { "  [archived]" } else { "" };
+    let text = format!("{icon}{}  ({n}, {live} live){mute_mark}{arch_mark}", g.key);
+    let mut style = if archived {
+        // Archived (only shown when revealed): dim gray, clearly set aside.
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    } else if skipped {
         // Dim blue: toned down from an active header, but still legible.
         Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
     } else {
@@ -2302,6 +2556,19 @@ fn conv_line(
     spans.extend(tag(auto, "  [auto]", Color::Green));
     spans.extend(tag(muted, "  [muted]", Color::DarkGray));
     spans.extend(tag(skip, "  [skip]", Color::DarkGray));
+    // Todo count badge (☑ N) from the conversation's session todos.
+    let todo_n = session
+        .and_then(|s| flags.todo_counts.get(s))
+        .copied()
+        .unwrap_or(0);
+    if todo_n > 0 {
+        let col = if selected {
+            base
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        spans.push(Span::styled(format!("  ☑{todo_n}"), col));
+    }
     Line::from(spans)
 }
 
