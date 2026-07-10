@@ -125,6 +125,12 @@ pub struct Conversation {
     /// CLAUDE_CONFIG_DIR (auth profile) to resume under; None = default `~/.claude`.
     #[serde(default)]
     pub auth_config_dir: Option<String>,
+    /// Runtime-only live resource sample (summed over the window's process tree);
+    /// 0 for closed conversations. Not persisted.
+    #[serde(skip)]
+    pub cpu: f32,
+    #[serde(skip)]
+    pub mem_kb: u64,
 }
 
 impl Conversation {
@@ -291,6 +297,8 @@ impl ConversationRegistry {
                     archived,
                     title: None,
                     auth_config_dir: None,
+                    cpu: 0.0,
+                    mem_kb: 0,
                 },
             );
         }
@@ -338,6 +346,8 @@ impl ConversationRegistry {
                             archived: false,
                             title,
                             auth_config_dir: entry.claude_config_dir.clone(),
+                            cpu: 0.0,
+                            mem_kb: 0,
                         },
                     );
                 }
@@ -485,6 +495,8 @@ mod tests {
             archived: false,
             title: None,
             auth_config_dir: None,
+            cpu: 0.0,
+            mem_kb: 0,
         }
     }
 
@@ -852,6 +864,8 @@ mod tests {
             archived: false,
             title: None,
             auth_config_dir: None,
+            cpu: 0.0,
+            mem_kb: 0,
         }
     }
 

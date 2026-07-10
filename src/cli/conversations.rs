@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sysinfo::System;
 
@@ -60,6 +60,17 @@ pub fn run_conversations(list: bool) -> Result<()> {
 /// disk existence + live placements + overlay, with parents resolved and the
 /// Closed set bounded.
 pub fn gather_conversations() -> ConversationRegistry {
+    gather_conversations_inner(None)
+}
+
+/// Like [`gather_conversations`], but also samples live CPU/mem into each live
+/// conversation's `cpu`/`mem_kb`. `sys` must be kept alive across calls so
+/// `cpu_percent` is a real delta (the classic TUI keeps its `System` alive too).
+pub fn gather_conversations_stats(sys: &mut System) -> ConversationRegistry {
+    gather_conversations_inner(Some(sys))
+}
+
+fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistry {
     let hook = HookState::load();
     // Cached scan: unchanged transcripts (by mtime) skip the head+tail re-parse,
     // so repeat refreshes and popup re-opens stay snappy.
@@ -68,8 +79,10 @@ pub fn gather_conversations() -> ConversationRegistry {
     let sidecar = ConversationSidecar::load();
 
     // Live placements: every currently-running Claude instance we can tie to a
-    // conversation id becomes the SOLE Live discriminator for that id.
+    // conversation id becomes the SOLE Live discriminator for that id. `id_pids`
+    // keeps each live id's process tree for the optional CPU/mem sample.
     let mut live_placements: HashMap<String, TmuxPlacement> = HashMap::new();
+    let mut id_pids: HashMap<String, Vec<u32>> = HashMap::new();
     for inst in instances::detect_all_instances() {
         // Prefer the hook-resolved conversation id. If a live Claude window has no
         // hook entry (state.json only tracks recently-active conversations), fall
@@ -86,6 +99,7 @@ pub fn gather_conversations() -> ConversationRegistry {
             }
         });
         if let Some(sid) = sid {
+            id_pids.insert(sid.clone(), inst.pids.clone());
             live_placements.insert(
                 sid,
                 TmuxPlacement {
@@ -145,6 +159,25 @@ pub fn gather_conversations() -> ConversationRegistry {
     reg.conversations.retain(|_, c| {
         c.lifecycle.is_actionable_here() || registry::should_surface_closed(c, now, &cfg)
     });
+
+    // Optional live-resource sample: sum each live conversation's window process
+    // tree. `refresh_all` gives cpu_percent as a delta since the caller's last call.
+    if let Some(sys) = stats {
+        sys.refresh_all();
+        for (id, pids) in &id_pids {
+            if let Some(c) = reg.conversations.get_mut(id) {
+                let (mut cpu, mut mem) = (0.0f32, 0u64);
+                for &pid in pids {
+                    if let Some(info) = get_process_info(sys, pid) {
+                        cpu += info.cpu_percent;
+                        mem += info.memory_kb;
+                    }
+                }
+                c.cpu = cpu;
+                c.mem_kb = mem;
+            }
+        }
+    }
 
     reg
 }
@@ -948,7 +981,10 @@ fn run_conversations_tui() -> Result<()> {
 }
 
 fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action> {
-    let mut reg = gather_conversations();
+    // Kept alive across gathers so per-conversation cpu_percent is a real delta.
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let mut reg = gather_conversations_stats(&mut sys);
     let mut flags = Flags::load();
     let projects = ProjectRegistry::load();
     // Default to the Active view (live conversations by session); `/` browses all.
@@ -999,6 +1035,9 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut hinting = false;
     let mut hint_labels: Vec<(String, usize)> = Vec::new();
     let mut hint_buffer = String::new();
+    // Live auto-refresh: re-gather on idle ticks so status/CPU stay current without
+    // a keypress (the classic TUI refreshes on a 1s background timer).
+    let mut last_refresh = Instant::now();
     let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
     let mut sel: usize = 0;
     // Project detail sub-screen: Some(state) while drilled into a project.
@@ -1044,7 +1083,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     confirm = None;
                     conv_detail = None;
                     detail = None;
-                    reg = gather_conversations();
+                    reg = gather_conversations_stats(&mut sys);
                     flags = Flags::load();
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
@@ -1162,7 +1201,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     if c.is_frozen() {
                         let _ = discard_frozen(c.id.as_str());
                         conv_detail = None;
-                        reg = gather_conversations();
+                        reg = gather_conversations_stats(&mut sys);
                         flags = Flags::load();
                         (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                         sel = 0;
@@ -1267,7 +1306,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     if let Some(c) = d.convs.get(d.sel).cloned() {
                         if c.is_frozen() {
                             let _ = discard_frozen(c.id.as_str());
-                            reg = gather_conversations();
+                            reg = gather_conversations_stats(&mut sys);
                             flags = Flags::load();
                             let key = detail.as_ref().unwrap().key.clone();
                             detail = Some(build_group_detail(&key, &reg));
@@ -1341,6 +1380,29 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         })?;
 
         if !event::poll(Duration::from_millis(250))? {
+            // Idle tick: refresh the registry every ~2s so status/CPU/mem stay live.
+            // Skipped while a modal/input is active (would disrupt the view), and the
+            // selected conversation is re-located by id so the cursor doesn't jump.
+            let quiet = !searching && !hinting && freezing.is_none();
+            if quiet && last_refresh.elapsed() >= Duration::from_secs(2) {
+                let keep = match rows.get(sel) {
+                    Some(Row::Conv { ci, .. }) => Some(convs[*ci].id.clone()),
+                    _ => None,
+                };
+                reg = gather_conversations_stats(&mut sys);
+                flags = Flags::load();
+                (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                if let Some(id) = keep {
+                    let new_rows = visible_rows(&groups, &collapsed);
+                    if let Some(i) = new_rows
+                        .iter()
+                        .position(|r| matches!(r, Row::Conv { ci, .. } if convs[*ci].id == id))
+                    {
+                        sel = i;
+                    }
+                }
+                last_refresh = Instant::now();
+            }
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -1425,7 +1487,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                         let c = convs[*ci].clone();
                         if c.is_frozen() {
                             let _ = discard_frozen(c.id.as_str());
-                            reg = gather_conversations();
+                            reg = gather_conversations_stats(&mut sys);
                             flags = Flags::load();
                             (groups, convs, collapsed) =
                                 rebuild(&view, &reg, &flags.skipped, &query);
@@ -1460,7 +1522,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     let _ = freeze_window(&target, &freeze_note);
                     freezing = None;
                     freeze_note.clear();
-                    reg = gather_conversations();
+                    reg = gather_conversations_stats(&mut sys);
                     flags = Flags::load();
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     sel = 0;
@@ -1569,7 +1631,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 None => {}
             },
             KeyCode::Char('r') => {
-                reg = gather_conversations();
+                reg = gather_conversations_stats(&mut sys);
                 flags = Flags::load();
                 (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 sel = 0;
@@ -1648,7 +1710,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 } else if let Some(c) = selected_conv(&rows, &convs) {
                     if c.is_frozen() {
                         let _ = discard_frozen(c.id.as_str());
-                        reg = gather_conversations();
+                        reg = gather_conversations_stats(&mut sys);
                         flags = Flags::load();
                         (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     } else if c.lifecycle.is_actionable_here() {
@@ -2770,6 +2832,24 @@ fn conv_line(
     if !ago.is_empty() {
         spans.push(Span::styled(ago, dim(base)));
     }
+    // Compact live CPU/mem (only when the window's process tree reports usage).
+    if c.lifecycle.is_actionable_here() && (c.cpu >= 0.05 || c.mem_kb > 0) {
+        let col = |co| {
+            if selected {
+                base
+            } else {
+                Style::default().fg(co)
+            }
+        };
+        spans.push(Span::styled(
+            format!("  {:.0}%", c.cpu),
+            col(cpu_color(c.cpu)),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", mem_str(c.mem_kb)),
+            col(mem_color(c.mem_kb)),
+        ));
+    }
     // Frozen note, distinguishing subpath, and tags.
     let fnote = frozen_note(c);
     if !fnote.is_empty() {
@@ -3139,6 +3219,8 @@ mod tests {
             archived: false,
             title: None,
             auth_config_dir: None,
+            cpu: 0.0,
+            mem_kb: 0,
         }
     }
 
