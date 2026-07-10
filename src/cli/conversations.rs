@@ -536,8 +536,10 @@ fn build_browse(
             grouped.entry(key.clone()).or_default();
         }
     }
-    // Hide archived projects (even ones with conversations) unless revealing.
-    if !reveal_archived {
+    // Hide archived projects only on the FULL list (`include_empty` == no search),
+    // matching the classic picker: they reappear as soon as you type a search, or
+    // when revealed via Ctrl+R.
+    if !reveal_archived && include_empty {
         grouped.retain(|key, _| !is_archived(key));
     }
 
@@ -3569,6 +3571,41 @@ mod tests {
         let set: std::collections::HashSet<&String> = labels.iter().collect();
         assert_eq!(set.len(), labels.len(), "labels must be unique");
         assert_eq!(&labels[0..3], &["aa", "as", "ad"]); // stable order
+    }
+
+    #[test]
+    fn test_build_browse_archived_hidden_on_list_shown_on_search() {
+        // Matches the classic picker: archived projects hide on the full list but
+        // reappear during a search (or when revealed).
+        let mut reg = ConversationRegistry::default();
+        reg.conversations.insert(
+            "a".into(),
+            mk(
+                "a",
+                Lifecycle::Closed,
+                Some("arch"),
+                Some("2026-07-01T00:00:00Z"),
+            ),
+        );
+        let mut projects = ProjectRegistry::default();
+        projects.projects.insert(
+            "arch".into(),
+            ProjectConfig {
+                archived: true,
+                ..Default::default()
+            },
+        );
+        let has = |g: &[Group], k: &str| g.iter().any(|x| x.key == k);
+
+        // Full list (include_empty=true), not revealed → hidden.
+        let (g, _) = build_browse(&reg, &projects, true, false);
+        assert!(!has(&g, "arch"), "archived hidden on the full list");
+        // Search (include_empty=false), not revealed → findable.
+        let (g, _) = build_browse(&reg, &projects, false, false);
+        assert!(has(&g, "arch"), "archived findable during search");
+        // Revealed → shown regardless.
+        let (g, _) = build_browse(&reg, &projects, true, true);
+        assert!(has(&g, "arch"), "archived shown when revealed");
     }
 
     fn mk(id: &str, lc: Lifecycle, parent: Option<&str>, last: Option<&str>) -> Conversation {
