@@ -143,6 +143,34 @@ pub fn get_current_tmux_session_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every tmux window across all sessions, keyed by session name → list of
+/// `(window_index, window_name)`. One `list-windows -a` call. Session and window
+/// names may contain spaces (emoji names), so fields are tab-separated.
+pub fn get_all_windows() -> std::collections::HashMap<String, Vec<(String, String)>> {
+    let mut map: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    let output = Command::new("tmux")
+        .args([
+            "list-windows",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_index}\t#{window_name}",
+        ])
+        .output();
+    if let Ok(o) = output {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut parts = line.splitn(3, '\t');
+            if let (Some(session), Some(idx)) = (parts.next(), parts.next()) {
+                let name = parts.next().unwrap_or("");
+                map.entry(session.to_string())
+                    .or_default()
+                    .push((idx.to_string(), name.to_string()));
+            }
+        }
+    }
+    map
+}
+
 /// Get the current active tmux session name
 pub fn get_current_tmux_session() -> Option<String> {
     Command::new("tmux")

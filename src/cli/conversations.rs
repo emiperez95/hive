@@ -42,7 +42,7 @@ use crate::common::registry::{
     TmuxPlacement,
 };
 use crate::common::tmux::{
-    get_current_tmux_session, get_current_tmux_session_names, select_window, switch_to_session,
+    get_all_windows, get_current_tmux_session, select_window, switch_to_session,
 };
 use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
@@ -202,6 +202,8 @@ enum Action {
     WtDelete(String, String),
     /// Switch to a bare tmux session (one with no live conversation).
     SwitchSession(String),
+    /// Switch to a specific non-Claude tmux window (session name, window index).
+    SwitchWindow(String, String),
 }
 
 /// Which list the TUI is showing.
@@ -218,6 +220,16 @@ struct Group {
     convs: Vec<usize>, // indices into the `convs` vec
     path: String,      // common directory prefix of the group's conversations
     emoji: String,     // project icon for the header (empty if none)
+    /// tmux windows of this session with NO Claude conversation (plain shells,
+    /// servers, editors). Active view only; shown as dimmed "window" rows so the
+    /// full session is visible, marked apart from real conversations.
+    windows: Vec<WinRow>,
+}
+
+/// A non-Claude tmux window shown as a row in the Active view.
+struct WinRow {
+    index: String,
+    name: String,
 }
 
 /// The project emoji for a Browse group key: a project key ("hive") or a worktree
@@ -248,10 +260,12 @@ fn project_key_of(group_key: &str, projects: &ProjectRegistry) -> Option<String>
         .then(|| pkey.to_string())
 }
 
-/// A visible row: a group header, or a conversation under an expanded group.
+/// A visible row: a group header, a conversation, or a non-Claude tmux window
+/// (both under an expanded group).
 enum Row {
-    Header(usize),                 // index into `groups`
-    Conv { ci: usize, gi: usize }, // conversation index + its group index
+    Header(usize),                   // index into `groups`
+    Conv { ci: usize, gi: usize },   // conversation index + its group index
+    Window { gi: usize, wi: usize }, // group index + index into that group's `windows`
 }
 
 /// Header key for the pinned group that enumerates all frozen conversations.
@@ -500,6 +514,7 @@ fn push_group(
         convs: idxs,
         path,
         emoji,
+        windows: Vec::new(),
     }
 }
 
@@ -613,6 +628,10 @@ fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
             for &ci in &g.convs {
                 rows.push(Row::Conv { ci, gi });
             }
+            // Non-Claude windows come after the session's conversations.
+            for wi in 0..g.windows.len() {
+                rows.push(Row::Window { gi, wi });
+            }
         }
     }
     rows
@@ -621,10 +640,15 @@ fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
 /// Active view: only LIVE conversations, grouped by the tmux session running
 /// them — the conversation-aware analog of the classic `prefix + s` session list.
 /// Skipped sessions are ordered last so they form a separate section.
+///
+/// `session_windows` (session name → its tmux windows) does double duty: its keys
+/// are the live sessions to surface even without a conversation, and each session's
+/// windows that host no conversation become dimmed "window" rows so the whole
+/// session is visible.
 fn build_active(
     reg: &ConversationRegistry,
     skipped: &HashSet<String>,
-    live_sessions: &HashSet<String>,
+    session_windows: &HashMap<String, Vec<(String, String)>>,
 ) -> (Vec<Group>, Vec<Conversation>) {
     use std::collections::BTreeMap;
     let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
@@ -643,7 +667,7 @@ fn build_active(
     // (0-conv) group, so the Active view matches classic's session-first list.
     // Otherwise a session where claude isn't running (a plain shell like `00-main`,
     // a skipped one, a server) is invisible here and can't be seen or un-skipped.
-    for name in live_sessions {
+    for name in session_windows.keys() {
         grouped.entry(name.clone()).or_default();
     }
     // Partition into three sections, matching classic's order: normal claude
@@ -669,7 +693,26 @@ fn build_active(
     let mut convs = Vec::new();
     for (key, group) in normal.into_iter().chain(other).chain(skip) {
         // Session names already carry their project emoji, so no separate icon.
-        groups.push(push_group(key, group, &mut convs, String::new()));
+        let mut g = push_group(key, group, &mut convs, String::new());
+        // Attach the session's windows that no conversation occupies — plain
+        // shells/servers/editors — as dimmed rows so the full session is visible.
+        if let Some(wins) = session_windows.get(&g.key) {
+            let covered: HashSet<String> = g
+                .convs
+                .iter()
+                .filter_map(|&ci| convs[ci].placement.as_ref())
+                .map(|p| p.window_index.clone())
+                .collect();
+            g.windows = wins
+                .iter()
+                .filter(|(idx, _)| !covered.contains(idx))
+                .map(|(index, name)| WinRow {
+                    index: index.clone(),
+                    name: name.clone(),
+                })
+                .collect();
+        }
+        groups.push(g);
     }
     (groups, convs)
 }
@@ -793,6 +836,8 @@ fn detail_of_row(
     projects: &ProjectRegistry,
 ) -> Option<ProjectDetailState> {
     match row? {
+        // A plain tmux window has no conversation/project to detail.
+        Row::Window { .. } => None,
         Row::Conv { ci, .. } => {
             let pkey = convs[*ci]
                 .parent
@@ -1058,6 +1103,10 @@ fn run_conversations_tui() -> Result<()> {
             crate::cli::worktree::run_wt_delete(&project, &branch, false, false)?
         }
         Action::SwitchSession(name) => switch_to_session(&name),
+        Action::SwitchWindow(session, window) => {
+            switch_to_session(&session);
+            select_window(&session, &window);
+        }
     }
     Ok(())
 }
@@ -1086,9 +1135,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         let src = &filtered;
         match view {
             View::Active => {
-                let live_sessions: HashSet<String> =
-                    get_current_tmux_session_names().into_iter().collect();
-                let (g, c) = build_active(src, skipped, &live_sessions);
+                let session_windows = get_all_windows();
+                let (g, c) = build_active(src, skipped, &session_windows);
                 (g, c, HashSet::new())
             }
             View::Browse => {
@@ -1734,7 +1782,9 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                             detail = Some(d);
                         }
                     }
-                    None => {}
+                    // Window rows are Active-only (search runs in Browse), so this is
+                    // unreachable in practice — no-op keeps the match exhaustive.
+                    Some(Row::Window { .. }) | None => {}
                 },
                 // → drills in: a conversation → its detail; a project → its detail.
                 KeyCode::Right => {
@@ -1840,13 +1890,24 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     path: String::new(),
                 });
             }
-            // Number keys 1-9 jump to the Nth visible conversation (like classic hive).
+            // Number keys 1-9 jump to the Nth visible switch target — a conversation
+            // or a plain window, in display order (like classic hive).
             KeyCode::Char(d @ '1'..='9') => {
                 let n = d as usize - '1' as usize;
-                if let Some(Row::Conv { ci, .. }) =
-                    rows.iter().filter(|r| matches!(r, Row::Conv { .. })).nth(n)
+                match rows
+                    .iter()
+                    .filter(|r| matches!(r, Row::Conv { .. } | Row::Window { .. }))
+                    .nth(n)
                 {
-                    return Ok(activate(&convs[*ci]));
+                    Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
+                    Some(Row::Window { gi, wi }) => {
+                        let g = &groups[*gi];
+                        return Ok(Action::SwitchWindow(
+                            g.key.clone(),
+                            g.windows[*wi].index.clone(),
+                        ));
+                    }
+                    _ => {}
                 }
             }
             // `g` labels every visible conversation for hint-jump (beyond the 1-9 cap).
@@ -1905,10 +1966,18 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 sel = 0;
             }
             KeyCode::Enter => match rows.get(sel) {
-                // Enter on a conversation switches/resumes it; on a header, it opens
-                // the project detail — except a bare Active session (no live conv),
-                // where there's nothing to detail, so Enter attaches to the session.
+                // Enter on a conversation switches/resumes it; on a plain window it
+                // switches to that window; on a header it opens the project detail —
+                // except a bare Active session (no live conv), where there's nothing
+                // to detail, so Enter attaches to the session.
                 Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
+                Some(Row::Window { gi, wi }) => {
+                    let g = &groups[*gi];
+                    return Ok(Action::SwitchWindow(
+                        g.key.clone(),
+                        g.windows[*wi].index.clone(),
+                    ));
+                }
                 Some(Row::Header(gi)) => {
                     if matches!(view, View::Active) && groups[*gi].convs.is_empty() {
                         return Ok(Action::SwitchSession(groups[*gi].key.clone()));
@@ -1950,7 +2019,12 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                         .placement
                         .as_ref()
                         .map(|p| p.session_name.clone()),
-                    Some(Row::Header(gi)) if matches!(view, View::Active) => {
+                    // A window or session header (Active) resolves to its session —
+                    // these flags are session-level, so skipping a plain window
+                    // skips its whole session.
+                    Some(Row::Header(gi) | Row::Window { gi, .. })
+                        if matches!(view, View::Active) =>
+                    {
                         Some(groups[*gi].key.clone())
                     }
                     _ => None,
@@ -2147,7 +2221,8 @@ fn draw(
     }
     let mut display: Vec<Line> = Vec::new();
     let mut sel_display = 0usize;
-    let mut conv_seen = 0usize;
+    // Numbers 1-9 address every switchable row in order — conversations AND windows.
+    let mut switch_seen = 0usize;
     let mut shown_skip = false;
     let mut shown_other = false;
     for (ri, row) in rows.iter().enumerate() {
@@ -2174,9 +2249,9 @@ fn draw(
                 display.push(Line::raw(""));
             }
         }
-        let num = if let Row::Conv { .. } = row {
-            conv_seen += 1;
-            (conv_seen <= 9).then_some(conv_seen)
+        let num = if matches!(row, Row::Conv { .. } | Row::Window { .. }) {
+            switch_seen += 1;
+            (switch_seen <= 9).then_some(switch_seen)
         } else {
             None
         };
@@ -2217,6 +2292,7 @@ fn draw(
                 bold_convs.contains(ci),
                 hints.get(ci).map(|s| s.as_str()),
             ),
+            Row::Window { gi, wi } => window_line(&groups[*gi].windows[*wi], selected, num),
         });
     }
 
@@ -3007,7 +3083,7 @@ fn help_lines() -> Vec<Line<'static>> {
             Span::raw("   "),
             Span::styled("● busy", Style::default().fg(Color::Blue)),
             Span::styled(
-                "   ○ closed (resumable)   💤 frozen   ",
+                "   ○ closed (resumable)   💤 frozen   ❯ window (no claude)   ",
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled("skipped/archived", Style::default().fg(Color::DarkGray)),
@@ -3315,6 +3391,37 @@ fn conv_line(
     Line::from(spans)
 }
 
+/// A non-Claude tmux window row: a dimmed `❯` line (shell prompt glyph) aligned
+/// under the session's conversations, with a trailing `window` tag so it reads
+/// clearly as a plain tmux window, not a Claude conversation.
+fn window_line(w: &WinRow, selected: bool, num: Option<usize>) -> Line<'static> {
+    let num_prefix = match num {
+        Some(n) => format!("{n} "),
+        None => "  ".to_string(),
+    };
+    // Dim gray throughout — deliberately quieter than a colored conversation row.
+    let base = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    };
+    let name = if w.name.is_empty() {
+        "(window)".to_string()
+    } else {
+        w.name.chars().take(36).collect::<String>()
+    };
+    Line::from(vec![
+        // Blank favorite slot + 1-9 lead, matching conv_line's leading columns so
+        // window rows line up under the conversations.
+        Span::styled(" ", base),
+        Span::styled(format!(" {num_prefix} "), base),
+        Span::styled(format!("❯ {:8}  {:<36}", w.index, name), base),
+        Span::styled("  window", base),
+    ])
+}
+
 /// The tmux session that owns this conversation's project/worktree, if resolvable
 /// from its logical `parent` key.
 fn target_session(c: &Conversation) -> Option<String> {
@@ -3611,6 +3718,21 @@ mod tests {
     use super::*;
     use crate::common::registry::{ConversationId, Lifecycle};
 
+    /// Build a `session_windows` map (session → its `(index, name)` windows) for
+    /// `build_active`, from a compact literal.
+    fn win_map(pairs: &[(&str, &[(&str, &str)])]) -> HashMap<String, Vec<(String, String)>> {
+        pairs
+            .iter()
+            .map(|(s, ws)| {
+                let ws = ws
+                    .iter()
+                    .map(|(i, n)| (i.to_string(), n.to_string()))
+                    .collect();
+                (s.to_string(), ws)
+            })
+            .collect()
+    }
+
     #[test]
     fn test_hint_labels_unique_stable_2char() {
         let labels = gen_hint_labels(40);
@@ -3628,16 +3750,23 @@ mod tests {
         let reg = ConversationRegistry::default();
         let one = |s: &str| -> HashSet<String> { [s.to_string()].into_iter().collect() };
 
-        let (groups, convs) = build_active(&reg, &one("🌳 Bare"), &one("🌳 Bare"));
-        assert!(
-            groups.iter().any(|g| g.key == "🌳 Bare"),
-            "bare skipped shows"
+        let (groups, convs) = build_active(
+            &reg,
+            &one("🌳 Bare"),
+            &win_map(&[("🌳 Bare", &[("0", "bash")])]),
         );
+        let bare = groups.iter().find(|g| g.key == "🌳 Bare");
+        assert!(bare.is_some(), "bare skipped shows");
         assert!(convs.is_empty(), "bare session has no conversations");
+        assert_eq!(bare.unwrap().windows.len(), 1, "its window shows as a row");
 
         // A non-skipped bare live session (e.g. `00-main`, a plain shell) now shows
         // too — it belongs to the trailing "other" bucket, not hidden.
-        let (groups, _) = build_active(&reg, &HashSet::new(), &one("00-main"));
+        let (groups, _) = build_active(
+            &reg,
+            &HashSet::new(),
+            &win_map(&[("00-main", &[("0", "zsh")])]),
+        );
         assert!(
             groups.iter().any(|g| g.key == "00-main"),
             "non-skipped bare live session shows in the other bucket"
@@ -3662,14 +3791,26 @@ mod tests {
             pane_id: None,
         });
         reg.conversations.insert("live".into(), live);
-        let live_sessions: HashSet<String> = ["🐝 claude", "00-other", "🌳 skip"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        // 🐝 claude has one window (index 0) that its conversation occupies; 00-other
+        // is a plain two-window session; 🌳 skip is skipped.
+        let session_windows = win_map(&[
+            ("🐝 claude", &[("0", "claude")]),
+            ("00-other", &[("0", "bash"), ("1", "server")]),
+            ("🌳 skip", &[("0", "bash")]),
+        ]);
         let skipped: HashSet<String> = ["🌳 skip"].into_iter().map(String::from).collect();
-        let (groups, _) = build_active(&reg, &skipped, &live_sessions);
+        let (groups, _) = build_active(&reg, &skipped, &session_windows);
         let keys: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
         assert_eq!(keys, vec!["🐝 claude", "00-other", "🌳 skip"]);
+        // The claude window is covered by its conversation → no window row for it.
+        let claude = groups.iter().find(|g| g.key == "🐝 claude").unwrap();
+        assert!(
+            claude.windows.is_empty(),
+            "the claude window is covered by its conversation"
+        );
+        // The plain session surfaces both its windows as rows.
+        let other = groups.iter().find(|g| g.key == "00-other").unwrap();
+        assert_eq!(other.windows.len(), 2, "both plain windows show");
     }
 
     #[test]
