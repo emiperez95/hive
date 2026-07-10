@@ -378,6 +378,22 @@ fn done_session_todo(session: &str, idx: usize) {
     save_completed_todos(&completed);
 }
 
+/// Delete the `idx`-th (0-based) todo outright — dropped, NOT moved to completed.
+fn delete_session_todo(session: &str, idx: usize) {
+    let mut todos = load_session_todos();
+    let Some(items) = todos.get_mut(session) else {
+        return;
+    };
+    if idx >= items.len() {
+        return;
+    }
+    items.remove(idx);
+    if items.is_empty() {
+        todos.remove(session);
+    }
+    save_session_todos(&todos);
+}
+
 /// Which session-level flag a key toggles.
 #[derive(Clone, Copy)]
 enum Flag {
@@ -779,6 +795,8 @@ struct ConvDetailState {
     adding: bool,
     /// True while editing the conversation's note; `input` holds the text.
     editing_note: bool,
+    /// True after `d` is pressed, waiting for a digit to delete that todo.
+    del_armed: bool,
     input: String,
 }
 
@@ -821,6 +839,7 @@ fn spawn_conv_detail(c: &Conversation) -> ConvDetailState {
         todos,
         adding: false,
         editing_note: false,
+        del_armed: false,
         input: String::new(),
     }
 }
@@ -1100,7 +1119,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         if conv_detail.is_some() {
             {
                 let cd = conv_detail.as_ref().unwrap();
-                terminal.draw(|frame| draw_conv_detail(frame, cd))?;
+                terminal.draw(|frame| draw_conv_detail(frame, cd, &flags))?;
             }
             if !event::poll(Duration::from_millis(250))? {
                 continue;
@@ -1168,6 +1187,21 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 continue;
             }
 
+            // Delete-todo armed (after `d`): the next digit deletes that todo; any
+            // other key cancels. Either way the key is consumed.
+            if conv_detail.as_ref().unwrap().del_armed {
+                let cd = conv_detail.as_mut().unwrap();
+                cd.del_armed = false;
+                if let KeyCode::Char(d @ '1'..='9') = key.code {
+                    if let Some(s) = cd.session().map(|s| s.to_string()) {
+                        delete_session_todo(&s, d as usize - '1' as usize);
+                        cd.reload_todos();
+                        flags = Flags::load();
+                    }
+                }
+                continue;
+            }
+
             match key.code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                     conv_detail = None
@@ -1227,13 +1261,47 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     cd.editing_note = true;
                     cd.input = cd.conv.note.clone();
                 }
-                // Todos (session-level): `a` add, `1-9` mark the Nth done.
+                // Session-level flags on the conversation's session (live only), and
+                // `z` freezes its window — matching the classic detail view.
+                KeyCode::Char('v')
+                | KeyCode::Char('m')
+                | KeyCode::Char('s')
+                | KeyCode::Char('!') => {
+                    if let Some(session) =
+                        conv_detail.as_ref().unwrap().session().map(str::to_string)
+                    {
+                        let flag = match key.code {
+                            KeyCode::Char('v') => Flag::Favorite,
+                            KeyCode::Char('m') => Flag::Mute,
+                            KeyCode::Char('!') => Flag::AutoApprove,
+                            _ => Flag::Skip,
+                        };
+                        toggle_flag(&session, flag);
+                        flags = Flags::load();
+                    }
+                }
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    let c = conv_detail.as_ref().unwrap().conv.clone();
+                    if c.lifecycle.is_actionable_here() {
+                        if let Some(t) = freeze_target_of(&c) {
+                            freezing = Some(t);
+                            freeze_note.clear();
+                            conv_detail = None; // back to the list, which shows the note prompt
+                        }
+                    }
+                }
+                // Todos (session-level): `a` add, `1-9` mark the Nth done, `d`+digit
+                // deletes the Nth outright.
                 KeyCode::Char('a') => {
                     let cd = conv_detail.as_mut().unwrap();
                     if cd.session().is_some() {
                         cd.adding = true;
                         cd.input.clear();
                     }
+                }
+                KeyCode::Char('d') => {
+                    let cd = conv_detail.as_mut().unwrap();
+                    cd.del_armed = cd.session().is_some() && !cd.todos.is_empty();
                 }
                 KeyCode::Char(d @ '1'..='9') => {
                     let cd = conv_detail.as_mut().unwrap();
@@ -2194,7 +2262,7 @@ fn ellipsize(s: &str, n: usize) -> String {
 
 /// Render the conversation detail: an instant static header, then the async
 /// resources (or a loading placeholder while the worker thread runs).
-fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
+fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState, flags: &Flags) {
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -2291,6 +2359,43 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
             ));
         }
     }
+    // Session flags (favorite / mute / auto-approve / skip), if any are set.
+    if let Some(session) = cd.session() {
+        let mut fs: Vec<Span> = Vec::new();
+        let tag = |fs: &mut Vec<Span<'static>>, on: bool, text: &'static str, col: Color| {
+            if on {
+                fs.push(Span::styled(text, Style::default().fg(col)));
+                fs.push(Span::raw(" "));
+            }
+        };
+        tag(
+            &mut fs,
+            flags.favorite.contains(session),
+            "★fav",
+            Color::Yellow,
+        );
+        tag(
+            &mut fs,
+            flags.auto_approve.contains(session),
+            "[auto]",
+            Color::Green,
+        );
+        tag(
+            &mut fs,
+            flags.muted.contains(session),
+            "[muted]",
+            Color::DarkGray,
+        );
+        tag(
+            &mut fs,
+            flags.skipped.contains(session),
+            "[skip]",
+            Color::DarkGray,
+        );
+        if !fs.is_empty() {
+            lines.push(field("flags", fs));
+        }
+    }
 
     // Todos — session-level, surfaced here (only for a conversation with a session).
     if cd.session().is_some() {
@@ -2353,9 +2458,14 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState) {
                 Style::default().fg(Color::DarkGray),
             ),
         ])
+    } else if cd.del_armed {
+        Line::from(Span::styled(
+            " delete which todo? press 1-9 · any other key cancels",
+            Style::default().fg(Color::Red),
+        ))
     } else {
         Line::from(Span::styled(
-            " Enter switch · P pin · e note · a todo · 1-9 done · o chrome · Del close · Esc back",
+            " Enter switch · v★ m ! s · z freeze · P pin · e note · a/1-9/d todo · o chrome · Del close · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
