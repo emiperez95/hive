@@ -36,7 +36,7 @@ use crate::common::persistence::{
 };
 use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
 use crate::common::process::get_process_info;
-use crate::common::projects::{ensure_tmux_session, expand_tilde, ProjectRegistry};
+use crate::common::projects::{ensure_tmux_session, expand_tilde, ProjectConfig, ProjectRegistry};
 use crate::common::registry::{
     self, Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
     TmuxPlacement,
@@ -191,6 +191,13 @@ enum Action {
     Reopen(Box<Conversation>),
     /// Start a fresh conversation in the given project (key).
     NewInProject(String),
+    /// Spread N sessions into iTerm2 panes / collapse back (classic `L`).
+    Spread(usize),
+    Collapse,
+    /// Create a worktree (project key, branch) and switch to it.
+    WtNew(String, String),
+    /// Delete a worktree (project key, branch).
+    WtDelete(String, String),
 }
 
 /// Which list the TUI is showing.
@@ -300,6 +307,33 @@ impl Flags {
                 .collect(),
         }
     }
+}
+
+/// A minimal 3-step new-project wizard state (`N` in the list): key → emoji → path.
+struct NewProject {
+    step: u8,
+    key: String,
+    emoji: String,
+    path: String,
+}
+
+/// Register a new project in projects.toml (other fields default; edit the TOML or
+/// use `hive project add` for the full set).
+fn create_project(key: &str, emoji: &str, path: &str) {
+    let mut reg = ProjectRegistry::load();
+    reg.add_project(
+        key.to_string(),
+        ProjectConfig {
+            emoji: if emoji.is_empty() {
+                "📁".to_string()
+            } else {
+                emoji.to_string()
+            },
+            project_root: path.to_string(),
+            ..Default::default()
+        },
+    );
+    let _ = reg.save();
 }
 
 /// Toggle a project's remembered mute preference and persist it.
@@ -640,6 +674,7 @@ struct ProjectDetailState {
     convs: Vec<Conversation>, // display order: live first, frozen last, else recency
     path: String,             // common cwd prefix (for subpath elision in rows)
     sel: usize,               // selected conversation index
+    wt_input: Option<String>, // Some ⇒ typing a branch name for a new worktree
 }
 
 impl ProjectDetailState {
@@ -724,6 +759,7 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
         convs,
         path,
         sel: 0,
+        wt_input: None,
     }
 }
 
@@ -995,6 +1031,14 @@ fn run_conversations_tui() -> Result<()> {
         }
         Action::Reopen(c) => println!("{}", reopen(&c)?),
         Action::NewInProject(key) => println!("{}", new_conversation(&key)?),
+        Action::Spread(n) => crate::cli::session::run_spread(n)?,
+        Action::Collapse => crate::cli::session::run_collapse()?,
+        Action::WtNew(project, branch) => crate::cli::worktree::run_wt_new(
+            &project, &branch, None, false, "worktree", None, false, false,
+        )?,
+        Action::WtDelete(project, branch) => {
+            crate::cli::worktree::run_wt_delete(&project, &branch, false, false)?
+        }
     }
     Ok(())
 }
@@ -1057,6 +1101,10 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     // Live auto-refresh: re-gather on idle ticks so status/CPU stay current without
     // a keypress (the classic TUI refreshes on a 1s background timer).
     let mut last_refresh = Instant::now();
+    // Spread prompt (`L` with ≤1 iTerm pane): typing a digit spreads N sessions.
+    let mut spreading = false;
+    // New-project wizard (`N`): Some while stepping through key → emoji → path.
+    let mut wizard: Option<NewProject> = None;
     let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
     let mut sel: usize = 0;
     // Project detail sub-screen: Some(state) while drilled into a project.
@@ -1066,6 +1114,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut conv_detail: Option<ConvDetailState> = None;
     // Some(conv) while awaiting y/n to close (kill the window of) a live conversation.
     let mut confirm: Option<Conversation> = None;
+    // Some((project, branch)) while awaiting y/n to DELETE a worktree.
+    let mut wt_confirm: Option<(String, String)> = None;
 
     // Enter/number activation: switch to a live conversation, else reopen it.
     let activate = |c: &Conversation| -> Action {
@@ -1108,6 +1158,29 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     sel = 0;
                 }
                 _ => confirm = None,
+            }
+            continue;
+        }
+
+        // ── Worktree-delete confirmation ────────────────────────────────────
+        // Deleting a worktree removes its dir, branch, and session — gated by y/n
+        // and returned as an Action so the CLI teardown runs after the TUI exits.
+        if let Some((project, branch)) = wt_confirm.clone() {
+            terminal.draw(|frame| draw_confirm_wt_delete(frame, &project, &branch))?;
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    return Ok(Action::WtDelete(project, branch));
+                }
+                _ => wt_confirm = None,
             }
             continue;
         }
@@ -1343,6 +1416,31 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // Branch-name input for a new worktree (`w`). Enter creates it; Esc cancels.
+            if detail.as_ref().unwrap().wt_input.is_some() {
+                let d = detail.as_mut().unwrap();
+                match key.code {
+                    KeyCode::Esc => d.wt_input = None,
+                    KeyCode::Enter => {
+                        let branch = d.wt_input.take().unwrap_or_default().trim().to_string();
+                        if !branch.is_empty() {
+                            return Ok(Action::WtNew(d.key.clone(), branch));
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(s) = d.wt_input.as_mut() {
+                            s.pop();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some(s) = d.wt_input.as_mut() {
+                            s.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => detail = None,
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -1412,6 +1510,28 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                         flags = Flags::load();
                     }
                 }
+                // `w` creates a worktree (prompts for a branch); `x` deletes the
+                // selected conversation's worktree (with a y/n confirm).
+                KeyCode::Char('w') => {
+                    let d = detail.as_mut().unwrap();
+                    if projects.projects.contains_key(&d.key) {
+                        d.wt_input = Some(String::new());
+                    }
+                }
+                KeyCode::Char('x') => {
+                    let d = detail.as_ref().unwrap();
+                    // The selected conversation's parent "project/branch" → the branch.
+                    if let Some(branch) = d
+                        .convs
+                        .get(d.sel)
+                        .and_then(|c| c.parent.as_deref())
+                        .and_then(|p| p.split_once('/'))
+                        .filter(|(proj, _)| *proj == d.key)
+                        .map(|(_, br)| br.to_string())
+                    {
+                        wt_confirm = Some((d.key.clone(), branch));
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -1430,6 +1550,15 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             HashMap::new()
         };
         let hint_buf = hinting.then(|| hint_buffer.clone());
+        // New-project wizard prompt for the footer (current step's field + value).
+        let wiz_prompt = wizard.as_ref().map(|w| {
+            let (label, val) = match w.step {
+                0 => ("key", &w.key),
+                1 => ("emoji (optional)", &w.emoji),
+                _ => ("path", &w.path),
+            };
+            format!(" new project — {label}: {val}")
+        });
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -1444,6 +1573,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 freeze.as_deref(),
                 &hint_map,
                 hint_buf.as_deref(),
+                spreading,
+                wiz_prompt.as_deref(),
             )
         })?;
 
@@ -1451,7 +1582,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
             // Idle tick: refresh the registry every ~2s so status/CPU/mem stay live.
             // Skipped while a modal/input is active (would disrupt the view), and the
             // selected conversation is re-located by id so the cursor doesn't jump.
-            let quiet = !searching && !hinting && freezing.is_none();
+            let quiet =
+                !searching && !hinting && freezing.is_none() && !spreading && wizard.is_none();
             if quiet && last_refresh.elapsed() >= Duration::from_secs(2) {
                 let keep = match rows.get(sel) {
                     Some(Row::Conv { ci, .. }) => Some(convs[*ci].id.clone()),
@@ -1503,6 +1635,56 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                         if let Some((_, ci)) = hint_labels.iter().find(|(l, _)| *l == cand) {
                             return Ok(activate(&convs[*ci]));
                         }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Spread prompt: a digit spreads that many sessions into iTerm2 panes.
+        if spreading {
+            match key.code {
+                KeyCode::Char(d @ '1'..='9') => {
+                    return Ok(Action::Spread(d as usize - '0' as usize));
+                }
+                _ => spreading = false,
+            }
+            continue;
+        }
+
+        // New-project wizard: step through key → emoji → path, then register it.
+        if wizard.is_some() {
+            match key.code {
+                KeyCode::Esc => wizard = None,
+                KeyCode::Enter => {
+                    let w = wizard.as_mut().unwrap();
+                    if w.step < 2 {
+                        w.step += 1;
+                    } else {
+                        let w = wizard.take().unwrap();
+                        let (k, p) = (w.key.trim(), w.path.trim());
+                        if !k.is_empty() && !p.is_empty() {
+                            create_project(k, w.emoji.trim(), p);
+                            (groups, convs, collapsed) =
+                                rebuild(&view, &reg, &flags.skipped, &query);
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    let w = wizard.as_mut().unwrap();
+                    match w.step {
+                        0 => w.key.pop(),
+                        1 => w.emoji.pop(),
+                        _ => w.path.pop(),
+                    };
+                }
+                KeyCode::Char(c) => {
+                    let w = wizard.as_mut().unwrap();
+                    match w.step {
+                        0 => w.key.push(c),
+                        1 => w.emoji.push(c),
+                        _ => w.path.push(c),
                     }
                 }
                 _ => {}
@@ -1621,6 +1803,22 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 sel = 0;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
+            // `L` spreads sessions into iTerm2 panes, or collapses if already spread.
+            KeyCode::Char('L') => {
+                if crate::common::iterm::get_iterm_pane_count() > 1 {
+                    return Ok(Action::Collapse);
+                }
+                spreading = true;
+            }
+            // `N` starts the new-project wizard.
+            KeyCode::Char('N') => {
+                wizard = Some(NewProject {
+                    step: 0,
+                    key: String::new(),
+                    emoji: String::new(),
+                    path: String::new(),
+                });
+            }
             // Number keys 1-9 jump to the Nth visible conversation (like classic hive).
             KeyCode::Char(d @ '1'..='9') => {
                 let n = d as usize - '1' as usize;
@@ -1805,6 +2003,8 @@ fn draw(
     freeze: Option<&str>,
     hints: &HashMap<usize, String>,
     hint_buf: Option<&str>,
+    spread_prompt: bool,
+    wiz_prompt: Option<&str>,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -1985,8 +2185,22 @@ fn draw(
     let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), body[1]);
 
-    // Footer: hint-jump prompt, else freeze-note, else search query, else key hints.
-    let footer_line = if let Some(buf) = hint_buf {
+    // Footer: wizard/spread prompt, hint-jump, freeze-note, search query, else hints.
+    let footer_line = if let Some(w) = wiz_prompt {
+        Line::from(vec![
+            Span::styled(w.to_string(), Style::default().fg(Color::Green)),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   Enter next/create · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if spread_prompt {
+        Line::from(Span::styled(
+            " spread how many sessions into panes? press 1-9 · any other key cancels",
+            Style::default().fg(Color::Yellow),
+        ))
+    } else if let Some(buf) = hint_buf {
         Line::from(vec![
             Span::styled(" jump: ", Style::default().fg(Color::Yellow)),
             Span::styled(
@@ -2209,14 +2423,54 @@ fn draw_project_detail(
     let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let footer = " Enter switch · → detail · Del close · n new · r resume · m mute · Esc back";
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            footer,
+    let footer_line = if let Some(branch) = &state.wt_input {
+        Line::from(vec![
+            Span::styled(" new worktree branch: ", Style::default().fg(Color::Green)),
+            Span::styled(branch.clone(), Style::default().fg(Color::Green)),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   Enter create · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " Enter switch · → detail · Del close · n new · r resume · w worktree · x delete-wt · m mute · Esc back",
             Style::default().fg(Color::DarkGray),
-        ))),
-        chunks[2],
-    );
+        ))
+    };
+    frame.render_widget(Paragraph::new(footer_line), chunks[2]);
+}
+
+/// Full-screen y/n prompt before deleting a worktree (removes dir + branch + session).
+fn draw_confirm_wt_delete(frame: &mut ratatui::Frame, project: &str, branch: &str) {
+    let lines = vec![
+        Line::raw(""),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Delete this worktree?",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("    {project} / {branch}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Removes the worktree directory, its branch, and its tmux session.",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                "  [y] delete   ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[n] cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), frame.area());
 }
 
 fn mem_str(kb: u64) -> String {
@@ -2678,6 +2932,9 @@ fn help_lines() -> Vec<Line<'static>> {
             "! / s",
             "Toggle auto-approve / skip the conversation's session",
         ),
+        key("L", "Spread sessions into iTerm2 panes / collapse back"),
+        key("N", "New-project wizard (key → emoji → path)"),
+        key("w / x", "In a project detail: create / delete a worktree"),
         key(
             "→ / l",
             "Detail: a conversation's own, or a project header's",

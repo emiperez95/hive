@@ -57,7 +57,7 @@ impl FilePatterns {
 }
 
 /// A single project configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// Emoji identifier for session names
     pub emoji: String,
