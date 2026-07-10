@@ -213,6 +213,24 @@ enum Row {
 /// Header key for the pinned group that enumerates all frozen conversations.
 const FROZEN_GROUP: &str = "💤 frozen";
 
+/// Home-row alphabet for hint-jump labels (9 keys → 81 two-char labels).
+const HINT_ALPHABET: &[u8] = b"asdfghjkl";
+
+/// `count` unique 2-char labels from the home row in stable order (aa, as, ad, …),
+/// so any visible conversation is one hop away regardless of the 1-9 quick-jump cap.
+fn gen_hint_labels(count: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(count);
+    'outer: for &a in HINT_ALPHABET {
+        for &b in HINT_ALPHABET {
+            if out.len() >= count {
+                break 'outer;
+            }
+            out.push(format!("{}{}", a as char, b as char));
+        }
+    }
+    out
+}
+
 /// The session-level flag sets (all keyed by tmux session name), loaded together
 /// so a conversation row can show ★ / [muted] / [auto] / [skip] and toggle them.
 struct Flags {
@@ -975,6 +993,12 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     // Freeze-note input: Some(target) while typing the note for a pending freeze.
     let mut freezing: Option<FreezeTarget> = None;
     let mut freeze_note = String::new();
+    // Hint-jump (`g`): each visible conversation gets a 2-char label; typing one
+    // activates it. `hint_labels` maps label → conv index; `hint_buffer` is the
+    // partial input.
+    let mut hinting = false;
+    let mut hint_labels: Vec<(String, usize)> = Vec::new();
+    let mut hint_buffer = String::new();
     let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
     let mut sel: usize = 0;
     // Project detail sub-screen: Some(state) while drilled into a project.
@@ -1292,6 +1316,13 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         }
         let search = searching.then(|| query.clone());
         let freeze = freezing.as_ref().map(|_| freeze_note.clone());
+        // Hint labels (conv index → label) for the current visible rows.
+        let hint_map: HashMap<usize, String> = if hinting {
+            hint_labels.iter().map(|(l, ci)| (*ci, l.clone())).collect()
+        } else {
+            HashMap::new()
+        };
+        let hint_buf = hinting.then(|| hint_buffer.clone());
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -1304,6 +1335,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 &flags,
                 search.as_deref(),
                 freeze.as_deref(),
+                &hint_map,
+                hint_buf.as_deref(),
             )
         })?;
 
@@ -1320,6 +1353,30 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         // Help overlay: any key dismisses it (? / Esc / q explicitly).
         if showing_help {
             showing_help = false;
+            continue;
+        }
+
+        // Hint-jump: type a label to activate its conversation. A char that extends
+        // no label's prefix is ignored; Esc cancels.
+        if hinting {
+            match key.code {
+                KeyCode::Esc => {
+                    hinting = false;
+                    hint_buffer.clear();
+                    hint_labels.clear();
+                }
+                KeyCode::Char(c) => {
+                    let mut cand = hint_buffer.clone();
+                    cand.push(c.to_ascii_lowercase());
+                    if hint_labels.iter().any(|(l, _)| l.starts_with(&cand)) {
+                        hint_buffer = cand.clone();
+                        if let Some((_, ci)) = hint_labels.iter().find(|(l, _)| *l == cand) {
+                            return Ok(activate(&convs[*ci]));
+                        }
+                    }
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -1441,6 +1498,21 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     rows.iter().filter(|r| matches!(r, Row::Conv { .. })).nth(n)
                 {
                     return Ok(activate(&convs[*ci]));
+                }
+            }
+            // `g` labels every visible conversation for hint-jump (beyond the 1-9 cap).
+            KeyCode::Char('g') => {
+                let cis: Vec<usize> = rows
+                    .iter()
+                    .filter_map(|r| match r {
+                        Row::Conv { ci, .. } => Some(*ci),
+                        _ => None,
+                    })
+                    .collect();
+                if !cis.is_empty() {
+                    hint_labels = gen_hint_labels(cis.len()).into_iter().zip(cis).collect();
+                    hint_buffer.clear();
+                    hinting = true;
                 }
             }
             // Esc backs out of Browse to Active; from Active it quits.
@@ -1599,6 +1671,8 @@ fn draw(
     flags: &Flags,
     search: Option<&str>,
     freeze: Option<&str>,
+    hints: &HashMap<usize, String>,
+    hint_buf: Option<&str>,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -1620,7 +1694,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · z freeze · P pin · Del close · f★ m ! s · M mute-all · / search · ? · q",
+            " → detail · Enter switch · g jump · z freeze · P pin · Del close · f★ m ! s · M mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -1764,6 +1838,7 @@ fn draw(
                 num,
                 flags,
                 bold_convs.contains(ci),
+                hints.get(ci).map(|s| s.as_str()),
             ),
         });
     }
@@ -1778,8 +1853,23 @@ fn draw(
     let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
     frame.render_widget(Paragraph::new(lines), body[1]);
 
-    // Footer: freeze-note prompt, else search query, else the key hints.
-    let footer_line = if let Some(note) = freeze {
+    // Footer: hint-jump prompt, else freeze-note, else search query, else key hints.
+    let footer_line = if let Some(buf) = hint_buf {
+        Line::from(vec![
+            Span::styled(" jump: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                buf.to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   type a label · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if let Some(note) = freeze {
         Line::from(vec![
             Span::styled(" 💤 freeze note: ", Style::default().fg(Color::Blue)),
             Span::styled(note.to_string(), Style::default().fg(Color::Blue)),
@@ -1964,7 +2054,15 @@ fn draw_project_detail(
             conv_pos.push(display.len());
             let num = (i < 9).then_some(i + 1);
             let bold = last_id.as_ref() == Some(&c.id);
-            display.push(conv_line(c, &state.path, i == state.sel, num, flags, bold));
+            display.push(conv_line(
+                c,
+                &state.path,
+                i == state.sel,
+                num,
+                flags,
+                bold,
+                None,
+            ));
         }
     }
 
@@ -2374,6 +2472,10 @@ fn help_lines() -> Vec<Line<'static>> {
         )),
         Line::raw(""),
         key("1-9", "Jump to / switch the Nth conversation"),
+        key(
+            "g",
+            "Hint-jump: label every conversation, type one to switch",
+        ),
         key("↑/↓ j/k", "Move selection"),
         key(
             "Enter",
@@ -2551,6 +2653,7 @@ fn live_color(c: &Conversation) -> Color {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv_line(
     c: &Conversation,
     group_path: &str,
@@ -2558,6 +2661,7 @@ fn conv_line(
     num: Option<usize>,
     flags: &Flags,
     bold: bool,
+    hint: Option<&str>,
 ) -> Line<'static> {
     // Session-level flags apply to a live conversation's tmux session.
     let session = c.placement.as_ref().map(|p| p.session_name.as_str());
@@ -2629,17 +2733,24 @@ fn conv_line(
     } else {
         Span::styled(" ", base)
     };
-    // Line 1 fragment: number · marker · id · title (classic name column).
+    // Leading slot: the hint-jump label (highlighted) during hint mode, else the
+    // 1-9 quick-jump number — both occupy the same 4-char width so rows don't shift.
+    let lead = match hint {
+        Some(label) => Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled(format!(" {num_prefix} "), base),
+    };
+    // Line 1 fragment: marker · id · title (classic name column).
     let mut spans = vec![
         fav_span,
+        lead,
         Span::styled(
-            format!(
-                " {} {} {:8}  {:<36}",
-                num_prefix,
-                marker,
-                short_id(c.id.as_str()),
-                title
-            ),
+            format!("{} {:8}  {:<36}", marker, short_id(c.id.as_str()), title),
             base,
         ),
     ];
@@ -3000,6 +3111,16 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
 mod tests {
     use super::*;
     use crate::common::registry::{ConversationId, Lifecycle};
+
+    #[test]
+    fn test_hint_labels_unique_stable_2char() {
+        let labels = gen_hint_labels(40);
+        assert_eq!(labels.len(), 40);
+        assert!(labels.iter().all(|l| l.chars().count() == 2));
+        let set: std::collections::HashSet<&String> = labels.iter().collect();
+        assert_eq!(set.len(), labels.len(), "labels must be unique");
+        assert_eq!(&labels[0..3], &["aa", "as", "ad"]); // stable order
+    }
 
     fn mk(id: &str, lc: Lifecycle, parent: Option<&str>, last: Option<&str>) -> Conversation {
         Conversation {
