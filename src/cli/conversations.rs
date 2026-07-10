@@ -639,17 +639,17 @@ fn build_active(
             .unwrap_or_else(|| "(detached)".to_string());
         grouped.entry(key).or_default().push(c);
     }
-    // Surface SKIPPED live tmux sessions that have no live conversation as bare
-    // (0-conv) groups, so the skipped set matches classic's session-first list —
-    // otherwise a skipped session where claude isn't running is invisible here and
-    // can't be seen or un-skipped.
+    // Surface EVERY live tmux session that has no live conversation as a bare
+    // (0-conv) group, so the Active view matches classic's session-first list.
+    // Otherwise a session where claude isn't running (a plain shell like `00-main`,
+    // a skipped one, a server) is invisible here and can't be seen or un-skipped.
     for name in live_sessions {
-        if skipped.contains(name) {
-            grouped.entry(name.clone()).or_default();
-        }
+        grouped.entry(name.clone()).or_default();
     }
-    // Partition into normal (first) and skipped (last) session groups.
+    // Partition into three sections, matching classic's order: normal claude
+    // groups first, then "other" (bare live sessions with no claude), then skipped.
     let mut normal = Vec::new();
+    let mut other = Vec::new();
     let mut skip = Vec::new();
     for (key, mut group) in grouped {
         group.sort_by(|a, b| {
@@ -659,13 +659,15 @@ fn build_active(
         });
         if skipped.contains(&key) {
             skip.push((key, group));
+        } else if group.is_empty() {
+            other.push((key, group));
         } else {
             normal.push((key, group));
         }
     }
     let mut groups = Vec::new();
     let mut convs = Vec::new();
-    for (key, group) in normal.into_iter().chain(skip) {
+    for (key, group) in normal.into_iter().chain(other).chain(skip) {
         // Session names already carry their project emoji, so no separate icon.
         groups.push(push_group(key, group, &mut convs, String::new()));
     }
@@ -2147,15 +2149,25 @@ fn draw(
     let mut sel_display = 0usize;
     let mut conv_seen = 0usize;
     let mut shown_skip = false;
+    let mut shown_other = false;
     for (ri, row) in rows.iter().enumerate() {
         if let Row::Header(gi) = row {
             let is_skip_group = flags.skipped.contains(&groups[*gi].key);
+            // A bare live session (no claude, not skipped) — classic's "other" bucket.
+            let is_other_group =
+                matches!(view, View::Active) && !is_skip_group && groups[*gi].convs.is_empty();
             if is_skip_group && !shown_skip {
                 shown_skip = true;
                 if !display.is_empty() {
                     display.push(Line::raw(""));
                 }
                 display.push(divider("skipped"));
+            } else if is_other_group && !shown_other {
+                shown_other = true;
+                if !display.is_empty() {
+                    display.push(Line::raw(""));
+                }
+                display.push(divider("other"));
             } else if !display.is_empty() && matches!(view, View::Active) {
                 // Blank line between groups only in Active; Browse stays dense so
                 // the many project headers are scannable at a glance.
@@ -3032,7 +3044,12 @@ fn header_line(
     // Trailing 🔇 marks a project muted; [archived] marks a revealed archived one.
     let mute_mark = if muted { "  🔇" } else { "" };
     let arch_mark = if archived { "  [archived]" } else { "" };
-    let text = format!("{icon}{}  ({n}, {live} live){mute_mark}{arch_mark}", g.key);
+    // A bare session/project (no conversations) reads cleaner as just its name.
+    let text = if n == 0 {
+        format!("{icon}{}{mute_mark}{arch_mark}", g.key)
+    } else {
+        format!("{icon}{}  ({n}, {live} live){mute_mark}{arch_mark}", g.key)
+    };
     let mut style = if archived {
         // Archived (only shown when revealed): dim gray, clearly set aside.
         Style::default()
@@ -3605,9 +3622,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_active_surfaces_bare_skipped_session() {
-        // A SKIPPED live tmux session with no conversation shows as a bare group
-        // (parity with classic's session-first list); a non-skipped one does not.
+    fn test_build_active_surfaces_bare_live_sessions() {
+        // Every live tmux session shows as a bare (0-conv) group for parity with
+        // classic's session-first list — skipped ones and plain shells alike.
         let reg = ConversationRegistry::default();
         let one = |s: &str| -> HashSet<String> { [s.to_string()].into_iter().collect() };
 
@@ -3618,11 +3635,41 @@ mod tests {
         );
         assert!(convs.is_empty(), "bare session has no conversations");
 
-        let (groups, _) = build_active(&reg, &HashSet::new(), &one("🐝 nope"));
+        // A non-skipped bare live session (e.g. `00-main`, a plain shell) now shows
+        // too — it belongs to the trailing "other" bucket, not hidden.
+        let (groups, _) = build_active(&reg, &HashSet::new(), &one("00-main"));
         assert!(
-            !groups.iter().any(|g| g.key == "🐝 nope"),
-            "non-skipped bare session stays hidden"
+            groups.iter().any(|g| g.key == "00-main"),
+            "non-skipped bare live session shows in the other bucket"
         );
+    }
+
+    #[test]
+    fn test_build_active_orders_normal_other_skipped() {
+        // Section order matches classic: claude groups, then bare "other", then skipped.
+        use crate::common::registry::TmuxPlacement;
+        let mut reg = ConversationRegistry::default();
+        let mut live = mk(
+            "live",
+            Lifecycle::Live,
+            Some("hive"),
+            Some("2026-07-01T00:00:00Z"),
+        );
+        live.placement = Some(TmuxPlacement {
+            session_name: "🐝 claude".to_string(),
+            window_index: "0".to_string(),
+            window_name: String::new(),
+            pane_id: None,
+        });
+        reg.conversations.insert("live".into(), live);
+        let live_sessions: HashSet<String> = ["🐝 claude", "00-other", "🌳 skip"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let skipped: HashSet<String> = ["🌳 skip"].into_iter().map(String::from).collect();
+        let (groups, _) = build_active(&reg, &skipped, &live_sessions);
+        let keys: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, vec!["🐝 claude", "00-other", "🌳 skip"]);
     }
 
     #[test]
