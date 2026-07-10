@@ -993,7 +993,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     // Freeze-note input: Some(target) while typing the note for a pending freeze.
     let mut freezing: Option<FreezeTarget> = None;
     let mut freeze_note = String::new();
-    // Hint-jump (`g`): each visible conversation gets a 2-char label; typing one
+    // Hint-jump (`f`): each visible conversation gets a 2-char label; typing one
     // activates it. `hint_labels` maps label → conv index; `hint_buffer` is the
     // partial input.
     let mut hinting = false;
@@ -1501,7 +1501,8 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
             }
             // `g` labels every visible conversation for hint-jump (beyond the 1-9 cap).
-            KeyCode::Char('g') => {
+            // `f` (Vimium-style) labels every visible conversation for hint-jump.
+            KeyCode::Char('f') => {
                 let cis: Vec<usize> = rows
                     .iter()
                     .filter_map(|r| match r {
@@ -1587,11 +1588,12 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 }
             }
             // Session-level flag toggles on the selected LIVE conversation's session.
-            KeyCode::Char('f') | KeyCode::Char('m') | KeyCode::Char('s') | KeyCode::Char('!') => {
+            // `v` favorites (★) — `f` is hint-jump, mirroring Vimium.
+            KeyCode::Char('v') | KeyCode::Char('m') | KeyCode::Char('s') | KeyCode::Char('!') => {
                 if let Some(c) = selected_conv(&rows, &convs) {
                     if let Some(p) = &c.placement {
                         let flag = match key.code {
-                            KeyCode::Char('f') => Flag::Favorite,
+                            KeyCode::Char('v') => Flag::Favorite,
                             KeyCode::Char('m') => Flag::Mute,
                             KeyCode::Char('!') => Flag::AutoApprove,
                             _ => Flag::Skip,
@@ -1694,7 +1696,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · g jump · z freeze · P pin · Del close · f★ m ! s · M mute-all · / search · ? · q",
+            " → detail · Enter switch · f jump · z freeze · P pin · Del close · v★ m ! s · M mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -2473,8 +2475,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::raw(""),
         key("1-9", "Jump to / switch the Nth conversation"),
         key(
-            "g",
-            "Hint-jump: label every conversation, type one to switch",
+            "f",
+            "Hint-jump: label every conversation, type one to switch (Vimium-style)",
         ),
         key("↑/↓ j/k", "Move selection"),
         key(
@@ -2489,7 +2491,7 @@ fn help_lines() -> Vec<Line<'static>> {
             "z",
             "Freeze the selected live conversation (prompts for a note)",
         ),
-        key("f / m", "Favorite ★ / mute the conversation's session"),
+        key("v / m", "Favorite ★ / mute the conversation's session"),
         key(
             "m",
             "On a project (Browse/detail): mute the whole project (remembered)",
