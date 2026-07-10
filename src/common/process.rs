@@ -68,6 +68,65 @@ pub fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children
 }
 
+/// Build a pid→full-command-line map via one `ps -axww -o pid=,command=` call.
+/// Unlike `sysinfo`'s `cmd()` (empty for Claude on macOS, which is why claude is
+/// detected by its version-string process name), `ps` reports the real argv, so
+/// this recovers `claude --resume <session_id>` — the per-window conversation id
+/// that survives hook-state pruning. `-ww` disables width truncation.
+pub fn build_cmdline_map() -> HashMap<u32, String> {
+    let output = match std::process::Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim_start();
+        if let Some((pid_str, cmd)) = line.split_once(char::is_whitespace) {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                map.insert(pid, cmd.trim().to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Extract the `--resume <id>` (or `--resume=<id>`) Claude session id from a command
+/// line, validated as UUID-shaped. None for `claude -c` / plain `claude` (no id in argv).
+pub fn parse_resume_id(cmd: &str) -> Option<String> {
+    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    for (i, t) in toks.iter().enumerate() {
+        let id = if let Some(rest) = t.strip_prefix("--resume=") {
+            Some(rest.to_string())
+        } else if *t == "--resume" {
+            toks.get(i + 1).map(|s| s.to_string())
+        } else {
+            None
+        };
+        if let Some(id) = id {
+            if is_uuidish(&id) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Canonical 8-4-4-4-12 hex UUID shape (a Claude session id), so a stray `--resume`
+/// argument can't be mistaken for one.
+fn is_uuidish(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    b.iter().enumerate().all(|(i, &c)| match i {
+        8 | 13 | 18 | 23 => c == b'-',
+        _ => c.is_ascii_hexdigit(),
+    })
+}
+
 /// Walk a pre-built children map to collect all descendant PIDs of `parent_pid`.
 pub fn collect_descendants(
     children: &HashMap<u32, Vec<u32>>,
@@ -130,6 +189,25 @@ mod tests {
     fn test_is_claude_command_contains() {
         assert!(is_claude_process(&make_proc("node", "/path/to/claude")));
         assert!(is_claude_process(&make_proc("node", "claude -c")));
+    }
+
+    #[test]
+    fn test_parse_resume_id() {
+        let id = "d67ea1c0-cd45-4c2e-b8f9-d531265e8dac";
+        assert_eq!(
+            parse_resume_id(&format!("claude --resume {id}")).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            parse_resume_id(&format!("/usr/bin/claude --resume={id} --foo")).as_deref(),
+            Some(id)
+        );
+        // No id in argv → None (fresh session / continue).
+        assert_eq!(parse_resume_id("claude"), None);
+        assert_eq!(parse_resume_id("claude -c"), None);
+        // A non-UUID resume argument must not be mistaken for a session id.
+        assert_eq!(parse_resume_id("claude --resume latest"), None);
+        assert_eq!(parse_resume_id("claude --resume"), None);
     }
 
     #[test]

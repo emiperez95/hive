@@ -416,6 +416,29 @@ pub fn find_latest_jsonl_for_cwd(cwd: &str) -> Option<PathBuf> {
         .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+/// Every transcript id (jsonl basename) for a cwd across all profile dirs, most
+/// recently modified first. Used to assign the newest unclaimed conversation to a
+/// live Claude window sharing a cwd, when its exact id can't be read from argv.
+pub fn list_jsonls_for_cwd_by_recency(cwd: &str) -> Vec<String> {
+    let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
+    for dir in candidate_projects_paths(cwd) {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                if let (Some(stem), Ok(mtime)) = (
+                    p.file_stem().map(|s| s.to_string_lossy().into_owned()),
+                    e.metadata().and_then(|m| m.modified()),
+                ) {
+                    entries.push((stem, mtime));
+                }
+            }
+        }
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.into_iter().map(|(id, _)| id).collect()
+}
+
 /// Find a specific session's jsonl file (`<session_id>.jsonl`) across profile dirs for a cwd.
 /// The Claude `session_id` is exactly the jsonl basename, so this resolves an instance to
 /// its own conversation even when several Claude instances share the same working directory.

@@ -85,21 +85,55 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
     // keeps each live id's process tree for the optional CPU/mem sample.
     let mut live_placements: HashMap<String, TmuxPlacement> = HashMap::new();
     let mut id_pids: HashMap<String, Vec<u32>> = HashMap::new();
-    for inst in instances::detect_all_instances() {
-        // Prefer the hook-resolved conversation id. If a live Claude window has no
-        // hook entry (state.json only tracks recently-active conversations), fall
-        // back to the newest transcript in its cwd — but ONLY when the cwd isn't
-        // shared by multiple windows, where that fallback would be ambiguous
-        // (the S4/S5 seam). Without this, live windows absent from state.json are
-        // invisible in the Active view even though classic `prefix + s` shows them.
+    // Full process argv (one `ps`) so we can read `claude --resume <id>` — the
+    // per-window conversation id that survives hook-state pruning.
+    let cmdlines = crate::common::process::build_cmdline_map();
+    let instances = instances::detect_all_instances();
+    // `claimed` prevents two windows resolving to the same transcript.
+    let mut claimed: HashSet<String> = HashSet::new();
+
+    // Pass 1 — EXACT ids: the hook-resolved id, else `--resume <id>` from the
+    // process argv (validated: the transcript must exist). Both are per-window
+    // exact, so they always beat the recency guess below.
+    let mut pending: Vec<(Option<String>, instances::ClaudeInstance)> = Vec::new();
+    for inst in instances {
         let sid = inst.session_id.clone().or_else(|| {
-            if inst.cwd_shared {
-                None
-            } else {
-                jsonl::find_latest_jsonl_for_cwd(&inst.cwd)
-                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-            }
+            inst.pids
+                .iter()
+                .filter_map(|pid| cmdlines.get(pid))
+                .find_map(|cmd| crate::common::process::parse_resume_id(cmd))
+                .filter(|id| jsonl::find_jsonl_by_session_id(&inst.cwd, id).is_some())
         });
+        if let Some(s) = &sid {
+            claimed.insert(s.clone());
+        }
+        pending.push((sid, inst));
+    }
+
+    // Pass 2 — FILL unresolved windows (no hook, plain `claude` with no id in argv,
+    // e.g. state.json pruned). A single-window cwd takes its newest transcript; a
+    // shared cwd takes the newest transcript not already claimed by a sibling window
+    // (N live windows ↔ N most-recent transcripts). Without this, live windows
+    // absent from state.json are invisible here though classic `prefix + s` shows them.
+    for (sid, inst) in &mut pending {
+        if sid.is_some() {
+            continue;
+        }
+        let candidate = if inst.cwd_shared {
+            jsonl::list_jsonls_for_cwd_by_recency(&inst.cwd)
+                .into_iter()
+                .find(|id| !claimed.contains(id))
+        } else {
+            jsonl::find_latest_jsonl_for_cwd(&inst.cwd)
+                .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        };
+        if let Some(c) = candidate {
+            claimed.insert(c.clone());
+            *sid = Some(c);
+        }
+    }
+
+    for (sid, inst) in pending {
         if let Some(sid) = sid {
             id_pids.insert(sid.clone(), inst.pids.clone());
             live_placements.insert(
