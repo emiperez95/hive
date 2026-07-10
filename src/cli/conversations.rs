@@ -41,7 +41,9 @@ use crate::common::registry::{
     self, Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
     TmuxPlacement,
 };
-use crate::common::tmux::{get_current_tmux_session, select_window, switch_to_session};
+use crate::common::tmux::{
+    get_current_tmux_session, get_current_tmux_session_names, select_window, switch_to_session,
+};
 use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
 use crate::ipc::messages::{HookState, SessionStatus};
@@ -198,6 +200,8 @@ enum Action {
     WtNew(String, String),
     /// Delete a worktree (project key, branch).
     WtDelete(String, String),
+    /// Switch to a bare tmux session (one with no live conversation).
+    SwitchSession(String),
 }
 
 /// Which list the TUI is showing.
@@ -620,6 +624,7 @@ fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
 fn build_active(
     reg: &ConversationRegistry,
     skipped: &HashSet<String>,
+    live_sessions: &HashSet<String>,
 ) -> (Vec<Group>, Vec<Conversation>) {
     use std::collections::BTreeMap;
     let mut grouped: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
@@ -633,6 +638,15 @@ fn build_active(
             .map(|p| p.session_name.clone())
             .unwrap_or_else(|| "(detached)".to_string());
         grouped.entry(key).or_default().push(c);
+    }
+    // Surface SKIPPED live tmux sessions that have no live conversation as bare
+    // (0-conv) groups, so the skipped set matches classic's session-first list —
+    // otherwise a skipped session where claude isn't running is invisible here and
+    // can't be seen or un-skipped.
+    for name in live_sessions {
+        if skipped.contains(name) {
+            grouped.entry(name.clone()).or_default();
+        }
     }
     // Partition into normal (first) and skipped (last) session groups.
     let mut normal = Vec::new();
@@ -1041,6 +1055,7 @@ fn run_conversations_tui() -> Result<()> {
         Action::WtDelete(project, branch) => {
             crate::cli::worktree::run_wt_delete(&project, &branch, false, false)?
         }
+        Action::SwitchSession(name) => switch_to_session(&name),
     }
     Ok(())
 }
@@ -1069,7 +1084,9 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
         let src = &filtered;
         match view {
             View::Active => {
-                let (g, c) = build_active(src, skipped);
+                let live_sessions: HashSet<String> =
+                    get_current_tmux_session_names().into_iter().collect();
+                let (g, c) = build_active(src, skipped, &live_sessions);
                 (g, c, HashSet::new())
             }
             View::Browse => {
@@ -1886,10 +1903,14 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                 sel = 0;
             }
             KeyCode::Enter => match rows.get(sel) {
-                // Enter on a conversation switches/resumes it; on a header (a
-                // project), it opens that project's detail.
+                // Enter on a conversation switches/resumes it; on a header, it opens
+                // the project detail — except a bare Active session (no live conv),
+                // where there's nothing to detail, so Enter attaches to the session.
                 Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
-                Some(Row::Header(_)) => {
+                Some(Row::Header(gi)) => {
+                    if matches!(view, View::Active) && groups[*gi].convs.is_empty() {
+                        return Ok(Action::SwitchSession(groups[*gi].key.clone()));
+                    }
                     if let Some(d) =
                         detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
                     {
@@ -1917,22 +1938,32 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
                     }
                 }
             }
-            // Session-level flag toggles on the selected LIVE conversation's session.
+            // Session-level flag toggles. Target session = the selected LIVE
+            // conversation's session, OR (Active) the selected session header —
+            // so a bare skipped session can be un-skipped here too.
             // `v` favorites (★) — `f` is hint-jump, mirroring Vimium.
             KeyCode::Char('v') | KeyCode::Char('m') | KeyCode::Char('s') | KeyCode::Char('!') => {
-                if let Some(c) = selected_conv(&rows, &convs) {
-                    if let Some(p) = &c.placement {
-                        let flag = match key.code {
-                            KeyCode::Char('v') => Flag::Favorite,
-                            KeyCode::Char('m') => Flag::Mute,
-                            KeyCode::Char('!') => Flag::AutoApprove,
-                            _ => Flag::Skip,
-                        };
-                        toggle_flag(&p.session_name, flag);
-                        flags = Flags::load();
-                        // Skip changes grouping/section, so rebuild.
-                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                let session = match rows.get(sel) {
+                    Some(Row::Conv { ci, .. }) => convs[*ci]
+                        .placement
+                        .as_ref()
+                        .map(|p| p.session_name.clone()),
+                    Some(Row::Header(gi)) if matches!(view, View::Active) => {
+                        Some(groups[*gi].key.clone())
                     }
+                    _ => None,
+                };
+                if let Some(session) = session {
+                    let flag = match key.code {
+                        KeyCode::Char('v') => Flag::Favorite,
+                        KeyCode::Char('m') => Flag::Mute,
+                        KeyCode::Char('!') => Flag::AutoApprove,
+                        _ => Flag::Skip,
+                    };
+                    toggle_flag(&session, flag);
+                    flags = Flags::load();
+                    // Skip changes grouping/section, so rebuild.
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 }
             }
             // Shift-M toggles GLOBAL mute (all notifications), distinct from the
@@ -3571,6 +3602,27 @@ mod tests {
         let set: std::collections::HashSet<&String> = labels.iter().collect();
         assert_eq!(set.len(), labels.len(), "labels must be unique");
         assert_eq!(&labels[0..3], &["aa", "as", "ad"]); // stable order
+    }
+
+    #[test]
+    fn test_build_active_surfaces_bare_skipped_session() {
+        // A SKIPPED live tmux session with no conversation shows as a bare group
+        // (parity with classic's session-first list); a non-skipped one does not.
+        let reg = ConversationRegistry::default();
+        let one = |s: &str| -> HashSet<String> { [s.to_string()].into_iter().collect() };
+
+        let (groups, convs) = build_active(&reg, &one("🌳 Bare"), &one("🌳 Bare"));
+        assert!(
+            groups.iter().any(|g| g.key == "🌳 Bare"),
+            "bare skipped shows"
+        );
+        assert!(convs.is_empty(), "bare session has no conversations");
+
+        let (groups, _) = build_active(&reg, &HashSet::new(), &one("🐝 nope"));
+        assert!(
+            !groups.iter().any(|g| g.key == "🐝 nope"),
+            "non-skipped bare session stays hidden"
+        );
     }
 
     #[test]
