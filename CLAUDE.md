@@ -5,12 +5,30 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 204 tests (183 unit + 21 CLI smoke)
+cargo test                # 270 tests (248 unit + 22 CLI smoke)
 cargo build               # dev build
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
+cargo fmt                 # CI has a fmt gate — run before committing
 cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
+
+> `cargo test` prints ~478 passing because `common/` + `ipc/` (208 tests) compile into
+> **both** the lib and bin targets and run twice. Distinct tests: 248 unit + 22 smoke.
+
+## Two TUIs (parallel coexistence)
+
+hive currently ships **two** interactive views over the same data. This is a deliberate
+strangler-fig migration state — neither is retired:
+
+| | classic (`hive`, `prefix + s`) | conversations (`hive conversations`, `prefix + a`) |
+|---|---|---|
+| Base entity | **tmux session** (session-first) | **Claude conversation** (UUID-keyed) |
+| Shows | live sessions only | live **and** closed/resumable/frozen conversations |
+| Code | `src/tui/` | `src/cli/conversations.rs` |
+
+The conversations TUI is feature-complete and at full parity with classic (plus more).
+See **Conversations TUI** below. Classic is untouched — you can run either.
 
 ## Architecture
 
@@ -23,15 +41,23 @@ TUI (1s refresh)  → reads state.json   + tmux sessions + sysinfo + libproc + C
 
 **Data flow**: `hive hook` writes `state.json` atomically (write .tmp, rename). TUI reads it each refresh cycle. No locking needed.
 
+**Important**: `state.json` is *ephemeral* — the hook handler prunes entries after 10 min of
+inactivity, so a long-idle-but-running Claude window often has **no** hook entry. Anything
+that must see every live Claude window (the conversation model) cannot rely on it alone.
+
 ## CLI
 
 ```
-hive                    # open TUI (default)
+hive                    # open classic TUI (default)
+hive conversations      # open conversation-first TUI (prefix + a)
+hive conversations --list  # static listing (no TUI); also used when piped
+hive stats [--days N]   # usage summary from the activity log (default 7 days)
 hive start              # auto-attach to first available session (or fall through to picker)
 hive --detail           # open TUI with detail view for current session
 hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
 hive setup              # register hooks, agent, and tmux keybindings
+hive uninstall          # remove hooks + tmux keybindings
 hive update             # update to latest version from GitHub + re-run setup
 hive --version          # print current version
 hive cycle-next         # switch to next tmux session (skipping skipped)
@@ -83,25 +109,33 @@ Installed to `~/.claude/agents/janus-wt-portal.md` globally so it's available in
 ```
 src/
 ├── main.rs                 CLI entry point: arg parsing + dispatch (~125 lines)
-├── lib.rs                  exports common module for bench binary
+├── lib.rs                  exports common + ipc modules for the bench binary
 ├── bin/bench.rs            benchmark tool
 ├── cli/
 │   ├── mod.rs              Args, Command, subcommand enums, PostAction
-│   ├── hook.rs             run_hook(): parse stdin JSON, update state, notify
+│   ├── conversations.rs    ★ conversation-first TUI (self-contained: gather, views, render, keys) — ~3.9k lines
+│   ├── hook.rs             run_hook(): parse stdin JSON, update state, notify (honors muted projects)
 │   ├── setup.rs            run_setup(), run_uninstall(), is_hive_hook_command()
 │   ├── worktree.rs         run_wt_new/delete/list/import(): full worktree lifecycle
 │   ├── project.rs          run_project_add/remove/list/import()
 │   ├── todo.rs             run_todo*(), resolve_session()
 │   ├── session.rs          run_cycle/spread/collapse/connect/start()
+│   ├── stats.rs            run_stats(): usage summary from the activity log
 │   └── update.rs           run_update(): self-update from GitHub
 ├── common/
 │   ├── types.rs            TmuxSession, SessionInfo, ClaudeStatus, ProcessInfo, PERMISSION_KEYS
-│   ├── tmux.rs             tmux command helpers (list-sessions, switch, send-keys, kill, resolve_tmux_path, set_all_sessions_layout)
-│   ├── process.rs          Claude process detection, process tree traversal (sysinfo)
+│   ├── registry.rs         ★ conversation model: Conversation, ConversationId, Lifecycle, TmuxPlacement,
+│   │                         ConversationRegistry::from_shadow(), resolve_parent(), sidecar/overlay
+│   ├── instances.rs        ★ per-WINDOW Claude detection (a session may host many); HookIndex pane→id resolve
+│   ├── frozen.rs           freeze/thaw one Claude window (FrozenState/FrozenEntry, frozen.json)
+│   ├── activity.rs         append-only activity log + open-windows snapshot; compute_stats()
+│   ├── machine.rs          machine sleep/wake intervals from `pmset -g log` (macOS), for accurate usage time
+│   ├── tmux.rs             tmux helpers (list-sessions/windows, switch, send-keys, kill, get_all_windows, layout)
+│   ├── process.rs          Claude process detection, process tree, build_cmdline_map/parse_resume_id
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
 │   ├── iterm.rs            iTerm2 pane spread/collapse via AppleScript (macOS only, #[cfg] guarded)
-│   ├── jsonl.rs            JSONL parsing for Claude status + conversation extraction from ~/.claude/projects/ (searches all auth profiles)
+│   ├── jsonl.rs            JSONL parsing + transcript scan (all auth profiles), mtime-keyed scan cache
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
@@ -111,21 +145,40 @@ src/
 │   └── notifier.rs         platform-native notifications (terminal-notifier/osascript/notify-send)
 ├── ipc/
 │   └── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
-├── serve/
+├── serve/                  NOTE: still on the OLD session model (no ConversationRegistry yet)
 │   ├── mod.rs              module registration (server, web, web_types)
 │   ├── server.rs           gather_session_data() — collects local sessions for the web API
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
-├── tui/
+├── tui/                    classic (session-first) TUI
 │   ├── app.rs              App struct, refresh(), session management, search, favorites, todos
 │   ├── event_loop.rs       run_tui(): key handling, input modes, post-action dispatch
 │   └── ui.rs               ratatui rendering (list, detail, search, help, input modals)
 └── tests/
-    └── cli_smoke.rs        21 integration tests: CLI arg parsing, read-only commands, todo roundtrip
+    └── cli_smoke.rs        22 integration tests: CLI arg parsing, read-only commands, todo roundtrip
 ```
 
 ## Key Types
+
+**Conversation model** (the re-rooted model behind `hive conversations`):
+
+- `Conversation` (common/registry.rs) — the base entity, keyed by the Claude conversation UUID
+  (the `<uuid>.jsonl` basename): id, cwd, lifecycle, status, last_activity, placement, parent,
+  frozen, note, pinned, archived, title, auth_config_dir, and runtime-only `cpu`/`mem_kb`
+- `ConversationId` — newtype over the UUID (machine-independent, unlike tmux names)
+- `Lifecycle` — `Live` | `Closed`. **A live tmux placement is the SOLE discriminator** for Live
+- `TmuxPlacement` — where a conversation currently runs (session_name, window_index, window_name,
+  pane_id). Ephemeral — tmux names are per-host, the UUID is not
+- `ConversationRegistry` (common/registry.rs) — `HashMap<id, Conversation>`, built read-only via
+  `from_shadow(hook, disk_ids, live_placements, sidecar)` — a left-join over state.json + a disk
+  scan + the overlay sidecar
+- `ConversationSidecar` / `ConversationOverlay` — writable per-conversation overlay
+  (note/pinned/archived), persisted to `conversations.json`
+- `ClaudeInstance` (common/instances.rs) — one running Claude **window** (session, window_index,
+  window_name, pane, cwd, pids, session_id, `cwd_shared`)
+
+**Session model** (classic TUI, hooks, web):
 
 - `HookState` (ipc/messages.rs) — `HashMap<session_id, SessionState>`, serialized to state.json
 - `SessionState` — session_id, cwd, status, needs_attention, last_activity
@@ -153,13 +206,18 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 ~/.hive/
 ├── projects.toml              # project registry
 ├── cache/                     # runtime state
-│   ├── state.json             # hook state (session statuses)
+│   ├── state.json             # hook state (session statuses) — PRUNED after 10min idle
 │   ├── worktrees.json         # registered worktrees
 │   ├── frozen.json            # frozen (hibernated) Claude windows — resume metadata + notes
-│   ├── favorites.txt           # favorite session names
+│   ├── conversations.json     # per-conversation overlay sidecar: note / pinned / archived
+│   ├── conversation-scan.json # mtime-keyed transcript scan cache (warm gather ~6x faster)
+│   ├── activity.jsonl         # append-only lifecycle/focus event log (feeds `hive stats`)
+│   ├── open-windows.json      # snapshot of currently-open windows (recovery projection)
+│   ├── favorites.txt          # favorite session names
 │   ├── todos.txt              # per-session todo lists (active)
 │   ├── todos-done.txt         # per-session completed todos
 │   ├── muted.txt              # muted session names
+│   ├── muted-projects.txt     # muted PROJECT keys (remembered preference; honored by the hook notifier)
 │   ├── auto-approve.txt       # auto-approve session names
 │   ├── skipped.txt            # skipped-from-cycling session names
 │   ├── restore.txt            # sessions to restore
@@ -171,6 +229,10 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
         └── lib/               # shared shell libraries for hooks
 ```
 
+Files are created on demand — `conversations.json` / `muted-projects.txt` only exist once you
+pin/note a conversation or mute a project. (Old installs may also have stale `parked.txt` /
+`remote-*.json` on disk; no current code reads them.)
+
 ## Platform Guards
 
 macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other platforms:
@@ -178,7 +240,7 @@ macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other
 - `chrome.rs`: `get_chrome_tabs()`, `open_chrome_tab()`, `focus_chrome_tab()`, `focus_all_matched_tabs()` — uses JXA (sees all Chrome profiles)
 - `iterm.rs`: `get_iterm_pane_count()`, `spread_panes()`, `collapse_panes()` — uses AppleScript
 
-## Key Handling
+## Key Handling (classic TUI)
 
 All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::Press` only (crossterm 0.28 sends release events that break Esc in tmux popups). The if/else chain priority:
 
@@ -191,6 +253,97 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 6. Normal list → navigate, switch (exits app), approve permissions, search, `L` spread/collapse, quit
 
 Switching sessions (1-9, Enter in detail, connect project, thawing a frozen session) always exits the app.
+
+## Conversations TUI (`hive conversations`, `prefix + a`)
+
+The conversation-first view. Self-contained in `src/cli/conversations.rs` (~3.9k lines) over
+the `common/registry.rs` model. Base entity is the **conversation** (Claude UUID), not the tmux
+session — so closed/resumable and frozen conversations are first-class, and identity survives
+tmux renames (a prerequisite for the future distributed/offload tier).
+
+### Two views
+
+**Active** (default) — live conversations grouped by the tmux session running them. It is
+**session-first-complete**: it mirrors classic's buckets so nothing is invisible.
+
+```
+🐝 hive  (2, 1 live)          ← sessions running claude
+ 1 ● abc12345  my task          → working  (2m ago)  12%  340M
+ 2 ❯ 2         server             window     ← non-claude window of that session
+
+  ── other ──                 ← live sessions with NO claude
+📁 00-main
+ 3 ❯ 1         ssh                window
+
+  ── skipped ──               ← skipped sessions (dim blue)
+🌳 Clear Session  (2, 2 live)
+```
+
+- A session's tmux windows that host **no** conversation render as dimmed `❯ … window` rows.
+  They're switch targets like conversations (numbered 1-9, Enter switches).
+- Bare (0-conversation) headers show just the session name; Enter attaches.
+- `s/v/m/!` on a window row or session header act on the **parent session** (these flags are
+  session-level).
+
+**Browse** (`/`) — a project launchpad: flat project list (empty registered projects included),
+`💤 frozen` bucket pinned first. Typing searches projects-first then conversations. Archived
+projects hide on the full list but surface on search (matching classic) or via `Ctrl+R`.
+
+### Detail screens
+
+Stack above the list; `←`/`h`/`Esc` pops back.
+- **Project detail** — config, worktrees w/ live·frozen counts, all its conversations;
+  `n` new conversation, `r` resume-last, `w`/`x` create/delete worktree.
+- **Conversation detail** — **async** (`std::thread` + `Arc<Mutex<…>>`, no tokio): paints
+  instantly from the registry, then fills CPU/mem, processes, ports (+Chrome titles), git
+  commits, and a transcript tail as they arrive.
+
+### Keys
+
+| Key | Action |
+|---|---|
+| `1-9` | switch to the Nth switch target (conversation **or** window) |
+| `f` | hint-jump — 2-char home-row labels on every conversation (Vimium-style) |
+| `Enter` | conversation → switch/resume · window → switch · header → project detail |
+| `→`/`l` | drill into detail · `←`/`h`/`Esc` back |
+| `/` | Browse + search (types immediately) |
+| `v` `m` `s` `!` | favorite · mute · skip · auto-approve (session-level) |
+| `M` | global mute · `P` pin conversation · `e` edit note |
+| `z`/`Z` | freeze a Claude window (prompts for a note) |
+| `Del` | close live conv (kill window) · discard frozen · archive project |
+| `L` `N` | iTerm spread/collapse · new-project wizard |
+| `Ctrl+R` | Browse: reveal/hide archived |
+
+**Mute has three levels**: `m` per-session, `M` global, and `m` on a *project* (Browse header /
+project detail) = a remembered preference in `muted-projects.txt` honored by the hook notifier,
+so future sessions of that project stay silent.
+
+### How a live conversation is resolved (the tricky part)
+
+`gather_conversations_inner()` must map each running Claude **window** to its conversation UUID.
+`state.json` can't be trusted for this (pruned after 10min idle — often 1 entry while 10 windows
+run), and a cwd shared by several Claude windows makes "newest transcript in this cwd" ambiguous.
+Resolution order per window:
+
+1. **Hook id** — pane-bound `state.json` entry (authoritative when present).
+2. **`claude --resume <id>` from process argv** — pruning-proof and per-window exact. Read via
+   `process::build_cmdline_map()` (`ps -axww`), because **sysinfo's `cmd()` is empty for claude
+   on macOS** — which is also why `is_claude_process` falls back to the version-string process
+   *name*. Validated against an on-disk transcript. Covers every hive thaw/reopen (they launch
+   with `--resume <id>`).
+3. **Recency fill** — a plain `claude` (no id in argv) takes the newest transcript for its cwd
+   not already claimed by a sibling window (N live windows ↔ N newest transcripts).
+
+*Known residual*: fresh **parallel** `claude` sessions in one cwd are matched by recency — a
+best-effort guess, not a true window↔transcript link (none exists off-process: claude doesn't
+hold the jsonl open). Exact wherever argv has `--resume`.
+
+### Performance
+
+`jsonl::scan_all_disk_conversations_cached()` keys an on-disk cache
+(`conversation-scan.json`) by transcript mtime: it stats every transcript but only re-parses
+changed ones. Warm gather **0.43s → 0.07s (~6x)**. The list auto-refreshes on a 2s idle tick,
+preserving selection by conversation id.
 
 ## Frozen Windows (Freeze / Thaw)
 
@@ -417,29 +570,49 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 ## Testing
 
-204 tests total. Run with `cargo test`.
+270 distinct tests. Run with `cargo test`.
 
-**Unit tests (183)** — in-module `#[cfg(test)]` blocks:
-- `common/` modules: types, projects, worktree, jsonl, chrome, process, persistence (escape/unescape, set/todo file roundtrips)
-- `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
-- `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
+> `cargo test` prints ~478 passing: `common/` + `ipc/` (208) compile into **both** the lib and
+> bin targets and run twice. Per target: lib 208 · bin 248 (the superset — adds cli/daemon/tui)
+> · smoke 22.
 
-**Integration tests (21)** — `tests/cli_smoke.rs`, run the actual binary:
+**Unit tests (248)** — in-module `#[cfg(test)]` blocks:
+- `common/` (193): types, projects, worktree, jsonl, chrome, process (claude detection,
+  `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
+  (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
+  frozen, activity
+- `ipc/messages.rs` (15): HookState operations, cleanup, serialization roundtrips
+- `daemon/hooks.rs` (27): all HookEvent variants, status transitions, session lifecycle
+- `tui/` (7) and `cli/` (6): incl. `conversations.rs` — `build_active` bucketing
+  (normal/other/skipped), bare-session surfacing, covered-window exclusion, `build_browse`
+  archived visibility, hint labels
+
+**Integration tests (22)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
-- Read-only commands exit 0 (project list, wt list, todo list)
+- Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
 - Todo full roundtrip (add → list → next → done → clear)
 - Project archive roundtrip (add → archive → list hides → `--all` shows → unarchive), isolated via a temp `$HOME`
 
-No TUI tests (interactive rendering). No tmux-dependent tests (would need integration test infrastructure).
+No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test
+infrastructure) — hence the pure `build_active`/`build_browse` functions take their tmux/flag
+inputs as parameters, which is what makes them unit-testable.
 
 ## Conventions
 
-- No `tokio` or async — everything is synchronous
-- Atomic file writes for state.json (write to .tmp, rename)
+- No `tokio` or async — everything is synchronous. Background work (conversation detail) uses
+  `std::thread` + `Arc<Mutex<…>>`, not a runtime
+- Atomic file writes for state.json (write to .tmp, rename) — same idiom for frozen.json,
+  conversations.json, worktrees.json
 - `anyhow::Result` for error handling throughout
-- `sysinfo::System` is kept alive in `App` for CPU delta accuracy (needs two refresh_all calls)
-- Stale sessions cleaned up after 10 minutes of inactivity (in hook handler)
+- `sysinfo::System` is kept alive in `App` / the conversations loop for CPU delta accuracy
+  (needs two refresh calls)
+- Stale sessions cleaned up after 10 minutes of inactivity (in hook handler) — so **never treat
+  `state.json` as a complete list of live Claude windows**
+- **Gotcha**: `sysinfo`'s `cmd()` is empty for claude on macOS — use `ps` (`build_cmdline_map`)
+  for argv, and note `is_claude_process` therefore keys off the version-string process *name*
+- Prefer pure functions taking their environment as parameters (e.g. `build_active(reg, skipped,
+  session_windows)`) so tmux-dependent logic stays unit-testable
 
 ## Session Naming
 

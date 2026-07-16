@@ -1,7 +1,11 @@
 //! Re-rooted conversation model, keyed by the Claude conversation UUID (the
 //! `<uuid>.jsonl` basename). Built read-only as a shadow over the existing
-//! `state.json` + a disk scan + a `conversations.json` overlay sidecar. Nothing here
-//! is wired into a writer or a view yet (Increment 0).
+//! `state.json` + a disk scan + a `conversations.json` overlay sidecar.
+//!
+//! This is the model behind the `hive conversations` TUI (`src/cli/conversations.rs`,
+//! `prefix + a`). It does not write `state.json` — the hook remains the sole writer;
+//! the only writable surface here is the overlay sidecar (note / pinned / archived).
+//! The classic session-first TUI (`src/tui/`) is untouched and still runs alongside.
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
