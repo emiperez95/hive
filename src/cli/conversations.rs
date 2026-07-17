@@ -965,19 +965,29 @@ impl ConvDetailState {
 
 /// The live conversation running in the caller's current tmux window (for `--detail`).
 /// Prefers an exact session+window match; falls back to any live conversation in the
-/// current session when the window index can't be read.
+/// current session (mirroring classic's session-level `--detail`) when the window index
+/// can't be read or doesn't line up — e.g. a popup reporting its own window.
 fn current_window_conv(reg: &ConversationRegistry) -> Option<Conversation> {
     let session = get_current_tmux_session()?;
-    let window = get_current_tmux_window();
-    reg.conversations
+    let in_session: Vec<&Conversation> = reg
+        .conversations
         .values()
         .filter(|c| c.lifecycle.is_actionable_here())
-        .find(|c| {
-            c.placement.as_ref().is_some_and(|p| {
-                p.session_name == session && window.as_ref().is_none_or(|w| &p.window_index == w)
-            })
+        .filter(|c| {
+            c.placement
+                .as_ref()
+                .is_some_and(|p| p.session_name == session)
         })
-        .cloned()
+        .collect();
+    if let Some(w) = get_current_tmux_window() {
+        if let Some(c) = in_session
+            .iter()
+            .find(|c| c.placement.as_ref().is_some_and(|p| p.window_index == w))
+        {
+            return Some((*c).clone());
+        }
+    }
+    in_session.first().map(|c| (*c).clone())
 }
 
 /// Open a conversation's detail: keep the instant static data and spawn a detached
