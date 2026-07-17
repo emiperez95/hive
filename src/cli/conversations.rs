@@ -519,6 +519,16 @@ fn toggle_flag(session: &str, flag: Flag) {
     save(&set);
 }
 
+/// Un-skip a session (remove it from the skipped set) if present. Switching TO a
+/// session means you're actively using it, so it should re-enter cycling — mirrors
+/// classic's `unskip` on switch.
+fn unskip_session(name: &str) {
+    let mut skipped = load_skipped_sessions();
+    if skipped.remove(name) {
+        save_skipped_sessions(&skipped);
+    }
+}
+
 /// Build a freeze target from a live conversation (its window placement + id).
 fn freeze_target_of(c: &Conversation) -> Option<FreezeTarget> {
     let p = c.placement.as_ref()?;
@@ -1163,13 +1173,20 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
         Action::Quit => {}
         Action::Switch(c) => {
             if let Some(p) = &c.placement {
+                unskip_session(&p.session_name);
                 switch_to_session(&p.session_name);
                 if !p.window_index.is_empty() {
                     select_window(&p.session_name, &p.window_index);
                 }
             }
         }
-        Action::Reopen(c) => println!("{}", reopen(&c)?),
+        Action::Reopen(c) => {
+            // Resuming into a session you're actively opening should un-skip it.
+            if let Some(s) = target_session(&c) {
+                unskip_session(&s);
+            }
+            println!("{}", reopen(&c)?)
+        }
         Action::NewInProject(key) => println!("{}", new_conversation(&key)?),
         Action::Spread(n) => crate::cli::session::run_spread(n)?,
         Action::Collapse => crate::cli::session::run_collapse()?,
@@ -1179,8 +1196,12 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
         Action::WtDelete(project, branch) => {
             crate::cli::worktree::run_wt_delete(&project, &branch, false, false)?
         }
-        Action::SwitchSession(name) => switch_to_session(&name),
+        Action::SwitchSession(name) => {
+            unskip_session(&name);
+            switch_to_session(&name);
+        }
         Action::SwitchWindow(session, window) => {
+            unskip_session(&session);
             switch_to_session(&session);
             select_window(&session, &window);
         }
