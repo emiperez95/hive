@@ -12,10 +12,34 @@ use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::cli::conversations::ConvOptions;
 use crate::cli::{Args, Command, ProjectCommand};
 use crate::common::debug::init_debug;
 use crate::common::tmux::resolve_tmux_path;
 use crate::tui::event_loop::{handle_post_action, run_tui};
+
+/// Build conversation-TUI options from the shared global CLI flags.
+fn conv_opts(args: &Args, list: bool) -> ConvOptions {
+    ConvOptions {
+        list,
+        detail: args.detail,
+        picker: args.picker,
+        filter: args.filter.clone(),
+    }
+}
+
+/// Run the classic session-first TUI (bare `hive classic` / `hive start` fall-through).
+fn run_classic(args: &Args) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))
+        .expect("Error setting Ctrl-C handler");
+    let mut terminal = init_terminal()?;
+    let action = run_tui(&mut terminal, args, running);
+    ratatui::restore();
+    // Run spread/collapse after terminal is restored (popup closed).
+    handle_post_action(action?)
+}
 
 /// Initialize ratatui. Returns a clean anyhow error instead of panicking
 /// when stdout isn't a TTY (e.g. piped or redirected invocations).
@@ -55,7 +79,10 @@ fn main() -> Result<()> {
         Some(Command::Spread { count }) => cli::session::run_spread(count),
         Some(Command::Collapse) => cli::session::run_collapse(),
         Some(Command::Stats { days }) => cli::stats::run_stats(days),
-        Some(Command::Conversations { list }) => cli::conversations::run_conversations(list),
+        Some(Command::Conversations { list }) => {
+            cli::conversations::run_conversations(conv_opts(&args, list))
+        }
+        Some(Command::Classic) => run_classic(&args),
         Some(Command::Event {
             kind,
             session,
@@ -75,21 +102,13 @@ fn main() -> Result<()> {
                     .exec();
                 bail!("exec failed: {}", err);
             }
-            // No available session — fall through to TUI picker
+            // No available session — fall through to the classic picker, whose
+            // PostAction::Attach exec's `tmux attach` (works from outside tmux, which
+            // a cold iTerm-startup invocation is; the conversations view switches via
+            // switch-client, which needs an existing client).
             args.picker = true;
             args.command = None;
-            // fall through below
-            let running = Arc::new(AtomicBool::new(true));
-            let r = running.clone();
-            ctrlc::set_handler(move || {
-                r.store(false, Ordering::SeqCst);
-            })
-            .expect("Error setting Ctrl-C handler");
-
-            let mut terminal = init_terminal()?;
-            let action = run_tui(&mut terminal, &args, running);
-            ratatui::restore();
-            handle_post_action(action?)
+            run_classic(&args)
         }
         Some(Command::Wt { command }) => {
             use crate::cli::WtCommand;
@@ -123,20 +142,8 @@ fn main() -> Result<()> {
                 WtCommand::Import { project } => cli::worktree::run_wt_import(&project),
             }
         }
-        Some(Command::Tui) | None => {
-            // Set up signal handler for graceful shutdown
-            let running = Arc::new(AtomicBool::new(true));
-            let r = running.clone();
-            ctrlc::set_handler(move || {
-                r.store(false, Ordering::SeqCst);
-            })
-            .expect("Error setting Ctrl-C handler");
-
-            let mut terminal = init_terminal()?;
-            let action = run_tui(&mut terminal, &args, running);
-            ratatui::restore();
-            // Run spread/collapse after terminal is restored (popup closed)
-            handle_post_action(action?)
-        }
+        // Default view is now the conversation-first TUI. The classic session-first
+        // TUI stays available via `hive classic` during the migration.
+        Some(Command::Tui) | None => cli::conversations::run_conversations(conv_opts(&args, false)),
     }
 }

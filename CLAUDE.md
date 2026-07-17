@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 270 tests (248 unit + 22 CLI smoke)
+cargo test                # 271 tests (248 unit + 23 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,22 +13,27 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~478 passing because `common/` + `ipc/` (208 tests) compile into
-> **both** the lib and bin targets and run twice. Distinct tests: 248 unit + 22 smoke.
+> `cargo test` prints ~479 passing because `common/` + `ipc/` (208 tests) compile into
+> **both** the lib and bin targets and run twice. Distinct tests: 248 unit + 23 smoke.
 
-## Two TUIs (parallel coexistence)
+## Two TUIs (migration in progress)
 
-hive currently ships **two** interactive views over the same data. This is a deliberate
-strangler-fig migration state — neither is retired:
+hive ships **two** interactive views over the same data. The conversation-first view is now
+the **default**; the classic session-first view is retained during the migration but no longer
+the default:
 
-| | classic (`hive`, `prefix + s`) | conversations (`hive conversations`, `prefix + a`) |
+| | conversations (**default**) | classic (retained) |
 |---|---|---|
-| Base entity | **tmux session** (session-first) | **Claude conversation** (UUID-keyed) |
-| Shows | live sessions only | live **and** closed/resumable/frozen conversations |
-| Code | `src/tui/` | `src/cli/conversations.rs` |
+| Invoke | `hive` · `hive conversations` | `hive classic` |
+| tmux | `prefix + s` (list) · `prefix + d` (detail) | `prefix + a` |
+| Base entity | **Claude conversation** (UUID-keyed) | **tmux session** (session-first) |
+| Shows | live **and** closed/resumable/frozen conversations | live sessions only |
+| Code | `src/cli/conversations.rs` | `src/tui/` |
 
-The conversations TUI is feature-complete and at full parity with classic (plus more).
-See **Conversations TUI** below. Classic is untouched — you can run either.
+The conversations TUI is feature-complete and at full parity with classic (plus more). See
+**Conversations TUI** below. Classic still runs unchanged — the only classic-only feature is
+permission approve/reject (`y`/`z`/`x`). `main.rs` dispatches bare `hive` / `hive tui` to
+conversations and `hive classic` to `run_classic()`.
 
 ## Architecture
 
@@ -48,9 +53,12 @@ that must see every live Claude window (the conversation model) cannot rely on i
 ## CLI
 
 ```
-hive                    # open classic TUI (default)
-hive conversations      # open conversation-first TUI (prefix + a)
-hive conversations --list  # static listing (no TUI); also used when piped
+hive                    # open conversations TUI (default; also prefix + s)
+hive --detail           # conversations detail for the current window (prefix + d)
+hive --picker           # conversations, start in Browse + search
+hive --filter <q>       # conversations, start in Browse + search pre-filled with <q>
+hive classic            # open the classic session-first TUI (prefix + a)
+hive conversations      # explicit; --list for a static listing (also used when piped)
 hive stats [--days N]   # usage summary from the activity log (default 7 days)
 hive start              # auto-attach to first available session (or fall through to picker)
 hive --detail           # open TUI with detail view for current session
@@ -254,7 +262,7 @@ All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::
 
 Switching sessions (1-9, Enter in detail, connect project, thawing a frozen session) always exits the app.
 
-## Conversations TUI (`hive conversations`, `prefix + a`)
+## Conversations TUI (`hive` / `hive conversations`, `prefix + s`, `prefix + d`)
 
 The conversation-first view. Self-contained in `src/cli/conversations.rs` (~3.9k lines) over
 the `common/registry.rs` model. Base entity is the **conversation** (Claude UUID), not the tmux
@@ -560,9 +568,9 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 ## Tmux Integration
 
-- `prefix + s` — hive popup (list view)
-- `prefix + d` — hive popup (detail view for current session)
-- `prefix + a` — hive conversations popup (conversation-first TUI)
+- `prefix + s` — conversations popup, list view (`hive`)
+- `prefix + d` — conversations popup, detail for the current window (`hive --detail`)
+- `prefix + a` — classic session-first TUI (`hive classic`)
 - `Ctrl+n` / `Ctrl+p` — cycle next/prev session
 - `Ctrl+g` — jump to the next non-busy Claude window (current session first, then others)
 - `Ctrl+\` — cycle to next window in the current session (`window-prev` is CLI-only)

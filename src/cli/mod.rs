@@ -49,8 +49,10 @@ pub struct Args {
 /// Available subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Open the TUI (default behavior)
+    /// Open the TUI (default behavior — the conversation-first view)
     Tui,
+    /// Open the classic session-first TUI (retained during the migration)
+    Classic,
     /// Process a Claude Code hook event (reads JSON from stdin)
     Hook {
         /// Hook event type (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification, SessionEnd)

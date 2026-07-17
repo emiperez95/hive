@@ -47,6 +47,14 @@ fn conversations_command_exits_zero() {
 }
 
 #[test]
+fn classic_help_exits_zero() {
+    let output = hive_cmd().args(["classic", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("classic"));
+}
+
+#[test]
 fn help_lists_all_subcommands() {
     let output = hive_cmd().arg("--help").output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -63,7 +71,8 @@ fn help_lists_all_subcommands() {
         "start",
         "web",
         "update",
-        "sessions",
+        "classic",
+        "conversations",
     ] {
         assert!(
             stdout.contains(cmd),

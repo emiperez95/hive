@@ -142,6 +142,18 @@ impl WorktreeState {
     }
 }
 
+/// One-shot startup migration of old-format worktree session names to the
+/// `[project_key]` scheme (renames live tmux sessions + rewrites worktrees.json and
+/// every persistence file). Idempotent — a no-op once names are migrated, so it's
+/// safe to call on every TUI launch. Rehomed here (out of the classic TUI) so BOTH
+/// the classic and conversation TUIs run it — otherwise flipping the default away
+/// from classic would silently stop the migration.
+pub fn migrate_session_names_once() {
+    let registry = crate::common::projects::ProjectRegistry::load();
+    let mut wt_state = WorktreeState::load();
+    wt_state.migrate_session_names(&registry);
+}
+
 // ─── Branch name sanitization ────────────────────────────────────────────────
 
 /// Sanitize user input into a valid git branch name by replacing spaces with hyphens

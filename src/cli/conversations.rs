@@ -42,7 +42,8 @@ use crate::common::registry::{
     TmuxPlacement,
 };
 use crate::common::tmux::{
-    get_all_windows, get_current_tmux_session, select_window, switch_to_session,
+    get_all_windows, get_current_tmux_session, get_current_tmux_window, select_window,
+    switch_to_session,
 };
 use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
@@ -50,12 +51,27 @@ use crate::ipc::messages::{HookState, SessionStatus};
 
 /// Entry point. Interactive TUI on a terminal; static listing with `--list` or
 /// when output is piped/redirected.
-pub fn run_conversations(list: bool) -> Result<()> {
-    if list || !std::io::stdout().is_terminal() {
+/// Startup options for the conversations TUI, mapped from the CLI. Mirrors the
+/// classic flags so the tmux bindings keep working after the default view flips to
+/// this one (`prefix+d` → `--detail`, the picker fall-through, `--filter`).
+#[derive(Default)]
+pub struct ConvOptions {
+    /// Print a static listing and exit (no TUI).
+    pub list: bool,
+    /// Open the current tmux window's conversation detail on startup (classic `--detail`).
+    pub detail: bool,
+    /// Start in Browse + search mode (classic `--picker`).
+    pub picker: bool,
+    /// Start in Browse + search pre-filled with this query (classic `--filter`).
+    pub filter: Option<String>,
+}
+
+pub fn run_conversations(opts: ConvOptions) -> Result<()> {
+    if opts.list || !std::io::stdout().is_terminal() {
         print!("{}", render_conversations(&gather_conversations()));
         return Ok(());
     }
-    run_conversations_tui()
+    run_conversations_tui(&opts)
 }
 
 /// Build the conversation registry from live state (READ-ONLY): hook status +
@@ -947,6 +963,23 @@ impl ConvDetailState {
     }
 }
 
+/// The live conversation running in the caller's current tmux window (for `--detail`).
+/// Prefers an exact session+window match; falls back to any live conversation in the
+/// current session when the window index can't be read.
+fn current_window_conv(reg: &ConversationRegistry) -> Option<Conversation> {
+    let session = get_current_tmux_session()?;
+    let window = get_current_tmux_window();
+    reg.conversations
+        .values()
+        .filter(|c| c.lifecycle.is_actionable_here())
+        .find(|c| {
+            c.placement.as_ref().is_some_and(|p| {
+                p.session_name == session && window.as_ref().is_none_or(|w| &p.window_index == w)
+            })
+        })
+        .cloned()
+}
+
 /// Open a conversation's detail: keep the instant static data and spawn a detached
 /// worker for the slow bits. The UI polls `res` each redraw and fills in when ready.
 fn spawn_conv_detail(c: &Conversation) -> ConvDetailState {
@@ -1110,10 +1143,10 @@ fn rel_below(cwd: &str, base: &str) -> String {
         .unwrap_or_else(|| abbrev_home(cwd))
 }
 
-fn run_conversations_tui() -> Result<()> {
+fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
     let mut terminal =
         ratatui::try_init().context("hive conversations: needs a terminal (run interactively)")?;
-    let action = conversations_loop(&mut terminal);
+    let action = conversations_loop(&mut terminal, opts);
     ratatui::restore();
 
     match action? {
@@ -1145,7 +1178,13 @@ fn run_conversations_tui() -> Result<()> {
     Ok(())
 }
 
-fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action> {
+fn conversations_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    opts: &ConvOptions,
+) -> Result<Action> {
+    // One-shot worktree name migration — shared with the classic TUI so it runs
+    // whichever view is the default (this is the default view now).
+    crate::common::worktree::migrate_session_names_once();
     // Kept alive across gathers so per-conversation cpu_percent is a real delta.
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -1153,6 +1192,7 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     let mut flags = Flags::load();
     let projects = ProjectRegistry::load();
     // Default to the Active view (live conversations by session); `/` browses all.
+    // `--filter`/`--picker` start in Browse + search instead (mirroring classic).
     let mut view = View::Active;
     // Reveal archived projects in Browse (Ctrl+R). A Cell so the rebuild closure
     // can read it by shared ref while other handlers still flip it.
@@ -1192,6 +1232,15 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
 
     let mut query = String::new();
     let mut searching = false;
+    // `--filter <q>` / `--picker` open straight into Browse + search, exactly as
+    // pressing `/` (then typing) would — so the classic entry points keep working.
+    if opts.filter.is_some() || opts.picker {
+        view = View::Browse;
+        searching = true;
+        if let Some(f) = &opts.filter {
+            query = f.clone();
+        }
+    }
     // Freeze-note input: Some(target) while typing the note for a pending freeze.
     let mut freezing: Option<FreezeTarget> = None;
     let mut freeze_note = String::new();
@@ -1215,6 +1264,14 @@ fn conversations_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Action>
     // Conversation detail: sits ON TOP of the project detail (so backing out of a
     // conversation returns to the project it was opened from, if any).
     let mut conv_detail: Option<ConvDetailState> = None;
+    // `--detail` (classic `prefix+d`): open the current tmux window's conversation
+    // detail on startup. Resolves via the current session + window (the popup runs
+    // against the client's session, same as classic's auto-detail).
+    if opts.detail {
+        if let Some(c) = current_window_conv(&reg) {
+            conv_detail = Some(spawn_conv_detail(&c));
+        }
+    }
     // Some(conv) while awaiting y/n to close (kill the window of) a live conversation.
     let mut confirm: Option<Conversation> = None;
     // Some((project, branch)) while awaiting y/n to DELETE a worktree.

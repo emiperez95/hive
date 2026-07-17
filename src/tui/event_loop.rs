@@ -10,7 +10,7 @@ use crate::cli::session::{run_collapse, run_spread};
 use crate::cli::worktree::{run_wt_delete, run_wt_new};
 use crate::cli::{Args, PostAction};
 use crate::common::debug::debug_log;
-use crate::common::projects::{connect_session, ProjectRegistry};
+use crate::common::projects::connect_session;
 use crate::common::tmux::{get_current_tmux_session, resolve_tmux_path, switch_to_session};
 use crate::common::types::{SessionInfo, PERMISSION_KEYS};
 use crate::tui::app::{
@@ -34,12 +34,9 @@ pub fn run_tui(
     let mut app = App::new(args.filter.clone(), args.watch);
     app.auto_detail = args.detail;
 
-    // Migrate old worktree session names to new [project_key] format
-    {
-        let registry = ProjectRegistry::load();
-        let mut wt_state = crate::common::worktree::WorktreeState::load();
-        wt_state.migrate_session_names(&registry);
-    }
+    // Migrate old worktree session names to new [project_key] format (shared with
+    // the conversations TUI so it runs whichever view is the default).
+    crate::common::worktree::migrate_session_names_once();
 
     if args.picker {
         app.auto_picker = true;
