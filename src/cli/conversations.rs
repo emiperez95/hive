@@ -794,6 +794,8 @@ struct ProjectDetailState {
     worktrees: Vec<WtRow>,
     convs: Vec<Conversation>, // display order: live first, frozen last, else recency
     path: String,             // common cwd prefix (for subpath elision in rows)
+    /// Session-level todos for the project, grouped by session (only sessions with any).
+    todos: Vec<(String, Vec<String>)>,
     sel: usize,               // selected conversation index
     wt_input: Option<String>, // Some ⇒ typing a branch name for a new worktree
 }
@@ -874,11 +876,41 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
         rows
     };
 
+    // Session-level todos surfaced for the project — the header badge counts these,
+    // so without this the drill-in showed nothing. Gather every session the project
+    // touches (its own session, each worktree session, and any session its
+    // conversations run in), deduped, and keep those with todos.
+    let todos: Vec<(String, Vec<String>)> = if frozen_bucket || unassigned {
+        Vec::new()
+    } else {
+        let all_todos = load_session_todos();
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(config) = ProjectRegistry::load().projects.get(key) {
+            candidates.push(ProjectRegistry::session_name(key, config));
+        }
+        candidates.extend(worktrees.iter().map(|w| w.session.clone()));
+        candidates.extend(
+            convs
+                .iter()
+                .filter_map(|c| c.placement.as_ref().map(|p| p.session_name.clone())),
+        );
+        let mut seen = HashSet::new();
+        candidates
+            .into_iter()
+            .filter(|s| seen.insert(s.clone()))
+            .filter_map(|s| {
+                let items = all_todos.get(&s).cloned().unwrap_or_default();
+                (!items.is_empty()).then_some((s, items))
+            })
+            .collect()
+    };
+
     ProjectDetailState {
         key: key.to_string(),
         worktrees,
         convs,
         path,
+        todos,
         sel: 0,
         wt_input: None,
     }
@@ -2623,6 +2655,32 @@ fn draw_project_detail(
                 ),
                 Span::styled(tail, Style::default().add_modifier(Modifier::DIM)),
             ]));
+        }
+    }
+
+    // Todos (session-level) — shown here because the header badge counts them.
+    let todo_total: usize = state.todos.iter().map(|(_, items)| items.len()).sum();
+    if todo_total > 0 {
+        display.push(Line::raw(""));
+        display.push(Line::from(Span::styled(
+            format!("  Todos ({todo_total})"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        let multi = state.todos.len() > 1;
+        for (session, items) in &state.todos {
+            // Only label the session when the project spans more than one.
+            if multi {
+                display.push(Line::from(Span::styled(
+                    format!("    {session}"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                )));
+            }
+            for item in items {
+                display.push(Line::from(vec![
+                    Span::styled("    ☐ ", Style::default().fg(Color::Yellow)),
+                    Span::raw(item.clone()),
+                ]));
+            }
         }
     }
 
