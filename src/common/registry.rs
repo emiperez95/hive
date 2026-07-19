@@ -2,10 +2,9 @@
 //! `<uuid>.jsonl` basename). Built read-only as a shadow over the existing
 //! `state.json` + a disk scan + a `conversations.json` overlay sidecar.
 //!
-//! This is the model behind the `hive conversations` TUI (`src/cli/conversations.rs`,
-//! `prefix + a`). It does not write `state.json` — the hook remains the sole writer;
-//! the only writable surface here is the overlay sidecar (note / pinned / archived).
-//! The classic session-first TUI (`src/tui/`) is untouched and still runs alongside.
+//! This is the model behind the default `hive` TUI (`src/cli/conversations.rs`). It
+//! does not write `state.json` — the hook remains the sole writer; the only writable
+//! surface here is the overlay sidecar (note / pinned / archived).
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -456,19 +455,6 @@ pub fn should_surface_closed(
         || session.parent.is_some()
         || session.pinned
         || session.frozen.as_ref().is_some_and(|f| f.pinned)
-}
-
-/// Cached disk scan so the ~1-1.5s refresh never does a full FS walk each tick.
-pub struct ScanCache {
-    pub ids: Vec<String>,
-    pub scanned_at: DateTime<Utc>,
-}
-
-impl ScanCache {
-    /// True while still within the rescan interval (inject `now` for testing).
-    pub fn is_fresh(&self, now: DateTime<Utc>, interval_secs: i64) -> bool {
-        (now - self.scanned_at).num_seconds() < interval_secs
-    }
 }
 
 #[cfg(test)]
@@ -1038,20 +1024,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_scan_cache_reuses_within_interval() {
-        let cache = ScanCache {
-            ids: vec!["x".to_string()],
-            scanned_at: chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        };
-        let within = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:05Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert!(cache.is_fresh(within, 30));
-    }
-
     fn frozen_entry(id: Option<&str>, note: &str) -> crate::common::frozen::FrozenEntry {
         let idj = match id {
             Some(i) => format!("\"{i}\""),
@@ -1120,19 +1092,5 @@ mod tests {
         reg.apply_frozen(&fs);
 
         assert!(!reg.conversations["live1"].is_frozen());
-    }
-
-    #[test]
-    fn test_scan_cache_refreshes_after_interval() {
-        let cache = ScanCache {
-            ids: vec!["x".to_string()],
-            scanned_at: chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        };
-        let after = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:01:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert!(!cache.is_fresh(after, 30));
     }
 }

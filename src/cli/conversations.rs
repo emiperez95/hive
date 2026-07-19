@@ -1221,6 +1221,22 @@ fn rel_below(cwd: &str, base: &str) -> String {
         .unwrap_or_else(|| abbrev_home(cwd))
 }
 
+/// Go to a session: `switch-client` when we're inside tmux (the popup / `prefix+s`
+/// case), or `exec tmux attach` when we're not (the `hive start` cold-start picker,
+/// launched from a bare terminal). The attach path replaces this process, so it
+/// never returns — callers must treat it as terminal.
+fn attach_or_switch(session: &str) {
+    if std::env::var_os("TMUX").is_some() {
+        switch_to_session(session);
+    } else {
+        use std::os::unix::process::CommandExt;
+        let tmux = crate::common::tmux::resolve_tmux_path();
+        let _ = Command::new(tmux)
+            .args(["attach-session", "-t", session])
+            .exec();
+    }
+}
+
 fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
     let mut terminal =
         ratatui::try_init().context("hive conversations: needs a terminal (run interactively)")?;
@@ -1232,9 +1248,13 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
         Action::Switch(c) => {
             if let Some(p) = &c.placement {
                 unskip_session(&p.session_name);
-                switch_to_session(&p.session_name);
-                if !p.window_index.is_empty() {
+                if !p.window_index.is_empty() && std::env::var_os("TMUX").is_some() {
+                    // Inside tmux: switch, then focus the exact window.
+                    switch_to_session(&p.session_name);
                     select_window(&p.session_name, &p.window_index);
+                } else {
+                    // Outside tmux (`hive start`): attach (exec, never returns).
+                    attach_or_switch(&p.session_name);
                 }
             }
         }
@@ -1260,12 +1280,16 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
         }
         Action::SwitchSession(name) => {
             unskip_session(&name);
-            switch_to_session(&name);
+            attach_or_switch(&name);
         }
         Action::SwitchWindow(session, window) => {
             unskip_session(&session);
-            switch_to_session(&session);
-            select_window(&session, &window);
+            if std::env::var_os("TMUX").is_some() {
+                switch_to_session(&session);
+                select_window(&session, &window);
+            } else {
+                attach_or_switch(&session);
+            }
         }
     }
     Ok(())
@@ -3678,7 +3702,7 @@ fn reopen(c: &Conversation) -> Result<String> {
     // legacy entries), and removes the frozen.json entry. Then switch to it.
     if c.is_frozen() {
         let session = crate::common::frozen::thaw_window(c.id.as_str())?;
-        switch_to_session(&session);
+        attach_or_switch(&session);
         return Ok(format!("Thawed {} in {session}", short_id(c.id.as_str())));
     }
 
@@ -3721,7 +3745,7 @@ fn reopen(c: &Conversation) -> Result<String> {
         return Err(anyhow!("failed to create session '{target}'"));
     }
 
-    switch_to_session(&target);
+    attach_or_switch(&target);
     Ok(format!(
         "Reopened {} in {target} — {startup}",
         short_id(c.id.as_str())
@@ -3765,7 +3789,7 @@ fn new_conversation(key: &str) -> Result<String> {
         return Err(anyhow!("failed to create session '{session}'"));
     }
 
-    switch_to_session(&session);
+    attach_or_switch(&session);
     Ok(format!("New conversation in {session}"))
 }
 
@@ -3847,7 +3871,7 @@ fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
         }
     }
 
-    switch_to_session(session);
+    attach_or_switch(session);
     Ok(format!("Started task in {session} — {startup}"))
 }
 

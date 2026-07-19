@@ -57,19 +57,6 @@ pub struct OpenWindow {
     pub last_seen: String,
 }
 
-impl OpenWindow {
-    /// Short label for the window within its session (window name, else `win N`).
-    pub fn window_label(&self) -> String {
-        if !self.window_name.is_empty() {
-            self.window_name.clone()
-        } else if !self.window_index.is_empty() {
-            format!("win {}", self.window_index)
-        } else {
-            String::new()
-        }
-    }
-}
-
 /// The fields a hook fire knows about a window — input to [`OpenWindowsState::upsert`].
 #[derive(Debug, Clone)]
 pub struct WindowSeen {
@@ -170,6 +157,7 @@ impl OpenWindowsState {
     }
 
     /// Entries sorted newest-`last_seen` first, for display.
+    #[allow(dead_code)] // retained + tested; no live caller since classic went
     pub fn sorted(&self) -> Vec<&OpenWindow> {
         let mut entries: Vec<&OpenWindow> = self.windows.values().collect();
         entries.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));

@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 271 tests (248 unit + 23 CLI smoke)
+cargo test                # 255 tests (233 unit + 22 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,27 +13,21 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~479 passing because `common/` + `ipc/` (208 tests) compile into
-> **both** the lib and bin targets and run twice. Distinct tests: 248 unit + 23 smoke.
+> `cargo test` prints ~454 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 233 unit + 22 smoke.
 
-## Two TUIs (migration in progress)
+## The TUI (conversation-first)
 
-hive ships **two** interactive views over the same data. The conversation-first view is now
-the **default**; the classic session-first view is retained during the migration but no longer
-the default:
+hive has a single interactive view: the **conversation-first** TUI in
+`src/cli/conversations.rs`. Its base entity is the **Claude conversation** (UUID-keyed), so
+closed/resumable and frozen conversations are first-class, not just live tmux sessions. `main.rs`
+dispatches bare `hive` / `hive tui` to it; see **Conversations TUI** below.
 
-| | conversations (**default**) | classic (retained) |
-|---|---|---|
-| Invoke | `hive` · `hive conversations` | `hive classic` |
-| tmux | `prefix + s` (list) · `prefix + d` (detail) | `prefix + a` |
-| Base entity | **Claude conversation** (UUID-keyed) | **tmux session** (session-first) |
-| Shows | live **and** closed/resumable/frozen conversations | live sessions only |
-| Code | `src/cli/conversations.rs` | `src/tui/` |
-
-The conversations TUI is feature-complete and at full parity with classic (plus more). See
-**Conversations TUI** below. Classic still runs unchanged — the only classic-only feature is
-permission approve/reject (`y`/`z`/`x`). `main.rs` dispatches bare `hive` / `hive tui` to
-conversations and `hive classic` to `run_classic()`.
+The old **classic session-first TUI** (`src/tui/`) was retired in the cutover — `git log` for
+its history. Its one non-ported feature, permission approve/reject from the dashboard, is
+documented in `docs/permission-approve-reject.md` for future revival. Note `serve/` (the web
+dashboard) still renders the **old session model** and shares a few `common/` types (e.g.
+`ClaudeStatus`) with it, pending a port to the conversation model.
 
 ## Architecture
 
@@ -57,7 +51,6 @@ hive                    # open conversations TUI (default; also prefix + s)
 hive --detail           # conversations detail for the current window (prefix + d)
 hive --picker           # conversations, start in Browse + search
 hive --filter <q>       # conversations, start in Browse + search pre-filled with <q>
-hive classic            # open the classic session-first TUI (prefix + a)
 hive conversations      # explicit; --list for a static listing (also used when piped)
 hive stats [--days N]   # usage summary from the activity log (default 7 days)
 hive start              # auto-attach to first available session (or fall through to picker)
@@ -131,7 +124,7 @@ src/
 │   ├── stats.rs            run_stats(): usage summary from the activity log
 │   └── update.rs           run_update(): self-update from GitHub
 ├── common/
-│   ├── types.rs            TmuxSession, SessionInfo, ClaudeStatus, ProcessInfo, PERMISSION_KEYS
+│   ├── types.rs            TmuxSession/Window/Pane, ProcessInfo, ClaudeStatus (ClaudeStatus shared with serve/)
 │   ├── registry.rs         ★ conversation model: Conversation, ConversationId, Lifecycle, TmuxPlacement,
 │   │                         ConversationRegistry::from_shadow(), resolve_parent(), sidecar/overlay
 │   ├── instances.rs        ★ per-WINDOW Claude detection (a session may host many); HookIndex pane→id resolve
@@ -159,13 +152,12 @@ src/
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
-├── tui/                    classic (session-first) TUI
-│   ├── app.rs              App struct, refresh(), session management, search, favorites, todos
-│   ├── event_loop.rs       run_tui(): key handling, input modes, post-action dispatch
-│   └── ui.rs               ratatui rendering (list, detail, search, help, input modals)
 └── tests/
     └── cli_smoke.rs        22 integration tests: CLI arg parsing, read-only commands, todo roundtrip
 ```
+
+(The classic session-first TUI lived in `src/tui/` — removed in the cutover; see git history
+and `docs/permission-approve-reject.md`.)
 
 ## Key Types
 
@@ -186,14 +178,12 @@ src/
 - `ClaudeInstance` (common/instances.rs) — one running Claude **window** (session, window_index,
   window_name, pane, cwd, pids, session_id, `cwd_shared`)
 
-**Session model** (classic TUI, hooks, web):
+**Session model** (hooks + web dashboard):
 
 - `HookState` (ipc/messages.rs) — `HashMap<session_id, SessionState>`, serialized to state.json
 - `SessionState` — session_id, cwd, status, needs_attention, last_activity
 - `SessionStatus` — Working, Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked, RunningWorkflow (derived; see Background Tasks)
-- `App` (tui/app.rs) — all TUI state: sessions, selection, input mode, favorites, todos, flags
-- `SessionInfo` (common/types.rs) — enriched session data for display (processes, ports, status)
-- `ClaudeStatus` (common/types.rs) — TUI-side status enum mapped from SessionStatus
+- `ClaudeStatus` (common/types.rs) — JSONL-parsed status enum; `serve/` maps it to wire `SessionStatus`
 - `ProjectRegistry` (common/projects.rs) — `HashMap<name, ProjectConfig>`, loaded from projects.toml
 - `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, auth_profile, etc.)
 - `WorktreeState` (common/worktree.rs) — `HashMap<"{project}/{branch}", WorktreeEntry>`, persisted to worktrees.json
@@ -245,22 +235,8 @@ pin/note a conversation or mute a project. (Old installs may also have stale `pa
 
 macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other platforms:
 - `ports.rs`: `get_listening_ports_for_pids()` — uses `libproc`
-- `chrome.rs`: `get_chrome_tabs()`, `open_chrome_tab()`, `focus_chrome_tab()`, `focus_all_matched_tabs()` — uses JXA (sees all Chrome profiles)
+- `chrome.rs`: `get_chrome_tabs()`, `focus_all_matched_tabs()` — uses JXA (sees all Chrome profiles)
 - `iterm.rs`: `get_iterm_pane_count()`, `spread_panes()`, `collapse_panes()` — uses AppleScript
-
-## Key Handling (classic TUI)
-
-All key input is in `main.rs::run_tui()`. Events are filtered to `KeyEventKind::Press` only (crossterm 0.28 sends release events that break Esc in tmux popups). The if/else chain priority:
-
-1. Help screen → `?`/Esc dismiss, `Q` quit
-2. AddTodo input → text entry modal
-3. SpreadPrompt → digit 1-9 triggers spread, Esc cancels
-3b. FreezeWindowPick → choose which Claude window to freeze (multi-window session); FreezeNote → text entry for the note
-4. Search mode → filter, navigate, select; `Del` archive/unarchive highlighted project (or discard a highlighted frozen window), `Ctrl+R` reveal archived projects (archived are hidden from the picker by default)
-5. Detail view → todos, ports, switch, favorite, flags, `Z` freeze window, `O` open Chrome tabs
-6. Normal list → navigate, switch (exits app), approve permissions, search, `L` spread/collapse, quit
-
-Switching sessions (1-9, Enter in detail, connect project, thawing a frozen session) always exits the app.
 
 ## Conversations TUI (`hive` / `hive conversations`, `prefix + s`, `prefix + d`)
 
@@ -272,7 +248,8 @@ tmux renames (a prerequisite for the future distributed/offload tier).
 ### Two views
 
 **Active** (default) — live conversations grouped by the tmux session running them. It is
-**session-first-complete**: it mirrors classic's buckets so nothing is invisible.
+**session-first-complete**: every live tmux session shows, bucketed claude / other / skipped,
+so nothing is invisible.
 
 ```
 🐝 hive  (2, 1 live)          ← sessions running claude
@@ -295,7 +272,7 @@ tmux renames (a prerequisite for the future distributed/offload tier).
 
 **Browse** (`/`) — a project launchpad: flat project list (empty registered projects included),
 `💤 frozen` bucket pinned first. Typing searches projects-first then conversations. Archived
-projects hide on the full list but surface on search (matching classic) or via `Ctrl+R`.
+projects hide on the full list but surface on search or via `Ctrl+R`.
 
 ### Detail screens
 
@@ -570,7 +547,6 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 - `prefix + s` — conversations popup, list view (`hive`)
 - `prefix + d` — conversations popup, detail for the current window (`hive --detail`)
-- `prefix + a` — classic session-first TUI (`hive classic`)
 - `Ctrl+n` / `Ctrl+p` — cycle next/prev session
 - `Ctrl+g` — jump to the next non-busy Claude window (current session first, then others)
 - `Ctrl+\` — cycle to next window in the current session (`window-prev` is CLI-only)
@@ -578,22 +554,22 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 ## Testing
 
-270 distinct tests. Run with `cargo test`.
+255 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints ~478 passing: `common/` + `ipc/` (208) compile into **both** the lib and
-> bin targets and run twice. Per target: lib 208 · bin 248 (the superset — adds cli/daemon/tui)
+> `cargo test` prints ~454 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 199 · bin 233 (the superset — adds cli/daemon/serve)
 > · smoke 22.
 
-**Unit tests (248)** — in-module `#[cfg(test)]` blocks:
-- `common/` (193): types, projects, worktree, jsonl, chrome, process (claude detection,
+**Unit tests (233)** — in-module `#[cfg(test)]` blocks:
+- `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
   frozen, activity
-- `ipc/messages.rs` (15): HookState operations, cleanup, serialization roundtrips
-- `daemon/hooks.rs` (27): all HookEvent variants, status transitions, session lifecycle
-- `tui/` (7) and `cli/` (6): incl. `conversations.rs` — `build_active` bucketing
-  (normal/other/skipped), bare-session surfacing, covered-window exclusion, `build_browse`
-  archived visibility, hint labels
+- `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
+- `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
+- `cli/conversations.rs`: `build_active` bucketing (normal/other/skipped), bare-session
+  surfacing, covered-window exclusion, `build_browse` archived visibility, hint labels,
+  `sh_quote`
 
 **Integration tests (22)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages

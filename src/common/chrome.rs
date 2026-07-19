@@ -126,54 +126,6 @@ pub fn match_tabs_to_ports(tabs: &[ChromeTab], ports: &[ListeningPort]) -> Vec<(
 }
 
 /// Open a URL in Chrome (new tab).
-#[cfg(target_os = "macos")]
-pub fn open_chrome_tab(url: &str) -> bool {
-    std::process::Command::new("open")
-        .args(["-a", "Google Chrome", url])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn open_chrome_tab(_url: &str) -> bool {
-    false
-}
-
-/// Focus a specific Chrome tab by activating its window and setting the active tab index.
-#[cfg(target_os = "macos")]
-pub fn focus_chrome_tab(tab: &ChromeTab) -> bool {
-    use std::process::Command;
-
-    let script = format!(
-        r#"
-var chrome = Application('Google Chrome');
-var se = Application('System Events');
-var proc = se.processes.byName('Google Chrome');
-chrome.windows[{}].activeTabIndex = {};
-proc.windows[{}].actions.byName('AXRaise').perform();
-proc.frontmost = true;
-"#,
-        tab.window_index - 1,
-        tab.tab_index,
-        tab.window_index - 1
-    );
-
-    Command::new("osascript")
-        .arg("-l")
-        .arg("JavaScript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn focus_chrome_tab(_tab: &ChromeTab) -> bool {
-    false
-}
-
 /// Focus all Chrome tabs matching a session's ports.
 ///
 /// If any port has at least one matching tab, activates every matched tab across all windows

@@ -79,6 +79,7 @@ impl WorktreeState {
     }
 
     /// Get a worktree entry by project/branch
+    #[allow(dead_code)] // registry API, retained + tested; no live caller since classic went
     pub fn get(&self, project: &str, branch: &str) -> Option<&WorktreeEntry> {
         let key = Self::make_key(project, branch);
         self.worktrees.get(&key)
@@ -158,6 +159,7 @@ pub fn migrate_session_names_once() {
 
 /// Sanitize user input into a valid git branch name by replacing spaces with hyphens
 /// and collapsing consecutive hyphens.
+#[allow(dead_code)] // utility, retained + tested; no live caller since classic went
 pub fn sanitize_branch_name(input: &str) -> String {
     let sanitized: String = input
         .chars()
@@ -192,36 +194,6 @@ pub fn build_session_name(
 }
 
 // ─── Worktree lookup helpers ─────────────────────────────────────────────────
-
-/// Find a worktree entry by its session name. Returns None if not found.
-pub fn find_worktree_by_session_name(session_name: &str) -> Option<WorktreeEntry> {
-    WorktreeState::load()
-        .worktrees
-        .values()
-        .find(|e| e.session_name == session_name)
-        .cloned()
-}
-
-/// Connect/create a tmux session for a worktree (similar to connect_project).
-/// Creates the session at the worktree path if it doesn't exist.
-pub fn connect_worktree(session_name: &str) -> bool {
-    let Some(entry) = find_worktree_by_session_name(session_name) else {
-        return false;
-    };
-
-    // Look up startup command + env from parent project config
-    let registry = crate::common::projects::ProjectRegistry::load();
-    let project_config = registry.projects.get(&entry.project_key);
-    let startup_cmd = project_config.and_then(|c| c.startup_command.as_deref());
-    let env = project_config.map(|c| c.tmux_env()).unwrap_or_default();
-
-    crate::common::projects::ensure_tmux_session(
-        &entry.session_name,
-        &entry.path,
-        startup_cmd,
-        &env,
-    )
-}
 
 // ─── Import ─────────────────────────────────────────────────────────────────
 

@@ -290,9 +290,6 @@ fn convert_claude_to_session_status(status: &crate::common::types::ClaudeStatus)
         },
         ClaudeStatus::PlanReview => SessionStatus::PlanReview,
         ClaudeStatus::QuestionAsked => SessionStatus::QuestionAsked,
-        ClaudeStatus::RunningWorkflow(summary) => SessionStatus::RunningWorkflow {
-            summary: summary.clone(),
-        },
         ClaudeStatus::Unknown => SessionStatus::Working,
     }
 }

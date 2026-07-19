@@ -5,18 +5,14 @@ mod common;
 mod daemon;
 mod ipc;
 mod serve;
-mod tui;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::Parser;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use crate::cli::conversations::ConvOptions;
 use crate::cli::{Args, Command, ProjectCommand};
 use crate::common::debug::init_debug;
 use crate::common::tmux::resolve_tmux_path;
-use crate::tui::event_loop::{handle_post_action, run_tui};
 
 /// Build conversation-TUI options from the shared global CLI flags.
 fn conv_opts(args: &Args, list: bool) -> ConvOptions {
@@ -28,28 +24,8 @@ fn conv_opts(args: &Args, list: bool) -> ConvOptions {
     }
 }
 
-/// Run the classic session-first TUI (bare `hive classic` / `hive start` fall-through).
-fn run_classic(args: &Args) -> Result<()> {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))
-        .expect("Error setting Ctrl-C handler");
-    let mut terminal = init_terminal()?;
-    let action = run_tui(&mut terminal, args, running);
-    ratatui::restore();
-    // Run spread/collapse after terminal is restored (popup closed).
-    handle_post_action(action?)
-}
-
-/// Initialize ratatui. Returns a clean anyhow error instead of panicking
-/// when stdout isn't a TTY (e.g. piped or redirected invocations).
-fn init_terminal() -> Result<ratatui::DefaultTerminal> {
-    ratatui::try_init()
-        .context("hive: this command needs a terminal. Run it from an interactive shell.")
-}
-
 fn main() -> Result<()> {
-    let mut args = Args::parse();
+    let args = Args::parse();
     init_debug(args.debug);
 
     match args.command {
@@ -82,7 +58,6 @@ fn main() -> Result<()> {
         Some(Command::Conversations { list }) => {
             cli::conversations::run_conversations(conv_opts(&args, list))
         }
-        Some(Command::Classic) => run_classic(&args),
         Some(Command::Event {
             kind,
             session,
@@ -102,13 +77,13 @@ fn main() -> Result<()> {
                     .exec();
                 bail!("exec failed: {}", err);
             }
-            // No available session — fall through to the classic picker, whose
-            // PostAction::Attach exec's `tmux attach` (works from outside tmux, which
-            // a cold iTerm-startup invocation is; the conversations view switches via
-            // switch-client, which needs an existing client).
-            args.picker = true;
-            args.command = None;
-            run_classic(&args)
+            // No available session — open the conversations picker (Browse + search).
+            // A `hive start` invocation is outside tmux, so selecting/creating a
+            // session there exec's `tmux attach` (see conversations::attach_or_switch).
+            cli::conversations::run_conversations(ConvOptions {
+                picker: true,
+                ..Default::default()
+            })
         }
         Some(Command::Wt { command }) => {
             use crate::cli::WtCommand;

@@ -300,15 +300,6 @@ pub fn run_setup(yes: bool) -> Result<()> {
             && line.contains("hive")
             && line.contains("--detail")
     });
-    // `prefix+a` now opens the classic TUI (`hive classic`). A pre-migration binding
-    // to `hive conversations` no longer matches, so it's treated as unbound and
-    // upgraded to `hive classic` on the next `hive setup`.
-    let tmux_a_bound = tmux_keys.lines().any(|line| {
-        line.contains("prefix")
-            && line.contains(" a ")
-            && line.contains("hive")
-            && line.contains("classic")
-    });
     // The cycle bindings require `--pane` so stale, pre-`--pane` bindings are
     // treated as unbound and get upgraded on the next `hive setup`.
     let tmux_cn_bound = tmux_keys.lines().any(|line| {
@@ -369,11 +360,6 @@ pub fn run_setup(yes: bool) -> Result<()> {
         println!("  [ok]      tmux prefix+d keybinding (conversations detail)");
     } else {
         println!("  [missing] tmux prefix+d keybinding (conversations detail)");
-    }
-    if tmux_a_bound {
-        println!("  [ok]      tmux prefix+a keybinding (classic TUI)");
-    } else {
-        println!("  [missing] tmux prefix+a keybinding (classic TUI)");
     }
     if tmux_cn_bound {
         println!("  [ok]      tmux Ctrl+n keybinding (cycle next)");
@@ -444,7 +430,6 @@ pub fn run_setup(yes: bool) -> Result<()> {
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();
     let all_tmux_bound = tmux_s_bound
         && tmux_d_bound
-        && tmux_a_bound
         && tmux_cn_bound
         && tmux_cp_bound
         && tmux_wn_bound
@@ -573,7 +558,6 @@ pub fn run_setup(yes: bool) -> Result<()> {
     if !all_tmux_bound {
         let tmux_s_cmd = format!("display-popup -E -w 80% -h 70% \"{}\"", binary_str);
         let tmux_d_cmd = format!("display-popup -E -w 80% -h 70% \"{} --detail\"", binary_str);
-        let tmux_a_cmd = format!("display-popup -E -w 80% -h 70% \"{} classic\"", binary_str);
         // `#{pane_id}` is expanded by tmux to the pane that triggered the key, so
         // hive can resolve the real current session/window (a run-shell child can't
         // determine it from the environment — see common::tmux::display_message_for_pane).
@@ -597,7 +581,6 @@ pub fn run_setup(yes: bool) -> Result<()> {
         let bindings: Vec<(&str, &str, &str, bool)> = vec![
             ("prefix", "s", &tmux_s_cmd, tmux_s_bound),
             ("prefix", "d", &tmux_d_cmd, tmux_d_bound),
-            ("prefix", "a", &tmux_a_cmd, tmux_a_bound),
             ("root", "C-n", &tmux_cn_cmd, tmux_cn_bound),
             ("root", "C-p", &tmux_cp_cmd, tmux_cp_bound),
             ("root", "C-\\", &tmux_wn_cmd, tmux_wn_bound),

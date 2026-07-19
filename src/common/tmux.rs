@@ -120,14 +120,6 @@ pub fn select_window(session: &str, window_index: &str) {
         .output();
 }
 
-/// Send a key to a tmux pane
-pub fn send_key_to_pane(session: &str, window: &str, pane: &str, key: &str) {
-    let target = format!("{}:{}.{}", session, window, pane);
-    let _ = Command::new("tmux")
-        .args(["send-keys", "-t", &target, key])
-        .output();
-}
-
 /// Get list of currently running tmux session names
 pub fn get_current_tmux_session_names() -> Vec<String> {
     Command::new("tmux")
@@ -221,16 +213,6 @@ pub fn display_message_for_pane(pane_id: &str, format: &str) -> Option<String> {
                 Some(s)
             }
         })
-}
-
-/// Get the session name attached to the caller's tmux client.
-pub fn get_current_session() -> Option<String> {
-    Command::new("tmux")
-        .args(["display-message", "-p", "#{client_session}"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// Get session names attached to tmux clients other than the caller's.

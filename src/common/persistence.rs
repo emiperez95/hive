@@ -128,21 +128,6 @@ pub fn get_restore_file_path() -> Option<PathBuf> {
     cache_dir().map(|p| p.join("restore.txt"))
 }
 
-/// Save restorable session names to disk (only sessions with sesh config)
-pub fn save_restorable_sessions(session_names: &[String]) {
-    let Some(path) = get_restore_file_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = fs::File::create(&path) {
-        for name in session_names {
-            let _ = writeln!(file, "{}", name);
-        }
-    }
-}
-
 /// Get the path to the auto-approve sessions file
 pub fn get_auto_approve_file_path() -> Option<PathBuf> {
     cache_dir().map(|p| p.join("auto-approve.txt"))

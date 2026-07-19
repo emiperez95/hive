@@ -60,6 +60,7 @@ impl FrozenEntry {
 
     /// Short label for the window within its session (window name, else `win N`).
     /// Empty when no window info was captured (pre-window-level entries).
+    #[allow(dead_code)] // retained + tested; no live caller since classic went
     pub fn window_label(&self) -> String {
         if !self.window_name.is_empty() {
             self.window_name.clone()
@@ -127,11 +128,13 @@ impl FrozenState {
         Ok(())
     }
 
+    #[allow(dead_code)] // retained + tested; no live caller since classic went
     pub fn get(&self, key: &str) -> Option<&FrozenEntry> {
         self.frozen.get(key)
     }
 
     /// Entries sorted newest-frozen first, for display.
+    #[allow(dead_code)] // retained + tested; no live caller since classic went
     pub fn sorted(&self) -> Vec<&FrozenEntry> {
         let mut entries: Vec<&FrozenEntry> = self.frozen.values().collect();
         entries.sort_by(|a, b| b.frozen_at.cmp(&a.frozen_at));

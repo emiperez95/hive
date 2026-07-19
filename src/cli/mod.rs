@@ -25,15 +25,11 @@ pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Filter sessions by name pattern (case-insensitive)
+    /// Filter conversations by pattern (opens Browse + search pre-filled)
     #[arg(short, long, global = true)]
     pub filter: Option<String>,
 
-    /// Refresh interval in seconds (default: 1)
-    #[arg(short, long, default_value = "1", global = true)]
-    pub watch: u64,
-
-    /// Open detail view for the current tmux session on startup
+    /// Open the current window's conversation detail on startup
     #[arg(short = 'D', long, global = true)]
     pub detail: bool,
 
@@ -51,8 +47,6 @@ pub struct Args {
 pub enum Command {
     /// Open the TUI (default behavior — the conversation-first view)
     Tui,
-    /// Open the classic session-first TUI (retained during the migration)
-    Classic,
     /// Process a Claude Code hook event (reads JSON from stdin)
     Hook {
         /// Hook event type (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification, SessionEnd)
@@ -330,28 +324,5 @@ pub enum TodoCommand {
     Clear {
         #[arg(short, long)]
         session: Option<String>,
-    },
-}
-
-/// Action to perform after the TUI exits and the terminal is restored.
-///
-/// Some actions (like spreading iTerm panes or exec-ing into tmux) must
-/// happen after ratatui has cleaned up the alternate screen.
-pub enum PostAction {
-    None,
-    Spread(usize),
-    Collapse,
-    /// Attach to a tmux session via exec (used by `hive start` outside tmux)
-    Attach(String),
-    /// Create a worktree and switch to its session
-    CreateWorktree {
-        project: String,
-        branch: String,
-        base: String,
-    },
-    /// Delete a worktree (confirmed in TUI)
-    DeleteWorktree {
-        project: String,
-        branch: String,
     },
 }
