@@ -243,6 +243,9 @@ enum Action {
     Reopen(Box<Conversation>),
     /// Start a fresh conversation in the given project (key).
     NewInProject(String),
+    /// Start a fresh conversation in a tmux session (name) with an initial prompt —
+    /// used to turn a todo into a `claude "task: …"` window.
+    NewTask(String, String),
     /// Spread N sessions into iTerm2 panes / collapse back (classic `L`).
     Spread(usize),
     Collapse,
@@ -794,9 +797,10 @@ struct ProjectDetailState {
     worktrees: Vec<WtRow>,
     convs: Vec<Conversation>, // display order: live first, frozen last, else recency
     path: String,             // common cwd prefix (for subpath elision in rows)
-    /// Session-level todos for the project, grouped by session (only sessions with any).
-    todos: Vec<(String, Vec<String>)>,
-    sel: usize,               // selected conversation index
+    /// Session-level todos, flat and in display order: `(session_name, text)`. The
+    /// cursor selects over todos FIRST, then conversations.
+    todos: Vec<(String, String)>,
+    sel: usize,               // index into the combined [todos ++ convs] list
     wt_input: Option<String>, // Some ⇒ typing a branch name for a new worktree
 }
 
@@ -806,6 +810,23 @@ impl ProjectDetailState {
         self.convs
             .iter()
             .max_by(|a, b| a.last_activity.cmp(&b.last_activity))
+    }
+
+    /// Total selectable rows: todos come first, then conversations.
+    fn num_items(&self) -> usize {
+        self.todos.len() + self.convs.len()
+    }
+
+    /// The selected todo `(session, text)` if the cursor is on a todo row.
+    fn selected_todo(&self) -> Option<&(String, String)> {
+        (self.sel < self.todos.len()).then(|| &self.todos[self.sel])
+    }
+
+    /// The selected conversation if the cursor is past the todos, on a conv row.
+    fn selected_conv(&self) -> Option<&Conversation> {
+        self.sel
+            .checked_sub(self.todos.len())
+            .and_then(|i| self.convs.get(i))
     }
 }
 
@@ -879,8 +900,9 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
     // Session-level todos surfaced for the project — the header badge counts these,
     // so without this the drill-in showed nothing. Gather every session the project
     // touches (its own session, each worktree session, and any session its
-    // conversations run in), deduped, and keep those with todos.
-    let todos: Vec<(String, Vec<String>)> = if frozen_bucket || unassigned {
+    // conversations run in), deduped, keep those with todos, and flatten to
+    // `(session, text)` rows in session order (so the cursor can select each one).
+    let todos: Vec<(String, String)> = if frozen_bucket || unassigned {
         Vec::new()
     } else {
         let all_todos = load_session_todos();
@@ -898,9 +920,13 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
         candidates
             .into_iter()
             .filter(|s| seen.insert(s.clone()))
-            .filter_map(|s| {
-                let items = all_todos.get(&s).cloned().unwrap_or_default();
-                (!items.is_empty()).then_some((s, items))
+            .flat_map(|s| {
+                all_todos
+                    .get(&s)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |t| (s.clone(), t))
             })
             .collect()
     };
@@ -1220,6 +1246,10 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
             println!("{}", reopen(&c)?)
         }
         Action::NewInProject(key) => println!("{}", new_conversation(&key)?),
+        Action::NewTask(session, prompt) => {
+            unskip_session(&session);
+            println!("{}", new_task_in_session(&session, &prompt)?)
+        }
         Action::Spread(n) => crate::cli::session::run_spread(n)?,
         Action::Collapse => crate::cli::session::run_collapse()?,
         Action::WtNew(project, branch) => crate::cli::worktree::run_wt_new(
@@ -1668,7 +1698,7 @@ fn conversations_loop(
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => detail = None,
                 KeyCode::Down | KeyCode::Char('j') => {
                     let d = detail.as_mut().unwrap();
-                    if d.sel + 1 < d.convs.len() {
+                    if d.sel + 1 < d.num_items() {
                         d.sel += 1;
                     }
                 }
@@ -1676,23 +1706,28 @@ fn conversations_loop(
                     let d = detail.as_mut().unwrap();
                     d.sel = d.sel.saturating_sub(1);
                 }
+                // Enter: on a todo → start a `task: <todo>` conversation in its
+                // session; on a conversation → switch/resume it.
                 KeyCode::Enter => {
                     let d = detail.as_ref().unwrap();
-                    if let Some(c) = d.convs.get(d.sel) {
+                    if let Some((session, text)) = d.selected_todo() {
+                        return Ok(Action::NewTask(session.clone(), format!("task: {text}")));
+                    }
+                    if let Some(c) = d.selected_conv() {
                         return Ok(activate(c));
                     }
                 }
-                // → drills into the selected conversation's detail.
+                // → drills into the selected conversation's detail (todos have none).
                 KeyCode::Right | KeyCode::Char('l') => {
                     let d = detail.as_ref().unwrap();
-                    if let Some(c) = d.convs.get(d.sel) {
+                    if let Some(c) = d.selected_conv() {
                         conv_detail = Some(spawn_conv_detail(c));
                     }
                 }
                 // Del: discard a frozen conversation, or close a live one (confirm).
                 KeyCode::Delete => {
                     let d = detail.as_ref().unwrap();
-                    if let Some(c) = d.convs.get(d.sel).cloned() {
+                    if let Some(c) = d.selected_conv().cloned() {
                         if c.is_frozen() {
                             let _ = discard_frozen(c.id.as_str());
                             reg = gather_conversations_stats(&mut sys);
@@ -1745,8 +1780,7 @@ fn conversations_loop(
                     let d = detail.as_ref().unwrap();
                     // The selected conversation's parent "project/branch" → the branch.
                     if let Some(branch) = d
-                        .convs
-                        .get(d.sel)
+                        .selected_conv()
                         .and_then(|c| c.parent.as_deref())
                         .and_then(|p| p.split_once('/'))
                         .filter(|(proj, _)| *proj == d.key)
@@ -2589,9 +2623,11 @@ fn draw_project_detail(
     ));
     frame.render_widget(Paragraph::new(Line::from(title_spans)), chunks[0]);
 
-    // Body: config block, worktrees, then the navigable conversation list.
+    // Body: config block, worktrees, todos, then the navigable conversation list.
     let mut display: Vec<Line> = Vec::new();
-    let mut conv_pos: Vec<usize> = Vec::new();
+    // Display line index of each selectable item, in cursor order: todos first,
+    // then conversations. `state.sel` indexes into this.
+    let mut item_pos: Vec<usize> = Vec::new();
     display.push(Line::raw(""));
 
     let field = |label: &str, val: String| -> Line<'static> {
@@ -2659,28 +2695,48 @@ fn draw_project_detail(
     }
 
     // Todos (session-level) — shown here because the header badge counts them.
-    let todo_total: usize = state.todos.iter().map(|(_, items)| items.len()).sum();
-    if todo_total > 0 {
+    // Selectable: Enter on a todo starts a `task: <todo>` conversation in its session.
+    if !state.todos.is_empty() {
         display.push(Line::raw(""));
         display.push(Line::from(Span::styled(
-            format!("  Todos ({todo_total})"),
+            format!("  Todos ({})", state.todos.len()),
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        let multi = state.todos.len() > 1;
-        for (session, items) in &state.todos {
-            // Only label the session when the project spans more than one.
-            if multi {
+        let multi = state
+            .todos
+            .iter()
+            .map(|(s, _)| s)
+            .collect::<HashSet<_>>()
+            .len()
+            > 1;
+        let mut prev: Option<&str> = None;
+        for (i, (session, text)) in state.todos.iter().enumerate() {
+            // Label the session only when the project spans more than one.
+            if multi && prev != Some(session.as_str()) {
                 display.push(Line::from(Span::styled(
                     format!("    {session}"),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
                 )));
+                prev = Some(session.as_str());
             }
-            for item in items {
-                display.push(Line::from(vec![
-                    Span::styled("    ☐ ", Style::default().fg(Color::Yellow)),
-                    Span::raw(item.clone()),
-                ]));
-            }
+            item_pos.push(display.len());
+            let selected = state.sel == i;
+            let base = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            display.push(Line::from(vec![
+                Span::styled(
+                    "    ☐ ",
+                    if selected {
+                        base
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+                Span::styled(text.clone(), base),
+            ]));
         }
     }
 
@@ -2698,24 +2754,18 @@ fn draw_project_detail(
         // Bold "the last conversation" — the most-recent one (what `r` resumes).
         let last_id = state.most_recent().map(|c| c.id.clone());
         for (i, c) in state.convs.iter().enumerate() {
-            conv_pos.push(display.len());
+            item_pos.push(display.len());
             let num = (i < 9).then_some(i + 1);
             let bold = last_id.as_ref() == Some(&c.id);
-            display.push(conv_line(
-                c,
-                &state.path,
-                i == state.sel,
-                num,
-                flags,
-                bold,
-                None,
-            ));
+            // Conversations sit after the todos in the combined selection space.
+            let selected = state.sel == state.todos.len() + i;
+            display.push(conv_line(c, &state.path, selected, num, flags, bold, None));
         }
     }
 
-    // Scroll so the selected conversation stays visible.
+    // Scroll so the selected row (todo or conversation) stays visible.
     let h = chunks[1].height as usize;
-    let sel_display = conv_pos.get(state.sel).copied().unwrap_or(0);
+    let sel_display = item_pos.get(state.sel).copied().unwrap_or(0);
     let offset = if sel_display >= h {
         sel_display + 1 - h
     } else {
@@ -2736,7 +2786,7 @@ fn draw_project_detail(
         ])
     } else {
         Line::from(Span::styled(
-            " Enter switch · → detail · Del close · n new · r resume · w worktree · x delete-wt · m mute · Esc back",
+            " Enter switch / start-todo · → detail · Del close · n new · r resume · w worktree · x delete-wt · m mute · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -3719,6 +3769,88 @@ fn new_conversation(key: &str) -> Result<String> {
     Ok(format!("New conversation in {session}"))
 }
 
+/// POSIX single-quote a string so it survives being typed onto a shell command line
+/// (todos can contain apostrophes, colons, `$`, …): wrap in `'…'` and rewrite each
+/// embedded `'` as `'\''`.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Resolve a tmux session name back to a `(cwd, env)` for creating a window in it —
+/// via the project registry (project session) or the worktree registry (worktree
+/// session, inheriting the parent project's env). None if it matches neither.
+fn resolve_session_target(session: &str) -> Option<(String, Vec<(String, String)>)> {
+    let projects = ProjectRegistry::load();
+    for (key, config) in &projects.projects {
+        if ProjectRegistry::session_name(key, config) == session {
+            let cwd = expand_tilde(&config.project_root)
+                .to_string_lossy()
+                .into_owned();
+            return Some((cwd, config.tmux_env()));
+        }
+    }
+    let wts = WorktreeState::load();
+    if let Some(e) = wts.worktrees.values().find(|e| e.session_name == session) {
+        let env = projects
+            .projects
+            .get(&e.project_key)
+            .map(|c| c.tmux_env())
+            .unwrap_or_default();
+        return Some((e.path.clone(), env));
+    }
+    None
+}
+
+/// Start a fresh conversation in `session` with an initial `prompt` (`claude "…"`).
+/// Opens a new window if the session is alive, else recreates it from the project /
+/// worktree registry. Then switches to it.
+fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
+    let startup = format!("claude {}", sh_quote(prompt));
+    let target = resolve_session_target(session);
+    let alive = Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if alive {
+        let mut cmd = Command::new("tmux");
+        cmd.args(["new-window", "-t", session]);
+        if let Some((cwd, env)) = &target {
+            cmd.args(["-c", cwd]);
+            for (k, v) in env {
+                cmd.arg("-e").arg(format!("{k}={v}"));
+            }
+        }
+        if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+            return Err(anyhow!("failed to open a new window in '{session}'"));
+        }
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", session, &startup, "Enter"])
+            .output();
+    } else {
+        let (cwd, env) = target.ok_or_else(|| {
+            anyhow!("session '{session}' isn't alive and matches no known project/worktree")
+        })?;
+        if !ensure_tmux_session(session, &cwd, Some(&startup), &env) {
+            return Err(anyhow!("failed to create session '{session}'"));
+        }
+    }
+
+    switch_to_session(session);
+    Ok(format!("Started task in {session} — {startup}"))
+}
+
 /// Close a live conversation: kill its tmux window (freeing the Claude process).
 /// The window's the unit — sibling conversations in the session are untouched;
 /// if it was the last window, tmux drops the session. History stays on disk, so
@@ -3921,6 +4053,14 @@ mod tests {
         let set: std::collections::HashSet<&String> = labels.iter().collect();
         assert_eq!(set.len(), labels.len(), "labels must be unique");
         assert_eq!(&labels[0..3], &["aa", "as", "ad"]); // stable order
+    }
+
+    #[test]
+    fn test_sh_quote() {
+        assert_eq!(sh_quote("task: fix scrolling"), "'task: fix scrolling'");
+        // An apostrophe is broken out and backslash-escaped so the shell rejoins it.
+        assert_eq!(sh_quote("it's a $test"), "'it'\\''s a $test'");
+        assert_eq!(sh_quote(""), "''");
     }
 
     #[test]
