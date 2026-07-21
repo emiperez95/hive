@@ -14,7 +14,7 @@ use crate::common::persistence::{load_session_todos, load_skipped_sessions};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{build_children_map, get_process_info};
 use crate::common::projects::ProjectRegistry;
-use crate::common::registry::Conversation;
+use crate::common::registry::{Conversation, ConversationRegistry};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::{HookState, SessionStatus};
 use crate::serve::web_types::{
@@ -282,12 +282,11 @@ fn aggregate_status(windows: &[WindowView]) -> Option<SessionStatus> {
 
 // ── Conversation-first view (new `/api/conversations`) ──────────────────────
 
-/// Gather the conversation-first view for the new `/api/conversations` endpoint.
-/// Reuses the shared [`crate::common::conversations`] gather (live + closed +
-/// frozen, UUID-keyed) so the web dashboard sees the same model as the TUI.
-/// `sys` must be kept alive across calls for accurate CPU deltas.
-pub(crate) fn gather_conversation_views(sys: &mut System) -> Vec<ConversationView> {
-    let reg = crate::common::conversations::gather_conversations_stats(sys);
+/// Build the conversation-first view for `/api/conversations` from an already-
+/// gathered registry (live + closed + frozen, UUID-keyed) so the web dashboard
+/// sees the same model as the TUI. The caller gathers the registry once and feeds
+/// both this and [`gather_active_views`].
+pub(crate) fn build_conversation_views(reg: &ConversationRegistry) -> Vec<ConversationView> {
     let projects = ProjectRegistry::load();
     let mut views: Vec<ConversationView> = reg
         .conversations
@@ -305,6 +304,147 @@ pub(crate) fn gather_conversation_views(sys: &mut System) -> Vec<ConversationVie
             .then_with(|| a.id.cmp(&b.id))
     });
     views
+}
+
+/// Project the registry's LIVE conversations into the session-grouped
+/// [`SessionView`] shape the Active view consumes (`/api/active`), plus every
+/// live tmux session as a bare/startable entry. This is the conversation-model
+/// replacement for [`gather_session_data`]: each window carries a stable
+/// conversation id and the registry's robust window→conversation resolution +
+/// enriched status (so shared-cwd multi-Claude sessions report correct per-window
+/// status, which the hook-only path cannot). CPU/mem/ports come from the registry
+/// sample, so no `System` is needed here.
+pub(crate) fn gather_active_views(reg: &ConversationRegistry) -> Vec<SessionView> {
+    let sessions = match get_tmux_sessions() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let other_client_sessions = get_other_client_sessions();
+    let skipped_sessions = load_skipped_sessions();
+    let auto_approve_sessions = crate::common::persistence::load_auto_approve_sessions();
+    let session_todos = load_session_todos();
+
+    // Group live conversations by the tmux session running them.
+    let mut convs_by_session: HashMap<String, Vec<&Conversation>> = HashMap::new();
+    for c in reg.conversations.values() {
+        if !c.lifecycle.is_actionable_here() {
+            continue;
+        }
+        if let Some(p) = &c.placement {
+            convs_by_session
+                .entry(p.session_name.clone())
+                .or_default()
+                .push(c);
+        }
+    }
+
+    let mut results = Vec::new();
+    for session in &sessions {
+        let is_auto_approve = auto_approve_sessions.contains(&session.name);
+
+        let mut session_convs = convs_by_session.remove(&session.name).unwrap_or_default();
+        session_convs.sort_by(|a, b| window_index_of(a).cmp(window_index_of(b)));
+
+        let windows: Vec<WindowView> = session_convs
+            .iter()
+            .map(|c| conv_to_window_view(c, is_auto_approve))
+            .collect();
+
+        let cpu = windows.iter().map(|w| w.cpu).sum();
+        let mem_kb = windows.iter().map(|w| w.mem_kb).sum();
+        let mut ports: Vec<u16> = windows
+            .iter()
+            .flat_map(|w| w.ports.iter().copied())
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        let last_activity = windows.iter().filter_map(|w| w.last_activity.clone()).max();
+        let status = aggregate_status(&windows);
+
+        let session_cwd = session
+            .windows
+            .first()
+            .and_then(|w| w.panes.first())
+            .map(|p| p.cwd.clone());
+
+        // Bare session with no Claude: expose the pane only when `claude -c` failed
+        // with "No conversation found to continue" (safe to offer a fresh start).
+        let mut pane = windows.first().and_then(|w| w.pane.clone());
+        let mut claude_continue_failed = false;
+        if pane.is_none() {
+            if let Some((s, w, p)) = session.windows.first().and_then(|win| {
+                win.panes
+                    .first()
+                    .map(|p| (session.name.clone(), win.index.clone(), p.index.clone()))
+            }) {
+                if crate::common::tmux::capture_pane(&s, &w, &p)
+                    .is_some_and(|t| t.contains("No conversation found to continue"))
+                {
+                    claude_continue_failed = true;
+                    pane = Some((s, w, p));
+                }
+            }
+        }
+
+        results.push(SessionView {
+            name: session.name.clone(),
+            status,
+            cpu,
+            mem_kb,
+            ports,
+            processes: Vec::new(),
+            cwd: session_cwd,
+            last_activity,
+            attached: other_client_sessions.contains(&session.name),
+            pane,
+            claude_continue_failed,
+            skipped: skipped_sessions.contains(&session.name),
+            todo_count: session_todos
+                .get(&session.name)
+                .map(|t| t.len() as u32)
+                .unwrap_or(0),
+            messages: Vec::new(),
+            windows,
+        });
+    }
+
+    results
+}
+
+/// A live conversation's tmux window index (for ordering windows within a session).
+fn window_index_of(c: &Conversation) -> &str {
+    c.placement
+        .as_ref()
+        .map(|p| p.window_index.as_str())
+        .unwrap_or("")
+}
+
+/// Build one [`WindowView`] from a live conversation: its placement + the
+/// registry-resolved status/resources, with auto-approve masking applied.
+fn conv_to_window_view(c: &Conversation, is_auto_approve: bool) -> WindowView {
+    let (session, window_index, window_name, pane_id) = match &c.placement {
+        Some(p) => (
+            p.session_name.clone(),
+            p.window_index.clone(),
+            p.window_name.clone(),
+            p.pane_id.clone().unwrap_or_default(),
+        ),
+        None => (String::new(), String::new(), String::new(), String::new()),
+    };
+    let status = mask_auto_approve(c.status.as_ref().map(|s| s.status.clone()), is_auto_approve);
+    WindowView {
+        pane_id: pane_id.clone(),
+        window_index: window_index.clone(),
+        window_name,
+        session_id: Some(c.id.as_str().to_string()),
+        status,
+        cpu: c.cpu,
+        mem_kb: c.mem_kb,
+        ports: c.ports.clone(),
+        cwd: (!c.cwd.is_empty()).then(|| c.cwd.clone()),
+        last_activity: c.last_activity.clone(),
+        pane: Some((session, window_index, pane_id)),
+    }
 }
 
 fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> ConversationView {

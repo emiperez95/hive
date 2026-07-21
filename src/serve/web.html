@@ -2808,7 +2808,9 @@ let lastConversationsJson = '';
 
 async function fetchSessions() {
   try {
-    const res = await fetch('/api/sessions');
+    // Active view now comes from the conversation model (/api/active). Same
+    // SessionView shape as the old /api/sessions, so rendering is unchanged.
+    const res = await fetch('/api/active');
     const json = await res.text();
     document.getElementById('connDot').style.background = 'var(--secondary)';
 

@@ -11,8 +11,8 @@ use crate::common::persistence::{
 use crate::common::projects::{connect_project, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
 use crate::ipc::messages::HookState;
-use crate::serve::server::{gather_conversation_views, gather_session_data};
-use crate::serve::web_types::{ConversationMessage, ConversationView, ToolSummary};
+use crate::serve::server::{build_conversation_views, gather_active_views, gather_session_data};
+use crate::serve::web_types::{ConversationMessage, ConversationView, SessionView, ToolSummary};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -93,11 +93,15 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         eprintln!("  {}: http://{}:{}", label, ip, port);
     }
 
-    // Shared session data between the data thread and request handlers
+    // Shared session data between the data thread and request handlers. `shared_data`
+    // is the OLD session-first view (/api/sessions, still backs detail/actions during
+    // the migration); `shared_active` is the Active view projected from the conversation
+    // model (/api/active, what the frontend list now consumes); `shared_conversations`
+    // is the closed/frozen set (/api/conversations, drives the Resume view).
     let shared_data = Arc::new(Mutex::new(Vec::new()));
     let data_for_thread = Arc::clone(&shared_data);
-    // Conversation-first view (new model) served alongside the session view during
-    // the web migration. Refreshed by the same thread.
+    let shared_active: Arc<Mutex<Vec<SessionView>>> = Arc::new(Mutex::new(Vec::new()));
+    let active_for_thread = Arc::clone(&shared_active);
     let shared_conversations: Arc<Mutex<Vec<ConversationView>>> = Arc::new(Mutex::new(Vec::new()));
     let conversations_for_thread = Arc::clone(&shared_conversations);
 
@@ -114,10 +118,18 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             sys.refresh_all();
             let hook_state = HookState::load();
             let sessions = gather_session_data(&sys, &hook_state);
-            let conversations = gather_conversation_views(&mut sys_conv);
+
+            // Gather the conversation registry ONCE and project it into both the
+            // Active view (session-grouped) and the Resume view (closed/frozen).
+            let reg = crate::common::conversations::gather_conversations_stats(&mut sys_conv);
+            let active = gather_active_views(&reg);
+            let conversations = build_conversation_views(&reg);
 
             if let Ok(mut data) = data_for_thread.lock() {
                 *data = sessions;
+            }
+            if let Ok(mut data) = active_for_thread.lock() {
+                *data = active;
             }
             if let Ok(mut data) = conversations_for_thread.lock() {
                 *data = conversations;
@@ -143,6 +155,22 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 
             (Method::Get, "/api/sessions") => {
                 let json = if let Ok(data) = shared_data.lock() {
+                    serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
+                } else {
+                    "[]".to_string()
+                };
+
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let response = Response::from_string(json).with_header(header);
+                let _ = request.respond(response);
+            }
+
+            (Method::Get, "/api/active") => {
+                // Active view projected from the conversation model (live convs grouped
+                // by tmux session + bare/startable sessions). Same SessionView shape as
+                // /api/sessions, so the frontend list is unchanged — but each window now
+                // carries a stable conversation id and registry-resolved status.
+                let json = if let Ok(data) = shared_active.lock() {
                     serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
                 } else {
                     "[]".to_string()
