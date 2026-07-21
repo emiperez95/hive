@@ -138,6 +138,10 @@ pub struct Conversation {
     /// empty for closed conversations. Not persisted.
     #[serde(skip)]
     pub ports: Vec<u16>,
+    /// Runtime-only process ids of this live conversation's window tree; empty for
+    /// closed. Not persisted. Lets the web build the per-process breakdown.
+    #[serde(skip)]
+    pub pids: Vec<u32>,
 }
 
 impl Conversation {
@@ -307,6 +311,7 @@ impl ConversationRegistry {
                     cpu: 0.0,
                     mem_kb: 0,
                     ports: Vec::new(),
+                    pids: Vec::new(),
                 },
             );
         }
@@ -357,6 +362,7 @@ impl ConversationRegistry {
                             cpu: 0.0,
                             mem_kb: 0,
                             ports: Vec::new(),
+                            pids: Vec::new(),
                         },
                     );
                 }
@@ -494,6 +500,7 @@ mod tests {
             cpu: 0.0,
             mem_kb: 0,
             ports: Vec::new(),
+            pids: Vec::new(),
         }
     }
 
@@ -864,6 +871,7 @@ mod tests {
             cpu: 0.0,
             mem_kb: 0,
             ports: Vec::new(),
+            pids: Vec::new(),
         }
     }
 

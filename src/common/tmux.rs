@@ -343,7 +343,13 @@ fn layout_3_panes(target: &str, mode: &str) {
 
 /// Send literal text to a tmux pane followed by Enter
 pub fn send_text_to_pane(session: &str, window: &str, pane: &str, text: &str) {
-    let target = format!("{}:{}.{}", session, window, pane);
+    // A global pane id ("%12") is a complete, rename-proof tmux target on its own;
+    // otherwise address the pane positionally as session:window.paneindex.
+    let target = if pane.starts_with('%') {
+        pane.to_string()
+    } else {
+        format!("{}:{}.{}", session, window, pane)
+    };
     // Send the text literally (-l flag prevents interpretation of special keys)
     let _ = Command::new("tmux")
         .args(["send-keys", "-t", &target, "-l", text])

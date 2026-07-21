@@ -1,8 +1,9 @@
 //! Serializable types for the web dashboard JSON API.
 //!
-//! `SessionView` is produced by `serve::server::gather_session_data()` and
-//! returned by `/api/sessions`. `ConversationMessage` is returned by
-//! `/api/messages`.
+//! `SessionView` is produced by `serve::server::gather_active_views()` (the
+//! Active view projected from the conversation registry) and returned by
+//! `/api/active`; `ConversationView` by `build_conversation_views()` for
+//! `/api/conversations`. `ConversationMessage` is returned by `/api/messages`.
 
 use crate::ipc::messages::SessionStatus;
 use serde::{Deserialize, Serialize};

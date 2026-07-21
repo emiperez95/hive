@@ -25,9 +25,12 @@ dispatches bare `hive` / `hive tui` to it; see **Conversations TUI** below.
 
 The old **classic session-first TUI** (`src/tui/`) was retired in the cutover — `git log` for
 its history. Its one non-ported feature, permission approve/reject from the dashboard, is
-documented in `docs/permission-approve-reject.md` for future revival. Note `serve/` (the web
-dashboard) still renders the **old session model** and shares a few `common/` types (e.g.
-`ClaudeStatus`) with it, pending a port to the conversation model.
+documented in `docs/permission-approve-reject.md` for future revival. The web dashboard
+(`serve/`) has also been ported to the conversation model: it now projects the shared
+`ConversationRegistry` (via `common/conversations.rs`) into its wire shapes, so both the TUI
+and the web run off one gather. The old per-endpoint session gather (`gather_session_data`) and
+`/api/sessions` are gone; `ClaudeStatus` survives only as the JSONL-parse intermediate the
+registry's live-status recovery uses.
 
 ## Architecture
 
@@ -146,9 +149,9 @@ src/
 │   └── notifier.rs         platform-native notifications (terminal-notifier/osascript/notify-send)
 ├── ipc/
 │   └── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
-├── serve/                  NOTE: still on the OLD session model (no ConversationRegistry yet)
+├── serve/                  web dashboard — projects the ConversationRegistry (conversation model)
 │   ├── mod.rs              module registration (server, web, web_types)
-│   ├── server.rs           gather_session_data() — collects local sessions for the web API
+│   ├── server.rs           gather_active_views()/build_conversation_views() — project the registry
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
@@ -367,7 +370,7 @@ in place of it.
 
 **Web**: same `frozen.rs` layer via `/api/frozen` (list), `/api/freeze`, `/api/thaw`,
 `/api/discard-frozen`. The info modal shows a per-window Freeze button (the window identity
-comes from the live `/api/sessions` `windows` array); a `FROZEN` section in the session list
+comes from the live `/api/active` `windows` array); a `FROZEN` section in the session list
 thaws on tap and discards via a trash icon.
 
 ## Background Tasks (workflow detection)
@@ -448,17 +451,18 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 **Architecture:**
 
 ```
-┌─────────────────┐     ┌──────────────────────────────────────┐
-│  Data Thread     │     │  HTTP Thread (main, blocking recv)   │
-│  (1s refresh)    │     │                                      │
-│  sysinfo.refresh │     │  GET /             → embedded HTML   │
-│  HookState::load │     │  GET /api/sessions → session JSON    │
-│  gather_sessions │     │  GET /api/messages → conversation    │
-│  → Arc<Mutex>    │     │  GET /api/config   → {tts: bool}    │
-│                  │     │  POST /api/send    → tmux send-keys  │
-└─────────────────┘     │  POST /api/tts-hls → HLS via TTS    │
-                        │  GET /hls/*        → proxy segments  │
-                        └──────────────────────────────────────┘
+┌──────────────────┐     ┌──────────────────────────────────────┐
+│  Data Thread      │     │  HTTP Thread (main, blocking recv)   │
+│  (1s refresh)     │     │                                      │
+│  gather registry  │     │  GET /             → embedded HTML   │
+│  once, project →  │     │  GET /api/active   → session view    │
+│  active + convs   │     │  GET /api/conversations → resume set │
+│  → Arc<Mutex>     │     │  GET /api/messages → conversation    │
+│                   │     │  POST /api/send    → tmux send-keys  │
+└──────────────────┘     │  POST /api/resume  → reopen closed   │
+                         │  POST /api/tts-hls → HLS via TTS    │
+                         │  GET /hls/*        → proxy segments  │
+                         └──────────────────────────────────────┘
 ```
 
 **API endpoints:**
@@ -466,7 +470,9 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Serve embedded HTML (or from disk in `--dev` mode) |
-| GET | `/api/sessions` | Session list with status, CPU, ports, skipped flag (polled every 1.5s) |
+| GET | `/api/active` | Active view (live convs grouped by tmux session + bare/startable sessions), projected from the registry; SessionView shape, polled every 1.5s |
+| GET | `/api/conversations` | Closed/frozen conversations for the Resume view (ConversationView) |
+| POST | `/api/resume` | Reopen a closed conversation by id (`claude --resume <id>` in its project session) |
 | GET | `/api/messages?session=X` | Full conversation for a session (user + assistant + tool uses) |
 | GET | `/api/config` | Feature flags (`{"tts": true/false}`) |
 | GET | `/api/projects` | All registered projects with exists flag |

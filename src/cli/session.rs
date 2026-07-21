@@ -48,19 +48,19 @@ pub fn run_cycle(forward: bool, pane: Option<&str>) -> Result<()> {
 /// Always moves forward — it's a single "jump to a free window" action.
 /// `pane` is the triggering pane (`#{pane_id}`) used to locate the current window.
 pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
-    use crate::ipc::messages::{HookState, SessionStatus};
+    use crate::ipc::messages::SessionStatus;
     use sysinfo::System;
 
     let skipped = load_skipped_sessions();
     let other_clients = get_other_client_sessions();
 
-    // Reuse the dashboard's per-window status resolution so "busy" stays
-    // consistent across the app. Heavier than a plain cycle (full process scan),
-    // but it's a one-shot keypress.
+    // Reuse the dashboard's per-window status resolution (the conversation
+    // registry) so "busy" stays consistent across the app. Heavier than a plain
+    // cycle (full process scan), but it's a one-shot keypress.
     let mut sys = System::new_all();
     sys.refresh_all();
-    let hook_state = HookState::load();
-    let session_data = crate::serve::server::gather_session_data(&sys, &hook_state);
+    let reg = crate::common::conversations::gather_conversations_stats(&mut sys);
+    let session_data = crate::serve::server::gather_active_views(&reg, &sys);
 
     // Flatten to one entry per Claude window in tmux order. A session's windows
     // are contiguous (sorted by window index), so a forward scan from the current

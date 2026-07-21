@@ -3997,6 +3997,7 @@ mod tests {
             cpu: 0.0,
             mem_kb: 0,
             ports: Vec::new(),
+            pids: Vec::new(),
         }
     }
 

@@ -216,6 +216,7 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
                 }
                 c.cpu = cpu;
                 c.mem_kb = mem;
+                c.pids = pids.clone();
                 c.ports = get_listening_ports_for_pids(pids, sys)
                     .into_iter()
                     .map(|lp| lp.port)

@@ -10,8 +10,7 @@ use crate::common::persistence::{
 };
 use crate::common::projects::{connect_project, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
-use crate::ipc::messages::HookState;
-use crate::serve::server::{build_conversation_views, gather_active_views, gather_session_data};
+use crate::serve::server::{build_conversation_views, gather_active_views};
 use crate::serve::web_types::{ConversationMessage, ConversationView, SessionView, ToolSummary};
 
 use anyhow::Result;
@@ -93,13 +92,11 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         eprintln!("  {}: http://{}:{}", label, ip, port);
     }
 
-    // Shared session data between the data thread and request handlers. `shared_data`
-    // is the OLD session-first view (/api/sessions, still backs detail/actions during
-    // the migration); `shared_active` is the Active view projected from the conversation
-    // model (/api/active, what the frontend list now consumes); `shared_conversations`
-    // is the closed/frozen set (/api/conversations, drives the Resume view).
-    let shared_data = Arc::new(Mutex::new(Vec::new()));
-    let data_for_thread = Arc::clone(&shared_data);
+    // Shared data between the data thread and request handlers. `shared_active` is
+    // the Active view projected from the conversation model (/api/active — the list,
+    // plus the backing store for detail/messages/send/session-info); `shared_conversations`
+    // is the closed/frozen set (/api/conversations, drives the Resume view). Both are
+    // projections of a single registry gathered once per cycle.
     let shared_active: Arc<Mutex<Vec<SessionView>>> = Arc::new(Mutex::new(Vec::new()));
     let active_for_thread = Arc::clone(&shared_active);
     let shared_conversations: Arc<Mutex<Vec<ConversationView>>> = Arc::new(Mutex::new(Vec::new()));
@@ -109,25 +106,14 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     std::thread::spawn(move || {
         let mut sys = System::new_all();
         sys.refresh_all();
-        // A second System dedicated to the conversation gather so its CPU deltas
-        // span the full loop interval, independent of the session view's refresh.
-        let mut sys_conv = System::new_all();
-        sys_conv.refresh_all();
 
         loop {
-            sys.refresh_all();
-            let hook_state = HookState::load();
-            let sessions = gather_session_data(&sys, &hook_state);
-
-            // Gather the conversation registry ONCE and project it into both the
+            // Gather the conversation registry ONCE, then project it into both the
             // Active view (session-grouped) and the Resume view (closed/frozen).
-            let reg = crate::common::conversations::gather_conversations_stats(&mut sys_conv);
-            let active = gather_active_views(&reg);
+            let reg = crate::common::conversations::gather_conversations_stats(&mut sys);
+            let active = gather_active_views(&reg, &sys);
             let conversations = build_conversation_views(&reg);
 
-            if let Ok(mut data) = data_for_thread.lock() {
-                *data = sessions;
-            }
             if let Ok(mut data) = active_for_thread.lock() {
                 *data = active;
             }
@@ -153,23 +139,10 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(response);
             }
 
-            (Method::Get, "/api/sessions") => {
-                let json = if let Ok(data) = shared_data.lock() {
-                    serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
-                } else {
-                    "[]".to_string()
-                };
-
-                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
-                let response = Response::from_string(json).with_header(header);
-                let _ = request.respond(response);
-            }
-
             (Method::Get, "/api/active") => {
                 // Active view projected from the conversation model (live convs grouped
-                // by tmux session + bare/startable sessions). Same SessionView shape as
-                // /api/sessions, so the frontend list is unchanged — but each window now
-                // carries a stable conversation id and registry-resolved status.
+                // by tmux session + bare/startable sessions). SessionView shape — each
+                // window carries a stable conversation id and registry-resolved status.
                 let json = if let Ok(data) = shared_active.lock() {
                     serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
                 } else {
@@ -182,8 +155,8 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Get, "/api/conversations") => {
-                // New conversation-first model (live + closed + frozen, UUID-keyed).
-                // Served alongside /api/sessions during the web migration.
+                // Conversation-first model (live + closed + frozen, UUID-keyed) —
+                // drives the Resume view.
                 let json = if let Ok(data) = shared_conversations.lock() {
                     serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
                 } else {
@@ -205,7 +178,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     // (pane id) is given, use that instance's cwd + session_id so each
                     // Claude in a multi-window session maps to its own transcript.
                     let source: Option<(String, Option<String>)> =
-                        shared_data.lock().ok().and_then(|data| {
+                        shared_active.lock().ok().and_then(|data| {
                             let s = data.iter().find(|s| s.name == name)?;
                             let win = match &window {
                                 Some(pid) => s.windows.iter().find(|w| &w.pane_id == pid),
@@ -403,7 +376,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 
                     // Resolve the target pane from cached data. A window (pane id) targets
                     // that specific Claude; otherwise fall back to the session's primary pane.
-                    let pane = shared_data
+                    let pane = shared_active
                         .lock()
                         .ok()
                         .and_then(|data| {
@@ -545,7 +518,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 });
 
                 let json = if let Some(name) = session_name {
-                    let session_data = shared_data
+                    let session_data = shared_active
                         .lock()
                         .ok()
                         .and_then(|data| data.iter().find(|s| s.name == name).cloned());
@@ -715,7 +688,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 
             (Method::Post, "/api/freeze") => {
                 // Freeze one Claude window. The frontend posts the window's identity (it has
-                // it from /api/sessions); we kill that window and record it for resume.
+                // it from /api/active); we kill that window and record it for resume.
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
                 let json = (|| -> Option<String> {

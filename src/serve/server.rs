@@ -1,225 +1,24 @@
-//! Session data gathering for the web dashboard.
+//! Data gathering for the web dashboard's JSON API.
 //!
-//! Provides `gather_session_data()` — a TUI-state-free version of `App::refresh()`
-//! that collects local tmux/sysinfo/hook data into serializable structs for the
-//! web API.
-//!
-//! A single tmux session can host several Claude instances (one per window). This
-//! builds one [`WindowView`] per Claude instance via the shared
-//! [`crate::common::instances`] core, then aggregates them into a session-level
-//! [`SessionView`]. The web dashboard renders multi-window sessions as an accordion.
+//! Projects the shared [`crate::common::conversations`] registry into the wire
+//! shapes the dashboard consumes: [`gather_active_views`] (the session-grouped
+//! live view, `/api/active`) and [`build_conversation_views`] (the closed/frozen
+//! set, `/api/conversations`). A single tmux session can host several Claude
+//! windows; each becomes a [`WindowView`] and they aggregate into a
+//! [`SessionView`], which the dashboard renders as an accordion.
 
-use crate::common::instances::{detect_claude_instances, ClaudeInstance, HookIndex};
 use crate::common::persistence::{load_session_todos, load_skipped_sessions};
-use crate::common::ports::get_listening_ports_for_pids;
-use crate::common::process::{build_children_map, get_process_info};
+use crate::common::process::get_process_info;
 use crate::common::projects::ProjectRegistry;
 use crate::common::registry::{Conversation, ConversationRegistry};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
-use crate::ipc::messages::{HookState, SessionStatus};
+use crate::ipc::messages::SessionStatus;
 use crate::serve::web_types::{
     ConversationView, PlacementView, ProcessView, SessionView, WindowView,
 };
 
 use std::collections::HashMap;
 use sysinfo::System;
-
-/// Gather session data from local tmux + sysinfo + hook state.
-/// This is a simplified version of App::refresh() that doesn't need TUI state.
-pub(crate) fn gather_session_data(sys: &System, hook_state: &HookState) -> Vec<SessionView> {
-    let sessions = match get_tmux_sessions() {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let other_client_sessions = get_other_client_sessions();
-    let hook_index = HookIndex::build(hook_state);
-
-    // Detect every Claude instance across all sessions in one pass, then group by session.
-    let children_map = build_children_map();
-    let instances = detect_claude_instances(&sessions, sys, &children_map, &hook_index);
-    let mut instances_by_session: HashMap<String, Vec<ClaudeInstance>> = HashMap::new();
-    for inst in instances {
-        instances_by_session
-            .entry(inst.session_name.clone())
-            .or_default()
-            .push(inst);
-    }
-
-    let skipped_sessions = load_skipped_sessions();
-    let auto_approve_sessions = crate::common::persistence::load_auto_approve_sessions();
-    let session_todos = load_session_todos();
-    let mut results = Vec::new();
-
-    for session in &sessions {
-        let session_cwd = session
-            .windows
-            .first()
-            .and_then(|w| w.panes.first())
-            .map(|p| p.cwd.clone());
-
-        let is_auto_approve = auto_approve_sessions.contains(&session.name);
-
-        // Build one window per Claude instance in this session (ordered by window index).
-        let mut session_instances = instances_by_session
-            .remove(&session.name)
-            .unwrap_or_default();
-        session_instances.sort_by(|a, b| a.window_index.cmp(&b.window_index));
-
-        let windows: Vec<WindowView> = session_instances
-            .iter()
-            .map(|inst| build_window_view(inst, sys, &hook_index, is_auto_approve))
-            .collect();
-
-        // Aggregate the windows into session-level fields. Single-window sessions
-        // mirror their one window so existing single-Claude behaviour is unchanged.
-        let cpu = windows.iter().map(|w| w.cpu).sum();
-        let mem_kb = windows.iter().map(|w| w.mem_kb).sum();
-        let mut ports: Vec<u16> = windows
-            .iter()
-            .flat_map(|w| w.ports.iter().copied())
-            .collect();
-        ports.sort_unstable();
-        ports.dedup();
-        let last_activity = windows.iter().filter_map(|w| w.last_activity.clone()).max();
-        let status = aggregate_status(&windows);
-
-        // When no Claude is running, check whether the pane is a shell where `claude -c`
-        // failed with "No conversation found to continue". Only then do we expose the pane
-        // for send-keys and flag it startable — a pane running a server or another CLI tool
-        // must stay untargetable.
-        let mut pane = windows.first().and_then(|w| w.pane.clone());
-        let mut claude_continue_failed = false;
-        if pane.is_none() {
-            if let Some((s, w, p)) = session.windows.first().and_then(|win| {
-                win.panes
-                    .first()
-                    .map(|p| (session.name.clone(), win.index.clone(), p.index.clone()))
-            }) {
-                if crate::common::tmux::capture_pane(&s, &w, &p)
-                    .is_some_and(|t| t.contains("No conversation found to continue"))
-                {
-                    claude_continue_failed = true;
-                    pane = Some((s, w, p));
-                }
-            }
-        }
-
-        // Resources are counted from the Claude panes' process trees only.
-        let mut processes: Vec<ProcessView> = session_instances
-            .iter()
-            .flat_map(|inst| inst.pids.iter().copied())
-            .filter_map(|pid| {
-                get_process_info(sys, pid).map(|info| ProcessView {
-                    pid: info.pid,
-                    name: info.name,
-                    cpu_percent: info.cpu_percent,
-                    memory_kb: info.memory_kb,
-                    command: info.command,
-                })
-            })
-            .collect();
-        processes.sort_by(|a, b| {
-            b.cpu_percent
-                .partial_cmp(&a.cpu_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        results.push(SessionView {
-            name: session.name.clone(),
-            status,
-            cpu,
-            mem_kb,
-            ports,
-            processes,
-            cwd: session_cwd,
-            last_activity,
-            attached: other_client_sessions.contains(&session.name),
-            pane,
-            claude_continue_failed,
-            skipped: skipped_sessions.contains(&session.name),
-            todo_count: session_todos
-                .get(&session.name)
-                .map(|t| t.len() as u32)
-                .unwrap_or(0),
-            messages: Vec::new(),
-            windows,
-        });
-    }
-
-    results
-}
-
-/// Build a [`WindowView`] for a single Claude instance: per-window status, CPU/mem, ports.
-fn build_window_view(
-    inst: &ClaudeInstance,
-    sys: &System,
-    hook_index: &HookIndex,
-    is_auto_approve: bool,
-) -> WindowView {
-    // Status comes from THIS window's own pane. With no pane-bound hook session we fall back
-    // to the instance's own jsonl only when its cwd is unique; a shared cwd can't tell sibling
-    // windows apart, so we report idle rather than borrow whichever sibling is currently busy.
-    let pane_hook = hook_index.resolve_pane(&inst.pane_id);
-    let identified = pane_hook.is_some() || !inst.cwd_shared;
-    let (status, last_activity) = if let Some(hook) = pane_hook {
-        (Some(hook.status.clone()), hook.last_activity.clone())
-    } else if inst.cwd_shared {
-        (Some(SessionStatus::Waiting), None)
-    } else if let Some(jsonl) = crate::common::jsonl::get_claude_status_from_jsonl_for(
-        &inst.cwd,
-        inst.session_id.as_deref(),
-    ) {
-        (
-            Some(crate::common::conversations::convert_claude_to_session_status(&jsonl.status)),
-            jsonl.timestamp.map(|t| t.to_rfc3339()),
-        )
-    } else {
-        (Some(SessionStatus::Unknown), None)
-    };
-
-    // An idle main thread may still have a workflow / background agent running. Override
-    // Waiting with the in-flight summary so the dashboard shows it as busy — but only for
-    // windows we can identify (a shared-cwd unhooked window has no reliable transcript).
-    let status = if identified && matches!(status, Some(SessionStatus::Waiting)) {
-        crate::common::jsonl::background_running_summary(&inst.cwd, inst.session_id.as_deref())
-            .map(|summary| SessionStatus::RunningWorkflow { summary })
-            .or(status)
-    } else {
-        status
-    };
-
-    let status = mask_auto_approve(status, is_auto_approve);
-
-    let mut cpu = 0.0f32;
-    let mut mem_kb = 0u64;
-    for &pid in &inst.pids {
-        if let Some(info) = get_process_info(sys, pid) {
-            cpu += info.cpu_percent;
-            mem_kb += info.memory_kb;
-        }
-    }
-
-    let ports: Vec<u16> = get_listening_ports_for_pids(&inst.pids, sys)
-        .iter()
-        .map(|lp| lp.port)
-        .collect();
-
-    let (s, w, p) = inst.target();
-    WindowView {
-        pane_id: inst.pane_id.clone(),
-        window_index: inst.window_index.clone(),
-        window_name: inst.window_name.clone(),
-        session_id: inst.session_id.clone(),
-        status,
-        cpu,
-        mem_kb,
-        ports,
-        cwd: Some(inst.cwd.clone()),
-        last_activity,
-        pane: Some((s, w, p)),
-    }
-}
 
 /// Auto-approved sessions should surface as Working, never as a permission/edit prompt.
 fn mask_auto_approve(
@@ -308,13 +107,14 @@ pub(crate) fn build_conversation_views(reg: &ConversationRegistry) -> Vec<Conver
 
 /// Project the registry's LIVE conversations into the session-grouped
 /// [`SessionView`] shape the Active view consumes (`/api/active`), plus every
-/// live tmux session as a bare/startable entry. This is the conversation-model
-/// replacement for [`gather_session_data`]: each window carries a stable
+/// live tmux session as a bare/startable entry. The conversation-model
+/// replacement for the old session gather: each window carries a stable
 /// conversation id and the registry's robust window→conversation resolution +
 /// enriched status (so shared-cwd multi-Claude sessions report correct per-window
-/// status, which the hook-only path cannot). CPU/mem/ports come from the registry
-/// sample, so no `System` is needed here.
-pub(crate) fn gather_active_views(reg: &ConversationRegistry) -> Vec<SessionView> {
+/// status, which the hook-only path could not). CPU/mem/ports come from the
+/// registry sample; `sys` (kept alive by the caller for CPU deltas) is used only
+/// to build the per-process breakdown for the info modal.
+pub(crate) fn gather_active_views(reg: &ConversationRegistry, sys: &System) -> Vec<SessionView> {
     let sessions = match get_tmux_sessions() {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -386,13 +186,33 @@ pub(crate) fn gather_active_views(reg: &ConversationRegistry) -> Vec<SessionView
             }
         }
 
+        // Per-process breakdown (info modal), from this session's Claude pids.
+        let mut processes: Vec<ProcessView> = session_convs
+            .iter()
+            .flat_map(|c| c.pids.iter().copied())
+            .filter_map(|pid| {
+                get_process_info(sys, pid).map(|info| ProcessView {
+                    pid: info.pid,
+                    name: info.name,
+                    cpu_percent: info.cpu_percent,
+                    memory_kb: info.memory_kb,
+                    command: info.command,
+                })
+            })
+            .collect();
+        processes.sort_by(|a, b| {
+            b.cpu_percent
+                .partial_cmp(&a.cpu_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         results.push(SessionView {
             name: session.name.clone(),
             status,
             cpu,
             mem_kb,
             ports,
-            processes: Vec::new(),
+            processes,
             cwd: session_cwd,
             last_activity,
             attached: other_client_sessions.contains(&session.name),

@@ -35,8 +35,6 @@ pub struct ClaudeInstance {
     pub window_index: String,
     /// tmux window name.
     pub window_name: String,
-    /// tmux pane index within the window.
-    pub pane_index: String,
     /// tmux global pane id (e.g. "%1").
     pub pane_id: String,
     /// Working directory of the pane.
@@ -49,17 +47,6 @@ pub struct ClaudeInstance {
     pub cwd_shared: bool,
     /// PIDs of the Claude pane's process tree (the pane pid + descendants).
     pub pids: Vec<u32>,
-}
-
-impl ClaudeInstance {
-    /// `(session, window, pane)` tuple used for tmux `send-keys` / targeting.
-    pub fn target(&self) -> (String, String, String) {
-        (
-            self.session_name.clone(),
-            self.window_index.clone(),
-            self.pane_index.clone(),
-        )
-    }
 }
 
 /// Index over hook state for resolving a pane (or cwd) to its recorded Claude session.
@@ -157,7 +144,6 @@ pub fn detect_claude_instances(
                     session_name: session.name.clone(),
                     window_index: window.index.clone(),
                     window_name: window.name.clone(),
-                    pane_index: pane.index.clone(),
                     pane_id: pane.id.clone(),
                     cwd: pane.cwd.clone(),
                     session_id,
