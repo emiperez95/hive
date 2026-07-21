@@ -1397,6 +1397,23 @@
   .stats-tab.active { background: var(--surface-container-lowest); color: var(--primary); }
   .stats-pane.hidden { display: none; }
   .stats-note { font-size: 12px; color: #5b6168; margin-top: 4px; line-height: 1.4; }
+
+  /* Active/Resume segmented toggle at the top of the session list */
+  .list-tabs {
+    display: flex; gap: 6px; margin: 12px 16px 2px;
+    background: var(--surface-container); border-radius: 10px; padding: 4px;
+  }
+  .list-tab {
+    flex: 1; border: none; background: none; cursor: pointer;
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    color: #5b6168;
+  }
+  .list-tab.active { background: var(--surface-container-lowest); color: var(--primary); }
+  /* Resume (closed/resumable) conversation rows */
+  .resume-item .resume-time { font-size: 11px; color: var(--on-surface-variant); font-weight: 600; white-space: nowrap; }
+  .resume-item .resume-icon { color: var(--primary); font-size: 26px; align-self: center; margin-left: 4px; }
+  .resume-item .mono { font-family: ui-monospace, monospace; font-size: 11px; opacity: 0.55; }
+  .conv-profile { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--tertiary); background: var(--surface-container); padding: 1px 6px; border-radius: 4px; margin-left: 6px; }
   .header-right { display: flex; align-items: center; gap: 10px; }
   .hdr-btn {
     background: none; border: none; padding: 4px; cursor: pointer;
@@ -1774,6 +1791,10 @@
         </div>
       </div>
     </div>
+    <div class="list-tabs">
+      <button class="list-tab active" data-tab="active" onclick="switchListTab('active')">Active</button>
+      <button class="list-tab" data-tab="resume" onclick="switchListTab('resume')">Resume</button>
+    </div>
     <div class="session-list" id="sessionList">
       <div class="loading"><span class="dot-pulse">Loading sessions...</span></div>
     </div>
@@ -1893,6 +1914,9 @@
 <script>
 let sessions = [];
 let frozenList = []; // frozen Claude windows (from /api/frozen)
+let conversations = []; // closed/resumable conversations (from /api/conversations)
+let conversationsLoaded = false;
+let listTab = 'active'; // 'active' (live sessions) | 'resume' (closed conversations)
 let selectedSession = null;
 let selectedWindow = null; // pane id (e.g. "%1") when a specific window is selected
 let expandedSessions = new Set(); // session names whose accordion is open
@@ -2384,6 +2408,7 @@ function renderWindowRow(s, w) {
 }
 
 function renderList() {
+  if (listTab === 'resume') { renderResumeList(); return; }
   const el = document.getElementById('sessionList');
   if (!sessions.length) {
     el.innerHTML = '<div class="loading">No sessions found</div>';
@@ -2420,6 +2445,84 @@ function renderFrozenItem(f) {
     <div class="frozen-time">${esc(f.relative || '')}</div>
     <button class="frozen-discard" onclick="event.stopPropagation();discardFrozen('${key}')"><span class="material-symbols-outlined">delete</span></button>
   </div>`;
+}
+
+// Resume tab: closed/resumable conversations grouped by project, most recent
+// first. Frozen conversations are excluded here — they live in the Active tab's
+// FROZEN section (thaw brings them back).
+function renderResumeList() {
+  const el = document.getElementById('sessionList');
+  if (!conversationsLoaded) {
+    el.innerHTML = '<div class="loading"><span class="dot-pulse">Loading conversations...</span></div>';
+    return;
+  }
+  const items = conversations.filter(c => c.lifecycle === 'closed' && !c.frozen);
+  if (!items.length) {
+    el.innerHTML = '<div class="loading">No resumable conversations</div>';
+    return;
+  }
+  // Group by project (or the raw parent, or "other"), each sorted newest-first.
+  const groups = new Map();
+  for (const c of items) {
+    const key = c.project_key || c.parent || 'other';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  const groupList = [...groups.entries()].map(([key, arr]) => {
+    arr.sort((a, b) => (b.last_activity || '').localeCompare(a.last_activity || ''));
+    return { key, arr, recent: arr[0] ? (arr[0].last_activity || '') : '' };
+  }).sort((a, b) => b.recent.localeCompare(a.recent));
+
+  let html = '';
+  for (const g of groupList) {
+    const emoji = g.arr[0].emoji || '\u{1F4C1}';
+    const label = g.key === 'other' ? 'OTHER' : g.key.toUpperCase();
+    html += `<div class="section-header">${emoji} ${esc(label)} · ${g.arr.length}</div>`;
+    html += g.arr.map(renderResumeItem).join('');
+  }
+  el.innerHTML = html;
+}
+
+function renderResumeItem(c) {
+  const title = c.title || c.short_id;
+  const rel = c.last_activity ? relativeTime(c.last_activity) : '';
+  const profile = c.auth_profile ? `<span class="conv-profile">${esc(c.auth_profile)}</span>` : '';
+  return `<div class="session-item resume-item" onclick="resumeConversation('${esc(c.id)}', this)">
+    <div class="emoji-box">${c.emoji || '\u{1F4AC}'}</div>
+    <div class="info">
+      <div class="name-row">
+        <div class="name">${esc(title)}</div>
+        <span class="resume-time">${esc(rel)}</span>
+      </div>
+      <div class="meta"><span class="mono">${esc(c.short_id)}</span>${profile}</div>
+    </div>
+    <span class="material-symbols-outlined resume-icon">play_circle</span>
+  </div>`;
+}
+
+// Resume a closed conversation: `claude --resume <id>` in its project/worktree
+// session (created if needed), then jump to the Active tab where it appears.
+async function resumeConversation(id, el) {
+  if (el) { el.style.opacity = '0.5'; el.style.pointerEvents = 'none'; }
+  try {
+    const res = await fetch('/api/resume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    const r = await res.json();
+    if (r.error) {
+      alert('Resume failed: ' + r.error);
+      if (el) { el.style.opacity = ''; el.style.pointerEvents = ''; }
+      return;
+    }
+    lastSessionsJson = '';
+    switchListTab('active');
+    fetchSessions();
+  } catch (e) {
+    alert('Resume failed');
+    if (el) { el.style.opacity = ''; el.style.pointerEvents = ''; }
+  }
 }
 
 function updateDetailBadges(s) {
@@ -2701,6 +2804,7 @@ async function startClaude() {
 // --- Polling ---
 let lastSessionsJson = '';
 let lastFrozenJson = '';
+let lastConversationsJson = '';
 
 async function fetchSessions() {
   try {
@@ -2715,12 +2819,17 @@ async function fetchSessions() {
     sessions = JSON.parse(json);
     frozenList = JSON.parse(frJson);
 
-    // Only re-render the list when either set actually changed.
-    if (json !== lastSessionsJson || frJson !== lastFrozenJson) {
-      lastSessionsJson = json;
-      lastFrozenJson = frJson;
+    // Only re-render the list when either set actually changed. (The Resume tab
+    // renders from `conversations`, refreshed separately by fetchConversations.)
+    if (listTab === 'active' && (json !== lastSessionsJson || frJson !== lastFrozenJson)) {
       renderList();
     }
+    lastSessionsJson = json;
+    lastFrozenJson = frJson;
+
+    // The resumable set changes slowly and is only visible on the Resume tab, so
+    // poll it only while that tab is showing.
+    if (listTab === 'resume') fetchConversations();
 
     // In detail view, only update badges (not chat — that has its own poll)
     if (selectedSession) {
@@ -2730,6 +2839,30 @@ async function fetchSessions() {
   } catch (e) {
     document.getElementById('connDot').style.background = 'var(--error)';
   }
+}
+
+// Fetch closed/resumable conversations for the Resume tab (own cadence).
+async function fetchConversations() {
+  try {
+    const json = await (await fetch('/api/conversations')).text();
+    conversations = JSON.parse(json);
+    conversationsLoaded = true;
+    if (json !== lastConversationsJson) {
+      lastConversationsJson = json;
+      if (listTab === 'resume') renderList();
+    }
+  } catch (e) { /* keep last */ }
+}
+
+// Switch the session list between the live Active view and the Resume view.
+function switchListTab(tab) {
+  if (tab === listTab) return;
+  listTab = tab;
+  for (const el of document.querySelectorAll('.list-tab')) {
+    el.classList.toggle('active', el.dataset.tab === tab);
+  }
+  renderList();
+  if (tab === 'resume') fetchConversations();
 }
 
 function esc(s) {

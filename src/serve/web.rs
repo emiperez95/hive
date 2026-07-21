@@ -723,6 +723,33 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            (Method::Post, "/api/resume") => {
+                // Reopen a closed (resumable) conversation by id: resume it in its
+                // project/worktree session under its auth profile, creating the session
+                // if needed. Frozen conversations go through /api/thaw instead.
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let id = req.get("id")?.as_str()?;
+                    // Look the conversation up from the source of truth (correct
+                    // cwd/auth/parent), never trusting client-supplied fields.
+                    let reg = crate::common::conversations::gather_conversations();
+                    let conv = reg.conversations.get(id)?;
+                    let result = crate::common::conversations::reopen_conversation(conv, None);
+                    Some(
+                        match result {
+                            Ok(session) => serde_json::json!({"ok": true, "session": session}),
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        }
+                        .to_string(),
+                    )
+                })()
+                .unwrap_or_else(|| r#"{"error":"conversation not found"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
             (Method::Post, "/api/thaw") => {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);

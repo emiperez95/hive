@@ -1100,7 +1100,7 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
         }
         Action::Reopen(c) => {
             // Resuming into a session you're actively opening should un-skip it.
-            if let Some(s) = target_session(&c) {
+            if let Some(s) = crate::common::conversations::target_session(&c) {
                 unskip_session(&s);
             }
             println!("{}", reopen(&c)?)
@@ -3527,78 +3527,16 @@ fn window_line(w: &WinRow, selected: bool, num: Option<usize>) -> Line<'static> 
 
 /// The tmux session that owns this conversation's project/worktree, if resolvable
 /// from its logical `parent` key.
-fn target_session(c: &Conversation) -> Option<String> {
-    let parent = c.parent.as_ref()?;
-    // A worktree parent ("project/branch") carries its own recorded session name.
-    if parent.contains('/') {
-        let wts = WorktreeState::load();
-        let name = wts.worktrees.get(parent).map(|e| e.session_name.clone())?;
-        return (!name.is_empty()).then_some(name);
-    }
-    // A project parent maps to the project's generated session name.
-    let projects = ProjectRegistry::load();
-    let config = projects.projects.get(parent)?;
-    Some(ProjectRegistry::session_name(parent, config))
-}
-
-/// Reopen a closed conversation: resume it (`claude --resume <id>`) in its own
-/// project/worktree session under its original auth profile — creating the
-/// session if needed — then switch to it. Falls back to the current session when
-/// the conversation has no resolvable parent (e.g. the "unassigned" group).
+/// Reopen a closed conversation via the shared [`crate::common::conversations`]
+/// core (resume in its project/worktree session under its auth profile, creating
+/// the session if needed), then switch this tmux client to it. Falls back to the
+/// current session when the conversation has no resolvable parent.
 fn reopen(c: &Conversation) -> Result<String> {
-    // Frozen conversations thaw through the existing frozen path, which recreates
-    // the window/session, resumes (`--resume <id>` or `claude -c` for id-less
-    // legacy entries), and removes the frozen.json entry. Then switch to it.
-    if c.is_frozen() {
-        let session = crate::common::frozen::thaw_window(c.id.as_str())?;
-        attach_or_switch(&session);
-        return Ok(format!("Thawed {} in {session}", short_id(c.id.as_str())));
-    }
-
-    let startup = format!("claude --resume {}", c.id);
-    // Resume under the same auth profile the conversation was created in.
-    let env: Vec<(String, String)> = match &c.auth_config_dir {
-        Some(dir) => vec![("CLAUDE_CONFIG_DIR".to_string(), dir.clone())],
-        None => Vec::new(),
-    };
-
-    let target = target_session(c)
-        .or_else(get_current_tmux_session)
-        .ok_or_else(|| anyhow!("no target session (not inside tmux and no project match)"))?;
-
-    let alive = Command::new("tmux")
-        .args(["has-session", "-t", &target])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if alive {
-        // Add a window to the existing session and resume in it.
-        let mut cmd = Command::new("tmux");
-        cmd.args(["new-window", "-t", &target, "-c", &c.cwd]);
-        for (k, v) in &env {
-            cmd.arg("-e").arg(format!("{k}={v}"));
-        }
-        if let Some(title) = &c.title {
-            if !title.is_empty() {
-                cmd.args(["-n", title]);
-            }
-        }
-        if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
-            return Err(anyhow!("failed to open a new window in '{target}'"));
-        }
-        let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &target, &startup, "Enter"])
-            .output();
-    } else if !ensure_tmux_session(&target, &c.cwd, Some(&startup), &env) {
-        return Err(anyhow!("failed to create session '{target}'"));
-    }
-
-    attach_or_switch(&target);
-    Ok(format!(
-        "Reopened {} in {target} — {startup}",
-        short_id(c.id.as_str())
-    ))
+    let frozen = c.is_frozen();
+    let session = crate::common::conversations::reopen_conversation(c, get_current_tmux_session())?;
+    attach_or_switch(&session);
+    let verb = if frozen { "Thawed" } else { "Reopened" };
+    Ok(format!("{verb} {} in {session}", short_id(c.id.as_str())))
 }
 
 /// Start a fresh conversation in a project: if its session is alive, open a new

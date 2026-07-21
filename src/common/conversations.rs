@@ -8,7 +8,9 @@
 //! TUI used to own this; it moved here for the web port.
 
 use std::collections::{HashMap, HashSet};
+use std::process::Command;
 
+use anyhow::{anyhow, Result};
 use sysinfo::System;
 
 use crate::common::frozen::FrozenState;
@@ -16,9 +18,10 @@ use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{build_cmdline_map, get_process_info, parse_resume_id};
-use crate::common::projects::ProjectRegistry;
+use crate::common::projects::{ensure_tmux_session, ProjectRegistry};
 use crate::common::registry::{
-    self, ConversationRegistry, ConversationSidecar, ConversationStatus, TmuxPlacement,
+    self, Conversation, ConversationRegistry, ConversationSidecar, ConversationStatus,
+    TmuxPlacement,
 };
 use crate::common::types::ClaudeStatus;
 use crate::common::worktree::WorktreeState;
@@ -252,4 +255,78 @@ fn status_needs_attention(s: &SessionStatus) -> bool {
             | SessionStatus::PlanReview
             | SessionStatus::QuestionAsked
     )
+}
+
+// ── Reopen (resume a closed conversation) ───────────────────────────────────
+
+/// Resolve a conversation's target tmux session name from its logical parent: a
+/// worktree parent ("project/branch") carries its own recorded session name; a
+/// project parent maps to the project's generated session name. None when the
+/// conversation has no resolvable parent (e.g. the "unassigned" group).
+pub fn target_session(c: &Conversation) -> Option<String> {
+    let parent = c.parent.as_ref()?;
+    if parent.contains('/') {
+        let wts = WorktreeState::load();
+        let name = wts.worktrees.get(parent).map(|e| e.session_name.clone())?;
+        return (!name.is_empty()).then_some(name);
+    }
+    let projects = ProjectRegistry::load();
+    let config = projects.projects.get(parent)?;
+    Some(ProjectRegistry::session_name(parent, config))
+}
+
+/// Reopen a closed conversation: resume it (`claude --resume <id>`) in its
+/// project/worktree session under its original auth profile — creating the
+/// session if needed. Returns the target tmux session name. Does NOT switch or
+/// attach the caller's tmux client (the TUI does that itself after; a web request
+/// must not). `fallback_session` is used when the conversation has no resolvable
+/// parent (the TUI passes the current tmux session; the web passes None).
+pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -> Result<String> {
+    // Frozen conversations thaw through the existing frozen path, which recreates
+    // the window/session, resumes (`--resume <id>` or `claude -c` for id-less
+    // legacy entries), and removes the frozen.json entry.
+    if c.is_frozen() {
+        return crate::common::frozen::thaw_window(c.id.as_str());
+    }
+
+    let startup = format!("claude --resume {}", c.id.as_str());
+    // Resume under the same auth profile the conversation was created in.
+    let env: Vec<(String, String)> = match &c.auth_config_dir {
+        Some(dir) => vec![("CLAUDE_CONFIG_DIR".to_string(), dir.clone())],
+        None => Vec::new(),
+    };
+
+    let target = target_session(c)
+        .or(fallback_session)
+        .ok_or_else(|| anyhow!("no target session (no project match)"))?;
+
+    let alive = Command::new("tmux")
+        .args(["has-session", "-t", &target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if alive {
+        // Add a window to the existing session and resume in it.
+        let mut cmd = Command::new("tmux");
+        cmd.args(["new-window", "-t", &target, "-c", &c.cwd]);
+        for (k, v) in &env {
+            cmd.arg("-e").arg(format!("{k}={v}"));
+        }
+        if let Some(title) = &c.title {
+            if !title.is_empty() {
+                cmd.args(["-n", title]);
+            }
+        }
+        if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+            return Err(anyhow!("failed to open a new window in '{target}'"));
+        }
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &target, &startup, "Enter"])
+            .output();
+    } else if !ensure_tmux_session(&target, &c.cwd, Some(&startup), &env) {
+        return Err(anyhow!("failed to create session '{target}'"));
+    }
+
+    Ok(target)
 }
