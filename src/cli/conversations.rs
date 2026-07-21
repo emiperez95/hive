@@ -25,6 +25,7 @@ use ratatui::widgets::Paragraph;
 use crate::common::chrome::{
     focus_all_matched_tabs, get_chrome_tabs, match_tabs_to_ports, ChromeTab,
 };
+use crate::common::conversations::{gather_conversations, gather_conversations_stats};
 use crate::common::frozen::{discard_frozen, freeze_window, relative_time, FreezeTarget};
 use crate::common::instances;
 use crate::common::jsonl;
@@ -38,8 +39,7 @@ use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
 use crate::common::process::get_process_info;
 use crate::common::projects::{ensure_tmux_session, expand_tilde, ProjectConfig, ProjectRegistry};
 use crate::common::registry::{
-    self, Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
-    TmuxPlacement,
+    Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
 };
 use crate::common::tmux::{
     get_all_windows, get_current_tmux_session, get_current_tmux_window, select_window,
@@ -47,7 +47,7 @@ use crate::common::tmux::{
 };
 use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
-use crate::ipc::messages::{HookState, SessionStatus};
+use crate::ipc::messages::SessionStatus;
 
 /// Entry point. Interactive TUI on a terminal; static listing with `--list` or
 /// when output is piped/redirected.
@@ -72,166 +72,6 @@ pub fn run_conversations(opts: ConvOptions) -> Result<()> {
         return Ok(());
     }
     run_conversations_tui(&opts)
-}
-
-/// Build the conversation registry from live state (READ-ONLY): hook status +
-/// disk existence + live placements + overlay, with parents resolved and the
-/// Closed set bounded.
-pub fn gather_conversations() -> ConversationRegistry {
-    gather_conversations_inner(None)
-}
-
-/// Like [`gather_conversations`], but also samples live CPU/mem into each live
-/// conversation's `cpu`/`mem_kb`. `sys` must be kept alive across calls so
-/// `cpu_percent` is a real delta (the classic TUI keeps its `System` alive too).
-pub fn gather_conversations_stats(sys: &mut System) -> ConversationRegistry {
-    gather_conversations_inner(Some(sys))
-}
-
-fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistry {
-    let hook = HookState::load();
-    // Cached scan: unchanged transcripts (by mtime) skip the head+tail re-parse,
-    // so repeat refreshes and popup re-opens stay snappy.
-    let disk = jsonl::scan_all_disk_conversations_cached();
-    let disk_ids: Vec<String> = disk.iter().map(|d| d.id.clone()).collect();
-    let sidecar = ConversationSidecar::load();
-
-    // Live placements: every currently-running Claude instance we can tie to a
-    // conversation id becomes the SOLE Live discriminator for that id. `id_pids`
-    // keeps each live id's process tree for the optional CPU/mem sample.
-    let mut live_placements: HashMap<String, TmuxPlacement> = HashMap::new();
-    let mut id_pids: HashMap<String, Vec<u32>> = HashMap::new();
-    // Full process argv (one `ps`) so we can read `claude --resume <id>` — the
-    // per-window conversation id that survives hook-state pruning.
-    let cmdlines = crate::common::process::build_cmdline_map();
-    let instances = instances::detect_all_instances();
-    // `claimed` prevents two windows resolving to the same transcript.
-    let mut claimed: HashSet<String> = HashSet::new();
-
-    // Pass 1 — EXACT ids: the hook-resolved id, else `--resume <id>` from the
-    // process argv (validated: the transcript must exist). Both are per-window
-    // exact, so they always beat the recency guess below.
-    let mut pending: Vec<(Option<String>, instances::ClaudeInstance)> = Vec::new();
-    for inst in instances {
-        let sid = inst.session_id.clone().or_else(|| {
-            inst.pids
-                .iter()
-                .filter_map(|pid| cmdlines.get(pid))
-                .find_map(|cmd| crate::common::process::parse_resume_id(cmd))
-                .filter(|id| jsonl::find_jsonl_by_session_id(&inst.cwd, id).is_some())
-        });
-        if let Some(s) = &sid {
-            claimed.insert(s.clone());
-        }
-        pending.push((sid, inst));
-    }
-
-    // Pass 2 — FILL unresolved windows (no hook, plain `claude` with no id in argv,
-    // e.g. state.json pruned). A single-window cwd takes its newest transcript; a
-    // shared cwd takes the newest transcript not already claimed by a sibling window
-    // (N live windows ↔ N most-recent transcripts). Without this, live windows
-    // absent from state.json are invisible here though classic `prefix + s` shows them.
-    for (sid, inst) in &mut pending {
-        if sid.is_some() {
-            continue;
-        }
-        let candidate = if inst.cwd_shared {
-            jsonl::list_jsonls_for_cwd_by_recency(&inst.cwd)
-                .into_iter()
-                .find(|id| !claimed.contains(id))
-        } else {
-            jsonl::find_latest_jsonl_for_cwd(&inst.cwd)
-                .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-        };
-        if let Some(c) = candidate {
-            claimed.insert(c.clone());
-            *sid = Some(c);
-        }
-    }
-
-    for (sid, inst) in pending {
-        if let Some(sid) = sid {
-            id_pids.insert(sid.clone(), inst.pids.clone());
-            live_placements.insert(
-                sid,
-                TmuxPlacement {
-                    session_name: inst.session_name,
-                    window_index: inst.window_index,
-                    window_name: inst.window_name,
-                    pane_id: Some(inst.pane_id),
-                },
-            );
-        }
-    }
-
-    let mut reg = ConversationRegistry::from_shadow(&hook, &disk_ids, &live_placements, &sidecar);
-
-    // Enrich disk-only (Closed) conversations with cwd + last-activity + title
-    // from the transcript — the hook side had none, so without this they can't
-    // be placed or bounded.
-    let disk_map: HashMap<&str, &jsonl::DiskConversation> =
-        disk.iter().map(|d| (d.id.as_str(), d)).collect();
-    for (id, c) in reg.conversations.iter_mut() {
-        if let Some(d) = disk_map.get(id.as_str()) {
-            if c.cwd.is_empty() {
-                if let Some(cwd) = &d.cwd {
-                    c.cwd = cwd.clone();
-                }
-            }
-            if c.last_activity.is_none() {
-                c.last_activity = d.last_activity.clone();
-            }
-            if c.title.is_none() {
-                c.title = d.title.clone();
-            }
-            if c.auth_config_dir.is_none() {
-                c.auth_config_dir = d.config_dir.clone();
-            }
-        }
-    }
-
-    // Resolve a logical parent for any conversation without one cached.
-    let worktrees = WorktreeState::load();
-    let projects = ProjectRegistry::load();
-    for c in reg.conversations.values_mut() {
-        if c.parent.is_none() {
-            c.parent = registry::resolve_parent(&c.cwd, &worktrees, &projects);
-        }
-    }
-
-    // Overlay the frozen facet (note + timestamp) so frozen windows read as
-    // Closed+frozen (💤). Must run BEFORE bounding, since a pinned freeze is one
-    // of the reasons a Closed conversation is surfaced.
-    reg.apply_frozen(&crate::common::frozen::FrozenState::load());
-
-    // Bound the (unbounded) on-disk Closed set: Live is always shown; a Closed
-    // conversation is kept only if recently active, parented, or a pinned freeze.
-    let now = chrono::Utc::now();
-    let cfg = registry::BoundingCfg { max_age_days: 14 };
-    reg.conversations.retain(|_, c| {
-        c.lifecycle.is_actionable_here() || registry::should_surface_closed(c, now, &cfg)
-    });
-
-    // Optional live-resource sample: sum each live conversation's window process
-    // tree. `refresh_all` gives cpu_percent as a delta since the caller's last call.
-    if let Some(sys) = stats {
-        sys.refresh_all();
-        for (id, pids) in &id_pids {
-            if let Some(c) = reg.conversations.get_mut(id) {
-                let (mut cpu, mut mem) = (0.0f32, 0u64);
-                for &pid in pids {
-                    if let Some(info) = get_process_info(sys, pid) {
-                        cpu += info.cpu_percent;
-                        mem += info.memory_kb;
-                    }
-                }
-                c.cpu = cpu;
-                c.mem_kb = mem;
-            }
-        }
-    }
-
-    reg
 }
 
 // ── Interactive TUI ─────────────────────────────────────────────────────────
@@ -2623,6 +2463,15 @@ fn draw_project_detail(
             Style::default().add_modifier(Modifier::DIM),
         ),
     ];
+    if config.map(|c| c.archived).unwrap_or(false) {
+        title_spans.push(Span::raw("   "));
+        title_spans.push(Span::styled(
+            "[archived]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if frozen > 0 {
         title_spans.push(Span::raw("   "));
         title_spans.push(Span::styled(
@@ -4209,6 +4058,7 @@ mod tests {
             auth_config_dir: None,
             cpu: 0.0,
             mem_kb: 0,
+            ports: Vec::new(),
         }
     }
 

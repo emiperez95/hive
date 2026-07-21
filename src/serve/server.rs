@@ -13,9 +13,13 @@ use crate::common::instances::{detect_claude_instances, ClaudeInstance, HookInde
 use crate::common::persistence::{load_session_todos, load_skipped_sessions};
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{build_children_map, get_process_info};
+use crate::common::projects::ProjectRegistry;
+use crate::common::registry::Conversation;
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::{HookState, SessionStatus};
-use crate::serve::web_types::{ProcessView, SessionView, WindowView};
+use crate::serve::web_types::{
+    ConversationView, PlacementView, ProcessView, SessionView, WindowView,
+};
 
 use std::collections::HashMap;
 use sysinfo::System;
@@ -167,7 +171,7 @@ fn build_window_view(
         inst.session_id.as_deref(),
     ) {
         (
-            Some(convert_claude_to_session_status(&jsonl.status)),
+            Some(crate::common::conversations::convert_claude_to_session_status(&jsonl.status)),
             jsonl.timestamp.map(|t| t.to_rfc3339()),
         )
     } else {
@@ -276,20 +280,102 @@ fn aggregate_status(windows: &[WindowView]) -> Option<SessionStatus> {
     windows.first().and_then(|w| w.status.clone())
 }
 
-/// Convert a TUI `ClaudeStatus` (parsed from JSONL) back to wire `SessionStatus`.
-fn convert_claude_to_session_status(status: &crate::common::types::ClaudeStatus) -> SessionStatus {
-    use crate::common::types::ClaudeStatus;
-    match status {
-        ClaudeStatus::Waiting => SessionStatus::Waiting,
-        ClaudeStatus::NeedsPermission(tool, desc) => SessionStatus::NeedsPermission {
-            tool_name: tool.clone(),
-            description: desc.clone(),
-        },
-        ClaudeStatus::EditApproval(filename) => SessionStatus::EditApproval {
-            filename: filename.clone(),
-        },
-        ClaudeStatus::PlanReview => SessionStatus::PlanReview,
-        ClaudeStatus::QuestionAsked => SessionStatus::QuestionAsked,
-        ClaudeStatus::Unknown => SessionStatus::Working,
+// ── Conversation-first view (new `/api/conversations`) ──────────────────────
+
+/// Gather the conversation-first view for the new `/api/conversations` endpoint.
+/// Reuses the shared [`crate::common::conversations`] gather (live + closed +
+/// frozen, UUID-keyed) so the web dashboard sees the same model as the TUI.
+/// `sys` must be kept alive across calls for accurate CPU deltas.
+pub(crate) fn gather_conversation_views(sys: &mut System) -> Vec<ConversationView> {
+    let reg = crate::common::conversations::gather_conversations_stats(sys);
+    let projects = ProjectRegistry::load();
+    let mut views: Vec<ConversationView> = reg
+        .conversations
+        .values()
+        .map(|c| build_conversation_view(c, &projects))
+        .collect();
+    // Live first, then most-recently-active first — a stable, sensible default;
+    // the frontend regroups by project/session as needed.
+    views.sort_by(|a, b| {
+        let a_live = a.lifecycle == "live";
+        let b_live = b.lifecycle == "live";
+        b_live
+            .cmp(&a_live)
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    views
+}
+
+fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> ConversationView {
+    let short_id = if c.id.as_str().contains('#') {
+        "—".to_string()
+    } else {
+        c.id.as_str().chars().take(8).collect()
+    };
+    // parent is "project" or "project/branch"; the project part drives emoji/grouping.
+    let project_key = c.parent.as_deref().and_then(|p| {
+        let pk = p.split('/').next().unwrap_or(p);
+        projects.projects.contains_key(pk).then(|| pk.to_string())
+    });
+    let emoji = project_key
+        .as_deref()
+        .and_then(|pk| projects.projects.get(pk))
+        .map(|cfg| cfg.emoji.clone())
+        .unwrap_or_default();
+    // Auth profile = the `.claude-<name>` suffix of the config dir; None = default.
+    let auth_profile = c.auth_config_dir.as_ref().and_then(|dir| {
+        std::path::Path::new(dir)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|b| b.strip_prefix(".claude-"))
+            .map(|s| s.to_string())
+    });
+    let (frozen, frozen_note, frozen_relative) = match &c.frozen {
+        Some(f) => (
+            true,
+            Some(f.note.clone()).filter(|s| !s.is_empty()),
+            Some(crate::common::frozen::relative_time(&f.frozen_at)),
+        ),
+        None => (false, None, None),
+    };
+    let placement = c.placement.as_ref().map(|p| PlacementView {
+        session_name: p.session_name.clone(),
+        window_index: p.window_index.clone(),
+        window_name: p.window_name.clone(),
+        pane_id: p.pane_id.clone(),
+    });
+    ConversationView {
+        id: c.id.as_str().to_string(),
+        short_id,
+        title: c.title.clone(),
+        cwd: (!c.cwd.is_empty()).then(|| c.cwd.clone()),
+        lifecycle: if c.lifecycle.is_actionable_here() {
+            "live"
+        } else {
+            "closed"
+        }
+        .to_string(),
+        status: c.status.as_ref().map(|s| s.status.clone()),
+        needs_attention: c
+            .status
+            .as_ref()
+            .map(|s| s.needs_attention)
+            .unwrap_or(false),
+        last_activity: c.last_activity.clone(),
+        placement,
+        parent: c.parent.clone(),
+        project_key,
+        emoji,
+        frozen,
+        frozen_note,
+        frozen_relative,
+        note: c.note.clone(),
+        pinned: c.pinned,
+        archived: c.archived,
+        auth_profile,
+        cpu: c.cpu,
+        mem_kb: c.mem_kb,
+        ports: c.ports.clone(),
     }
 }

@@ -134,6 +134,10 @@ pub struct Conversation {
     pub cpu: f32,
     #[serde(skip)]
     pub mem_kb: u64,
+    /// Runtime-only listening TCP ports for this live conversation's process tree;
+    /// empty for closed conversations. Not persisted.
+    #[serde(skip)]
+    pub ports: Vec<u16>,
 }
 
 impl Conversation {
@@ -302,6 +306,7 @@ impl ConversationRegistry {
                     auth_config_dir: None,
                     cpu: 0.0,
                     mem_kb: 0,
+                    ports: Vec::new(),
                 },
             );
         }
@@ -351,6 +356,7 @@ impl ConversationRegistry {
                             auth_config_dir: entry.claude_config_dir.clone(),
                             cpu: 0.0,
                             mem_kb: 0,
+                            ports: Vec::new(),
                         },
                     );
                 }
@@ -487,6 +493,7 @@ mod tests {
             auth_config_dir: None,
             cpu: 0.0,
             mem_kb: 0,
+            ports: Vec::new(),
         }
     }
 
@@ -856,6 +863,7 @@ mod tests {
             auth_config_dir: None,
             cpu: 0.0,
             mem_kb: 0,
+            ports: Vec::new(),
         }
     }
 

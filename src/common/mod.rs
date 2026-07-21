@@ -2,6 +2,8 @@
 
 pub mod activity;
 pub mod chrome;
+// Shared gather: builds the ConversationRegistry for both the TUI and the web.
+pub mod conversations;
 pub mod debug;
 pub mod frozen;
 // Shared multi-Claude-per-session detection (consumed by the web server; TUI next).

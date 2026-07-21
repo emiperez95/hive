@@ -11,8 +11,8 @@ use crate::common::persistence::{
 use crate::common::projects::{connect_project, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
 use crate::ipc::messages::HookState;
-use crate::serve::server::gather_session_data;
-use crate::serve::web_types::{ConversationMessage, ToolSummary};
+use crate::serve::server::{gather_conversation_views, gather_session_data};
+use crate::serve::web_types::{ConversationMessage, ConversationView, ToolSummary};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -96,19 +96,31 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     // Shared session data between the data thread and request handlers
     let shared_data = Arc::new(Mutex::new(Vec::new()));
     let data_for_thread = Arc::clone(&shared_data);
+    // Conversation-first view (new model) served alongside the session view during
+    // the web migration. Refreshed by the same thread.
+    let shared_conversations: Arc<Mutex<Vec<ConversationView>>> = Arc::new(Mutex::new(Vec::new()));
+    let conversations_for_thread = Arc::clone(&shared_conversations);
 
     // Background data refresh thread (1s interval, same as TUI)
     std::thread::spawn(move || {
         let mut sys = System::new_all();
         sys.refresh_all();
+        // A second System dedicated to the conversation gather so its CPU deltas
+        // span the full loop interval, independent of the session view's refresh.
+        let mut sys_conv = System::new_all();
+        sys_conv.refresh_all();
 
         loop {
             sys.refresh_all();
             let hook_state = HookState::load();
             let sessions = gather_session_data(&sys, &hook_state);
+            let conversations = gather_conversation_views(&mut sys_conv);
 
             if let Ok(mut data) = data_for_thread.lock() {
                 *data = sessions;
+            }
+            if let Ok(mut data) = conversations_for_thread.lock() {
+                *data = conversations;
             }
 
             std::thread::sleep(Duration::from_secs(1));
@@ -131,6 +143,20 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 
             (Method::Get, "/api/sessions") => {
                 let json = if let Ok(data) = shared_data.lock() {
+                    serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
+                } else {
+                    "[]".to_string()
+                };
+
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let response = Response::from_string(json).with_header(header);
+                let _ = request.respond(response);
+            }
+
+            (Method::Get, "/api/conversations") => {
+                // New conversation-first model (live + closed + frozen, UUID-keyed).
+                // Served alongside /api/sessions during the web migration.
+                let json = if let Ok(data) = shared_conversations.lock() {
                     serde_json::to_string(&*data).unwrap_or_else(|_| "[]".to_string())
                 } else {
                     "[]".to_string()

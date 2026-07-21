@@ -82,6 +82,92 @@ pub struct WindowView {
     pub pane: Option<(String, String, String)>,
 }
 
+/// One conversation as exposed to the web dashboard's new conversation-first API
+/// (`/api/conversations`). A faithful serialization of a [`crate::common::registry::Conversation`]
+/// plus a few derived conveniences (short id, project emoji/key, auth profile,
+/// frozen relative time) the frontend would otherwise recompute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationView {
+    /// Claude conversation UUID (the transcript basename) — the stable key.
+    pub id: String,
+    /// First 8 chars of the id ("—" for legacy composite `session#window` keys).
+    pub short_id: String,
+    /// User/AI conversation title, when the transcript carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Working directory the conversation runs/ran in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// "live" (running here now) or "closed" (known, resumable, not running here).
+    pub lifecycle: String,
+    /// Activity status (Working/Waiting/NeedsPermission/…); None for closed with
+    /// no recovered status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SessionStatus>,
+    /// Whether the status is one requiring the user to act.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_attention: bool,
+    /// Last activity timestamp (ISO 8601).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+    /// Where it currently runs (live only) — session/window/pane for routing actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementView>,
+    /// Logical parent key (a project key like "hive" or a worktree key "hive/CSD-1").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Registered project key this belongs to (parent's project part), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    /// Project emoji for display (empty when no registered project).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Frozen facet: this is a hibernated (pinned+noted Closed) conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frozen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_note: Option<String>,
+    /// Human "3h ago" relative to when it was frozen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_relative: Option<String>,
+    /// Free-text overlay note (from conversations.json).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    /// Auth profile to resume under ("work" etc.); None = default `~/.claude`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
+    /// Live CPU% across the conversation's process tree (0 for closed).
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub cpu: f32,
+    /// Live memory (KB) across the conversation's process tree (0 for closed).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub mem_kb: u64,
+    /// Listening TCP ports for the live process tree (empty for closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
+}
+
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.0
+}
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Where a live conversation currently runs, for routing send/switch/freeze.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementView {
+    pub session_name: String,
+    pub window_index: String,
+    pub window_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+}
+
 /// One message in the conversation (user or assistant text).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMessage {
