@@ -94,7 +94,7 @@ fn project_help_exits_zero() {
     let output = hive_cmd().args(["project", "--help"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for sub in ["add", "remove", "archive", "unarchive", "list", "import"] {
+    for sub in ["add", "remove", "archive", "unarchive", "list"] {
         assert!(stdout.contains(sub), "Missing project subcommand '{}'", sub);
     }
 }

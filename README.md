@@ -139,7 +139,6 @@ hive collapse           # close all panes except the current one
 hive project add <key>  # add a project (supports --emoji, --path, --startup, etc.)
 hive project remove <key>
 hive project list
-hive project import     # import from sesh.toml (only relevant if you already use `sesh`)
 ```
 
 ### Worktrees

@@ -49,7 +49,6 @@ fn main() -> Result<()> {
                 cli::project::run_project_set_archived(&key, false)
             }
             ProjectCommand::List { all } => cli::project::run_project_list(all),
-            ProjectCommand::Import => cli::project::run_project_import(),
         },
         Some(Command::Todo { command }) => cli::todo::run_todo(command),
         Some(Command::Spread { count }) => cli::session::run_spread(count),

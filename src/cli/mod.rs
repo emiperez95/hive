@@ -236,8 +236,6 @@ pub enum ProjectCommand {
         #[arg(long)]
         all: bool,
     },
-    /// Import projects from sesh.toml
-    Import,
 }
 
 #[derive(Subcommand, Debug)]

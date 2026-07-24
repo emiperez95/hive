@@ -75,7 +75,6 @@ hive project remove <key> # remove a project from the registry
 hive project archive <key>   # archive a project (hide from picker + default list)
 hive project unarchive <key> # unarchive a project
 hive project list [--all]    # list configured projects (--all includes archived)
-hive project import     # import projects from sesh.toml
 hive wt new <project> <branch>  # create worktree + tmux session (with hooks)
 hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
@@ -141,7 +140,7 @@ src/
 │   ├── iterm.rs            iTerm2 pane spread/collapse via AppleScript (macOS only, #[cfg] guarded)
 │   ├── jsonl.rs            JSONL parsing + transcript scan (all auth profiles), mtime-keyed scan cache
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
-│   ├── projects.rs         project registry (projects.toml), replaces sesh dependency
+│   ├── projects.rs         project registry (projects.toml)
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
 │   └── debug.rs            debug logging to cache dir
 ├── daemon/
