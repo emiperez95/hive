@@ -119,9 +119,15 @@ pub struct Conversation {
     /// Hive overlay: user-pinned (surfaced regardless of recency bounding).
     #[serde(default)]
     pub pinned: bool,
-    /// Hive overlay: hidden from default listings.
+    /// Hive overlay: hidden from default listings (still listed in project detail).
     #[serde(default)]
     pub archived: bool,
+    /// Hive overlay: why it was archived — free text captured when archiving.
+    #[serde(default)]
+    pub archive_reason: Option<String>,
+    /// Hive overlay: when it was archived (RFC3339).
+    #[serde(default)]
+    pub archived_at: Option<String>,
     /// User-assigned conversation title (from the transcript's `custom-title`).
     #[serde(default)]
     pub title: Option<String>,
@@ -194,6 +200,12 @@ pub struct ConversationOverlay {
     pub pinned: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// Why it was archived, and when — captured at archive time so the project
+    /// detail can explain a hidden conversation instead of just dropping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
     /// logical parent key (project/branch), resolved once and cached here
     #[serde(default)]
     pub parent: Option<String>,
@@ -292,6 +304,8 @@ impl ConversationRegistry {
             let note = overlay.map(|o| o.note.clone()).unwrap_or_default();
             let pinned = overlay.map(|o| o.pinned).unwrap_or(false);
             let archived = overlay.map(|o| o.archived).unwrap_or(false);
+            let archive_reason = overlay.and_then(|o| o.archive_reason.clone());
+            let archived_at = overlay.and_then(|o| o.archived_at.clone());
             conversations.insert(
                 id.to_string(),
                 Conversation {
@@ -306,6 +320,8 @@ impl ConversationRegistry {
                     note,
                     pinned,
                     archived,
+                    archive_reason,
+                    archived_at,
                     title: None,
                     auth_config_dir: None,
                     cpu: 0.0,
@@ -357,6 +373,8 @@ impl ConversationRegistry {
                             note: String::new(),
                             pinned: false,
                             archived: false,
+                            archive_reason: None,
+                            archived_at: None,
                             title,
                             auth_config_dir: entry.claude_config_dir.clone(),
                             cpu: 0.0,
@@ -446,16 +464,18 @@ pub struct BoundingCfg {
     pub max_age_days: i64,
 }
 
-/// Surface a Closed session iff it is not archived AND (recently active OR it has
-/// a resolved parent OR it is a pinned freeze). Keeps the Closed list bounded.
+/// Surface a Closed session iff it is recently active OR it has a resolved parent
+/// OR it is pinned OR it is a pinned freeze. Keeps the Closed list bounded.
+///
+/// Archiving is deliberately NOT a bound: an archived conversation stays in the
+/// registry so its project's detail screen can still list it (with the reason it
+/// was archived). Hiding it from the default listings is a DISPLAY decision made
+/// by each consumer — see `build_browse` and the web's conversation views.
 pub fn should_surface_closed(
     session: &Conversation,
     now: DateTime<Utc>,
     cfg: &BoundingCfg,
 ) -> bool {
-    if session.archived {
-        return false;
-    }
     let recent = match &session.last_activity {
         Some(ts) => match DateTime::parse_from_rfc3339(ts) {
             Ok(dt) => (now - dt.with_timezone(&Utc)).num_days() <= cfg.max_age_days,
@@ -495,6 +515,8 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            archive_reason: None,
+            archived_at: None,
             title: None,
             auth_config_dir: None,
             cpu: 0.0,
@@ -622,6 +644,8 @@ mod tests {
                 note: "wip".to_string(),
                 pinned: true,
                 archived: false,
+                archive_reason: None,
+                archived_at: None,
                 parent: Some("hive/CSD-1".to_string()),
                 frozen_at: Some("2026-07-01T00:00:00Z".to_string()),
             },
@@ -776,6 +800,8 @@ mod tests {
             note: note.to_string(),
             pinned,
             archived: false,
+            archive_reason: None,
+            archived_at: None,
             parent: parent.map(|s| s.to_string()),
             frozen_at: None,
         }
@@ -866,6 +892,8 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            archive_reason: None,
+            archived_at: None,
             title: None,
             auth_config_dir: None,
             cpu: 0.0,
@@ -1006,10 +1034,18 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let cfg = BoundingCfg { max_age_days: 7 };
 
-        // Archived → never surfaced, even if recent.
+        // Archived is NOT a bound: an archived conversation stays in the registry
+        // (the project detail lists it with its reason). Consumers hide it.
         let mut arch = closed("a", Some("2026-07-02T00:00:00Z"));
         arch.archived = true;
-        assert!(!should_surface_closed(&arch, now, &cfg));
+        arch.archive_reason = Some("superseded".to_string());
+        assert!(should_surface_closed(&arch, now, &cfg));
+
+        // ...but it is still bounded like anything else: old, unparented,
+        // unpinned → dropped, archived or not.
+        let mut old_arch = closed("a2", Some("2026-01-01T00:00:00Z"));
+        old_arch.archived = true;
+        assert!(!should_surface_closed(&old_arch, now, &cfg));
 
         // Recently active → surfaced.
         assert!(should_surface_closed(

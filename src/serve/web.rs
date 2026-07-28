@@ -3,6 +3,7 @@
 //! Serves an embedded single-page app and JSON API for monitoring
 //! and interacting with Claude sessions from a mobile browser.
 
+use crate::common::config::{HiveConfig, WEB_SESSION};
 use crate::common::persistence::{
     load_auto_approve_sessions, load_completed_todos, load_favorite_sessions, load_session_todos,
     load_skipped_sessions, save_auto_approve_sessions, save_completed_todos,
@@ -15,11 +16,66 @@ use crate::serve::web_types::{ConversationMessage, ConversationView, SessionView
 
 use anyhow::Result;
 use serde::Deserialize;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::System;
 use tiny_http::{Header, Method, Response, Server};
+
+/// True if a TCP server is already accepting on `127.0.0.1:port`. A localhost
+/// probe with a tight timeout — when nothing listens the OS returns
+/// `ECONNREFUSED` immediately (no DNS, no network round-trip), so this is
+/// effectively free. Used once at TUI startup to make autostart idempotent.
+fn web_server_listening(port: u16) -> bool {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+/// Wrap a string in single quotes for safe interpolation into the shell command
+/// tmux runs for a new session.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Ensure a web server is running, if `[web].autostart` is set — called ONCE at
+/// TUI startup, never in the refresh loop. Idempotent and best-effort: if a
+/// server is already up (localhost probe) it does nothing, and any failure is
+/// swallowed so it can never delay or block opening the TUI.
+///
+/// The server is launched as the detached, hidden `WEB_SESSION` tmux session so
+/// it outlives the ephemeral TUI popup (a thread inside the popup process would
+/// die when the popup closes). Runs non-`--dev` (embedded HTML): the popup's cwd
+/// is arbitrary, so serving `web.html` from disk wouldn't resolve anyway.
+pub fn ensure_web_autostart() {
+    let web = HiveConfig::load().web;
+    if !web.autostart || web_server_listening(web.port) {
+        return;
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "hive".to_string());
+    let mut cmd = format!("{} web --port {}", sh_quote(&exe), web.port);
+    if let Some(host) = &web.tts_host {
+        cmd.push_str(&format!(" --tts-host {}", sh_quote(host)));
+    }
+    // `new-session` on an existing name is a harmless no-op error (we already
+    // returned when the server was up); ignore the status either way.
+    let _ = Command::new("tmux")
+        .args(["new-session", "-d", "-s", WEB_SESSION, &cmd])
+        .status();
+}
 
 /// Embedded HTML frontend, included at compile time.
 const WEB_HTML: &str = include_str!("web.html");

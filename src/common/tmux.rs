@@ -1,5 +1,6 @@
 //! tmux command helpers.
 
+use crate::common::config::WEB_SESSION;
 use crate::common::types::{TmuxPane, TmuxSession, TmuxWindow};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -16,7 +17,9 @@ pub fn get_tmux_sessions() -> Result<Vec<TmuxSession>> {
     let mut sessions = Vec::new();
 
     for session_name in session_names.lines() {
-        if session_name.is_empty() {
+        // `WEB_SESSION` hosts an autostarted web server — infrastructure, never a
+        // work target, so it's hidden from every session listing.
+        if session_name.is_empty() || session_name == WEB_SESSION {
             continue;
         }
 
@@ -128,7 +131,7 @@ pub fn get_current_tmux_session_names() -> Vec<String> {
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .filter(|l| !l.is_empty())
+                .filter(|l| !l.is_empty() && *l != WEB_SESSION)
                 .map(|s| s.to_string())
                 .collect()
         })
@@ -153,6 +156,10 @@ pub fn get_all_windows() -> std::collections::HashMap<String, Vec<(String, Strin
         for line in String::from_utf8_lossy(&o.stdout).lines() {
             let mut parts = line.splitn(3, '\t');
             if let (Some(session), Some(idx)) = (parts.next(), parts.next()) {
+                // Hide the autostarted web server's session (see WEB_SESSION).
+                if session == WEB_SESSION {
+                    continue;
+                }
                 let name = parts.next().unwrap_or("");
                 map.entry(session.to_string())
                     .or_default()

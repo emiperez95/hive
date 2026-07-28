@@ -90,6 +90,10 @@ pub(crate) fn build_conversation_views(reg: &ConversationRegistry) -> Vec<Conver
     let mut views: Vec<ConversationView> = reg
         .conversations
         .values()
+        // Archived conversations stay in the registry (the TUI's project detail
+        // lists them with their archive reason) but are set aside by definition —
+        // keep them off the Resume view unless they're actually running.
+        .filter(|c| !c.archived || c.lifecycle.is_actionable_here())
         .map(|c| build_conversation_view(c, &projects))
         .collect();
     // Live first, then most-recently-active first — a stable, sensible default;

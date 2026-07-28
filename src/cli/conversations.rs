@@ -42,8 +42,8 @@ use crate::common::registry::{
     Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
 };
 use crate::common::tmux::{
-    get_all_windows, get_current_tmux_session, get_current_tmux_window, select_window,
-    switch_to_session,
+    get_all_windows, get_current_tmux_session, get_current_tmux_session_names,
+    get_current_tmux_window, select_window, switch_to_session,
 };
 use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
@@ -93,6 +93,11 @@ enum Action {
     WtNew(String, String),
     /// Delete a worktree (project key, branch).
     WtDelete(String, String),
+    /// Open a registered worktree's tmux session (project key, branch), starting
+    /// the session if it isn't running.
+    ConnectWorktree(String, String),
+    /// Start a fresh conversation in a worktree (project key, branch).
+    NewInWorktree(String, String),
     /// Switch to a bare tmux session (one with no live conversation).
     SwitchSession(String),
     /// Switch to a specific non-Claude tmux window (session name, window index).
@@ -117,12 +122,35 @@ struct Group {
     /// servers, editors). Active view only; shown as dimmed "window" rows so the
     /// full session is visible, marked apart from real conversations.
     windows: Vec<WinRow>,
+    /// Registered worktrees of this project. Browse only; shown as rows above the
+    /// project's conversations so a worktree is a jump target in its own right.
+    worktrees: Vec<BrowseWt>,
 }
 
 /// A non-Claude tmux window shown as a row in the Active view.
 struct WinRow {
     index: String,
     name: String,
+}
+
+/// A registered worktree shown as a row in the Browse list. A worktree is a place
+/// you go, independent of whether any conversation currently lives there: a fresh
+/// one has none, and an old one's have aged out of the (14-day) registry bound —
+/// so keying this off the worktree registry, not conversations, is what makes
+/// every worktree reachable from `/`.
+#[derive(Clone)]
+struct BrowseWt {
+    project: String,
+    branch: String,
+    /// Its tmux session is running right now (the name is re-resolved from the
+    /// worktree registry when the row is acted on, so it isn't carried here).
+    session_live: bool,
+    /// Live conversations currently under this worktree.
+    live: usize,
+    /// When this worktree was last worked in: the newest activity across its
+    /// conversations, falling back to when it was created (a brand-new worktree has
+    /// no conversations yet, and should still rank as recent).
+    last_activity: Option<String>,
 }
 
 /// The project emoji for a Browse group key: a project key ("hive") or a worktree
@@ -153,13 +181,27 @@ fn project_key_of(group_key: &str, projects: &ProjectRegistry) -> Option<String>
         .then(|| pkey.to_string())
 }
 
-/// A visible row: a group header, a conversation, or a non-Claude tmux window
-/// (both under an expanded group).
+/// A visible row: a group header, a conversation, a registered worktree, a
+/// non-Claude tmux window, or the `… N more` toggle that ends a capped section
+/// (everything but the header sits under an expanded group).
 enum Row {
     Header(usize),                   // index into `groups`
     Conv { ci: usize, gi: usize },   // conversation index + its group index
     Window { gi: usize, wi: usize }, // group index + index into that group's `windows`
+    Wt { gi: usize, wi: usize },     // group index + index into that group's `worktrees`
+    More { gi: usize, section: Section },
 }
+
+/// The two capped sections of a group — what a `More` row expands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Section {
+    Worktrees,
+    Convs,
+}
+
+/// How many worktrees / conversations a Browse group lists before it folds the
+/// rest behind a `… N more` row.
+const BROWSE_PAGE: usize = 5;
 
 /// Header key for the pinned group that enumerates all frozen conversations.
 const FROZEN_GROUP: &str = "💤 frozen";
@@ -284,6 +326,24 @@ fn set_conversation_pin(id: &str, pinned: bool) {
 /// Set (or clear) a conversation's free-text note (persisted overlay).
 fn set_conversation_note(id: &str, note: &str) {
     edit_overlay(id, |o| o.note = note.trim().to_string());
+}
+
+/// Archive (with a reason) or unarchive a conversation — persisted overlay.
+/// Archiving stamps the reason and the time so the project detail can say WHY a
+/// hidden conversation is hidden; unarchiving clears both, so an unarchived
+/// conversation carries no stale reason if it's archived again later.
+fn set_conversation_archived(id: &str, archived: bool, reason: Option<&str>) {
+    edit_overlay(id, |o| {
+        o.archived = archived;
+        if archived {
+            let reason = reason.unwrap_or("").trim();
+            o.archive_reason = (!reason.is_empty()).then(|| reason.to_string());
+            o.archived_at = Some(chrono::Utc::now().to_rfc3339());
+        } else {
+            o.archive_reason = None;
+            o.archived_at = None;
+        }
+    });
 }
 
 /// The active todo list for a tmux session (todos are session-level).
@@ -418,6 +478,7 @@ fn push_group(
         path,
         emoji,
         windows: Vec::new(),
+        worktrees: Vec::new(),
     }
 }
 
@@ -425,12 +486,16 @@ fn push_group(
 /// preceded by a pinned "💤 frozen" bucket. `include_empty` adds every registered
 /// non-archived project that has no conversations, so Browse doubles as a
 /// launchpad (open any project, start fresh). Projects sort by recent activity
-/// (most-recent first), empty ones last alphabetically.
+/// (most-recent first), empty ones last alphabetically. `worktrees` (keyed by
+/// project, from [`browse_worktrees`]) adds each project's worktrees as rows and
+/// surfaces the project itself when one of them is all the query matched.
 fn build_browse(
     reg: &ConversationRegistry,
     projects: &ProjectRegistry,
     include_empty: bool,
     reveal_archived: bool,
+    matched_projects: &HashSet<String>,
+    worktrees: &HashMap<String, Vec<BrowseWt>>,
 ) -> (Vec<Group>, Vec<Conversation>) {
     let is_archived = |key: &str| {
         projects
@@ -442,6 +507,13 @@ fn build_browse(
     let mut frozen: Vec<&Conversation> = Vec::new();
     let mut grouped: HashMap<String, Vec<&Conversation>> = HashMap::new();
     for c in reg.conversations.values() {
+        // Archiving means "out of the way": an archived conversation drops off
+        // Browse but is NOT forgotten — its project's detail screen still lists
+        // it, with the reason it was archived. (A live one always shows: you
+        // can't hide something that's running.)
+        if c.archived && !c.lifecycle.is_actionable_here() {
+            continue;
+        }
         if c.is_frozen() {
             frozen.push(c);
             continue;
@@ -464,13 +536,39 @@ fn build_browse(
     if !reveal_archived && include_empty {
         grouped.retain(|key, _| !is_archived(key));
     }
+    // Searching: a project matched BY NAME surfaces even with zero conversations —
+    // archived ones included, since the retain above is scoped to the full list.
+    // Without this, a project whose conversations aged out of the registry (every
+    // long-archived project) could not be found at all.
+    for key in matched_projects {
+        if projects.projects.contains_key(key) {
+            grouped.entry(key.clone()).or_default();
+        }
+    }
+    // Same for worktrees: a project surfaces because it HAS worktrees to show, even
+    // with no conversations of its own. `worktrees` is already query-filtered by the
+    // caller, so when searching this is exactly the branch-matched set; the archived
+    // guard mirrors the retain above (which only runs on the full list).
+    for key in worktrees.keys() {
+        if include_empty && !reveal_archived && is_archived(key) {
+            continue;
+        }
+        grouped.entry(key.clone()).or_default();
+    }
 
-    // Order projects by most-recent activity (desc), then name; empties last.
+    // Order: projects the query NAMED first — by project name or by one of their
+    // branches (both are "you asked for this project"), so a searched-for project
+    // outranks incidental conversation hits — then most-recent activity (desc),
+    // then name; empties last. Neither set is populated when not searching, and the
+    // branch half is scoped to a search so the flat list keeps its recency order.
+    let named =
+        |k: &String| matched_projects.contains(k) || (!include_empty && worktrees.contains_key(k));
     let recency = |g: &[&Conversation]| g.iter().filter_map(|c| c.last_activity.clone()).max();
     let mut keyed: Vec<(String, Vec<&Conversation>)> = grouped.into_iter().collect();
     keyed.sort_by(|(ka, a), (kb, b)| {
-        recency(b)
-            .cmp(&recency(a))
+        named(kb)
+            .cmp(&named(ka))
+            .then_with(|| recency(b).cmp(&recency(a)))
             .then_with(|| ka.to_lowercase().cmp(&kb.to_lowercase()))
     });
 
@@ -489,9 +587,76 @@ fn build_browse(
     for (key, mut group) in keyed {
         sort_convs(&mut group);
         let emoji = project_emoji(&key, projects);
-        groups.push(push_group(key, group, &mut convs, emoji));
+        let wts = worktrees.get(&key).cloned().unwrap_or_default();
+        let mut g = push_group(key, group, &mut convs, emoji);
+        g.worktrees = wts;
+        groups.push(g);
     }
     (groups, convs)
+}
+
+/// Browse's worktree rows, keyed by project: every registered worktree when the
+/// query is empty, only the matching ones while searching. A worktree matches on
+/// its branch, its tmux session name, or its path — and every worktree of a
+/// project the query NAMED comes along, mirroring how conversations follow their
+/// project.
+///
+/// Pure (tmux and disk state come in as arguments) so the filtering stays
+/// unit-testable. `reg` should be the FULL registry: the live counts describe the
+/// worktree, not the search.
+fn browse_worktrees(
+    wts: &WorktreeState,
+    reg: &ConversationRegistry,
+    live_sessions: &HashSet<String>,
+    query: &str,
+    matched_projects: &HashSet<String>,
+) -> HashMap<String, Vec<BrowseWt>> {
+    let q = query.to_lowercase();
+    let mut out: HashMap<String, Vec<BrowseWt>> = HashMap::new();
+    for e in wts.worktrees.values() {
+        let hay = |s: &str| s.to_lowercase().contains(&q);
+        let keep = q.is_empty()
+            || matched_projects.contains(&e.project_key)
+            || hay(&e.branch)
+            || hay(&e.session_name)
+            || hay(&e.path);
+        if !keep {
+            continue;
+        }
+        let wt_key = WorktreeState::make_key(&e.project_key, &e.branch);
+        let mine = || {
+            reg.conversations
+                .values()
+                .filter(|c| c.parent.as_deref() == Some(wt_key.as_str()))
+        };
+        let live = mine().filter(|c| c.lifecycle.is_actionable_here()).count();
+        // Newest conversation activity, else creation time — both RFC3339, so a
+        // string compare orders them (the same idiom the conversation rows use).
+        let last_activity = mine()
+            .filter_map(|c| c.last_activity.clone())
+            .max()
+            .or_else(|| (!e.created_at.is_empty()).then(|| e.created_at.clone()));
+        out.entry(e.project_key.clone())
+            .or_default()
+            .push(BrowseWt {
+                project: e.project_key.clone(),
+                branch: e.branch.clone(),
+                session_live: live_sessions.contains(&e.session_name),
+                live,
+                last_activity,
+            });
+    }
+    // Running worktrees first (where the work is), then most-recently-worked-in —
+    // so a capped list shows the 5 that matter. Branch name only breaks ties.
+    for rows in out.values_mut() {
+        rows.sort_by(|a, b| {
+            b.session_live
+                .cmp(&a.session_live)
+                .then_with(|| b.last_activity.cmp(&a.last_activity))
+                .then_with(|| a.branch.to_lowercase().cmp(&b.branch.to_lowercase()))
+        });
+    }
+    out
 }
 
 /// Case-insensitive match of a query against a conversation's title, id, parent
@@ -506,8 +671,48 @@ fn matches_query(c: &Conversation, q: &str) -> bool {
         || c.frozen.as_ref().map(|f| hay(&f.note)).unwrap_or(false)
 }
 
+/// Registered project keys whose key or display name matches `q` (case-insensitive).
+/// Browse searches projects FIRST: a project the user names has to surface even
+/// with zero conversations in the registry (it never had any, or they aged out of
+/// the bound) — which is the only way to find an archived one, since archiving is
+/// what removes it from the unfiltered list.
+fn projects_matching(projects: &ProjectRegistry, q: &str) -> HashSet<String> {
+    if q.is_empty() {
+        return HashSet::new();
+    }
+    let q = q.to_lowercase();
+    projects
+        .projects
+        .iter()
+        .filter(|(key, config)| {
+            key.to_lowercase().contains(&q)
+                || config
+                    .display_name
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&q))
+                    .unwrap_or(false)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// The project a conversation belongs to: its `parent` collapsed at the first `/`
+/// (so a worktree "proj/branch" reads as "proj"), matching Browse's grouping.
+fn conv_project_key(c: &Conversation) -> Option<&str> {
+    c.parent
+        .as_deref()
+        .map(|p| p.split('/').next().unwrap_or(p))
+}
+
 /// A registry containing only the conversations matching `query` (all, if empty).
-fn filter_registry(reg: &ConversationRegistry, query: &str) -> ConversationRegistry {
+/// A conversation also survives when its PROJECT is one of `matched_projects`, so
+/// naming a project in the query brings its conversations along even when none of
+/// them match the text themselves (e.g. searching a display name).
+fn filter_registry(
+    reg: &ConversationRegistry,
+    query: &str,
+    matched_projects: &HashSet<String>,
+) -> ConversationRegistry {
     if query.is_empty() {
         return reg.clone();
     }
@@ -515,26 +720,74 @@ fn filter_registry(reg: &ConversationRegistry, query: &str) -> ConversationRegis
         conversations: reg
             .conversations
             .iter()
-            .filter(|(_, c)| matches_query(c, query))
+            .filter(|(_, c)| {
+                matches_query(c, query)
+                    || conv_project_key(c)
+                        .map(|k| matched_projects.contains(k))
+                        .unwrap_or(false)
+            })
             .map(|(k, c)| (k.clone(), c.clone()))
             .collect(),
     }
 }
 
-/// The currently-visible rows: every header, plus the conversations of expanded
-/// groups. Recomputed whenever the collapsed set changes.
-fn visible_rows(groups: &[Group], collapsed: &HashSet<String>) -> Vec<Row> {
+/// The currently-visible rows: every header, plus the contents of expanded groups.
+/// Recomputed whenever the collapsed / expanded sets change.
+///
+/// `page` caps each section at N rows and follows it with a `More` row (Browse: a
+/// project with 26 worktrees and 29 conversations is a wall otherwise). `None`
+/// shows everything — the Active view stays complete, since a live window that
+/// isn't listed is a window you can't get back to.
+fn visible_rows(
+    groups: &[Group],
+    collapsed: &HashSet<String>,
+    expanded: &HashSet<(String, Section)>,
+    page: Option<usize>,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
         rows.push(Row::Header(gi));
-        if !collapsed.contains(&g.key) {
-            for &ci in &g.convs {
-                rows.push(Row::Conv { ci, gi });
+        if collapsed.contains(&g.key) {
+            continue;
+        }
+        // How many of `total` to list, and whether the section needs a More row.
+        let shown = |total: usize, section: Section| -> (usize, bool) {
+            match page {
+                Some(n) if total > n => {
+                    if expanded.contains(&(g.key.clone(), section)) {
+                        (total, true)
+                    } else {
+                        (n, true)
+                    }
+                }
+                _ => (total, false),
             }
-            // Non-Claude windows come after the session's conversations.
-            for wi in 0..g.windows.len() {
-                rows.push(Row::Window { gi, wi });
-            }
+        };
+        // Worktrees lead: they're places (a branch you can go work in), and
+        // the conversations below are what has happened in them.
+        let (n_wt, more_wt) = shown(g.worktrees.len(), Section::Worktrees);
+        for wi in 0..n_wt {
+            rows.push(Row::Wt { gi, wi });
+        }
+        if more_wt {
+            rows.push(Row::More {
+                gi,
+                section: Section::Worktrees,
+            });
+        }
+        let (n_conv, more_conv) = shown(g.convs.len(), Section::Convs);
+        for &ci in g.convs.iter().take(n_conv) {
+            rows.push(Row::Conv { ci, gi });
+        }
+        if more_conv {
+            rows.push(Row::More {
+                gi,
+                section: Section::Convs,
+            });
+        }
+        // Non-Claude windows come after the session's conversations.
+        for wi in 0..g.windows.len() {
+            rows.push(Row::Window { gi, wi });
         }
     }
     rows
@@ -627,47 +880,138 @@ struct WtRow {
     session: String,
     live: usize,
     frozen: usize,
+    /// When this worktree was last worked in — orders the list so a capped view
+    /// shows the latest few. See [`browse_worktrees`] for the same rule.
+    last_activity: Option<String>,
+}
+
+/// A worktree detail's own identity — set when the screen is showing a WORKTREE
+/// ("project/branch") rather than a project, which changes the header block (its
+/// own path + session) and what `n` / `x` act on.
+struct WtInfo {
+    project: String,
+    branch: String,
+    path: String,
+    session: String,
 }
 
 /// The project detail sub-screen: a project's config, its worktrees, and every
 /// conversation under it (live + closed + frozen), from which you can switch,
-/// resume, or start a new one.
+/// resume, or start a new one. The same screen also renders a single WORKTREE
+/// (drilled into from a worktree row) — then `wt_info` is set and the nested
+/// worktree list is dropped.
 struct ProjectDetailState {
     key: String,
     worktrees: Vec<WtRow>,
     convs: Vec<Conversation>, // display order: live first, frozen last, else recency
     path: String,             // common cwd prefix (for subpath elision in rows)
     /// Session-level todos, flat and in display order: `(session_name, text)`. The
-    /// cursor selects over todos FIRST, then conversations.
+    /// cursor selects worktrees FIRST, then todos, then conversations — matching
+    /// the order they're drawn in.
     todos: Vec<(String, String)>,
-    sel: usize,               // index into the combined [todos ++ convs] list
+    sel: usize,               // index into the combined [worktrees ++ todos ++ convs] list
     wt_input: Option<String>, // Some ⇒ typing a branch name for a new worktree
+    /// Some ⇒ typing the archive reason for that conversation id (`A`).
+    archive_input: Option<(String, String)>,
+    /// `Tab`: list every worktree and conversation instead of the latest
+    /// `BROWSE_PAGE`. A project with 26 worktrees and 29 conversations buries its
+    /// todos and its recent work otherwise.
+    show_all: bool,
+    /// Some ⇒ this screen is one worktree, not a project.
+    wt_info: Option<WtInfo>,
+    /// This screen is a cross-project BUCKET (💤 frozen / "(unassigned)"), not a
+    /// project: it has no config, no worktrees, and its conversations come from
+    /// everywhere — so it labels each row with the project it belongs to.
+    bucket: bool,
 }
 
 impl ProjectDetailState {
     /// The most recently-active conversation — what `r` (resume last) opens.
+    /// Archived ones are skipped: you archived them to get them out of the way,
+    /// so they must not become the thing `r` reopens.
     fn most_recent(&self) -> Option<&Conversation> {
         self.convs
             .iter()
+            .filter(|c| !c.archived)
             .max_by(|a, b| a.last_activity.cmp(&b.last_activity))
     }
 
-    /// Total selectable rows: todos come first, then conversations.
+    /// Index of the first archived conversation — where the "Archived" section
+    /// starts (the sort puts them last). `None` when there are none.
+    fn archived_from(&self) -> Option<usize> {
+        self.convs.iter().position(|c| c.archived)
+    }
+
+    /// How many conversations the list shows: all of them, or the latest page.
+    fn visible_convs(&self) -> usize {
+        if self.show_all {
+            self.convs.len()
+        } else {
+            self.convs.len().min(BROWSE_PAGE)
+        }
+    }
+
+    /// How many worktrees the list shows — same rule.
+    fn visible_worktrees(&self) -> usize {
+        if self.show_all {
+            self.worktrees.len()
+        } else {
+            self.worktrees.len().min(BROWSE_PAGE)
+        }
+    }
+
+    /// Total selectable rows, in cursor order: the VISIBLE worktrees, then todos,
+    /// then the VISIBLE conversations — capped, so the cursor can't walk off into
+    /// rows that aren't drawn.
     fn num_items(&self) -> usize {
-        self.todos.len() + self.convs.len()
+        self.visible_worktrees() + self.todos.len() + self.visible_convs()
+    }
+
+    /// The selected worktree if the cursor is on one of the worktree rows.
+    fn selected_worktree(&self) -> Option<&WtRow> {
+        (self.sel < self.visible_worktrees()).then(|| &self.worktrees[self.sel])
     }
 
     /// The selected todo `(session, text)` if the cursor is on a todo row.
     fn selected_todo(&self) -> Option<&(String, String)> {
-        (self.sel < self.todos.len()).then(|| &self.todos[self.sel])
+        self.sel
+            .checked_sub(self.visible_worktrees())
+            .filter(|i| *i < self.todos.len())
+            .map(|i| &self.todos[i])
     }
 
-    /// The selected conversation if the cursor is past the todos, on a conv row.
+    /// The selected conversation if the cursor is past the worktrees and todos.
     fn selected_conv(&self) -> Option<&Conversation> {
         self.sel
-            .checked_sub(self.todos.len())
+            .checked_sub(self.visible_worktrees() + self.todos.len())
             .and_then(|i| self.convs.get(i))
     }
+}
+
+/// Where a conversation lives, for display: "🌳 Clear Session" — or
+/// "🌳 Clear Session / CSD-2723" when it's in a worktree. `None` when it has no
+/// resolvable parent. Used by the cross-project buckets, where every row comes
+/// from somewhere different and the cwd's shared prefix says nothing.
+fn project_label(c: &Conversation, projects: &ProjectRegistry) -> Option<String> {
+    let parent = c.parent.as_deref()?;
+    let (key, branch) = match parent.split_once('/') {
+        Some((k, b)) => (k, Some(b)),
+        None => (parent, None),
+    };
+    let config = projects.projects.get(key);
+    let name = config
+        .and_then(|p| p.display_name.clone())
+        .unwrap_or_else(|| key.to_string());
+    let emoji = config.map(|p| p.emoji.clone()).unwrap_or_default();
+    let mut label = if emoji.is_empty() {
+        name
+    } else {
+        format!("{emoji} {name}")
+    };
+    if let Some(b) = branch {
+        label.push_str(&format!(" / {b}"));
+    }
+    Some(label)
 }
 
 /// True if a conversation belongs to `key` — either the project root (`parent ==
@@ -679,12 +1023,40 @@ fn conv_in_project(c: &Conversation, key: &str) -> bool {
     }
 }
 
+/// Display order for a project detail's conversation list: archived last (this
+/// is the ONE screen that still shows them, and they belong below the working
+/// set), then live first, non-frozen before frozen, then most-recent, then id
+/// for stability. The archived tail is what `archived_from()` sections off.
+fn sort_project_convs(convs: &mut [Conversation]) {
+    convs.sort_by(|a, b| {
+        a.archived
+            .cmp(&b.archived)
+            .then_with(|| {
+                b.lifecycle
+                    .is_actionable_here()
+                    .cmp(&a.lifecycle.is_actionable_here())
+            })
+            .then_with(|| a.is_frozen().cmp(&b.is_frozen()))
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+    });
+}
+
 /// Build the detail sub-screen for a Browse group `key` (READ-ONLY): gather its
 /// conversations, sort them for display, and (for a real project) summarize its
-/// worktrees. `key` is a project key, the frozen bucket, or "(unassigned)".
+/// worktrees. `key` is a project key, a WORKTREE key ("project/branch" — drilled
+/// into from a worktree row), the frozen bucket, or "(unassigned)".
+///
+/// A worktree key details the worktree itself: `conv_in_project` already matches
+/// on the exact parent, so it needs no new filter — what changes is that there's
+/// no nested worktree list, and the todos/header come from its own session.
 fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailState {
     let frozen_bucket = key == FROZEN_GROUP;
     let unassigned = key == "(unassigned)";
+    // "project/branch" ⇒ this screen is one worktree.
+    let wt_entry = key
+        .split_once('/')
+        .and_then(|(project, branch)| WorktreeState::load().get(project, branch).cloned());
     let mut convs: Vec<Conversation> = reg
         .conversations
         .values()
@@ -699,19 +1071,12 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
         })
         .cloned()
         .collect();
-    // Live first, then non-frozen before frozen, then most-recent, then id.
-    convs.sort_by(|a, b| {
-        b.lifecycle
-            .is_actionable_here()
-            .cmp(&a.lifecycle.is_actionable_here())
-            .then_with(|| a.is_frozen().cmp(&b.is_frozen()))
-            .then_with(|| b.last_activity.cmp(&a.last_activity))
-            .then_with(|| a.id.as_str().cmp(b.id.as_str()))
-    });
+    sort_project_convs(&mut convs);
     let path = common_prefix(&convs.iter().map(|c| c.cwd.as_str()).collect::<Vec<_>>());
 
-    // Worktree summary rows (real projects only), with per-worktree counts.
-    let worktrees = if frozen_bucket || unassigned {
+    // Worktree summary rows (real projects only), with per-worktree counts. A
+    // worktree detail lists none — it IS one.
+    let worktrees = if frozen_bucket || unassigned || wt_entry.is_some() {
         Vec::new()
     } else {
         let wts = WorktreeState::load();
@@ -730,10 +1095,25 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
                         .filter(|c| of(c) && c.lifecycle.is_actionable_here())
                         .count(),
                     frozen: convs.iter().filter(|c| of(c) && c.is_frozen()).count(),
+                    // Same recency rule as the Browse rows (`browse_worktrees`):
+                    // newest conversation activity, else when it was created.
+                    last_activity: convs
+                        .iter()
+                        .filter(of)
+                        .filter_map(|c| c.last_activity.clone())
+                        .max()
+                        .or_else(|| (!e.created_at.is_empty()).then(|| e.created_at.clone())),
                 }
             })
             .collect();
-        rows.sort_by(|a, b| a.branch.cmp(&b.branch));
+        // Live work first, then most-recently-worked-in — the list is capped to the
+        // latest few, so alphabetical order would make the cap arbitrary.
+        rows.sort_by(|a, b| {
+            b.live
+                .cmp(&a.live)
+                .then_with(|| b.last_activity.cmp(&a.last_activity))
+                .then_with(|| a.branch.to_lowercase().cmp(&b.branch.to_lowercase()))
+        });
         rows
     };
 
@@ -749,6 +1129,11 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
         let mut candidates: Vec<String> = Vec::new();
         if let Some(config) = ProjectRegistry::load().projects.get(key) {
             candidates.push(ProjectRegistry::session_name(key, config));
+        }
+        // A worktree's todos live on its own session, which is registered rather
+        // than derived — and is the only session it has when nothing is running.
+        if let Some(e) = &wt_entry {
+            candidates.push(e.session_name.clone());
         }
         candidates.extend(worktrees.iter().map(|w| w.session.clone()));
         candidates.extend(
@@ -779,6 +1164,15 @@ fn build_group_detail(key: &str, reg: &ConversationRegistry) -> ProjectDetailSta
         todos,
         sel: 0,
         wt_input: None,
+        archive_input: None,
+        show_all: false,
+        bucket: frozen_bucket || unassigned,
+        wt_info: wt_entry.map(|e| WtInfo {
+            project: e.project_key,
+            branch: e.branch,
+            path: e.path,
+            session: e.session_name,
+        }),
     }
 }
 
@@ -794,8 +1188,12 @@ fn detail_of_row(
     projects: &ProjectRegistry,
 ) -> Option<ProjectDetailState> {
     match row? {
-        // A plain tmux window has no conversation/project to detail.
-        Row::Window { .. } => None,
+        // A plain tmux window has no conversation/project to detail, and a `… more`
+        // row is a control, not a thing.
+        Row::Window { .. } | Row::More { .. } => None,
+        // A worktree details as its project — that screen already lists every
+        // worktree with its live/frozen counts.
+        Row::Wt { gi, wi } => Some(build_group_detail(&groups[*gi].worktrees[*wi].project, reg)),
         Row::Conv { ci, .. } => {
             let pkey = convs[*ci]
                 .parent
@@ -1078,6 +1476,11 @@ fn attach_or_switch(session: &str) {
 }
 
 fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
+    // One-shot, best-effort: if `[web].autostart` is set and no server is up yet,
+    // launch one (detached tmux session) so the phone dashboard is live whenever
+    // hive is open. Runs here — before the loop — so it fires exactly once per TUI
+    // launch, never on a refresh tick.
+    crate::serve::web::ensure_web_autostart();
     let mut terminal =
         ratatui::try_init().context("hive conversations: needs a terminal (run interactively)")?;
     let action = conversations_loop(&mut terminal, opts);
@@ -1117,6 +1520,12 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
         )?,
         Action::WtDelete(project, branch) => {
             crate::cli::worktree::run_wt_delete(&project, &branch, false, false)?
+        }
+        Action::ConnectWorktree(project, branch) => {
+            println!("{}", connect_worktree(&project, &branch)?)
+        }
+        Action::NewInWorktree(project, branch) => {
+            println!("{}", new_conversation_in_worktree(&project, &branch)?)
         }
         Action::SwitchSession(name) => {
             unskip_session(&name);
@@ -1162,21 +1571,35 @@ fn conversations_loop(
                    skipped: &HashSet<String>,
                    query: &str|
      -> (Vec<Group>, Vec<Conversation>, HashSet<String>) {
-        let filtered = filter_registry(reg, query);
-        let src = &filtered;
         match view {
             View::Active => {
+                let filtered = filter_registry(reg, query, &HashSet::new());
                 let session_windows = get_all_windows();
-                let (g, c) = build_active(src, skipped, &session_windows);
+                let (g, c) = build_active(&filtered, skipped, &session_windows);
                 (g, c, HashSet::new())
             }
             View::Browse => {
                 // No search → a flat project list (every group collapsed to just
-                // its header, empty projects included). Searching → drop empties and
-                // expand so matching conversations show under their project.
+                // its header, empty projects included). Searching → keep only
+                // matching conversations plus the projects the query NAMES, and
+                // expand so hits show under their project.
                 let live_projects = ProjectRegistry::load();
-                let (g, c) =
-                    build_browse(src, &live_projects, query.is_empty(), reveal_archived.get());
+                let matched = projects_matching(&live_projects, query);
+                let filtered = filter_registry(reg, query, &matched);
+                // Worktrees come from their own registry, not from conversations, so
+                // they show (and are searchable) even when nothing has run in them.
+                let live_sessions: HashSet<String> =
+                    get_current_tmux_session_names().into_iter().collect();
+                let wt_rows =
+                    browse_worktrees(&WorktreeState::load(), reg, &live_sessions, query, &matched);
+                let (g, c) = build_browse(
+                    &filtered,
+                    &live_projects,
+                    query.is_empty(),
+                    reveal_archived.get(),
+                    &matched,
+                    &wt_rows,
+                );
                 let collapsed = if query.is_empty() {
                     g.iter().map(|g| g.key.clone()).collect()
                 } else {
@@ -1215,7 +1638,14 @@ fn conversations_loop(
     // New-project wizard (`N`): Some while stepping through key → emoji → path.
     let mut wizard: Option<NewProject> = None;
     let (mut groups, mut convs, mut collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+    // Sections the user opened past the `BROWSE_PAGE` cap, keyed by (group, section)
+    // rather than by index so it survives a rebuild reordering the groups. Cleared
+    // whenever the query changes — a new result set is a new list.
+    let mut expanded: HashSet<(String, Section)> = HashSet::new();
     let mut sel: usize = 0;
+    // Parent detail screens, so drilling project → worktree pops back to the
+    // project rather than all the way out to the list.
+    let mut detail_stack: Vec<ProjectDetailState> = Vec::new();
     // Project detail sub-screen: Some(state) while drilled into a project.
     let mut detail: Option<ProjectDetailState> = None;
     // Conversation detail: sits ON TOP of the project detail (so backing out of a
@@ -1236,6 +1666,12 @@ fn conversations_loop(
 
     // Enter/number activation: switch to a live conversation, else reopen it.
     let activate = |c: &Conversation| -> Action {
+        // Opening an archived conversation puts it back in play, so it stops being
+        // archived — otherwise it would run while hidden from Browse. Mirrors
+        // un-skipping a session when you switch to it.
+        if c.archived {
+            set_conversation_archived(c.id.as_str(), false, None);
+        }
         if c.lifecycle.is_actionable_here() {
             Action::Switch(Box::new(c.clone()))
         } else {
@@ -1558,8 +1994,59 @@ fn conversations_loop(
                 }
                 continue;
             }
+            // Archive-reason input (`A`). Enter archives with the typed reason —
+            // empty is allowed (archived with no reason); Esc cancels outright.
+            if detail.as_ref().unwrap().archive_input.is_some() {
+                let d = detail.as_mut().unwrap();
+                match key.code {
+                    KeyCode::Esc => d.archive_input = None,
+                    KeyCode::Enter => {
+                        let (id, reason) = d.archive_input.take().unwrap();
+                        set_conversation_archived(&id, true, Some(&reason));
+                        reg = gather_conversations_stats(&mut sys);
+                        flags = Flags::load();
+                        let key = detail.as_ref().unwrap().key.clone();
+                        let sel = detail.as_ref().unwrap().sel;
+                        let show_all = detail.as_ref().unwrap().show_all;
+                        detail = Some(build_group_detail(&key, &reg));
+                        // The row just moved to the archived tail; keep the cursor
+                        // in range rather than pointing past the end. `show_all`
+                        // rides along so a rebuild doesn't silently re-cap the list
+                        // the user just opened.
+                        let d = detail.as_mut().unwrap();
+                        d.show_all = show_all;
+                        d.sel = sel.min(d.num_items().saturating_sub(1));
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    }
+                    KeyCode::Backspace => {
+                        if let Some((_, s)) = d.archive_input.as_mut() {
+                            s.pop();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some((_, s)) = d.archive_input.as_mut() {
+                            s.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => detail = None,
+                // Esc pops one level (worktree → its project → the list); q/Q leaves
+                // the detail screens outright.
+                KeyCode::Esc => detail = detail_stack.pop(),
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    detail_stack.clear();
+                    detail = None;
+                }
+                // Tab: full lists ⇄ the latest `BROWSE_PAGE` of each. Folding back
+                // can leave the cursor past the end, so clamp it.
+                KeyCode::Tab => {
+                    let d = detail.as_mut().unwrap();
+                    d.show_all = !d.show_all;
+                    d.sel = d.sel.min(d.num_items().saturating_sub(1));
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     let d = detail.as_mut().unwrap();
                     if d.sel + 1 < d.num_items() {
@@ -1574,30 +2061,47 @@ fn conversations_loop(
                 // session; on a conversation → switch/resume it.
                 KeyCode::Enter => {
                     let d = detail.as_ref().unwrap();
-                    if let Some((session, text)) = d.selected_todo() {
+                    // A worktree drills into its own detail — its conversations, its
+                    // todos, its path — with the project kept underneath for Esc.
+                    if let Some(w) = d.selected_worktree() {
+                        let wt_key = WorktreeState::make_key(&d.key, &w.branch);
+                        let child = build_group_detail(&wt_key, &reg);
+                        detail_stack.push(detail.take().unwrap());
+                        detail = Some(child);
+                    } else if let Some((session, text)) = d.selected_todo() {
                         return Ok(Action::NewTask(session.clone(), format!("task: {text}")));
-                    }
-                    if let Some(c) = d.selected_conv() {
+                    } else if let Some(c) = d.selected_conv() {
                         return Ok(activate(c));
                     }
                 }
-                // → drills into the selected conversation's detail (todos have none).
+                // → drills in: a worktree → its detail, a conversation → its own
+                // (todos have none).
                 KeyCode::Right | KeyCode::Char('l') => {
                     let d = detail.as_ref().unwrap();
-                    if let Some(c) = d.selected_conv() {
+                    if let Some(w) = d.selected_worktree() {
+                        let wt_key = WorktreeState::make_key(&d.key, &w.branch);
+                        let child = build_group_detail(&wt_key, &reg);
+                        detail_stack.push(detail.take().unwrap());
+                        detail = Some(child);
+                    } else if let Some(c) = d.selected_conv() {
                         conv_detail = Some(spawn_conv_detail(c));
                     }
                 }
-                // Del: discard a frozen conversation, or close a live one (confirm).
+                // Del: on a worktree → delete it; on a conversation → discard a
+                // frozen one, or close a live one (both confirmed).
                 KeyCode::Delete => {
                     let d = detail.as_ref().unwrap();
-                    if let Some(c) = d.selected_conv().cloned() {
+                    if let Some(w) = d.selected_worktree() {
+                        wt_confirm = Some((d.key.clone(), w.branch.clone()));
+                    } else if let Some(c) = d.selected_conv().cloned() {
                         if c.is_frozen() {
                             let _ = discard_frozen(c.id.as_str());
                             reg = gather_conversations_stats(&mut sys);
                             flags = Flags::load();
                             let key = detail.as_ref().unwrap().key.clone();
+                            let show_all = detail.as_ref().unwrap().show_all;
                             detail = Some(build_group_detail(&key, &reg));
+                            detail.as_mut().unwrap().show_all = show_all;
                             (groups, convs, collapsed) =
                                 rebuild(&view, &reg, &flags.skipped, &query);
                         } else if c.lifecycle.is_actionable_here() {
@@ -1605,18 +2109,26 @@ fn conversations_loop(
                         }
                     }
                 }
+                // Digits address the NUMBERED rows, so they stop at the cap — the
+                // number you press is the number you can see.
                 KeyCode::Char(dch @ '1'..='9') => {
                     let d = detail.as_ref().unwrap();
-                    if let Some(c) = d.convs.get(dch as usize - '1' as usize) {
-                        return Ok(activate(c));
+                    let n = dch as usize - '1' as usize;
+                    if n < d.visible_convs() {
+                        if let Some(c) = d.convs.get(n) {
+                            return Ok(activate(c));
+                        }
                     }
                 }
                 // `n` starts a fresh conversation (real projects only — the frozen
                 // and unassigned buckets have none); `r` resumes the last one.
                 KeyCode::Char('n') => {
-                    let key = detail.as_ref().unwrap().key.clone();
-                    if projects.projects.contains_key(&key) {
-                        return Ok(Action::NewInProject(key));
+                    let d = detail.as_ref().unwrap();
+                    if let Some(w) = &d.wt_info {
+                        return Ok(Action::NewInWorktree(w.project.clone(), w.branch.clone()));
+                    }
+                    if projects.projects.contains_key(&d.key) {
+                        return Ok(Action::NewInProject(d.key.clone()));
                     }
                 }
                 KeyCode::Char('r') => {
@@ -1632,6 +2144,42 @@ fn conversations_loop(
                         flags = Flags::load();
                     }
                 }
+                // `a` archives / unarchives the project (real projects only). An
+                // archived project drops off the unfiltered Browse list but stays
+                // findable by name in search — this is where you unarchive it.
+                KeyCode::Char('a') => {
+                    let key = detail.as_ref().unwrap().key.clone();
+                    if projects.projects.contains_key(&key) {
+                        toggle_archived_project(&key);
+                        flags = Flags::load();
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    }
+                }
+                // `A` archives the selected conversation (prompting for a reason)
+                // or unarchives it if it already is. Archiving hides it from Browse
+                // but keeps it here, under "Archived", labelled with that reason —
+                // so a conversation set aside can always be explained and recovered.
+                KeyCode::Char('A') => {
+                    let d = detail.as_mut().unwrap();
+                    if let Some(c) = d.selected_conv().cloned() {
+                        if c.archived {
+                            set_conversation_archived(c.id.as_str(), false, None);
+                            reg = gather_conversations_stats(&mut sys);
+                            flags = Flags::load();
+                            let key = detail.as_ref().unwrap().key.clone();
+                            let sel = detail.as_ref().unwrap().sel;
+                            let show_all = detail.as_ref().unwrap().show_all;
+                            detail = Some(build_group_detail(&key, &reg));
+                            let d = detail.as_mut().unwrap();
+                            d.show_all = show_all;
+                            d.sel = sel.min(d.num_items().saturating_sub(1));
+                            (groups, convs, collapsed) =
+                                rebuild(&view, &reg, &flags.skipped, &query);
+                        } else {
+                            d.archive_input = Some((c.id.as_str().to_string(), String::new()));
+                        }
+                    }
+                }
                 // `w` creates a worktree (prompts for a branch); `x` deletes the
                 // selected conversation's worktree (with a y/n confirm).
                 KeyCode::Char('w') => {
@@ -1642,8 +2190,14 @@ fn conversations_loop(
                 }
                 KeyCode::Char('x') => {
                     let d = detail.as_ref().unwrap();
-                    // The selected conversation's parent "project/branch" → the branch.
-                    if let Some(branch) = d
+                    if let Some(w) = d.selected_worktree() {
+                        // The row under the cursor is the obvious target.
+                        wt_confirm = Some((d.key.clone(), w.branch.clone()));
+                    } else if let Some(w) = &d.wt_info {
+                        // On a worktree's own screen, `x` deletes that worktree.
+                        wt_confirm = Some((w.project.clone(), w.branch.clone()));
+                    } else if let Some(branch) = d
+                        // Else fall back to the selected conversation's "project/branch".
                         .selected_conv()
                         .and_then(|c| c.parent.as_deref())
                         .and_then(|p| p.split_once('/'))
@@ -1658,7 +2212,10 @@ fn conversations_loop(
             continue;
         }
 
-        let rows = visible_rows(&groups, &collapsed);
+        // Only Browse pages its sections; Active lists every live window (see
+        // `visible_rows`).
+        let page = matches!(view, View::Browse).then_some(BROWSE_PAGE);
+        let rows = visible_rows(&groups, &collapsed, &expanded, page);
         if sel >= rows.len() {
             sel = rows.len().saturating_sub(1);
         }
@@ -1690,6 +2247,7 @@ fn conversations_loop(
                 sel,
                 showing_help,
                 &flags,
+                &expanded,
                 search.as_deref(),
                 freeze.as_deref(),
                 &hint_map,
@@ -1714,7 +2272,7 @@ fn conversations_loop(
                 flags = Flags::load();
                 (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 if let Some(id) = keep {
-                    let new_rows = visible_rows(&groups, &collapsed);
+                    let new_rows = visible_rows(&groups, &collapsed, &expanded, page);
                     if let Some(i) = new_rows
                         .iter()
                         .position(|r| matches!(r, Row::Conv { ci, .. } if convs[*ci].id == id))
@@ -1822,11 +2380,26 @@ fn conversations_loop(
                     query.clear();
                     view = View::Active;
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    expanded.clear();
                     sel = 0;
                 }
-                // Enter opens: a conversation switches/resumes; a project opens detail.
+                // Enter opens: a conversation switches/resumes; a worktree opens its
+                // session (creating it if it isn't running); a project opens detail.
                 KeyCode::Enter => match rows.get(sel) {
                     Some(Row::Conv { ci, .. }) => return Ok(activate(&convs[*ci])),
+                    Some(Row::Wt { gi, wi }) => {
+                        let w = &groups[*gi].worktrees[*wi];
+                        return Ok(Action::ConnectWorktree(w.project.clone(), w.branch.clone()));
+                    }
+                    // `… N more` / `… show fewer`: reveal (or re-fold) the rest of
+                    // that section. The cursor stays put, which lands it on the first
+                    // newly-revealed row.
+                    Some(Row::More { gi, section }) => {
+                        let k = (groups[*gi].key.clone(), *section);
+                        if !expanded.remove(&k) {
+                            expanded.insert(k);
+                        }
+                    }
                     Some(Row::Header(_)) => {
                         if let Some(d) =
                             detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
@@ -1838,10 +2411,27 @@ fn conversations_loop(
                     // unreachable in practice — no-op keeps the match exhaustive.
                     Some(Row::Window { .. }) | None => {}
                 },
-                // → drills in: a conversation → its detail; a project → its detail.
+                // Tab expands/collapses the project under the cursor. The unsearched
+                // flat list starts fully collapsed, so this is how you get at a
+                // project's worktrees and conversations without typing a query.
+                KeyCode::Tab => {
+                    if let Some(Row::Header(gi)) = rows.get(sel) {
+                        let key = groups[*gi].key.clone();
+                        if !collapsed.remove(&key) {
+                            collapsed.insert(key);
+                        }
+                    }
+                }
+                // → drills in: a conversation → its detail; a project → its detail;
+                // a `… N more` → expands it, same as Enter.
                 KeyCode::Right => {
                     if let Some(Row::Conv { ci, .. }) = rows.get(sel) {
                         conv_detail = Some(spawn_conv_detail(&convs[*ci]));
+                    } else if let Some(Row::More { gi, section }) = rows.get(sel) {
+                        let k = (groups[*gi].key.clone(), *section);
+                        if !expanded.remove(&k) {
+                            expanded.insert(k);
+                        }
                     } else if let Some(d) =
                         detail_of_row(rows.get(sel), &view, &groups, &convs, &reg, &projects)
                     {
@@ -1854,9 +2444,21 @@ fn conversations_loop(
                     }
                 }
                 KeyCode::Up => sel = sel.saturating_sub(1),
-                // Del: discard a frozen conversation, or close a live one (confirm).
-                KeyCode::Delete => {
-                    if let Some(Row::Conv { ci, .. }) = rows.get(sel) {
+                // Del: on a project header → archive/unarchive it; on a conversation
+                // → discard (frozen) or close (live, confirm). Browse is ALWAYS in
+                // search mode (`/` sets both, only Esc clears it — and that returns
+                // to Active), so this branch, not the main key match, is where every
+                // Browse action has to live.
+                KeyCode::Delete => match rows.get(sel) {
+                    Some(Row::Header(gi)) => {
+                        if let Some(pkey) = project_key_of(&groups[*gi].key, &projects) {
+                            toggle_archived_project(&pkey);
+                            flags = Flags::load();
+                            (groups, convs, collapsed) =
+                                rebuild(&view, &reg, &flags.skipped, &query);
+                        }
+                    }
+                    Some(Row::Conv { ci, .. }) => {
                         let c = convs[*ci].clone();
                         if c.is_frozen() {
                             let _ = discard_frozen(c.id.as_str());
@@ -1868,15 +2470,35 @@ fn conversations_loop(
                             confirm = Some(c);
                         }
                     }
-                }
+                    // On a worktree → delete it (dir + branch + session), behind the
+                    // same y/n confirm the project detail's `x` uses.
+                    Some(Row::Wt { gi, wi }) => {
+                        let w = &groups[*gi].worktrees[*wi];
+                        wt_confirm = Some((w.project.clone(), w.branch.clone()));
+                    }
+                    Some(Row::Window { .. } | Row::More { .. }) | None => {}
+                },
                 KeyCode::Backspace => {
                     query.pop();
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    expanded.clear();
                     sel = 0;
+                }
+                // Ctrl+<key> is a shortcut, never search text: Ctrl+R reveals/hides
+                // archived projects, anything else is ignored (it used to type its
+                // bare letter into the query, which is why Ctrl+R never worked).
+                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if c == 'r' {
+                        reveal_archived.set(!reveal_archived.get());
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                        expanded.clear();
+                        sel = 0;
+                    }
                 }
                 KeyCode::Char(c) => {
                     query.push(c);
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    expanded.clear();
                     sel = 0;
                 }
                 _ => {}
@@ -1919,12 +2541,6 @@ fn conversations_loop(
 
         match key.code {
             KeyCode::Char('?') => showing_help = true,
-            // Ctrl+R reveals/hides archived projects (Browse).
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                reveal_archived.set(!reveal_archived.get());
-                (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
-                sel = 0;
-            }
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
             // `L` spreads sessions into iTerm2 panes, or collapses if already spread.
             KeyCode::Char('L') => {
@@ -2030,6 +2646,19 @@ fn conversations_loop(
                         g.windows[*wi].index.clone(),
                     ));
                 }
+                // Worktree and `… more` rows are Browse-only (which is always in
+                // search mode), so these arms are unreachable in practice — kept in
+                // step with the search branch's Enter so the two never drift.
+                Some(Row::Wt { gi, wi }) => {
+                    let w = &groups[*gi].worktrees[*wi];
+                    return Ok(Action::ConnectWorktree(w.project.clone(), w.branch.clone()));
+                }
+                Some(Row::More { gi, section }) => {
+                    let k = (groups[*gi].key.clone(), *section);
+                    if !expanded.remove(&k) {
+                        expanded.insert(k);
+                    }
+                }
                 Some(Row::Header(gi)) => {
                     if matches!(view, View::Active) && groups[*gi].convs.is_empty() {
                         return Ok(Action::SwitchSession(groups[*gi].key.clone()));
@@ -2122,19 +2751,11 @@ fn conversations_loop(
                     }
                 }
             }
-            // Del: on a Browse project header → archive/unarchive it; on a
-            // conversation → discard (frozen) or close (live, confirm).
+            // Del: discard a frozen conversation, or close a live one (confirm).
+            // (Archiving a project lives in the search branch above — Browse never
+            // reaches this match — and on `a` in the project detail.)
             KeyCode::Delete => {
-                if matches!(view, View::Browse) && matches!(rows.get(sel), Some(Row::Header(_))) {
-                    if let Some(Row::Header(gi)) = rows.get(sel) {
-                        if let Some(pkey) = project_key_of(&groups[*gi].key, &projects) {
-                            toggle_archived_project(&pkey);
-                            flags = Flags::load();
-                            (groups, convs, collapsed) =
-                                rebuild(&view, &reg, &flags.skipped, &query);
-                        }
-                    }
-                } else if let Some(c) = selected_conv(&rows, &convs) {
+                if let Some(c) = selected_conv(&rows, &convs) {
                     if c.is_frozen() {
                         let _ = discard_frozen(c.id.as_str());
                         reg = gather_conversations_stats(&mut sys);
@@ -2160,6 +2781,9 @@ fn draw(
     sel: usize,
     showing_help: bool,
     flags: &Flags,
+    // Sections opened past the `BROWSE_PAGE` cap — a `More` row reads it to know
+    // whether it says "N more" or "show fewer".
+    expanded: &HashSet<(String, Section)>,
     search: Option<&str>,
     freeze: Option<&str>,
     hints: &HashMap<usize, String>,
@@ -2196,7 +2820,7 @@ fn draw(
                 groups.len(),
                 total - live
             ),
-            " Enter/→ open · m mute · Del archive · ^R reveal · / search · Esc back · q",
+            " Enter/→ open · Del archive · ^R archived · type to search · Esc back",
         ),
     };
     let mut header_spans = vec![
@@ -2343,8 +2967,23 @@ fn draw(
                 flags,
                 bold_convs.contains(ci),
                 hints.get(ci).map(|s| s.as_str()),
+                None,
             ),
             Row::Window { gi, wi } => window_line(&groups[*gi].windows[*wi], selected, num),
+            Row::Wt { gi, wi } => wt_line(&groups[*gi].worktrees[*wi], selected),
+            Row::More { gi, section } => {
+                let g = &groups[*gi];
+                let (total, what) = match section {
+                    Section::Worktrees => (g.worktrees.len(), "worktrees"),
+                    Section::Convs => (g.convs.len(), "conversations"),
+                };
+                more_line(
+                    total.saturating_sub(BROWSE_PAGE),
+                    what,
+                    expanded.contains(&(g.key.clone(), *section)),
+                    selected,
+                )
+            }
         });
     }
 
@@ -2404,7 +3043,7 @@ fn draw(
             Span::styled(q.to_string(), Style::default().fg(Color::Yellow)),
             Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             Span::styled(
-                "   Enter open · → detail · Del close · Esc cancel",
+                "   Enter open · Tab expand · → detail · Del close · Esc cancel",
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -2431,18 +3070,29 @@ fn draw_project_detail(
     ])
     .split(area);
 
-    let config = projects.projects.get(&state.key);
+    // A worktree detail borrows its PROJECT's config (emoji, profile, startup) —
+    // its own key isn't in the registry — but shows its own branch as the name.
+    let config_key = match &state.wt_info {
+        Some(w) => w.project.as_str(),
+        None => state.key.as_str(),
+    };
+    let config = projects.projects.get(config_key);
     let emoji = config.map(|c| c.emoji.clone()).unwrap_or_default();
-    let name = config
+    let project_name = config
         .and_then(|c| c.display_name.clone())
-        .unwrap_or_else(|| state.key.clone());
+        .unwrap_or_else(|| config_key.to_string());
+    let name = match &state.wt_info {
+        Some(w) => format!("{project_name} / {}", w.branch),
+        None => project_name,
+    };
     let live = state
         .convs
         .iter()
         .filter(|c| c.lifecycle.is_actionable_here())
         .count();
     let frozen = state.convs.iter().filter(|c| c.is_frozen()).count();
-    let closed = state.convs.len() - live;
+    let archived = state.convs.iter().filter(|c| c.archived).count();
+    let closed = state.convs.len() - live - archived;
 
     // Title bar: icon + name, counts, profile tag, back hint.
     let icon = if emoji.is_empty() {
@@ -2463,7 +3113,9 @@ fn draw_project_detail(
             Style::default().add_modifier(Modifier::DIM),
         ),
     ];
-    if config.map(|c| c.archived).unwrap_or(false) {
+    // Read from `flags` (reloaded on every toggle), not the `projects` registry the
+    // loop loaded once at startup — otherwise `a` wouldn't update the tag.
+    if flags.archived_projects.contains(&state.key) {
         title_spans.push(Span::raw("   "));
         title_spans.push(Span::styled(
             "[archived]",
@@ -2477,6 +3129,13 @@ fn draw_project_detail(
         title_spans.push(Span::styled(
             format!("💤 {frozen} frozen"),
             Style::default().fg(Color::Blue),
+        ));
+    }
+    if archived > 0 {
+        title_spans.push(Span::raw("   "));
+        title_spans.push(Span::styled(
+            format!("{archived} archived"),
+            Style::default().fg(Color::DarkGray),
         ));
     }
     if let Some(profile) = config.and_then(|c| c.auth_profile.clone()) {
@@ -2498,8 +3157,9 @@ fn draw_project_detail(
 
     // Body: config block, worktrees, todos, then the navigable conversation list.
     let mut display: Vec<Line> = Vec::new();
-    // Display line index of each selectable item, in cursor order: todos first,
-    // then conversations. `state.sel` indexes into this.
+    // Display line index of each selectable item, in cursor order: worktrees, then
+    // todos, then conversations — the order they're drawn. `state.sel` indexes into
+    // this, so pushes here must stay in step with `num_items`/`selected_*`.
     let mut item_pos: Vec<usize> = Vec::new();
     display.push(Line::raw(""));
 
@@ -2512,11 +3172,17 @@ fn draw_project_detail(
             Span::raw(val),
         ])
     };
+    if let Some(w) = &state.wt_info {
+        display.push(field("path", abbrev_home(&w.path)));
+        display.push(field("session", w.session.clone()));
+    }
     if let Some(c) = config {
-        display.push(field(
-            "path",
-            abbrev_home(expand_tilde(&c.project_root).to_string_lossy().as_ref()),
-        ));
+        if state.wt_info.is_none() {
+            display.push(field(
+                "path",
+                abbrev_home(expand_tilde(&c.project_root).to_string_lossy().as_ref()),
+            ));
+        }
         let profile = match &c.auth_profile {
             Some(p) => format!("{p}  (~/.claude-{p})"),
             None => "personal  (~/.claude)".to_string(),
@@ -2533,37 +3199,69 @@ fn draw_project_detail(
         }
     }
 
-    display.push(Line::raw(""));
-    display.push(Line::from(Span::styled(
-        format!("  Worktrees ({})", state.worktrees.len()),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    if state.worktrees.is_empty() {
+    // A worktree detail IS a worktree, and a bucket (frozen / unassigned) has no
+    // project to own worktrees — both would just render "Worktrees (0) none" and
+    // push the real content down.
+    if state.wt_info.is_none() && !state.bucket {
+        display.push(Line::raw(""));
         display.push(Line::from(Span::styled(
-            "    none",
-            Style::default().add_modifier(Modifier::DIM),
+            format!("  Worktrees ({})", state.worktrees.len()),
+            Style::default().add_modifier(Modifier::BOLD),
         )));
-    } else {
-        for w in &state.worktrees {
-            let mut tail = format!("{} live", w.live);
-            if w.frozen > 0 {
-                tail.push_str(&format!(" · {} frozen", w.frozen));
-            }
-            display.push(Line::from(vec![
-                Span::styled(
-                    format!("    {:<18}", w.branch),
+        if state.worktrees.is_empty() {
+            display.push(Line::from(Span::styled(
+                "    none",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        } else {
+            for (i, w) in state
+                .worktrees
+                .iter()
+                .take(state.visible_worktrees())
+                .enumerate()
+            {
+                let mut tail = format!("{} live", w.live);
+                if w.frozen > 0 {
+                    tail.push_str(&format!(" · {} frozen", w.frozen));
+                }
+                // Worktrees lead the cursor order, so their index IS `sel`.
+                item_pos.push(display.len());
+                let selected = state.sel == i;
+                let sel_style = Style::default().add_modifier(Modifier::REVERSED);
+                let branch_style = if selected {
+                    sel_style
+                } else {
                     Style::default().fg(if w.live > 0 {
                         Color::Green
                     } else {
                         Color::Gray
-                    }),
-                ),
-                Span::styled(
-                    format!("{:<24}", w.session),
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::styled(tail, Style::default().add_modifier(Modifier::DIM)),
-            ]));
+                    })
+                };
+                let dim = if selected {
+                    sel_style
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                };
+                // Ellipsized to their columns: ticket branches (and the session names
+                // built from them) routinely run past 40 chars, and a plain `{:<18}` let
+                // them run into the next column instead of widening it.
+                display.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {:<44}", ellipsize(&w.branch, 42)),
+                        branch_style,
+                    ),
+                    Span::styled(format!("{:<34}", ellipsize(&w.session, 32)), dim),
+                    Span::styled(tail, dim),
+                ]));
+            }
+            if let Some(more) = detail_more_line(
+                state.worktrees.len(),
+                state.visible_worktrees(),
+                "worktrees",
+                state.show_all,
+            ) {
+                display.push(more);
+            }
         }
     }
 
@@ -2593,7 +3291,7 @@ fn draw_project_detail(
                 prev = Some(session.as_str());
             }
             item_pos.push(display.len());
-            let selected = state.sel == i;
+            let selected = state.sel == state.visible_worktrees() + i;
             let base = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -2626,13 +3324,52 @@ fn draw_project_detail(
     } else {
         // Bold "the last conversation" — the most-recent one (what `r` resumes).
         let last_id = state.most_recent().map(|c| c.id.clone());
-        for (i, c) in state.convs.iter().enumerate() {
+        // Archived conversations sort last; they get their own sub-header so it's
+        // clear they're set aside, not part of the project's working set. This is
+        // the only screen that shows them at all (Browse hides them).
+        let arch_from = state.archived_from();
+        for (i, c) in state.convs.iter().enumerate().take(state.visible_convs()) {
+            if arch_from == Some(i) {
+                display.push(Line::raw(""));
+                display.push(Line::from(Span::styled(
+                    format!("    Archived ({})", state.convs.len() - i),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
             item_pos.push(display.len());
             let num = (i < 9).then_some(i + 1);
             let bold = last_id.as_ref() == Some(&c.id);
-            // Conversations sit after the todos in the combined selection space.
-            let selected = state.sel == state.todos.len() + i;
-            display.push(conv_line(c, &state.path, selected, num, flags, bold, None));
+            // Conversations sit after the worktrees and todos in the selection space.
+            let selected = state.sel == state.visible_worktrees() + state.todos.len() + i;
+            // On a bucket the rows span projects, so each says where it lives.
+            let project = state.bucket.then(|| project_label(c, projects)).flatten();
+            display.push(conv_line(
+                c,
+                &state.path,
+                selected,
+                num,
+                flags,
+                bold,
+                None,
+                project.as_deref(),
+            ));
+            // The reason lives on its own indented line: it's free text, and the
+            // row above is already at the width limit. Re-anchor the item to that
+            // line so scrolling to the last archived row keeps its reason on screen.
+            if let Some(reason) = archive_reason_line(c, selected) {
+                display.push(reason);
+                *item_pos.last_mut().unwrap() = display.len() - 1;
+            }
+        }
+        if let Some(more) = detail_more_line(
+            state.convs.len(),
+            state.visible_convs(),
+            "conversations",
+            state.show_all,
+        ) {
+            display.push(more);
         }
     }
 
@@ -2657,13 +3394,66 @@ fn draw_project_detail(
                 Style::default().fg(Color::DarkGray),
             ),
         ])
+    } else if let Some((_, reason)) = &state.archive_input {
+        Line::from(vec![
+            Span::styled(" archive reason: ", Style::default().fg(Color::Yellow)),
+            Span::styled(reason.clone(), Style::default().fg(Color::Yellow)),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   Enter archive · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if state.bucket {
+        // A bucket owns nothing: no project to mute/archive, no worktrees to make,
+        // no "new conversation" target. Only the per-row actions apply.
+        Line::from(Span::styled(
+            " Enter thaw / switch · → detail · Tab show-all · Del discard · Esc back",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if let Some(w) = &state.wt_info {
+        Line::from(Span::styled(
+            format!(
+                " Enter switch / start-todo · → detail · Tab show-all · Del close · n new in {} · r resume · x delete-wt · A archive-conv · Esc back",
+                w.branch
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))
     } else {
         Line::from(Span::styled(
-            " Enter switch / start-todo · → detail · Del close · n new · r resume · w worktree · x delete-wt · m mute · Esc back",
+            " Enter open wt / switch conv / start-todo · → detail · Tab show-all · Del close-conv / delete-wt · n new · r resume · w worktree · x delete-wt · m mute · a archive-project · A archive-conv · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
     frame.render_widget(Paragraph::new(footer_line), chunks[2]);
+}
+
+/// The `… N more` footer for a capped project-detail section. `None` when nothing
+/// is hidden and the list is already showing everything. Unlike the Browse list's
+/// `More` row this isn't selectable — neither section has a cursor of its own here
+/// (the worktrees have none at all) — so it names the key that reveals the rest.
+fn detail_more_line(
+    total: usize,
+    shown: usize,
+    what: &str,
+    show_all: bool,
+) -> Option<Line<'static>> {
+    // Nothing to page: no line in either state (an "all 3 — Tab for the latest 5"
+    // hint on a 3-item list is noise).
+    if total <= BROWSE_PAGE {
+        return None;
+    }
+    let text = if show_all {
+        format!("      … all {total} {what} — Tab for the latest {BROWSE_PAGE}")
+    } else {
+        format!("      … {} more {what} — Tab to show all", total - shown)
+    };
+    Some(Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+    )))
 }
 
 /// Full-screen y/n prompt before deleting a worktree (removes dir + branch + session).
@@ -2725,6 +3515,35 @@ fn mem_color(kb: u64) -> Color {
     } else {
         Color::Red
     }
+}
+
+/// Fit `s` into exactly `cells` terminal columns: truncated with `…` when wider,
+/// space-padded when narrower. Uses DISPLAY width, unlike the `{:<n}` padding used
+/// for plain-ASCII columns — an emoji is two cells but one char, so char padding
+/// pushes everything after it one column right on exactly the rows that have one.
+fn fit_cells(s: &str, cells: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if cells == 0 {
+        return String::new();
+    }
+    let total = s.width();
+    if total <= cells {
+        return format!("{s}{}", " ".repeat(cells - total));
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > cells - 1 {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    w += 1;
+    out.push_str(&" ".repeat(cells.saturating_sub(w)));
+    out
 }
 
 fn ellipsize(s: &str, n: usize) -> String {
@@ -3131,11 +3950,19 @@ fn help_lines() -> Vec<Line<'static>> {
         key("↑/↓ j/k", "Move selection"),
         key(
             "Enter",
-            "Conversation: switch/resume · project: open detail",
+            "Conversation: switch/resume · worktree: open its session · project: detail",
         ),
         key(
             "/",
-            "Search projects + conversations (type immediately to filter)",
+            "Search projects + worktrees + conversations (type immediately to filter)",
+        ),
+        key(
+            "Tab",
+            "Browse: expand/collapse a project · project detail: full lists / latest 5",
+        ),
+        key(
+            "Enter on … more",
+            "Browse lists the latest 5 per section — reveal the rest / fold back",
         ),
         key(
             "z",
@@ -3144,7 +3971,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("v / m", "Favorite ★ / mute the conversation's session"),
         key(
             "m",
-            "On a project (Browse/detail): mute the whole project (remembered)",
+            "In a project detail: mute the whole project (remembered)",
         ),
         key("M", "Toggle global mute (silence all notifications)"),
         key(
@@ -3160,14 +3987,26 @@ fn help_lines() -> Vec<Line<'static>> {
         key("N", "New-project wizard (key → emoji → path)"),
         key("w / x", "In a project detail: create / delete a worktree"),
         key(
+            "Enter on a worktree",
+            "In a project detail: open that worktree's own detail (Esc pops back)",
+        ),
+        key("a", "In a project detail: archive / unarchive the project"),
+        key(
+            "A",
+            "In a project detail: archive a conversation (asks why) / unarchive it",
+        ),
+        key(
             "→ / l",
             "Detail: a conversation's own, or a project header's",
         ),
         key(
             "Del",
-            "Close a live conv (kill window) · discard a frozen · archive a project",
+            "Close a live conv (kill window) · discard a frozen · archive a project · delete a worktree",
         ),
-        key("Ctrl+R", "Browse: reveal / hide archived projects"),
+        key(
+            "Ctrl+R",
+            "Browse: reveal / hide archived projects (they also match by name in search)",
+        ),
         key(
             "← / h",
             "Browse → Active · in a project detail, back to the list",
@@ -3249,6 +4088,21 @@ fn header_line(
         style = style.add_modifier(Modifier::REVERSED);
     }
     let mut spans = vec![Span::styled(text, style)];
+    // Worktree count — the flat Browse list keeps groups collapsed, so without this
+    // a project's worktrees would be invisible until you expanded (Tab) or searched.
+    if !g.worktrees.is_empty() {
+        let running = g.worktrees.iter().filter(|w| w.session_live).count();
+        let col = if selected {
+            style
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        let mut badge = format!("  {} wt", g.worktrees.len());
+        if running > 0 {
+            badge.push_str(&format!(", {running} up"));
+        }
+        spans.push(Span::styled(badge, col));
+    }
     // Todo badge on the header — todos are session-level, so every conversation in
     // the group shares them; showing the summed count once here avoids repeating it.
     if todos > 0 {
@@ -3313,6 +4167,35 @@ fn live_color(c: &Conversation) -> Color {
     }
 }
 
+/// The indented "archived <when> — <reason>" line rendered under an archived
+/// conversation in the project detail. `None` for anything not archived, so the
+/// working set is unaffected. An archived conversation with no reason still gets
+/// the line (with the timestamp) — the absence of a reason is itself the answer.
+fn archive_reason_line(c: &Conversation, selected: bool) -> Option<Line<'static>> {
+    if !c.archived {
+        return None;
+    }
+    let when = c
+        .archived_at
+        .as_deref()
+        .map(|t| format!(" {}", relative_time(t)))
+        .unwrap_or_default();
+    let reason = c.archive_reason.as_deref().unwrap_or("").trim();
+    let text = if reason.is_empty() {
+        format!("        archived{when} — no reason given")
+    } else {
+        format!("        archived{when} — {reason}")
+    };
+    let style = if selected {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC)
+    };
+    Some(Line::from(Span::styled(text, style)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn conv_line(
     c: &Conversation,
@@ -3322,6 +4205,10 @@ fn conv_line(
     flags: &Flags,
     bold: bool,
     hint: Option<&str>,
+    // Where this conversation lives, for a list that spans projects (the frozen
+    // bucket). Replaces the subpath column — in a mixed list a shared-prefix
+    // subpath is noise, and the project is the context you actually need.
+    project: Option<&str>,
 ) -> Line<'static> {
     // Session-level flags apply to a live conversation's tmux session.
     let session = c.placement.as_ref().map(|p| p.session_name.as_str());
@@ -3354,11 +4241,18 @@ fn conv_line(
         .unwrap_or_default();
     // Only the subpath that distinguishes this conversation from its group's
     // shared path (empty for the common case — the whole group shares one dir).
-    let sub = rel_below(&c.cwd, group_path);
-    let sub_part = if sub.is_empty() {
-        String::new()
-    } else {
-        format!("  {sub}")
+    // The subpath is dropped when a project column leads: in a cross-project list
+    // the cwd's shared-prefix remainder just restates it.
+    let sub_part = match project {
+        Some(_) => String::new(),
+        None => {
+            let sub = rel_below(&c.cwd, group_path);
+            if sub.is_empty() {
+                String::new()
+            } else {
+                format!("  {sub}")
+            }
+        }
     };
 
     let skip = is_skipped(c, &flags.skipped);
@@ -3405,15 +4299,24 @@ fn conv_line(
         ),
         None => Span::styled(format!(" {num_prefix} "), base),
     };
-    // Line 1 fragment: marker · id · title (classic name column).
-    let mut spans = vec![
-        fav_span,
-        lead,
-        Span::styled(
-            format!("{} {:8}  {:<36}", marker, short_id(c.id.as_str()), title),
-            base,
-        ),
-    ];
+    // Line 1 fragment: marker · [project] · id · title (classic name column). The
+    // project column only exists in a cross-project list, and leads — it's the
+    // first thing you want to know about a row you can't place.
+    let mut spans = vec![fav_span, lead, Span::styled(format!("{marker} "), base)];
+    if let Some(p) = project {
+        spans.push(Span::styled(
+            fit_cells(p, 24),
+            if selected {
+                base
+            } else {
+                Style::default().fg(Color::Cyan)
+            },
+        ));
+    }
+    spans.push(Span::styled(
+        format!("{:8}  {:<36}", short_id(c.id.as_str()), title),
+        base,
+    ));
 
     // Classic-style colored "→ status  (ago)".
     let (label, color) = status_span(c);
@@ -3475,6 +4378,7 @@ fn conv_line(
     spans.extend(tag(auto, "  [auto]", Color::Green));
     spans.extend(tag(muted, "  [muted]", Color::DarkGray));
     spans.extend(tag(skip, "  [skip]", Color::DarkGray));
+    spans.extend(tag(c.archived, "  [archived]", Color::DarkGray));
     // Overlay: a pin marker and the free-text note (persisted per-conversation).
     if c.pinned {
         let col = if selected {
@@ -3525,6 +4429,59 @@ fn window_line(w: &WinRow, selected: bool, num: Option<usize>) -> Line<'static> 
     ])
 }
 
+/// The `… N more worktrees` / `… show fewer` row that ends a capped section.
+/// Deliberately quiet (dim, italic) — it's a control, not an item.
+fn more_line(hidden: usize, what: &str, expanded: bool, selected: bool) -> Line<'static> {
+    let base = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM | Modifier::ITALIC)
+    };
+    let text = if expanded {
+        format!("      … show fewer {what}")
+    } else {
+        format!("      … {hidden} more {what}")
+    };
+    Line::from(Span::styled(text, base))
+}
+
+/// A registered worktree row (Browse): the branch, a `worktree` tag, and how much
+/// is running there. Uses the conversation rows' ●/○ vocabulary for "its session is
+/// up / not", and greens a running one so the eye lands on live work first.
+fn wt_line(w: &BrowseWt, selected: bool) -> Line<'static> {
+    let base = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else if w.session_live {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+    };
+    let dim = if selected {
+        base
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    let marker = if w.session_live { '●' } else { '○' };
+    let branch = ellipsize(&w.branch, 46);
+    let mut spans = vec![
+        // Blank favorite + 1-9 slots so worktrees align with the conversation rows.
+        Span::styled("  ", base),
+        Span::styled(format!("  {marker} {branch:<46}"), base),
+        Span::styled("  worktree", dim),
+    ];
+    if w.live > 0 {
+        let col = if selected {
+            base
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        spans.push(Span::styled(format!("  {} live", w.live), col));
+    }
+    Line::from(spans)
+}
+
 /// The tmux session that owns this conversation's project/worktree, if resolvable
 /// from its logical `parent` key.
 /// Reopen a closed conversation via the shared [`crate::common::conversations`]
@@ -3552,32 +4509,89 @@ fn new_conversation(key: &str) -> Result<String> {
     let root = expand_tilde(&config.project_root)
         .to_string_lossy()
         .into_owned();
-    let env = config.tmux_env();
+    open_new_conversation(&session, &root, &config.tmux_env())
+}
 
+/// Start a fresh conversation in a WORKTREE: a new `claude` window in its session
+/// (created at the worktree path under the project's auth env if it isn't running).
+/// Same shape as [`new_conversation`], keyed off the worktree registry instead of
+/// the project one — a worktree's session name is registered, not derived.
+fn new_conversation_in_worktree(project: &str, branch: &str) -> Result<String> {
+    let wts = WorktreeState::load();
+    let entry = wts
+        .get(project, branch)
+        .ok_or_else(|| anyhow!("unknown worktree '{project}/{branch}'"))?;
+    let env = ProjectRegistry::load()
+        .projects
+        .get(project)
+        .map(|c| c.tmux_env())
+        .unwrap_or_default();
+    open_new_conversation(&entry.session_name, &entry.path, &env)
+}
+
+/// The shared half: open a `claude` window in `session` at `cwd`, creating the
+/// session if needed, then switch to it.
+fn open_new_conversation(session: &str, cwd: &str, env: &[(String, String)]) -> Result<String> {
     let alive = Command::new("tmux")
-        .args(["has-session", "-t", &session])
+        .args(["has-session", "-t", session])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     if alive {
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-window", "-t", &session, "-c", &root]);
-        for (k, v) in &env {
+        cmd.args(["new-window", "-t", session, "-c", cwd]);
+        for (k, v) in env {
             cmd.arg("-e").arg(format!("{k}={v}"));
         }
         if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
             return Err(anyhow!("failed to open a new window in '{session}'"));
         }
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &session, "claude", "Enter"])
+            .args(["send-keys", "-t", session, "claude", "Enter"])
             .output();
-    } else if !ensure_tmux_session(&session, &root, Some("claude"), &env) {
+    } else if !ensure_tmux_session(session, cwd, Some("claude"), env) {
         return Err(anyhow!("failed to create session '{session}'"));
     }
 
-    attach_or_switch(&session);
+    attach_or_switch(session);
     Ok(format!("New conversation in {session}"))
+}
+
+/// Open a registered worktree: switch to its tmux session, creating it at the
+/// worktree path (with the project's startup command and auth env, exactly as
+/// `hive wt new` would) when it isn't running. The worktree directory, branch, and
+/// hooks are untouched — this only (re)creates the session you jump into, which is
+/// what makes a worktree with no live conversation a usable Browse row.
+fn connect_worktree(project: &str, branch: &str) -> Result<String> {
+    let wts = WorktreeState::load();
+    let entry = wts
+        .get(project, branch)
+        .ok_or_else(|| anyhow!("unknown worktree '{project}/{branch}'"))?;
+    let session = entry.session_name.clone();
+
+    let alive = Command::new("tmux")
+        .args(["has-session", "-t", &session])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !alive {
+        let projects = ProjectRegistry::load();
+        let config = projects.projects.get(project);
+        let startup = config.and_then(|c| c.startup_command.as_deref());
+        let env = config.map(|c| c.tmux_env()).unwrap_or_default();
+        if !ensure_tmux_session(&session, &entry.path, startup, &env) {
+            return Err(anyhow!("failed to create session '{session}'"));
+        }
+    }
+    // Opening a worktree is an explicit choice to work there — put it back in the
+    // cycle, same as switching to a conversation does.
+    unskip_session(&session);
+    attach_or_switch(&session);
+    Ok(format!(
+        "{} {session}",
+        if alive { "Switched to" } else { "Started" }
+    ))
 }
 
 /// POSIX single-quote a string so it survives being typed onto a shell command line
@@ -3734,20 +4748,25 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
 
     let skipped = load_skipped_sessions();
     let projects = ProjectRegistry::load();
-    let total = reg.conversations.len();
-    let live = reg
-        .conversations
-        .values()
+    // Archived conversations are hidden here for the same reason they're hidden
+    // in Browse — this is a default listing. They stay visible in project detail.
+    let listed = || {
+        reg.conversations
+            .values()
+            .filter(|c| !c.archived || c.lifecycle.is_actionable_here())
+    };
+    let total = listed().count();
+    let live = listed()
         .filter(|s| s.lifecycle.is_actionable_here())
         .count();
     let closed = total - live;
-    let frozen = reg.conversations.values().filter(|c| c.is_frozen()).count();
+    let frozen = listed().filter(|c| c.is_frozen()).count();
 
     // Frozen conversations are enumerated first under a pinned "💤 frozen" header;
     // the rest are grouped by parent (BTreeMap gives stable ordering).
     let mut groups: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
     let mut frozen_group: Vec<&Conversation> = Vec::new();
-    for s in reg.conversations.values() {
+    for s in listed() {
         if s.is_frozen() {
             frozen_group.push(s);
             continue;
@@ -3967,16 +4986,330 @@ mod tests {
             },
         );
         let has = |g: &[Group], k: &str| g.iter().any(|x| x.key == k);
+        let none = HashSet::new();
+        let no_wts = HashMap::new();
 
         // Full list (include_empty=true), not revealed → hidden.
-        let (g, _) = build_browse(&reg, &projects, true, false);
+        let (g, _) = build_browse(&reg, &projects, true, false, &none, &no_wts);
         assert!(!has(&g, "arch"), "archived hidden on the full list");
         // Search (include_empty=false), not revealed → findable.
-        let (g, _) = build_browse(&reg, &projects, false, false);
+        let (g, _) = build_browse(&reg, &projects, false, false, &none, &no_wts);
         assert!(has(&g, "arch"), "archived findable during search");
         // Revealed → shown regardless.
-        let (g, _) = build_browse(&reg, &projects, true, true);
+        let (g, _) = build_browse(&reg, &projects, true, true, &none, &no_wts);
         assert!(has(&g, "arch"), "archived shown when revealed");
+    }
+
+    #[test]
+    fn test_build_browse_surfaces_name_matched_empty_projects() {
+        // The regression that made archiving a one-way door: a project whose
+        // conversations aged out of the registry (or never existed) was dropped from
+        // every search, and archiving hides it from the full list — so it could not
+        // be reached at all. A project the query NAMES must surface regardless, and
+        // rank above incidental conversation hits.
+        let mut reg = ConversationRegistry::default();
+        reg.conversations.insert(
+            "other".into(),
+            mk(
+                "other",
+                Lifecycle::Closed,
+                Some("busy"),
+                Some("2026-07-01T00:00:00Z"),
+            ),
+        );
+        let mut projects = ProjectRegistry::default();
+        projects.projects.insert(
+            "arch".into(),
+            ProjectConfig {
+                archived: true,
+                ..Default::default()
+            },
+        );
+        projects
+            .projects
+            .insert("busy".into(), ProjectConfig::default());
+        let matched: HashSet<String> = ["arch"].into_iter().map(String::from).collect();
+
+        // Searching (include_empty=false) with "arch" named: it shows despite having
+        // zero conversations and being archived, ahead of the conversation hit.
+        let (g, _) = build_browse(&reg, &projects, false, false, &matched, &HashMap::new());
+        let keys: Vec<&str> = g.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(keys, vec!["arch", "busy"], "named project first");
+    }
+
+    /// A `WorktreeState` from `(project, branch, session, path)` tuples.
+    fn wt_state(entries: &[(&str, &str, &str, &str)]) -> WorktreeState {
+        use crate::common::worktree::WorktreeEntry;
+        let mut state = WorktreeState::default();
+        for (project, branch, session, path) in entries {
+            state.add(WorktreeEntry {
+                project_key: project.to_string(),
+                branch: branch.to_string(),
+                session_name: session.to_string(),
+                path: path.to_string(),
+                worktree_type: "worktree".to_string(),
+                metadata: serde_json::Value::Null,
+                created_at: String::new(),
+            });
+        }
+        state
+    }
+
+    /// Build a group with `n_wt` worktrees and `n_conv` conversations, plus the
+    /// `convs` backing store `visible_rows` indexes into.
+    fn paged_group(key: &str, n_wt: usize, n_conv: usize) -> (Vec<Group>, Vec<Conversation>) {
+        let convs: Vec<Conversation> = (0..n_conv)
+            .map(|i| mk(&format!("c{i}"), Lifecycle::Closed, Some(key), None))
+            .collect();
+        let worktrees = (0..n_wt)
+            .map(|i| BrowseWt {
+                project: key.to_string(),
+                branch: format!("br{i}"),
+                session_live: false,
+                live: 0,
+                last_activity: None,
+            })
+            .collect();
+        let group = Group {
+            key: key.to_string(),
+            convs: (0..n_conv).collect(),
+            path: String::new(),
+            emoji: String::new(),
+            windows: Vec::new(),
+            worktrees,
+        };
+        (vec![group], convs)
+    }
+
+    #[test]
+    fn test_visible_rows_pages_sections_behind_a_more_row() {
+        let (groups, _) = paged_group("cs", 26, 29);
+        let no_collapse = HashSet::new();
+        let mut expanded = HashSet::new();
+        let count = |rows: &[Row], f: fn(&Row) -> bool| rows.iter().filter(|r| f(r)).count();
+        let wts = |r: &Row| matches!(r, Row::Wt { .. });
+        let cvs = |r: &Row| matches!(r, Row::Conv { .. });
+        let more = |r: &Row| matches!(r, Row::More { .. });
+
+        // Browse pages both sections: 5 + 5 rows, one More row each.
+        let rows = visible_rows(&groups, &no_collapse, &expanded, Some(BROWSE_PAGE));
+        assert_eq!(count(&rows, wts), 5);
+        assert_eq!(count(&rows, cvs), 5);
+        assert_eq!(count(&rows, more), 2);
+        // The More row ends its own section, so the cursor lands on the first
+        // revealed item when it expands in place.
+        assert!(matches!(
+            rows[6],
+            Row::More {
+                section: Section::Worktrees,
+                ..
+            }
+        ));
+
+        // Expanding one section leaves the other capped, and keeps its More row so
+        // it can be folded back.
+        expanded.insert(("cs".to_string(), Section::Worktrees));
+        let rows = visible_rows(&groups, &no_collapse, &expanded, Some(BROWSE_PAGE));
+        assert_eq!(count(&rows, wts), 26);
+        assert_eq!(count(&rows, cvs), 5);
+        assert_eq!(count(&rows, more), 2, "both More rows stay");
+
+        // Active (page: None) never hides a row — a live window you can't see is a
+        // window you can't get back to.
+        let rows = visible_rows(&groups, &no_collapse, &HashSet::new(), None);
+        assert_eq!(count(&rows, wts), 26);
+        assert_eq!(count(&rows, cvs), 29);
+        assert_eq!(count(&rows, more), 0);
+
+        // A section at or under the cap gets no More row at all.
+        let (small, _) = paged_group("tiny", 2, 5);
+        let rows = visible_rows(&small, &no_collapse, &HashSet::new(), Some(BROWSE_PAGE));
+        assert_eq!(count(&rows, more), 0);
+
+        // A collapsed group shows only its header.
+        let collapsed: HashSet<String> = ["cs".to_string()].into_iter().collect();
+        let rows = visible_rows(&groups, &collapsed, &expanded, Some(BROWSE_PAGE));
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_browse_worktrees_orders_by_recency() {
+        // "Latest 5" has to mean latest: running first, then most-recent activity,
+        // with creation time standing in for a worktree nothing has run in yet.
+        let mut wts = wt_state(&[
+            ("cs", "stale", "s-stale", "/w/stale"),
+            ("cs", "recent", "s-recent", "/w/recent"),
+            ("cs", "fresh-empty", "s-fresh", "/w/fresh"),
+            ("cs", "running", "s-running", "/w/running"),
+        ]);
+        // A brand-new worktree with no conversations, created after the others ran.
+        wts.worktrees.get_mut("cs/fresh-empty").unwrap().created_at =
+            "2026-07-20T00:00:00Z".to_string();
+        let mut reg = ConversationRegistry::default();
+        for (id, branch, when) in [
+            ("a", "stale", "2026-01-01T00:00:00Z"),
+            ("b", "recent", "2026-07-25T00:00:00Z"),
+            ("c", "running", "2026-02-01T00:00:00Z"),
+        ] {
+            reg.conversations.insert(
+                id.into(),
+                mk(
+                    id,
+                    Lifecycle::Closed,
+                    Some(&format!("cs/{branch}")),
+                    Some(when),
+                ),
+            );
+        }
+        let live: HashSet<String> = ["s-running"].into_iter().map(String::from).collect();
+        let rows = browse_worktrees(&wts, &reg, &live, "", &HashSet::new());
+        let order: Vec<&str> = rows["cs"].iter().map(|w| w.branch.as_str()).collect();
+        assert_eq!(order, vec!["running", "recent", "fresh-empty", "stale"]);
+    }
+
+    #[test]
+    fn test_browse_worktrees_filters_by_branch_session_and_path() {
+        let wts = wt_state(&[
+            ("cs", "CSD-2723-dashboard", "🌳 [cs] CSD-2723", "/w/cs/2723"),
+            ("cs", "upgrade-versions", "🌳 [cs] upgrade", "/w/cs/upgrade"),
+            ("dio", "tactics-assets", "🏔️ [dio] tactics", "/w/dio/assets"),
+        ]);
+        let reg = ConversationRegistry::default();
+        let live: HashSet<String> = ["🌳 [cs] CSD-2723"].into_iter().map(String::from).collect();
+        let none = HashSet::new();
+        let branches = |m: &HashMap<String, Vec<BrowseWt>>, k: &str| -> Vec<String> {
+            m.get(k)
+                .map(|v| v.iter().map(|w| w.branch.clone()).collect())
+                .unwrap_or_default()
+        };
+
+        // No query → every registered worktree, running sessions first.
+        let all = browse_worktrees(&wts, &reg, &live, "", &none);
+        assert_eq!(
+            branches(&all, "cs"),
+            vec!["CSD-2723-dashboard", "upgrade-versions"],
+            "the running worktree sorts first"
+        );
+        assert!(all["cs"][0].session_live && !all["cs"][1].session_live);
+
+        // Branch text — the case that returned nothing before: a worktree with no
+        // conversations at all was unreachable from Browse.
+        let hit = browse_worktrees(&wts, &reg, &live, "tactics-assets", &none);
+        assert_eq!(branches(&hit, "dio"), vec!["tactics-assets"]);
+        assert!(!hit.contains_key("cs"), "non-matching projects drop out");
+
+        // Session name and path match too.
+        assert_eq!(
+            branches(&browse_worktrees(&wts, &reg, &live, "🏔️", &none), "dio"),
+            vec!["tactics-assets"]
+        );
+        assert_eq!(
+            branches(
+                &browse_worktrees(&wts, &reg, &live, "/w/cs/upgrade", &none),
+                "cs"
+            ),
+            vec!["upgrade-versions"]
+        );
+
+        // Naming the PROJECT brings all of its worktrees, matching how conversations
+        // follow their project.
+        let named: HashSet<String> = ["cs"].into_iter().map(String::from).collect();
+        assert_eq!(
+            browse_worktrees(&wts, &reg, &live, "zzz", &named)["cs"].len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_browse_worktrees_counts_live_conversations() {
+        let wts = wt_state(&[("cs", "CSD-1", "🌳 [cs] CSD-1", "/w/cs/1")]);
+        let mut reg = ConversationRegistry::default();
+        reg.conversations
+            .insert("a".into(), mk("a", Lifecycle::Live, Some("cs/CSD-1"), None));
+        reg.conversations.insert(
+            "b".into(),
+            mk("b", Lifecycle::Closed, Some("cs/CSD-1"), None),
+        );
+        // A conversation of the project root, not this worktree — must not count.
+        reg.conversations
+            .insert("c".into(), mk("c", Lifecycle::Live, Some("cs"), None));
+        let rows = browse_worktrees(&wts, &reg, &HashSet::new(), "", &HashSet::new());
+        assert_eq!(rows["cs"][0].live, 1);
+    }
+
+    #[test]
+    fn test_build_browse_surfaces_projects_for_their_worktrees() {
+        // The worktree analog of the name-match fix: a project whose only match is a
+        // branch has to surface — with zero conversations of its own — or that
+        // worktree can't be reached from `/` at all.
+        let reg = ConversationRegistry::default();
+        let mut projects = ProjectRegistry::default();
+        projects
+            .projects
+            .insert("dio".into(), ProjectConfig::default());
+        projects.projects.insert(
+            "arch".into(),
+            ProjectConfig {
+                archived: true,
+                ..Default::default()
+            },
+        );
+        let wt = |project: &str, branch: &str| BrowseWt {
+            project: project.to_string(),
+            branch: branch.to_string(),
+            session_live: false,
+            live: 0,
+            last_activity: None,
+        };
+        let matched_wts: HashMap<String, Vec<BrowseWt>> =
+            [("dio".to_string(), vec![wt("dio", "tactics-assets")])]
+                .into_iter()
+                .collect();
+        let none = HashSet::new();
+
+        let (g, _) = build_browse(&reg, &projects, false, false, &none, &matched_wts);
+        let dio = g.iter().find(|x| x.key == "dio").expect("project surfaces");
+        assert_eq!(dio.worktrees.len(), 1, "its worktree rides along as a row");
+
+        // On the full list an archived project stays hidden even though it has
+        // worktrees — the archived filter still wins there.
+        let arch_wts: HashMap<String, Vec<BrowseWt>> =
+            [("arch".to_string(), vec![wt("arch", "old-branch")])]
+                .into_iter()
+                .collect();
+        let (g, _) = build_browse(&reg, &projects, true, false, &none, &arch_wts);
+        assert!(!g.iter().any(|x| x.key == "arch"), "archived stays hidden");
+        // …but a search finds it through its branch.
+        let (g, _) = build_browse(&reg, &projects, false, false, &none, &arch_wts);
+        assert!(
+            g.iter().any(|x| x.key == "arch"),
+            "findable via its worktree"
+        );
+    }
+
+    #[test]
+    fn test_projects_matching() {
+        let mut projects = ProjectRegistry::default();
+        projects
+            .projects
+            .insert("spotify".into(), ProjectConfig::default());
+        projects.projects.insert(
+            "cs".into(),
+            ProjectConfig {
+                display_name: Some("Clear Session".into()),
+                ..Default::default()
+            },
+        );
+        let m = |q: &str| {
+            let mut v: Vec<String> = projects_matching(&projects, q).into_iter().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(m("spot"), vec!["spotify"], "matches the key");
+        assert_eq!(m("SPOT"), vec!["spotify"], "case-insensitive");
+        assert_eq!(m("clear"), vec!["cs"], "matches the display name");
+        assert!(m("").is_empty(), "empty query matches nothing");
+        assert!(m("zzz").is_empty());
     }
 
     fn mk(id: &str, lc: Lifecycle, parent: Option<&str>, last: Option<&str>) -> Conversation {
@@ -3992,6 +5325,8 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            archive_reason: None,
+            archived_at: None,
             title: None,
             auth_config_dir: None,
             cpu: 0.0,
@@ -3999,6 +5334,21 @@ mod tests {
             ports: Vec::new(),
             pids: Vec::new(),
         }
+    }
+
+    /// `mk` + the archive overlay, for the archived-conversation tests.
+    fn mk_archived(
+        id: &str,
+        lc: Lifecycle,
+        parent: Option<&str>,
+        last: Option<&str>,
+        reason: Option<&str>,
+    ) -> Conversation {
+        let mut c = mk(id, lc, parent, last);
+        c.archived = true;
+        c.archive_reason = reason.map(|s| s.to_string());
+        c.archived_at = Some("2026-07-20T00:00:00Z".to_string());
+        c
     }
 
     #[test]
@@ -4041,5 +5391,273 @@ mod tests {
         let reg = ConversationRegistry::default();
         let out = render_conversations(&reg);
         assert!(out.contains("0 known (0 live · 0 closed) across 0 groups"));
+    }
+
+    // ---- Archived conversations: hidden from the listings, shown in project detail ----
+
+    #[test]
+    fn test_build_browse_hides_archived_conversations() {
+        // Archiving a conversation takes it off Browse — that's the whole point.
+        // It is NOT deleted: `build_group_detail` still lists it (see the sort
+        // test below), which is why the registry keeps it.
+        let mut reg = ConversationRegistry::default();
+        for c in [
+            mk("keep", Lifecycle::Closed, Some("hive"), Some("2026-07-02")),
+            mk_archived(
+                "gone",
+                Lifecycle::Closed,
+                Some("hive"),
+                Some("2026-07-03"),
+                Some("superseded"),
+            ),
+        ] {
+            reg.conversations.insert(c.id.as_str().to_string(), c);
+        }
+        let (_, convs) = build_browse(
+            &reg,
+            &ProjectRegistry::default(),
+            false,
+            false,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let ids: Vec<&str> = convs.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["keep"], "archived conversation hidden in Browse");
+    }
+
+    #[test]
+    fn test_build_browse_shows_archived_conversation_that_is_live() {
+        // You can't hide something that's running: a live conversation shows even
+        // if the archive flag is still set on it.
+        let mut reg = ConversationRegistry::default();
+        let c = mk_archived(
+            "running",
+            Lifecycle::Live,
+            Some("hive"),
+            Some("2026-07-03"),
+            Some("was set aside"),
+        );
+        reg.conversations.insert(c.id.as_str().to_string(), c);
+        let (_, convs) = build_browse(
+            &reg,
+            &ProjectRegistry::default(),
+            false,
+            false,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(convs.len(), 1, "a live archived conversation still shows");
+    }
+
+    #[test]
+    fn test_sort_project_convs_puts_archived_last() {
+        // The project detail sorts archived to the tail so they can be sectioned
+        // off under an "Archived" header — even when an archived one is MORE
+        // recent than the working-set rows above it.
+        let mut convs = vec![
+            mk_archived(
+                "arch-recent",
+                Lifecycle::Closed,
+                Some("hive"),
+                Some("2026-07-09"),
+                Some("wrong approach"),
+            ),
+            mk(
+                "closed",
+                Lifecycle::Closed,
+                Some("hive"),
+                Some("2026-07-01"),
+            ),
+            mk("live", Lifecycle::Live, Some("hive"), Some("2026-07-02")),
+        ];
+        sort_project_convs(&mut convs);
+        let ids: Vec<&str> = convs.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["live", "closed", "arch-recent"]);
+    }
+
+    #[test]
+    fn test_archived_from_and_most_recent_skip_archived() {
+        // `archived_from` marks where the Archived section starts, and `r`
+        // (resume last) must never land on an archived conversation — otherwise
+        // archiving the newest one would make `r` reopen the thing you set aside.
+        let mut convs = vec![
+            mk("live", Lifecycle::Live, Some("hive"), Some("2026-07-02")),
+            mk_archived(
+                "arch",
+                Lifecycle::Closed,
+                Some("hive"),
+                Some("2026-07-09"),
+                None,
+            ),
+        ];
+        sort_project_convs(&mut convs);
+        let state = ProjectDetailState {
+            key: "hive".to_string(),
+            worktrees: Vec::new(),
+            convs,
+            path: String::new(),
+            todos: Vec::new(),
+            sel: 0,
+            wt_input: None,
+            archive_input: None,
+            show_all: false,
+            wt_info: None,
+            bucket: false,
+        };
+        assert_eq!(state.archived_from(), Some(1));
+        assert_eq!(
+            state.most_recent().map(|c| c.id.as_str().to_string()),
+            Some("live".to_string()),
+            "resume-last skips the (newer) archived conversation"
+        );
+    }
+
+    #[test]
+    fn test_project_detail_caps_lists_until_show_all() {
+        // The detail lists the latest `BROWSE_PAGE` of each section; `Tab` reveals
+        // the rest. `num_items` has to follow the cap, or the cursor walks off into
+        // conversations that aren't drawn.
+        let mut state = ProjectDetailState {
+            key: "cs".to_string(),
+            worktrees: (0..26)
+                .map(|i| WtRow {
+                    branch: format!("br{i}"),
+                    session: format!("s{i}"),
+                    live: 0,
+                    frozen: 0,
+                    last_activity: None,
+                })
+                .collect(),
+            convs: (0..29)
+                .map(|i| mk(&format!("c{i}"), Lifecycle::Closed, Some("cs"), None))
+                .collect(),
+            path: String::new(),
+            todos: vec![("s".to_string(), "todo".to_string())],
+            sel: 0,
+            wt_input: None,
+            archive_input: None,
+            show_all: false,
+            wt_info: None,
+            bucket: false,
+        };
+        assert_eq!(state.visible_worktrees(), BROWSE_PAGE);
+        assert_eq!(state.visible_convs(), BROWSE_PAGE);
+        assert_eq!(
+            state.num_items(),
+            BROWSE_PAGE + 1 + BROWSE_PAGE,
+            "capped worktrees + 1 todo + capped convs"
+        );
+
+        // The cursor runs worktrees → todos → conversations, in drawn order.
+        state.sel = 0;
+        assert_eq!(
+            state.selected_worktree().map(|w| w.branch.as_str()),
+            Some("br0")
+        );
+        assert!(state.selected_todo().is_none() && state.selected_conv().is_none());
+        state.sel = BROWSE_PAGE - 1;
+        assert_eq!(
+            state.selected_worktree().map(|w| w.branch.as_str()),
+            Some("br4")
+        );
+        state.sel = BROWSE_PAGE; // first todo
+        assert!(state.selected_worktree().is_none());
+        assert_eq!(state.selected_todo().map(|(_, t)| t.as_str()), Some("todo"));
+        state.sel = BROWSE_PAGE + 1; // first conversation
+        assert!(state.selected_todo().is_none());
+        assert_eq!(
+            state.selected_conv().map(|c| c.id.as_str().to_string()),
+            Some("c0".to_string())
+        );
+        // The cursor stops at the cap, not at conversation 29.
+        state.sel = state.num_items() - 1;
+        assert_eq!(
+            state.selected_conv().map(|c| c.id.as_str().to_string()),
+            Some("c4".to_string())
+        );
+
+        state.show_all = true;
+        assert_eq!(state.visible_worktrees(), 26);
+        assert_eq!(state.visible_convs(), 29);
+        assert_eq!(state.num_items(), 26 + 1 + 29);
+        // Offsets follow the now-uncapped worktree list.
+        state.sel = 26;
+        assert_eq!(state.selected_todo().map(|(_, t)| t.as_str()), Some("todo"));
+
+        // Sections at or under the cap are unaffected, and get no "more" line.
+        state.show_all = false;
+        state.convs.truncate(3);
+        assert_eq!(state.visible_convs(), 3);
+        assert_eq!(state.num_items(), BROWSE_PAGE + 1 + 3);
+        assert!(detail_more_line(3, 3, "conversations", false).is_none());
+        assert!(detail_more_line(3, 3, "conversations", true).is_none());
+        assert!(detail_more_line(29, BROWSE_PAGE, "conversations", false).is_some());
+    }
+
+    #[test]
+    fn test_fit_cells_pads_and_truncates_by_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        // Emoji are two cells but one char, so `{:<n}` would over-pad these rows.
+        for label in ["🚀 Eve-online", "📁 ProMobile ProSys", "👁️ iris", "plain"] {
+            assert_eq!(
+                fit_cells(label, 24).width(),
+                24,
+                "{label:?} must occupy exactly 24 columns"
+            );
+        }
+        // Too wide ⇒ truncated with an ellipsis, still exactly `cells` columns.
+        let long = fit_cells("🌳 Clear Session / CSD-2723-clinic-admin-dashboard", 24);
+        assert_eq!(long.width(), 24);
+        assert!(long.contains('…'));
+        assert_eq!(fit_cells("x", 0), "");
+    }
+
+    #[test]
+    fn test_project_label_names_project_and_worktree() {
+        // The frozen bucket lists conversations from everywhere, so each row has to
+        // say where it lives — the cwd's shared prefix ("00-Personal/…") doesn't.
+        let mut projects = ProjectRegistry::default();
+        projects.projects.insert(
+            "cs".into(),
+            ProjectConfig {
+                emoji: "🌳".into(),
+                display_name: Some("Clear Session".into()),
+                ..Default::default()
+            },
+        );
+        let label = |parent: Option<&str>| {
+            project_label(&mk("x", Lifecycle::Closed, parent, None), &projects)
+        };
+        assert_eq!(label(Some("cs")), Some("🌳 Clear Session".to_string()));
+        assert_eq!(
+            label(Some("cs/CSD-2723")),
+            Some("🌳 Clear Session / CSD-2723".to_string()),
+            "a worktree conversation names its branch too"
+        );
+        // An unregistered project falls back to its key; no parent ⇒ no label.
+        assert_eq!(label(Some("ghost")), Some("ghost".to_string()));
+        assert_eq!(label(None), None);
+    }
+
+    #[test]
+    fn test_archive_reason_line() {
+        // Only archived rows get the line; the reason is rendered when present,
+        // and its absence is stated rather than left blank.
+        assert!(
+            archive_reason_line(&mk("a", Lifecycle::Closed, None, None), false).is_none(),
+            "non-archived rows get no reason line"
+        );
+        let text = |c: &Conversation| {
+            archive_reason_line(c, false)
+                .unwrap()
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let with = mk_archived("b", Lifecycle::Closed, None, None, Some("superseded by X"));
+        assert!(text(&with).contains("superseded by X"));
+        let without = mk_archived("c", Lifecycle::Closed, None, None, None);
+        assert!(text(&without).contains("no reason given"));
     }
 }

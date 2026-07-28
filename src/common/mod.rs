@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod chrome;
+pub mod config;
 // Shared gather: builds the ConversationRegistry for both the TUI and the web.
 pub mod conversations;
 pub mod debug;

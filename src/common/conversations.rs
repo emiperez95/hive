@@ -195,6 +195,9 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
 
     // Bound the (unbounded) on-disk Closed set: Live is always shown; a Closed
     // conversation is kept only if recently active, parented, or a pinned freeze.
+    // Archived ones are kept too (they're still their project's history — the
+    // project detail lists them with a reason); hiding them from the default
+    // listings is each consumer's call, not the registry's.
     let now = chrono::Utc::now();
     let cfg = registry::BoundingCfg { max_age_days: 14 };
     reg.conversations.retain(|_, c| {

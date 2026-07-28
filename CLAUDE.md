@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 255 tests (233 unit + 22 CLI smoke)
+cargo test                # 271 tests (249 unit + 22 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~454 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 233 unit + 22 smoke.
+> bin targets and run twice. Distinct tests: 249 unit + 22 smoke.
 
 ## The TUI (conversation-first)
 
@@ -167,7 +167,8 @@ and `docs/permission-approve-reject.md`.)
 
 - `Conversation` (common/registry.rs) — the base entity, keyed by the Claude conversation UUID
   (the `<uuid>.jsonl` basename): id, cwd, lifecycle, status, last_activity, placement, parent,
-  frozen, note, pinned, archived, title, auth_config_dir, and runtime-only `cpu`/`mem_kb`
+  frozen, note, pinned, archived (+ `archive_reason`/`archived_at`), title, auth_config_dir,
+  and runtime-only `cpu`/`mem_kb`
 - `ConversationId` — newtype over the UUID (machine-independent, unlike tmux names)
 - `Lifecycle` — `Live` | `Closed`. **A live tmux placement is the SOLE discriminator** for Live
 - `TmuxPlacement` — where a conversation currently runs (session_name, window_index, window_name,
@@ -176,7 +177,7 @@ and `docs/permission-approve-reject.md`.)
   `from_shadow(hook, disk_ids, live_placements, sidecar)` — a left-join over state.json + a disk
   scan + the overlay sidecar
 - `ConversationSidecar` / `ConversationOverlay` — writable per-conversation overlay
-  (note/pinned/archived), persisted to `conversations.json`
+  (note/pinned/archived + `archive_reason`/`archived_at`), persisted to `conversations.json`
 - `ClaudeInstance` (common/instances.rs) — one running Claude **window** (session, window_index,
   window_name, pane, cwd, pids, session_id, `cwd_shared`)
 
@@ -205,11 +206,12 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 ```
 ~/.hive/
 ├── projects.toml              # project registry
+├── config.toml                # global settings — `[web]` autostart (common/config.rs)
 ├── cache/                     # runtime state
 │   ├── state.json             # hook state (session statuses) — PRUNED after 10min idle
 │   ├── worktrees.json         # registered worktrees
 │   ├── frozen.json            # frozen (hibernated) Claude windows — resume metadata + notes
-│   ├── conversations.json     # per-conversation overlay sidecar: note / pinned / archived
+│   ├── conversations.json     # per-conversation overlay sidecar: note / pinned / archived (+ reason, when)
 │   ├── conversation-scan.json # mtime-keyed transcript scan cache (warm gather ~6x faster)
 │   ├── activity.jsonl         # append-only lifecycle/focus event log (feeds `hive stats`)
 │   ├── open-windows.json      # snapshot of currently-open windows (recovery projection)
@@ -273,17 +275,95 @@ so nothing is invisible.
   session-level).
 
 **Browse** (`/`) — a project launchpad: flat project list (empty registered projects included),
-`💤 frozen` bucket pinned first. Typing searches projects-first then conversations. Archived
-projects hide on the full list but surface on search or via `Ctrl+R`.
+`💤 frozen` bucket pinned first. Typing searches **projects first** — a query is matched against
+every registered project's key and `display_name` (`projects_matching`), and a named project
+surfaces *even with zero conversations* and sorts above the conversation hits — then conversations
+(`matches_query`). Archived projects hide on the full list but surface on search or via `Ctrl+R`.
+
+> Search must match project *names*, not just conversations: the registry is age-bounded, so a
+> long-archived project has no conversations left to match — before this it was unreachable, i.e.
+> archiving was a one-way door.
+
+**Worktrees are Browse rows too.** Each project's registered worktrees (from `worktrees.json`,
+*not* from conversations) render above its conversations as `● branch … worktree` rows —
+`●` = its tmux session is up, `○` = not running — and the header carries an `N wt, M up` badge.
+`browse_worktrees()` filters them by branch / session name / path, and every worktree of a
+project the query NAMED comes along; `build_browse` then surfaces that project even with zero
+conversations, exactly as `matched_projects` does for a name hit. `Enter` on a worktree row
+opens its session (`connect_worktree` — `ensure_tmux_session` at the worktree path with the
+project's startup command + auth env when it isn't running), `→` opens the project detail,
+`Del` deletes the worktree behind the usual y/n confirm.
+
+> Same age-bounding problem as archived projects, one level down: a worktree with no
+> conversations — fresh, or old enough that its conversations aged out — matched nothing, so
+> `/` couldn't reach it at all. Keying the rows off the worktree registry is what fixes that.
+
+**`Tab` expands/collapses a project.** The unsearched flat list starts fully collapsed (25
+projects, 30 worktrees would otherwise be a wall), so `Tab` is how you open one project and see
+its worktrees + conversations without typing a query.
+
+**Each section pages at `BROWSE_PAGE` (5).** An expanded project shows its 5 latest worktrees
+and 5 latest conversations, each followed by a `… N more <section>` row; Enter/`→` on that row
+reveals the rest and flips it to `… show fewer`. `visible_rows` takes the `page` cap and the
+`expanded` set (keyed by `(group key, Section)`, so it survives a rebuild reordering the groups
+and resets whenever the query changes). Both sections page independently, and the More row sits
+*after* its items — so expanding in place leaves the cursor on the first revealed row.
+
+> `page` is `Some(5)` for Browse and **`None` for Active**: a live window that isn't listed is a
+> window you can't get back to, so the Active view stays session-first-complete.
+
+The **project detail** pages the same way, but with its own mechanism: a single `show_all` flag on
+`ProjectDetailState` toggles both sections, `Tab` flips it, and each section ends with a
+non-selectable `… N more <section> — Tab to show all` line (there's no per-section cursor to hang
+an expandable row on). `num_items()` counts only the VISIBLE rows, so the cursor can't walk off
+into rows that aren't drawn, and digits `1-9` stop at the cap for the same reason. `show_all` is
+carried across the detail's rebuilds (archive/unarchive/discard) so a refresh doesn't silently
+re-cap a list you just opened.
+
+"Latest" for worktrees means the newest activity across the worktree's conversations, falling
+back to its `created_at` (a worktree created five minutes ago has no conversations yet and must
+still rank as recent). Running worktrees still sort above everything.
+
+**Browse is always in search mode**: entering it (`/`, `--picker`, `--filter`) sets `searching`,
+and only Esc clears it — which also returns to Active. So `view == Browse` ⟹ `searching`, the
+`if searching { … } continue;` block shadows the main key match, and **every Browse action must
+live in that block**. Only non-letter keys can act there (letters are query text): Enter, `Tab`,
+`→`, arrows, `Del`, and Ctrl-chords. Project-level actions otherwise belong in the project detail.
 
 ### Detail screens
 
 Stack above the list; `←`/`h`/`Esc` pops back.
-- **Project detail** — config, worktrees w/ live·frozen counts, all its conversations;
-  `n` new conversation, `r` resume-last, `w`/`x` create/delete worktree.
+- **Project detail** — config, worktrees w/ live·frozen counts, its conversations;
+  `n` new conversation, `r` resume-last, `w`/`x` create/delete worktree, `m` mute, `a`
+  archive/unarchive the PROJECT (the `[archived]` tag reads from `Flags`, reloaded on each
+  toggle), `A` archive/unarchive the selected CONVERSATION — see below.
+- **Worktree detail** — the same screen, drilled into from a worktree row (`Enter`/`→`). Keyed by
+  the worktree key (`project/branch`), which `conv_in_project` already matches exactly, so it needs
+  no new filter: what changes is `wt_info` being set — its own path + session in the header, no
+  nested worktree list, todos from its own registered session, `n` opening a conversation there and
+  `x` deleting *it*. Details **stack**: `detail_stack` holds the parent, so `Esc` pops worktree →
+  project → list (`q` leaves outright).
 - **Conversation detail** — **async** (`std::thread` + `Arc<Mutex<…>>`, no tokio): paints
   instantly from the registry, then fills CPU/mem, processes, ports (+Chrome titles), git
   commits, and a transcript tail as they arrive.
+
+The detail's cursor runs **worktrees → todos → conversations**, matching the drawn order;
+`selected_worktree()` / `selected_todo()` / `selected_conv()` slice `sel` by the VISIBLE counts, so
+the offsets follow the cap and `item_pos` must be pushed in that same order.
+
+**The buckets (`💤 frozen`, `(unassigned)`) are not projects** — `bucket: true` on the state. They
+own no config, no worktrees and no "new conversation" target, so the worktree section and the
+project-level footer actions are dropped, and because their rows come from *everywhere* each one is
+labelled with `project_label()` (`🌳 Clear Session / CSD-2723`), which conv_line renders as a
+leading column right after the marker and *before* the id — where a row lands is the first thing
+you need when you can't place it — and which suppresses the subpath column (in a cross-project list
+the cwd's shared-prefix remainder just restates the project).
+
+> That column is padded with `fit_cells()`, not `{:<n}`: an emoji is one char but **two display
+> cells**, so char padding shifts every row whose project has an icon. (Residual drift on emoji
+> written with a VS16 selector — `👁️` — is tmux's width table disagreeing with the terminal, not
+> the padding.) `unicode-width` is a direct dependency for this; it was already in the tree via
+> ratatui.
 
 ### Keys
 
@@ -291,19 +371,54 @@ Stack above the list; `←`/`h`/`Esc` pops back.
 |---|---|
 | `1-9` | switch to the Nth switch target (conversation **or** window) |
 | `f` | hint-jump — 2-char home-row labels on every conversation (Vimium-style) |
-| `Enter` | conversation → switch/resume · window → switch · header → project detail |
+| `Enter` | conversation → switch/resume · worktree → open its session · window → switch · header → project detail |
 | `→`/`l` | drill into detail · `←`/`h`/`Esc` back |
-| `/` | Browse + search (types immediately) |
+| `/` | Browse + search (types immediately) — projects, worktrees, conversations |
+| `Tab` | Browse: expand/collapse the project under the cursor · project detail: full lists ⇄ latest 5 |
+| `Enter`/`→` on `… N more` | reveal the rest of that section (5 shown by default) / fold it back |
+| `Enter`/`→` on a worktree row | project detail: open that worktree's own detail (`Esc` pops back) |
 | `v` `m` `s` `!` | favorite · mute · skip · auto-approve (session-level) |
 | `M` | global mute · `P` pin conversation · `e` edit note |
 | `z`/`Z` | freeze a Claude window (prompts for a note) |
-| `Del` | close live conv (kill window) · discard frozen · archive project |
+| `Del` | close live conv (kill window) · discard frozen · archive project (Browse header) · delete worktree (confirm) |
+| `a` | project detail: archive / unarchive the project |
+| `A` | project detail: archive the selected conversation (prompts for a reason) / unarchive |
 | `L` `N` | iTerm spread/collapse · new-project wizard |
 | `Ctrl+R` | Browse: reveal/hide archived |
 
-**Mute has three levels**: `m` per-session, `M` global, and `m` on a *project* (Browse header /
-project detail) = a remembered preference in `muted-projects.txt` honored by the hook notifier,
-so future sessions of that project stay silent.
+**Mute has three levels**: `m` per-session, `M` global, and `m` on a *project* (project detail)
+= a remembered preference in `muted-projects.txt` honored by the hook notifier, so future
+sessions of that project stay silent.
+
+### Archived conversations (`A`)
+
+Archiving sets a conversation aside **without losing it**. `A` in the project detail prompts
+for a reason ("archive reason: …"; empty is allowed) and writes `archived` / `archive_reason` /
+`archived_at` to the conversation's overlay in `conversations.json`. `A` again unarchives and
+clears all three, so a re-archived conversation never carries a stale reason.
+
+The whole point is that it is hidden *somewhere* and explained *somewhere*:
+
+| Surface | Archived conversation |
+|---|---|
+| Browse (`/`), `--list`, web Resume view | **hidden** |
+| Project detail | shown, under an `Archived (n)` section at the bottom |
+
+The project detail renders it dimmed with an `[archived]` tag plus an indented
+`archived <when> — <reason>` line (`archive_reason_line`; "no reason given" when empty), and the
+title bar carries an `N archived` count separate from `closed`. `sort_project_convs` puts the
+archived tail last — `archived_from()` is where the section header goes.
+
+Two consequences worth knowing:
+
+- **The registry keeps archived conversations.** `should_surface_closed` deliberately does *not*
+  treat archived as a bound (it once did, which is why archived conversations were unreachable
+  rather than merely hidden) — they're still bounded by age/parent/pin like anything else, and
+  each consumer decides whether to display them. That's the one filter to remember when adding
+  a new listing surface.
+- **Opening an archived conversation unarchives it** (`activate`), mirroring un-skip-on-switch:
+  otherwise it would run while invisible in Browse. `r` (resume-last) skips archived ones, so
+  archiving the newest conversation doesn't make `r` reopen the thing you just set aside.
 
 ### How a live conversation is resolved (the tricky part)
 
@@ -447,6 +562,33 @@ hive web --port <N>                             # custom port (default: 8375)
 hive web --dev --tts-host http://10.18.1.2:9800 # both
 ```
 
+**Autostart (opt-in).** So the dashboard is live whenever you're at your machine without
+manually running `hive web`, the TUI can ensure a server exists on launch. Add to
+`~/.hive/config.toml`:
+
+```toml
+[web]
+autostart = true
+port = 8375                          # optional (default 8375)
+tts_host = "http://10.18.1.2:9800"   # optional — passed as --tts-host
+```
+
+`run_conversations_tui` then calls `serve::web::ensure_web_autostart()` **once** at startup (never
+in the refresh loop, so there's no ongoing polling cost). It's idempotent and best-effort:
+
+- A sub-millisecond localhost probe (`web_server_listening`) short-circuits if a server is already
+  up — so a second popup, or a manually-run `hive web`, never double-spawns.
+- Otherwise it launches the server as a **detached, hidden tmux session** named `__hive_web`
+  (`common::config::WEB_SESSION`), so it outlives the ephemeral TUI popup (a thread inside the
+  popup would die when the popup closes). Runs non-`--dev` (embedded HTML — the popup's cwd is
+  arbitrary). Stop it with `tmux kill-session -t __hive_web`.
+- `__hive_web` is filtered out of every session listing (`common::tmux` — `get_all_windows`,
+  `get_tmux_sessions`, `get_current_tmux_session_names`), so it never shows as a switch/cycle
+  target in the TUI, the web dashboard, or `hive start`.
+
+Default is **off**: autostart binds `0.0.0.0:<port>`, a LAN-exposed surface, so it must be opted
+into explicitly.
+
 **Architecture:**
 
 ```
@@ -559,22 +701,30 @@ hive web --dev --tts-host http://10.18.1.2:9800 # both
 
 ## Testing
 
-255 distinct tests. Run with `cargo test`.
+271 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~454 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 199 · bin 233 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 200 · bin 249 (the superset — adds cli/daemon/serve)
 > · smoke 22.
 
-**Unit tests (233)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (249)** — in-module `#[cfg(test)]` blocks:
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
-  frozen, activity
+  frozen, activity, config (`[web]` parse, defaults-off, legacy `[defaults]` ignored)
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
 - `cli/conversations.rs`: `build_active` bucketing (normal/other/skipped), bare-session
-  surfacing, covered-window exclusion, `build_browse` archived visibility, hint labels,
-  `sh_quote`
+  surfacing, covered-window exclusion, `build_browse` archived visibility + name-matched
+  (conversation-less) projects surfacing first, `projects_matching`, `browse_worktrees`
+  (branch/session/path filtering, project-named pass-through, live-conversation counts,
+  recency ordering) + `visible_rows` section paging (cap, per-section expand, Active uncapped) +
+  project-detail paging + cursor offsets (`visible_convs`/`num_items` under the cap,
+  `selected_worktree`/`selected_todo`/`selected_conv` boundaries, `detail_more_line`),
+  `project_label`, `fit_cells` (display-width padding/truncation) +
+  `build_browse` surfacing a project for its worktrees alone, archived conversations
+  (hidden in `build_browse` unless live, `sort_project_convs` tail, `archived_from` /
+  resume-last skipping them, `archive_reason_line`), hint labels, `sh_quote`
 
 **Integration tests (22)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
