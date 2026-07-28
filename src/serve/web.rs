@@ -157,6 +157,12 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     let active_for_thread = Arc::clone(&shared_active);
     let shared_conversations: Arc<Mutex<Vec<ConversationView>>> = Arc::new(Mutex::new(Vec::new()));
     let conversations_for_thread = Arc::clone(&shared_conversations);
+    // Third projection of the same gather: registry aggregates for `GET /metrics`. `None`
+    // until the first cycle completes, so the endpoint can omit those series rather than
+    // publish a misleading zero.
+    let shared_metrics: Arc<Mutex<Option<crate::serve::metrics::RegistrySnapshot>>> =
+        Arc::new(Mutex::new(None));
+    let metrics_for_thread = Arc::clone(&shared_metrics);
 
     // Background data refresh thread (1s interval, same as TUI)
     std::thread::spawn(move || {
@@ -164,17 +170,23 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         sys.refresh_all();
 
         loop {
-            // Gather the conversation registry ONCE, then project it into both the
-            // Active view (session-grouped) and the Resume view (closed/frozen).
+            // Gather the conversation registry ONCE, then project it into the Active view
+            // (session-grouped), the Resume view (closed/frozen), and the metrics snapshot.
             let reg = crate::common::conversations::gather_conversations_stats(&mut sys);
             let active = gather_active_views(&reg, &sys);
             let conversations = build_conversation_views(&reg);
+            // Taken from the FULL registry, not `conversations` — that view drops archived
+            // entries, which the backlog counts must still see.
+            let snapshot = crate::serve::metrics::RegistrySnapshot::from_registry(&reg);
 
             if let Ok(mut data) = active_for_thread.lock() {
                 *data = active;
             }
             if let Ok(mut data) = conversations_for_thread.lock() {
                 *data = conversations;
+            }
+            if let Ok(mut data) = metrics_for_thread.lock() {
+                *data = Some(snapshot);
             }
 
             std::thread::sleep(Duration::from_secs(1));
@@ -192,6 +204,21 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let header =
                     Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
                 let response = Response::from_string(html).with_header(header);
+                let _ = request.respond(response);
+            }
+
+            (Method::Get, "/metrics") => {
+                // Prometheus scrape target — hive's own view of the work (concurrency, active
+                // time, worktree debt, conversation registry), collected alongside Claude
+                // Code's native OTLP metrics. Registry aggregates come from the data thread's
+                // snapshot, so a scrape never triggers a gather of its own.
+                let snapshot = shared_metrics.lock().ok();
+                let body =
+                    crate::serve::metrics::render(snapshot.as_ref().and_then(|s| s.as_ref()));
+                let header =
+                    Header::from_bytes("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                        .unwrap();
+                let response = Response::from_string(body).with_header(header);
                 let _ = request.respond(response);
             }
 

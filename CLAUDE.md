@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 271 tests (249 unit + 22 CLI smoke)
+cargo test                # 282 tests (260 unit + 22 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~454 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 249 unit + 22 smoke.
+> `cargo test` prints ~482 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 260 unit + 22 smoke.
 
 ## The TUI (conversation-first)
 
@@ -149,8 +149,9 @@ src/
 ├── ipc/
 │   └── messages.rs         HookEvent, SessionState, HookState (load/save), SessionStatus
 ├── serve/                  web dashboard — projects the ConversationRegistry (conversation model)
-│   ├── mod.rs              module registration (server, web, web_types)
+│   ├── mod.rs              module registration (metrics, server, web, web_types)
 │   ├── server.rs           gather_active_views()/build_conversation_views() — project the registry
+│   ├── metrics.rs          Prometheus text exposition for GET /metrics (scraped by OTel)
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
@@ -611,6 +612,7 @@ into explicitly.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Serve embedded HTML (or from disk in `--dev` mode) |
+| GET | `/metrics` | Prometheus text exposition — see **Metrics** below |
 | GET | `/api/active` | Active view (live convs grouped by tmux session + bare/startable sessions), projected from the registry; SessionView shape, polled every 1.5s |
 | GET | `/api/conversations` | Closed/frozen conversations for the Resume view (ConversationView) |
 | POST | `/api/resume` | Reopen a closed conversation by id (`claude --resume <id>` in its project session) |
@@ -690,6 +692,86 @@ into explicitly.
 - Falls back to embedded HTML if file not found
 - For web development without affecting installed binary: `cargo run -- web --dev`
 
+## Metrics (`GET /metrics`)
+
+`serve/metrics.rs` renders hive's state as **Prometheus text exposition**, so an OTel collector
+can scrape it into the same Grafana as Claude Code's native `claude_code.*` cost/token
+telemetry. The point is one pane of glass: *what the agents cost* next to *how many were
+running, on what, for how long*.
+
+A scrape endpoint rather than an OTLP push, deliberately: `opentelemetry-otlp`'s gRPC transport
+pulls in tonic + tokio, and hive is synchronous by design (see **Conventions**). The web server
+already runs and autostarts (`__hive_web`), so exposing text costs zero new dependencies.
+
+**Cheap series** — computed per scrape from files + tmux:
+
+| Series | Type | Notes |
+|---|---|---|
+| `hive_windows_open` | gauge | **the concurrency signal** — agents running side by side |
+| `hive_frozen_windows` | gauge | frozen, awaiting resume |
+| `hive_worktrees{project,state}` | gauge | `state="dead"` is the **worktree-debt backlog** |
+| `hive_projects{state}` | gauge | active vs archived |
+| `hive_todos{state}` | gauge | active / done, summed across sessions |
+| `hive_tmux_sessions` | gauge | live sessions (`__hive_web` excluded) |
+| `hive_active_seconds_total{session}` | counter | focused time, machine-sleep subtracted |
+| `hive_web_seconds_total{session}` | counter | dashboard viewing time |
+| `hive_windows_{opened,closed,frozen,thawed}_total` | counter | lifecycle |
+| `hive_sessions_killed_total`, `hive_focus_switches_total`, `hive_web_views_total` | counter | |
+
+**Registry series** — from `RegistrySnapshot`, the conversation model. These are what Claude
+Code's own telemetry structurally *cannot* report: it knows what a session spent, not how many
+sessions exist, where they live, or whether they're stuck waiting on a human.
+
+| Series | Type | Notes |
+|---|---|---|
+| `hive_conversations{lifecycle}` | gauge | live vs closed-but-resumable |
+| `hive_conversations_blocked` | gauge | **the attention bottleneck** — live convs awaiting a human decision |
+| `hive_conversations_needs_attention` | gauge | registry's own attention flag |
+| `hive_conversations_by_status{status}` | gauge | working / waiting / needs_permission / plan_review / question_asked / running_workflow / edit_approval / unknown |
+| `hive_conversations_by_project{project,lifecycle}` | gauge | grouped by PROJECT (a worktree conv rolls up to its project) |
+| `hive_conversations_by_auth_profile{profile}` | gauge | `work` vs `default` — which identity is running |
+| `hive_conversations_{archived,pinned}` | gauge | overlay counts |
+| `hive_claude_cpu_percent{project}` | gauge | live process trees — the *local* cost of parallelism |
+| `hive_claude_memory_bytes{project}` | gauge | ditto; RAM bounds concurrency before spend does |
+
+Counters are computed over **all time** (`ALL_TIME_DAYS`), not a rolling window: the activity
+log is append-only, and a rolling window would sawtooth as events age out — Prometheus reads
+every decrease as a counter reset.
+
+### Where the registry series come from
+
+`/metrics` must **never** trigger a registry gather — that's a full process/tmux/JSONL sweep.
+The web data thread already gathers once per second, so it also builds a
+`metrics::RegistrySnapshot` and publishes it through a third `Arc<Mutex<…>>` alongside
+`shared_active` / `shared_conversations`. The handler only formats it.
+
+Two correctness constraints, both load-bearing:
+
+- The snapshot is built from the **full registry**, not from `build_conversation_views` — that
+  view filters archived conversations out, and a backlog count that silently omits set-aside
+  work is wrong.
+- `render(None)` **omits** every registry series rather than emitting zeros, so the first
+  second of `hive web` (before any gather) can't be misread as "no conversations exist".
+
+Status labels are payload-free (`needs_permission`, not the tool name) — the payload variants
+carry unbounded free text and would explode series cardinality.
+
+> **Gotcha**: `compute_stats` calls `machine::sleep_intervals`, which shells out to
+> `pmset -g log` — a **~1.8s** call that renders ~45k lines. That is fine for a one-shot
+> `hive stats`, but this endpoint is scraped on a timer and `/api/stats` is hit on every
+> dashboard load. `machine.rs` therefore memoizes the raw `pmset` output for 5 minutes
+> (process-lifetime, success-only). `/metrics` answers in ~25ms as a result. One-shot CLI runs
+> see a cold cache and behave exactly as before.
+
+> **Gotcha**: `compute_stats` calls `machine::sleep_intervals`, which shells out to
+> `pmset -g log` — a **~1.8s** call that renders ~45k lines. That is fine for a one-shot
+> `hive stats`, but this endpoint is scraped on a timer and `/api/stats` is hit on every
+> dashboard load. `machine.rs` therefore memoizes the raw `pmset` output for 5 minutes
+> (process-lifetime, success-only). `/metrics` answers in ~25ms as a result. One-shot CLI runs
+> see a cold cache and behave exactly as before.
+
+The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
+
 ## Tmux Integration
 
 - `prefix + s` — conversations popup, list view (`hive`)
@@ -701,13 +783,13 @@ into explicitly.
 
 ## Testing
 
-271 distinct tests. Run with `cargo test`.
+282 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints ~454 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 200 · bin 249 (the superset — adds cli/daemon/serve)
+> `cargo test` prints ~482 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 200 · bin 260 (the superset — adds cli/daemon/serve)
 > · smoke 22.
 
-**Unit tests (249)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (260)** — in-module `#[cfg(test)]` blocks:
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
@@ -725,6 +807,12 @@ into explicitly.
   `build_browse` surfacing a project for its worktrees alone, archived conversations
   (hidden in `build_browse` unless live, `sort_project_convs` tail, `archived_from` /
   resume-last skipping them, `archive_reason_line`), hint labels, `sh_quote`
+- `serve/metrics.rs`: Prometheus label escaping (reserved chars, emoji/space passthrough),
+  `scalar` HELP/TYPE/sample shape, `render()` well-formedness (every non-comment line ends in a
+  parseable numeric value) + registry series omitted without a snapshot, and `RegistrySnapshot`
+  (lifecycle counts, worktree convs rolling up to their project, archived still counted,
+  blocked-vs-working split, closed convs contributing no status/resources, auth-profile
+  defaulting, payload-free status labels)
 
 **Integration tests (22)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages

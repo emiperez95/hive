@@ -11,14 +11,48 @@ use chrono::{DateTime, Utc};
 /// non-macOS or any error — callers degrade to the interval cap.
 #[cfg(target_os = "macos")]
 pub fn sleep_intervals(since: DateTime<Utc>) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    parse_sleep_intervals(&pmset_log(), since)
+}
+
+/// `pmset -g log` output, memoized per process.
+///
+/// The call costs ~1.8s (it renders ~45k lines of OS power log), and every `compute_stats`
+/// needs it — so the web `/api/stats` and the scraped `/metrics` endpoint would each pay that
+/// in full on every request. Sleep history only ever grows at the tail and old spans never
+/// change, so a slightly stale read costs at most `TTL` of accuracy on the newest interval.
+///
+/// One-shot CLI runs (`hive stats`) see a cold cache and behave exactly as before.
+#[cfg(target_os = "macos")]
+fn pmset_log() -> String {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const TTL: Duration = Duration::from_secs(300);
+    static CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some((read_at, text)) = guard.as_ref() {
+            if read_at.elapsed() < TTL {
+                return text.clone();
+            }
+        }
+    }
+
+    // Only a successful read is cached — a transient failure shouldn't blind us for 5 minutes.
     let out = match std::process::Command::new("pmset")
         .args(["-g", "log"])
         .output()
     {
         Ok(o) if o.status.success() => o.stdout,
-        _ => return Vec::new(),
+        _ => return String::new(),
     };
-    parse_sleep_intervals(&String::from_utf8_lossy(&out), since)
+    let text = String::from_utf8_lossy(&out).into_owned();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), text.clone()));
+    }
+    text
 }
 
 #[cfg(not(target_os = "macos"))]
