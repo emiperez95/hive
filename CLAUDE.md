@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 282 tests (260 unit + 22 CLI smoke)
+cargo test                # 283 tests (261 unit + 22 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~482 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 260 unit + 22 smoke.
+> bin targets and run twice. Distinct tests: 261 unit + 22 smoke.
 
 ## The TUI (conversation-first)
 
@@ -52,12 +52,12 @@ that must see every live Claude window (the conversation model) cannot rely on i
 ```
 hive                    # open conversations TUI (default; also prefix + s)
 hive --detail           # conversations detail for the current window (prefix + d)
+hive --project-detail   # PROJECT detail for the current window (prefix + a)
 hive --picker           # conversations, start in Browse + search
 hive --filter <q>       # conversations, start in Browse + search pre-filled with <q>
 hive conversations      # explicit; --list for a static listing (also used when piped)
 hive stats [--days N]   # usage summary from the activity log (default 7 days)
 hive start              # auto-attach to first available session (or fall through to picker)
-hive --detail           # open TUI with detail view for current session
 hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
 hive setup              # register hooks, agent, and tmux keybindings
@@ -243,7 +243,7 @@ macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other
 - `chrome.rs`: `get_chrome_tabs()`, `focus_all_matched_tabs()` — uses JXA (sees all Chrome profiles)
 - `iterm.rs`: `get_iterm_pane_count()`, `spread_panes()`, `collapse_panes()` — uses AppleScript
 
-## Conversations TUI (`hive` / `hive conversations`, `prefix + s`, `prefix + d`)
+## Conversations TUI (`hive` / `hive conversations`, `prefix + s`, `prefix + d`, `prefix + a`)
 
 The conversation-first view. Self-contained in `src/cli/conversations.rs` (~3.9k lines) over
 the `common/registry.rs` model. Base entity is the **conversation** (Claude UUID), not the tmux
@@ -334,10 +334,12 @@ live in that block**. Only non-letter keys can act there (letters are query text
 ### Detail screens
 
 Stack above the list; `←`/`h`/`Esc` pops back.
-- **Project detail** — config, worktrees w/ live·frozen counts, its conversations;
+- **Project detail** — config, todos, its conversations, then worktrees w/ live·frozen counts;
   `n` new conversation, `r` resume-last, `w`/`x` create/delete worktree, `m` mute, `a`
   archive/unarchive the PROJECT (the `[archived]` tag reads from `Flags`, reloaded on each
-  toggle), `A` archive/unarchive the selected CONVERSATION — see below.
+  toggle), `A` archive/unarchive the selected CONVERSATION — see below. The worktree section
+  is **dropped entirely when the project has none** (an empty "Worktrees (0) / none" block is
+  noise), and sits *below* the conversations: worktrees are places to go, not work in flight.
 - **Worktree detail** — the same screen, drilled into from a worktree row (`Enter`/`→`). Keyed by
   the worktree key (`project/branch`), which `conv_in_project` already matches exactly, so it needs
   no new filter: what changes is `wt_info` being set — its own path + session in the header, no
@@ -348,9 +350,31 @@ Stack above the list; `←`/`h`/`Esc` pops back.
   instantly from the registry, then fills CPU/mem, processes, ports (+Chrome titles), git
   commits, and a transcript tail as they arrive.
 
-The detail's cursor runs **worktrees → todos → conversations**, matching the drawn order;
-`selected_worktree()` / `selected_todo()` / `selected_conv()` slice `sel` by the VISIBLE counts, so
+The detail's cursor runs **todos → conversations → worktrees**, matching the drawn order;
+`selected_todo()` / `selected_conv()` / `selected_worktree()` slice `sel` by the VISIBLE counts, so
 the offsets follow the cap and `item_pos` must be pushed in that same order.
+
+**Opening a detail straight from tmux.** `prefix + d` (`--detail`) opens the current window's
+CONVERSATION detail; `prefix + a` (`--project-detail`) opens its PROJECT detail.
+`current_window_project()` resolves the project two ways, because the window you press `a` from
+may not be running Claude at all: the current window's conversation names its `parent`, and
+failing that the pane's cwd goes through `registry::resolve_parent` — the same rule the registry
+groups by. A worktree resolves **up to its project** (that screen lists the worktree, its
+siblings, and every conversation under any of them; the worktree's own detail is one `Enter`
+away). The two flags are independent and compose: with both, the conversation detail draws on
+top and `Esc` pops to the project rather than out to the list.
+
+**Conversation sections.** The list is sectioned by sub-headers so a frozen conversation is
+visible as *pending*, not lost: `sort_project_convs` puts live first, then **frozen**, then plain
+closed, then the archived tail, and the draw emits `💤 Frozen (n)` / `Closed (n)` / `Archived (n)`
+at each boundary (`frozen_from()` / `closed_from()` / `archived_from()`).
+
+> Frozen used to sort *below* closed, which put the one conversation you froze in order to
+> remember it past the 5-row cap — invisible on the screen whose title bar counts it.
+
+`Closed (n)` only appears when a Frozen section precedes it (otherwise closed rows just continue
+the list unlabelled, as before), and `frozen_from()` returns `None` when *everything* is frozen —
+on the 💤 bucket the header would only restate the screen title and each row's own 💤 marker.
 
 **The buckets (`💤 frozen`, `(unassigned)`) are not projects** — `bucket: true` on the state. They
 own no config, no worktrees and no "new conversation" target, so the worktree section and the
@@ -776,6 +800,8 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 - `prefix + s` — conversations popup, list view (`hive`)
 - `prefix + d` — conversations popup, detail for the current window (`hive --detail`)
+- `prefix + a` — conversations popup, **project** detail for the current window
+  (`hive --project-detail`) — see `current_window_project()`
 - `Ctrl+n` / `Ctrl+p` — cycle next/prev session
 - `Ctrl+g` — jump to the next non-busy Claude window (current session first, then others)
 - `Ctrl+\` — cycle to next window in the current session (`window-prev` is CLI-only)
@@ -783,13 +809,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-282 distinct tests. Run with `cargo test`.
+283 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~482 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 200 · bin 260 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 200 · bin 261 (the superset — adds cli/daemon/serve)
 > · smoke 22.
 
-**Unit tests (260)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (261)** — in-module `#[cfg(test)]` blocks:
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
@@ -802,11 +828,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   (branch/session/path filtering, project-named pass-through, live-conversation counts,
   recency ordering) + `visible_rows` section paging (cap, per-section expand, Active uncapped) +
   project-detail paging + cursor offsets (`visible_convs`/`num_items` under the cap,
-  `selected_worktree`/`selected_todo`/`selected_conv` boundaries, `detail_more_line`),
+  `selected_todo`/`selected_conv`/`selected_worktree` boundaries, `detail_more_line`),
   `project_label`, `fit_cells` (display-width padding/truncation) +
   `build_browse` surfacing a project for its worktrees alone, archived conversations
   (hidden in `build_browse` unless live, `sort_project_convs` tail, `archived_from` /
-  resume-last skipping them, `archive_reason_line`), hint labels, `sh_quote`
+  resume-last skipping them, `archive_reason_line`), frozen conversations sectioned above
+  closed (`sort_project_convs` order, `frozen_from`/`closed_from`/`section_counts`, no header
+  on an all-frozen list), hint labels, `sh_quote`
 - `serve/metrics.rs`: Prometheus label escaping (reserved chars, emoji/space passthrough),
   `scalar` HELP/TYPE/sample shape, `render()` well-formedness (every non-comment line ends in a
   parseable numeric value) + registry series omitted without a snapshot, and `RegistrySnapshot`

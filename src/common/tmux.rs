@@ -186,6 +186,24 @@ pub fn get_current_tmux_session() -> Option<String> {
         })
 }
 
+/// Get the current active tmux pane's working directory. Read from tmux rather
+/// than `current_dir()` because the caller may be a popup, whose own cwd says
+/// nothing about the window the user pressed the key from.
+pub fn get_current_tmux_pane_path() -> Option<String> {
+    Command::new("tmux")
+        .args(["display-message", "-p", "#{pane_current_path}"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path)
+            }
+        })
+}
+
 /// Get the current active tmux window index (matches `WindowView.window_index`).
 pub fn get_current_tmux_window() -> Option<String> {
     Command::new("tmux")

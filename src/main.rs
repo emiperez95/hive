@@ -19,6 +19,7 @@ fn conv_opts(args: &Args, list: bool) -> ConvOptions {
     ConvOptions {
         list,
         detail: args.detail,
+        project_detail: args.project_detail,
         picker: args.picker,
         filter: args.filter.clone(),
     }

@@ -33,6 +33,10 @@ pub struct Args {
     #[arg(short = 'D', long, global = true)]
     pub detail: bool,
 
+    /// Open the current window's project detail on startup
+    #[arg(short = 'P', long, global = true)]
+    pub project_detail: bool,
+
     /// Enable debug logging to ~/.cache/hive/debug.log
     #[arg(long, global = true)]
     pub debug: bool,

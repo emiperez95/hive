@@ -72,7 +72,7 @@ This will:
 - Add hook entries to `~/.claude/settings.json` (preserves existing hooks)
 - Install the `janus-wt-portal` agent to `~/.claude/agents/`
 - Install the `hive/create-project` slash command to `~/.claude/commands/`
-- Optionally bind `prefix+s` (list view), `prefix+d` (detail view), `Ctrl+n`/`Ctrl+p` (cycle) in tmux
+- Optionally bind `prefix+s` (list view), `prefix+d` (detail view), `prefix+a` (project detail), `Ctrl+n`/`Ctrl+p` (cycle) in tmux
 
 > Tmux keybindings are applied to the **currently running tmux server only** — they don't persist across reboots. `hive setup` prints the `bind-key …` snippets you should paste into `~/.tmux.conf` for persistence.
 
@@ -113,6 +113,7 @@ As Claude runs tools, its status in the dashboard flips between Working / Waitin
 hive                    # open TUI dashboard (default)
 hive start              # auto-attach to first available tmux session
 hive --detail           # open TUI with detail view for current session
+hive --project-detail   # open TUI on the current window's project detail
 hive --picker           # open TUI in search/picker mode
 hive -w 5               # custom refresh interval (seconds)
 hive -f pattern         # filter sessions by name
@@ -178,7 +179,8 @@ Set `HIVE_NO_NOTIFY=1` to suppress desktop notifications (useful for CI / script
 | Key | Action |
 |---|---|
 | `prefix+s` | Open hive popup (list view) |
-| `prefix+d` | Open hive popup (detail view) |
+| `prefix+d` | Open hive popup (conversation detail for the current window) |
+| `prefix+a` | Open hive popup (project detail for the current window) |
 | `Ctrl+n` | Cycle to next session |
 | `Ctrl+p` | Cycle to previous session |
 

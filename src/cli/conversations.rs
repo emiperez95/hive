@@ -60,6 +60,8 @@ pub struct ConvOptions {
     pub list: bool,
     /// Open the current tmux window's conversation detail on startup (classic `--detail`).
     pub detail: bool,
+    /// Open the current tmux window's PROJECT detail on startup (`prefix+a`).
+    pub project_detail: bool,
     /// Start in Browse + search mode (classic `--picker`).
     pub picker: bool,
     /// Start in Browse + search pre-filled with this query (classic `--filter`).
@@ -906,10 +908,10 @@ struct ProjectDetailState {
     convs: Vec<Conversation>, // display order: live first, frozen last, else recency
     path: String,             // common cwd prefix (for subpath elision in rows)
     /// Session-level todos, flat and in display order: `(session_name, text)`. The
-    /// cursor selects worktrees FIRST, then todos, then conversations — matching
+    /// cursor selects todos FIRST, then conversations, then worktrees — matching
     /// the order they're drawn in.
     todos: Vec<(String, String)>,
-    sel: usize,               // index into the combined [worktrees ++ todos ++ convs] list
+    sel: usize,               // index into the combined [todos ++ convs ++ worktrees] list
     wt_input: Option<String>, // Some ⇒ typing a branch name for a new worktree
     /// Some ⇒ typing the archive reason for that conversation id (`A`).
     archive_input: Option<(String, String)>,
@@ -942,6 +944,43 @@ impl ProjectDetailState {
         self.convs.iter().position(|c| c.archived)
     }
 
+    /// Index of the first frozen conversation — where the "Frozen" section starts.
+    /// The sort puts them directly after the live ones, so they're always on the
+    /// first page: freezing is how you park work you mean to come back to, and it
+    /// only works if you can still see what's parked. `None` when there are none —
+    /// or when there is nothing else, since a header that sections off the whole
+    /// list (the 💤 bucket) only restates the screen and every row's own marker.
+    fn frozen_from(&self) -> Option<usize> {
+        let at = self
+            .convs
+            .iter()
+            .position(|c| c.is_frozen() && !c.archived)?;
+        let separates = at > 0 || !self.convs.iter().all(|c| c.is_frozen() && !c.archived);
+        separates.then_some(at)
+    }
+
+    /// Index of the first plain closed conversation, but only when a Frozen section
+    /// precedes it — that's the one case where the closed run needs a header of its
+    /// own, to mark where the frozen (pending) ones stop. Without a frozen section
+    /// the closed rows just continue the list, unlabelled, as before.
+    fn closed_from(&self) -> Option<usize> {
+        self.frozen_from()?;
+        self.convs
+            .iter()
+            .position(|c| !c.archived && !c.is_frozen() && !c.lifecycle.is_actionable_here())
+    }
+
+    /// How many conversations fall in each display section: `(frozen, closed)`,
+    /// counting only the non-archived ones (the archived tail counts itself).
+    fn section_counts(&self) -> (usize, usize) {
+        let alive = self.convs.iter().filter(|c| !c.archived);
+        let frozen = alive.clone().filter(|c| c.is_frozen()).count();
+        let closed = alive
+            .filter(|c| !c.is_frozen() && !c.lifecycle.is_actionable_here())
+            .count();
+        (frozen, closed)
+    }
+
     /// How many conversations the list shows: all of them, or the latest page.
     fn visible_convs(&self) -> usize {
         if self.show_all {
@@ -960,31 +999,33 @@ impl ProjectDetailState {
         }
     }
 
-    /// Total selectable rows, in cursor order: the VISIBLE worktrees, then todos,
-    /// then the VISIBLE conversations — capped, so the cursor can't walk off into
-    /// rows that aren't drawn.
+    /// Total selectable rows, in cursor order: todos, then the VISIBLE
+    /// conversations, then the VISIBLE worktrees — capped, so the cursor can't walk
+    /// off into rows that aren't drawn.
     fn num_items(&self) -> usize {
-        self.visible_worktrees() + self.todos.len() + self.visible_convs()
-    }
-
-    /// The selected worktree if the cursor is on one of the worktree rows.
-    fn selected_worktree(&self) -> Option<&WtRow> {
-        (self.sel < self.visible_worktrees()).then(|| &self.worktrees[self.sel])
+        self.todos.len() + self.visible_convs() + self.visible_worktrees()
     }
 
     /// The selected todo `(session, text)` if the cursor is on a todo row.
     fn selected_todo(&self) -> Option<&(String, String)> {
-        self.sel
-            .checked_sub(self.visible_worktrees())
-            .filter(|i| *i < self.todos.len())
-            .map(|i| &self.todos[i])
+        (self.sel < self.todos.len()).then(|| &self.todos[self.sel])
     }
 
-    /// The selected conversation if the cursor is past the worktrees and todos.
+    /// The selected conversation if the cursor is past the todos — and still within
+    /// the VISIBLE conversations, since the worktrees follow them.
     fn selected_conv(&self) -> Option<&Conversation> {
         self.sel
-            .checked_sub(self.visible_worktrees() + self.todos.len())
+            .checked_sub(self.todos.len())
+            .filter(|i| *i < self.visible_convs())
             .and_then(|i| self.convs.get(i))
+    }
+
+    /// The selected worktree if the cursor is past the todos and conversations —
+    /// the worktree list is drawn last, so it selects last.
+    fn selected_worktree(&self) -> Option<&WtRow> {
+        self.sel
+            .checked_sub(self.todos.len() + self.visible_convs())
+            .and_then(|i| self.worktrees.get(i))
     }
 }
 
@@ -1025,8 +1066,15 @@ fn conv_in_project(c: &Conversation, key: &str) -> bool {
 
 /// Display order for a project detail's conversation list: archived last (this
 /// is the ONE screen that still shows them, and they belong below the working
-/// set), then live first, non-frozen before frozen, then most-recent, then id
-/// for stability. The archived tail is what `archived_from()` sections off.
+/// set), then live first, **frozen before plain closed**, then most-recent, then
+/// id for stability. `archived_from()` / `frozen_from()` / `closed_from()` section
+/// off the runs this produces.
+///
+/// Frozen sorts ABOVE closed because it means something different: a frozen
+/// conversation is pending work you deliberately set aside to come back to, not
+/// a conversation that merely ended. Sorted below the closed pile it fell off the
+/// end of the capped list, so the one thing you froze *in order to remember it*
+/// was the one thing you couldn't see.
 fn sort_project_convs(convs: &mut [Conversation]) {
     convs.sort_by(|a, b| {
         a.archived
@@ -1036,7 +1084,7 @@ fn sort_project_convs(convs: &mut [Conversation]) {
                     .is_actionable_here()
                     .cmp(&a.lifecycle.is_actionable_here())
             })
-            .then_with(|| a.is_frozen().cmp(&b.is_frozen()))
+            .then_with(|| b.is_frozen().cmp(&a.is_frozen()))
             .then_with(|| b.last_activity.cmp(&a.last_activity))
             .then_with(|| a.id.as_str().cmp(b.id.as_str()))
     });
@@ -1294,6 +1342,30 @@ fn current_window_conv(reg: &ConversationRegistry) -> Option<Conversation> {
         }
     }
     in_session.first().map(|c| (*c).clone())
+}
+
+/// The project key for the caller's current tmux window (for `--project-detail`).
+///
+/// Two ways in, because the window you press `prefix+a` from may not be running
+/// Claude at all: the conversation in this window names its parent, and failing
+/// that the pane's cwd resolves the same way the registry itself groups
+/// conversations (`resolve_parent` — longest path prefix, worktree beats project).
+/// A worktree resolves to its PROJECT: that screen lists the worktree, its
+/// siblings, and every conversation under any of them, and the worktree's own
+/// detail is one `Enter` away.
+fn current_window_project(
+    reg: &ConversationRegistry,
+    projects: &ProjectRegistry,
+) -> Option<String> {
+    if let Some(key) = current_window_conv(reg)
+        .and_then(|c| c.parent)
+        .and_then(|p| project_key_of(&p, projects))
+    {
+        return Some(key);
+    }
+    let cwd = crate::common::tmux::get_current_tmux_pane_path()?;
+    let parent = crate::common::registry::resolve_parent(&cwd, &WorktreeState::load(), projects)?;
+    project_key_of(&parent, projects)
 }
 
 /// Open a conversation's detail: keep the instant static data and spawn a detached
@@ -1651,6 +1723,15 @@ fn conversations_loop(
     // Conversation detail: sits ON TOP of the project detail (so backing out of a
     // conversation returns to the project it was opened from, if any).
     let mut conv_detail: Option<ConvDetailState> = None;
+    // `--project-detail` (`prefix+a`): open the current window's PROJECT detail on
+    // startup. Independent of `--detail` — the conversation detail draws on top of
+    // this one, so passing both lands on the conversation with its project
+    // underneath, and Esc pops to the project rather than out to the list.
+    if opts.project_detail {
+        if let Some(key) = current_window_project(&reg, &projects) {
+            detail = Some(build_group_detail(&key, &reg));
+        }
+    }
     // `--detail` (classic `prefix+d`): open the current tmux window's conversation
     // detail on startup. Resolves via the current session + window (the popup runs
     // against the client's session, same as classic's auto-detail).
@@ -3155,11 +3236,11 @@ fn draw_project_detail(
     ));
     frame.render_widget(Paragraph::new(Line::from(title_spans)), chunks[0]);
 
-    // Body: config block, worktrees, todos, then the navigable conversation list.
+    // Body: config block, todos, the navigable conversation list, then worktrees.
     let mut display: Vec<Line> = Vec::new();
-    // Display line index of each selectable item, in cursor order: worktrees, then
-    // todos, then conversations — the order they're drawn. `state.sel` indexes into
-    // this, so pushes here must stay in step with `num_items`/`selected_*`.
+    // Display line index of each selectable item, in cursor order: todos, then
+    // conversations, then worktrees — the order they're drawn. `state.sel` indexes
+    // into this, so pushes here must stay in step with `num_items`/`selected_*`.
     let mut item_pos: Vec<usize> = Vec::new();
     display.push(Line::raw(""));
 
@@ -3199,72 +3280,6 @@ fn draw_project_detail(
         }
     }
 
-    // A worktree detail IS a worktree, and a bucket (frozen / unassigned) has no
-    // project to own worktrees — both would just render "Worktrees (0) none" and
-    // push the real content down.
-    if state.wt_info.is_none() && !state.bucket {
-        display.push(Line::raw(""));
-        display.push(Line::from(Span::styled(
-            format!("  Worktrees ({})", state.worktrees.len()),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        if state.worktrees.is_empty() {
-            display.push(Line::from(Span::styled(
-                "    none",
-                Style::default().add_modifier(Modifier::DIM),
-            )));
-        } else {
-            for (i, w) in state
-                .worktrees
-                .iter()
-                .take(state.visible_worktrees())
-                .enumerate()
-            {
-                let mut tail = format!("{} live", w.live);
-                if w.frozen > 0 {
-                    tail.push_str(&format!(" · {} frozen", w.frozen));
-                }
-                // Worktrees lead the cursor order, so their index IS `sel`.
-                item_pos.push(display.len());
-                let selected = state.sel == i;
-                let sel_style = Style::default().add_modifier(Modifier::REVERSED);
-                let branch_style = if selected {
-                    sel_style
-                } else {
-                    Style::default().fg(if w.live > 0 {
-                        Color::Green
-                    } else {
-                        Color::Gray
-                    })
-                };
-                let dim = if selected {
-                    sel_style
-                } else {
-                    Style::default().add_modifier(Modifier::DIM)
-                };
-                // Ellipsized to their columns: ticket branches (and the session names
-                // built from them) routinely run past 40 chars, and a plain `{:<18}` let
-                // them run into the next column instead of widening it.
-                display.push(Line::from(vec![
-                    Span::styled(
-                        format!("    {:<44}", ellipsize(&w.branch, 42)),
-                        branch_style,
-                    ),
-                    Span::styled(format!("{:<34}", ellipsize(&w.session, 32)), dim),
-                    Span::styled(tail, dim),
-                ]));
-            }
-            if let Some(more) = detail_more_line(
-                state.worktrees.len(),
-                state.visible_worktrees(),
-                "worktrees",
-                state.show_all,
-            ) {
-                display.push(more);
-            }
-        }
-    }
-
     // Todos (session-level) — shown here because the header badge counts them.
     // Selectable: Enter on a todo starts a `task: <todo>` conversation in its session.
     if !state.todos.is_empty() {
@@ -3290,8 +3305,9 @@ fn draw_project_detail(
                 )));
                 prev = Some(session.as_str());
             }
+            // Todos lead the cursor order, so their index IS `sel`.
             item_pos.push(display.len());
-            let selected = state.sel == state.visible_worktrees() + i;
+            let selected = state.sel == i;
             let base = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -3324,25 +3340,56 @@ fn draw_project_detail(
     } else {
         // Bold "the last conversation" — the most-recent one (what `r` resumes).
         let last_id = state.most_recent().map(|c| c.id.clone());
-        // Archived conversations sort last; they get their own sub-header so it's
-        // clear they're set aside, not part of the project's working set. This is
-        // the only screen that shows them at all (Browse hides them).
+        // Sub-headers mark where the list stops being live work. Frozen ones are
+        // pending by choice and sort just under the live rows, so they need a header
+        // saying so — and, once one exists, the closed run needs one too, marking
+        // where "parked, come back to it" ends and "over with" begins. Archived sort
+        // last: set aside, not part of the working set. This is the only screen that
+        // shows archived at all (Browse hides them).
         let arch_from = state.archived_from();
+        let frozen_from = state.frozen_from();
+        let closed_from = state.closed_from();
+        let (n_frozen, n_closed) = state.section_counts();
+        // The blank separator is skipped at `i == 0` — a section starting the list
+        // is already separated from the "Conversations" header above it.
+        let sub_header = |i: usize, text: String, color: Color| -> Vec<Line<'static>> {
+            let header = Line::from(Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            if i == 0 {
+                vec![header]
+            } else {
+                vec![Line::raw(""), header]
+            }
+        };
         for (i, c) in state.convs.iter().enumerate().take(state.visible_convs()) {
+            if frozen_from == Some(i) {
+                display.extend(sub_header(
+                    i,
+                    format!("    💤 Frozen ({n_frozen})"),
+                    Color::Blue,
+                ));
+            }
+            if closed_from == Some(i) {
+                display.extend(sub_header(
+                    i,
+                    format!("    Closed ({n_closed})"),
+                    Color::Gray,
+                ));
+            }
             if arch_from == Some(i) {
-                display.push(Line::raw(""));
-                display.push(Line::from(Span::styled(
+                display.extend(sub_header(
+                    i,
                     format!("    Archived ({})", state.convs.len() - i),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )));
+                    Color::DarkGray,
+                ));
             }
             item_pos.push(display.len());
             let num = (i < 9).then_some(i + 1);
             let bold = last_id.as_ref() == Some(&c.id);
-            // Conversations sit after the worktrees and todos in the selection space.
-            let selected = state.sel == state.visible_worktrees() + state.todos.len() + i;
+            // Conversations sit after the todos in the selection space.
+            let selected = state.sel == state.todos.len() + i;
             // On a bucket the rows span projects, so each says where it lives.
             let project = state.bucket.then(|| project_label(c, projects)).flatten();
             display.push(conv_line(
@@ -3373,7 +3420,68 @@ fn draw_project_detail(
         }
     }
 
-    // Scroll so the selected row (todo or conversation) stays visible.
+    // Worktrees last: they're places to go, not work in flight, so they sit below
+    // the conversations rather than pushing them off the screen. Skipped entirely
+    // when there are none — an empty "Worktrees (0) / none" block is pure noise on
+    // a project that doesn't use them. A worktree detail IS a worktree, and a bucket
+    // (frozen / unassigned) has no project to own any.
+    if state.wt_info.is_none() && !state.bucket && !state.worktrees.is_empty() {
+        display.push(Line::raw(""));
+        display.push(Line::from(Span::styled(
+            format!("  Worktrees ({})", state.worktrees.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for (i, w) in state
+            .worktrees
+            .iter()
+            .take(state.visible_worktrees())
+            .enumerate()
+        {
+            let mut tail = format!("{} live", w.live);
+            if w.frozen > 0 {
+                tail.push_str(&format!(" · {} frozen", w.frozen));
+            }
+            // Worktrees close the cursor order, after the todos and conversations.
+            item_pos.push(display.len());
+            let selected = state.sel == state.todos.len() + state.visible_convs() + i;
+            let sel_style = Style::default().add_modifier(Modifier::REVERSED);
+            let branch_style = if selected {
+                sel_style
+            } else {
+                Style::default().fg(if w.live > 0 {
+                    Color::Green
+                } else {
+                    Color::Gray
+                })
+            };
+            let dim = if selected {
+                sel_style
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            // Ellipsized to their columns: ticket branches (and the session names
+            // built from them) routinely run past 40 chars, and a plain `{:<18}` let
+            // them run into the next column instead of widening it.
+            display.push(Line::from(vec![
+                Span::styled(
+                    format!("    {:<44}", ellipsize(&w.branch, 42)),
+                    branch_style,
+                ),
+                Span::styled(format!("{:<34}", ellipsize(&w.session, 32)), dim),
+                Span::styled(tail, dim),
+            ]));
+        }
+        if let Some(more) = detail_more_line(
+            state.worktrees.len(),
+            state.visible_worktrees(),
+            "worktrees",
+            state.show_all,
+        ) {
+            display.push(more);
+        }
+    }
+
+    // Scroll so the selected row (todo, conversation or worktree) stays visible.
     let h = chunks[1].height as usize;
     let sel_display = item_pos.get(state.sel).copied().unwrap_or(0);
     let offset = if sel_display >= h {
@@ -3430,8 +3538,9 @@ fn draw_project_detail(
 
 /// The `… N more` footer for a capped project-detail section. `None` when nothing
 /// is hidden and the list is already showing everything. Unlike the Browse list's
-/// `More` row this isn't selectable — neither section has a cursor of its own here
-/// (the worktrees have none at all) — so it names the key that reveals the rest.
+/// `More` row this isn't selectable — one cursor runs across every section here,
+/// so there's no per-section row to hang it on — so it names the key that reveals
+/// the rest.
 fn detail_more_line(
     total: usize,
     shown: usize,
@@ -5512,6 +5621,86 @@ mod tests {
         );
     }
 
+    /// `mk` + the freeze overlay, for the frozen-section tests.
+    fn mk_frozen(id: &str, parent: Option<&str>, last: Option<&str>) -> Conversation {
+        let mut c = mk(id, Lifecycle::Closed, parent, last);
+        c.frozen = Some(crate::common::registry::FrozenInfo {
+            note: "postponed".to_string(),
+            pinned: true,
+            frozen_at: "2026-07-20T00:00:00Z".to_string(),
+        });
+        c
+    }
+
+    #[test]
+    fn test_frozen_convs_sort_above_closed_and_section_off() {
+        // Frozen == pending work you parked on purpose. Sorted below the closed pile
+        // it fell off the end of the capped list, so the detail had to be paged open
+        // to find the one conversation you froze *to remember it*. It now sits right
+        // under the live rows, with its own header — and the closed run gets one too,
+        // so it's clear where "parked" ends.
+        let mut convs = vec![
+            mk(
+                "closed-recent",
+                Lifecycle::Closed,
+                Some("hive"),
+                Some("2026-07-25"),
+            ),
+            mk_frozen("frozen", Some("hive"), Some("2026-07-01")),
+            mk_archived(
+                "arch",
+                Lifecycle::Closed,
+                Some("hive"),
+                Some("2026-07-26"),
+                None,
+            ),
+            mk("live", Lifecycle::Live, Some("hive"), Some("2026-07-02")),
+        ];
+        sort_project_convs(&mut convs);
+        let ids: Vec<&str> = convs.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["live", "frozen", "closed-recent", "arch"],
+            "frozen outranks a MORE recent plain closed conversation"
+        );
+
+        let mut state = ProjectDetailState {
+            key: "hive".to_string(),
+            worktrees: Vec::new(),
+            convs,
+            path: String::new(),
+            todos: Vec::new(),
+            sel: 0,
+            wt_input: None,
+            archive_input: None,
+            show_all: false,
+            wt_info: None,
+            bucket: false,
+        };
+        assert_eq!(state.frozen_from(), Some(1));
+        assert_eq!(state.closed_from(), Some(2));
+        assert_eq!(state.archived_from(), Some(3));
+        assert_eq!(
+            state.section_counts(),
+            (1, 1),
+            "one frozen, one plain closed"
+        );
+
+        // With nothing frozen the closed rows just continue the list — no header,
+        // exactly as before.
+        let all = std::mem::take(&mut state.convs);
+        state.convs = all.iter().filter(|c| !c.is_frozen()).cloned().collect();
+        assert_eq!(state.frozen_from(), None);
+        assert_eq!(state.closed_from(), None);
+        assert_eq!(state.section_counts(), (0, 1));
+
+        // An all-frozen list (the 💤 bucket) gets no header either: it would section
+        // off everything, restating the screen title and every row's 💤 marker.
+        state.convs = all.iter().filter(|c| c.is_frozen()).cloned().collect();
+        assert_eq!(state.frozen_from(), None);
+        assert_eq!(state.section_counts(), (1, 0));
+    }
+
     #[test]
     fn test_project_detail_caps_lists_until_show_all() {
         // The detail lists the latest `BROWSE_PAGE` of each section; `Tab` reveals
@@ -5544,51 +5733,55 @@ mod tests {
         assert_eq!(state.visible_convs(), BROWSE_PAGE);
         assert_eq!(
             state.num_items(),
-            BROWSE_PAGE + 1 + BROWSE_PAGE,
-            "capped worktrees + 1 todo + capped convs"
+            1 + BROWSE_PAGE + BROWSE_PAGE,
+            "1 todo + capped convs + capped worktrees"
         );
 
-        // The cursor runs worktrees → todos → conversations, in drawn order.
+        // The cursor runs todos → conversations → worktrees, in drawn order.
         state.sel = 0;
-        assert_eq!(
-            state.selected_worktree().map(|w| w.branch.as_str()),
-            Some("br0")
-        );
-        assert!(state.selected_todo().is_none() && state.selected_conv().is_none());
-        state.sel = BROWSE_PAGE - 1;
-        assert_eq!(
-            state.selected_worktree().map(|w| w.branch.as_str()),
-            Some("br4")
-        );
-        state.sel = BROWSE_PAGE; // first todo
-        assert!(state.selected_worktree().is_none());
         assert_eq!(state.selected_todo().map(|(_, t)| t.as_str()), Some("todo"));
-        state.sel = BROWSE_PAGE + 1; // first conversation
+        assert!(state.selected_conv().is_none() && state.selected_worktree().is_none());
+        state.sel = 1; // first conversation
         assert!(state.selected_todo().is_none());
         assert_eq!(
             state.selected_conv().map(|c| c.id.as_str().to_string()),
             Some("c0".to_string())
         );
-        // The cursor stops at the cap, not at conversation 29.
-        state.sel = state.num_items() - 1;
+        // The conversation run stops at the cap, not at conversation 29 — past it
+        // the cursor is on a worktree, not a conversation that isn't drawn.
+        state.sel = BROWSE_PAGE;
         assert_eq!(
             state.selected_conv().map(|c| c.id.as_str().to_string()),
             Some("c4".to_string())
+        );
+        state.sel = BROWSE_PAGE + 1; // first worktree
+        assert!(state.selected_conv().is_none());
+        assert_eq!(
+            state.selected_worktree().map(|w| w.branch.as_str()),
+            Some("br0")
+        );
+        state.sel = state.num_items() - 1;
+        assert_eq!(
+            state.selected_worktree().map(|w| w.branch.as_str()),
+            Some("br4")
         );
 
         state.show_all = true;
         assert_eq!(state.visible_worktrees(), 26);
         assert_eq!(state.visible_convs(), 29);
-        assert_eq!(state.num_items(), 26 + 1 + 29);
-        // Offsets follow the now-uncapped worktree list.
-        state.sel = 26;
-        assert_eq!(state.selected_todo().map(|(_, t)| t.as_str()), Some("todo"));
+        assert_eq!(state.num_items(), 1 + 29 + 26);
+        // Offsets follow the now-uncapped conversation list.
+        state.sel = 1 + 29;
+        assert_eq!(
+            state.selected_worktree().map(|w| w.branch.as_str()),
+            Some("br0")
+        );
 
         // Sections at or under the cap are unaffected, and get no "more" line.
         state.show_all = false;
         state.convs.truncate(3);
         assert_eq!(state.visible_convs(), 3);
-        assert_eq!(state.num_items(), BROWSE_PAGE + 1 + 3);
+        assert_eq!(state.num_items(), 1 + 3 + BROWSE_PAGE);
         assert!(detail_more_line(3, 3, "conversations", false).is_none());
         assert!(detail_more_line(3, 3, "conversations", true).is_none());
         assert!(detail_more_line(29, BROWSE_PAGE, "conversations", false).is_some());

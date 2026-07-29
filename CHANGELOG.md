@@ -4,6 +4,29 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- **`prefix + a` / `hive --project-detail`** — open the current window's *project* detail
+  straight from tmux, alongside `prefix + s` (list) and `prefix + d` (conversation detail). The
+  project resolves from the current window's conversation, or — when the window isn't running
+  Claude — from the pane's cwd. A worktree resolves up to its project. `hive setup` registers
+  and reports the binding; `hive uninstall` already removed it.
+- **Frozen conversations are sectioned in the project detail** under a `💤 Frozen (n)` header,
+  with `Closed (n)` marking where the parked ones end.
+
+### Changed
+
+- **Project detail lists worktrees *after* conversations**, and omits the section entirely when
+  the project has none. The cursor order follows the drawn order: todos → conversations →
+  worktrees.
+
+### Fixed
+
+- **Frozen conversations were effectively invisible in the project detail.** They sorted below
+  every plain closed conversation, so the one you froze in order to come back to it fell past
+  the 5-row page cap — on the very screen whose title bar counts it. They now sort directly
+  under the live rows.
+
 ## [0.1.0] — First public release
 
 First tagged public release. macOS-only (Apple Silicon + Intel). Linux is deferred.
