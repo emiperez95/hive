@@ -303,6 +303,21 @@ fn log_file_path() -> Option<PathBuf> {
 }
 
 /// Append one event as a JSON line. Best-effort — swallows errors so it never breaks a hook.
+///
+/// The newline is part of the buffer and the write is a **single** `write_all`, deliberately.
+/// `writeln!` goes through `write_fmt`, which issues one `write()` syscall per format piece —
+/// so `writeln!(f, "{line}")` is two syscalls, one for the JSON and one for the `\n`. `O_APPEND`
+/// makes each individual write atomic but gives no guarantee across a pair, so two hooks firing
+/// at once could interleave as:
+///
+/// ```text
+/// {"event":"focus",...}{"event":"blur",...}
+/// ```
+///
+/// — two objects on one physical line, which breaks every line-oriented reader. This is not
+/// hypothetical: 9 such lines exist in the log as of 2026-07-30, and hive runs a hook on every
+/// tool call across a fleet of concurrent sessions, so collisions get more likely as concurrency
+/// rises. One buffer, one syscall, one line.
 pub fn append_event(entry: &ActivityEntry) {
     use std::io::Write;
     let Some(path) = log_file_path() else {
@@ -311,7 +326,7 @@ pub fn append_event(entry: &ActivityEntry) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(line) = serde_json::to_string(entry) else {
+    let Some(line) = entry_line(entry) else {
         return;
     };
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -319,8 +334,19 @@ pub fn append_event(entry: &ActivityEntry) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// One entry as one complete log line, trailing newline included.
+///
+/// Split out so the single-buffer invariant is testable: the whole point is that the caller
+/// hands the OS one buffer ending in `\n`, never a JSON write followed by a separate newline
+/// write.
+fn entry_line(entry: &ActivityEntry) -> Option<String> {
+    let mut line = serde_json::to_string(entry).ok()?;
+    line.push('\n');
+    Some(line)
 }
 
 /// Log a clean window close (SessionEnd).
@@ -629,6 +655,46 @@ pub fn compute_stats(days: i64) -> StatsSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One entry must produce exactly one line, newline at the end and nowhere else.
+    ///
+    /// This is the invariant that keeps the log parseable under concurrent hooks. It broke
+    /// once: `writeln!` splits into one `write()` per format piece, so the JSON and the `\n`
+    /// went out as separate syscalls and two simultaneous hooks interleaved into a single
+    /// physical line carrying two objects (9 such lines existed in the real log).
+    #[test]
+    fn entry_line_is_exactly_one_line() {
+        let entry = ActivityEntry::new(EVENT_WINDOW_OPEN, Utc::now()).with(
+            "sid-1",
+            "🐝 hive",
+            "2",
+            "a window title",
+        );
+        let line = entry_line(&entry).expect("serializes");
+        assert!(line.ends_with('\n'), "line must end with a newline");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly one newline, at the end: {line:?}"
+        );
+        assert!(
+            serde_json::from_str::<ActivityEntry>(line.trim_end()).is_ok(),
+            "the line without its newline must be one parseable object"
+        );
+    }
+
+    /// A session name carrying a literal newline must not split the record across lines.
+    #[test]
+    fn entry_line_escapes_embedded_newlines() {
+        let entry =
+            ActivityEntry::new(EVENT_FOCUS, Utc::now()).with("sid", "we\nird", "1", "t\nitle");
+        let line = entry_line(&entry).expect("serializes");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "JSON must escape interior newlines"
+        );
+    }
 
     fn seen(sid: &str, session: &str, idx: &str, title: &str) -> WindowSeen {
         WindowSeen {

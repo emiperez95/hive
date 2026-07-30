@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 283 tests (261 unit + 22 CLI smoke)
+cargo test                # 285 tests (263 unit + 22 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~482 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 261 unit + 22 smoke.
+> bin targets and run twice. Distinct tests: 263 unit + 22 smoke.
 
 ## The TUI (conversation-first)
 
@@ -809,17 +809,18 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-283 distinct tests. Run with `cargo test`.
+285 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~482 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 200 · bin 261 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 200 · bin 263 (the superset — adds cli/daemon/serve)
 > · smoke 22.
 
-**Unit tests (261)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (263)** — in-module `#[cfg(test)]` blocks:
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
-  frozen, activity, config (`[web]` parse, defaults-off, legacy `[defaults]` ignored)
+  frozen, activity (incl. `entry_line` single-line/one-syscall invariant), config
+  (`[web]` parse, defaults-off, legacy `[defaults]` ignored)
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
 - `cli/conversations.rs`: `build_active` bucketing (normal/other/skipped), bare-session
