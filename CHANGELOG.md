@@ -13,6 +13,22 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
   and reports the binding; `hive uninstall` already removed it.
 - **Frozen conversations are sectioned in the project detail** under a `💤 Frozen (n)` header,
   with `Closed (n)` marking where the parked ones end.
+- **`GET /metrics` on `hive web`** — Prometheus text exposition, so hive's view of the work can
+  be scraped into the same dashboard as Claude Code's own OpenTelemetry export. Claude's
+  telemetry reports what a session *spent*; it structurally cannot report how many sessions
+  exist, which project they belong to, whether they're live or merely resumable, or whether
+  they're stopped waiting on a human. Series cover window concurrency, conversations by
+  lifecycle / project / status / auth profile, conversations blocked awaiting a human decision,
+  worktree debt (dead worktrees per project), per-project active time and CPU/memory, todos, and
+  lifecycle counters.
+
+  A scrape endpoint rather than an OTLP push on purpose: `opentelemetry-otlp`'s gRPC transport
+  pulls in tonic and an async runtime, and hive is synchronous by design. The registry
+  aggregates are built by the web data thread, which already gathers once a second — a scrape
+  never triggers a gather of its own.
+
+  A ready-to-run collector + Prometheus + Grafana stack lives outside this repo, in
+  `claude-logging/otel-stack/`.
 
 ### Changed
 
@@ -30,6 +46,14 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
   single-keypress permission approval (never ported to the conversation-first TUI — see
   `docs/permission-approve-reject.md`) and flags that no longer exist (`hive -w`). Rewritten
   against the shipped key map: list, project detail, conversation detail.
+- **Every usage-stats request re-read the whole macOS power log.** `compute_stats` calls
+  `machine::sleep_intervals` to subtract machine-sleep from focus time, which shells out to
+  `pmset -g log` — a ~1.8s call rendering ~45k lines. That cost was already being paid on every
+  web `/api/stats` load, and a scraped `/metrics` would have made it continuous. The raw output
+  is now memoized for 5 minutes (per process, successful reads only), taking `/metrics` to
+  ~25ms. Sleep history only grows at the tail and old spans never change, so the staleness costs
+  at most five minutes of accuracy on the newest interval. One-shot CLI runs (`hive stats`) see a
+  cold cache and behave exactly as before.
 - **`.githooks/pre-commit` announced version bumps it never made.** It wrote the version with
   sed's `0,/re/` address, a GNU extension that BSD sed (macOS) accepts, exits 0 on, and ignores
   — so `Cargo.toml` sat at `0.1.0` while every commit reported a bump. Now uses awk and verifies
