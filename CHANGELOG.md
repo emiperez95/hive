@@ -26,6 +26,16 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
   every plain closed conversation, so the one you froze in order to come back to it fell past
   the 5-row page cap — on the very screen whose title bar counts it. They now sort directly
   under the live rows.
+- **README documented the retired classic TUI.** The keyboard-shortcut tables still listed
+  single-keypress permission approval (never ported to the conversation-first TUI — see
+  `docs/permission-approve-reject.md`) and flags that no longer exist (`hive -w`). Rewritten
+  against the shipped key map: list, project detail, conversation detail.
+- **`.githooks/pre-commit` announced version bumps it never made.** It wrote the version with
+  sed's `0,/re/` address, a GNU extension that BSD sed (macOS) accepts, exits 0 on, and ignores
+  — so `Cargo.toml` sat at `0.1.0` while every commit reported a bump. Now uses awk and verifies
+  the write, failing the commit if the version didn't land. Also swapped `cargo generate-lockfile`
+  for `cargo update --workspace`, so unrelated third-party upgrades stop being swept into
+  whatever commit is in flight.
 
 ## [0.1.0] — First public release
 

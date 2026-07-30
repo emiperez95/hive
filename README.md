@@ -6,14 +6,16 @@
 
 Interactive [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) session dashboard for tmux.
 
-Monitor and manage multiple parallel Claude Code sessions from a single TUI. See which sessions need permission, approve them with a keypress, and switch between sessions instantly. A hive "session" is just a tmux session — hive tracks Claude's status inside each one via Claude Code hooks and mirrors it in the dashboard.
+Monitor and manage multiple parallel Claude Code sessions from a single TUI. See which ones are working, which are blocked waiting on you, and switch between them instantly. hive tracks Claude's status via Claude Code hooks and mirrors it in the dashboard.
+
+The base entity is the **conversation**, not the tmux session — so a conversation you closed is still listed and resumable, and one you deliberately froze stays visible as pending work.
 
 ## Features
 
-- **Session overview** — every tmux session running Claude, with CPU/memory and real-time status
-- **Permission approval** — approve Bash, Write, Edit permissions with single keypresses
-- **Detail view** — per-session todos, listening ports, Chrome tab matching, process tree
-- **Search** — fuzzy search across active sessions and registered projects
+- **Conversation overview** — every Claude conversation, live or resumable, with CPU/memory and real-time status
+- **Freeze / thaw** — park one Claude window (killing its process, freeing the RAM) and resume it later from its transcript
+- **Detail views** — per-project todos, worktrees and conversations; per-conversation ports, Chrome tab matching, process tree, transcript tail
+- **Search** — search across registered projects, their worktrees, and conversations
 - **Project registry** — emoji identifiers, startup commands, per-project auth profiles
 - **Worktree management** — create/delete git worktrees with tmux sessions and lifecycle hooks
 - **Mobile dashboard** — `hive web` exposes a phone-friendly UI with conversation view, TTS playback, and remote session control
@@ -103,7 +105,7 @@ claude
 hive
 ```
 
-As Claude runs tools, its status in the dashboard flips between Working / Waiting / Needs Permission in real time. Press `y` to approve a pending permission.
+As Claude runs tools, its status in the dashboard flips between Working / Waiting / Needs Permission in real time. Press `Enter` on a conversation to switch to it and answer the prompt (permissions can also be approved without switching from the [mobile dashboard](#mobile-dashboard-hive-web)).
 
 ## Commands
 
@@ -112,11 +114,11 @@ As Claude runs tools, its status in the dashboard flips between Working / Waitin
 ```bash
 hive                    # open TUI dashboard (default)
 hive start              # auto-attach to first available tmux session
-hive --detail           # open TUI with detail view for current session
-hive --project-detail   # open TUI on the current window's project detail
-hive --picker           # open TUI in search/picker mode
-hive -w 5               # custom refresh interval (seconds)
-hive -f pattern         # filter sessions by name
+hive --detail           # open on the current window's conversation detail
+hive --project-detail   # open on the current window's project detail
+hive --picker           # open in Browse + search
+hive -f pattern         # open in Browse + search pre-filled with <pattern>
+hive conversations --list  # static listing, no TUI (also what you get when piped)
 ```
 
 ### Session Navigation
@@ -186,35 +188,61 @@ Set `HIVE_NO_NOTIFY=1` to suppress desktop notifications (useful for CI / script
 
 ### Keyboard Shortcuts
 
-#### List View
+The TUI is **conversation-first**: the thing you select is a Claude conversation, so
+closed-but-resumable and frozen ones are listed alongside the live ones. `?` shows this
+list in-app.
+
+#### List
+
+Two views: **Active** (live conversations grouped by their tmux session) and **Browse**
+(`/` — every project, its worktrees, and its conversations, searchable).
 
 | Key | Action |
 |---|---|
-| `↑↓` / `j/k` | Navigate sessions |
-| `Enter` | Open detail view |
-| `1-9` | Switch to session by number (exits) |
-| `y/z/x/w/v` | Approve permission (once) |
-| `Y/Z/X/W/V` | Approve permission (always) |
-| `/` | Search sessions |
-| `L` | Spread/collapse iTerm2 panes |
-| `M` | Toggle global mute |
-| `R` | Force refresh |
-| `?` | Help screen |
-| `Esc` / `Q` | Quit |
+| `↑↓` / `j/k` | Move selection |
+| `1-9` | Switch to the Nth conversation or window |
+| `f` | Hint-jump — type a 2-char label to switch (Vimium-style) |
+| `Enter` | Conversation: switch / resume · worktree: open its session · project: detail |
+| `→` / `l` | Drill into detail · `←` / `h` back |
+| `/` | Browse + search — projects, worktrees, conversations |
+| `Tab` | Browse: expand / collapse the project under the cursor |
+| `z` | Freeze a Claude window (prompts for a note) |
+| `v` `m` `s` `!` | Favorite · mute · skip from cycling · auto-approve (session-level) |
+| `M` / `P` | Global mute / pin the conversation |
+| `Del` | Close a live conversation (kills its window) · discard a frozen one |
+| `L` / `N` | Spread / collapse iTerm2 panes · new-project wizard |
+| `Ctrl+R` | Browse: reveal / hide archived projects |
+| `r` / `?` / `q` | Refresh · help · quit |
 
-#### Detail View
+#### Project detail
+
+Reached with `→` on a project, or `prefix+a` from any tmux window. Lists the project's
+todos, its conversations (frozen ones sectioned near the top so parked work stays
+visible), and its worktrees.
 
 | Key | Action |
 |---|---|
-| `↑↓` / `j/k` | Navigate todos/ports |
-| `Enter` | Switch to session / open port |
-| `A` | Add todo |
-| `D` | Delete selected todo |
-| `F` | Toggle favorite |
-| `!` | Toggle auto-approve |
-| `M` | Toggle mute |
-| `S` | Toggle skip from cycling |
-| `Esc` / `Q` | Quit |
+| `↑↓` / `j/k` | Move through todos → conversations → worktrees |
+| `Enter` | Todo: start a conversation for it · conversation: switch / resume · worktree: its own detail |
+| `Tab` | Show every conversation and worktree instead of the latest 5 |
+| `n` / `r` | New conversation here · resume the most recent one |
+| `w` / `x` | Create a worktree · delete the selected one |
+| `m` / `a` | Mute the project (remembered) · archive / unarchive it |
+| `A` | Archive the selected conversation (asks why) / unarchive it |
+| `Esc` | Back one level (worktree → project → list) |
+
+#### Conversation detail
+
+| Key | Action |
+|---|---|
+| `↑↓` / `j/k` | Scroll |
+| `Enter` | Switch to it, or resume it if closed |
+| `p` | Jump up to its project detail |
+| `e` / `P` | Edit its note · pin it |
+| `z` | Freeze its window |
+| `v` `m` `s` `!` | Session-level flags, as in the list |
+| `Del` | Close it (live) or discard it (frozen) |
+| `Esc` / `q` | Back |
 
 ## Mobile dashboard (`hive web`)
 
