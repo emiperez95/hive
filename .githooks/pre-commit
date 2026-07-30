@@ -27,12 +27,29 @@ esac
 
 new_version="$major.$minor.$patch"
 
-# Update Cargo.toml (first version = line only)
-sed -i '' "0,/^version = \".*\"/s//version = \"$new_version\"/" "$CARGO_TOML"
+# Update Cargo.toml — the FIRST `version = ` line, i.e. the one `grep -m1` read
+# above ([package].version, not a dependency's).
+#
+# awk, not sed: the `0,/re/` address this used to rely on is a GNU extension.
+# BSD sed (macOS) accepts it, exits 0, and substitutes NOTHING — so the hook
+# announced a bump on every commit while Cargo.toml sat at 0.1.0 for months.
+awk -v v="$new_version" '
+    !done && /^version = "/ { sub(/"[^"]*"/, "\"" v "\""); done = 1 }
+    { print }
+' "$CARGO_TOML" > "$CARGO_TOML.tmp" && mv "$CARGO_TOML.tmp" "$CARGO_TOML"
 
-# Update Cargo.lock if it exists and is tracked
+# Never announce a bump that didn't land — that failure mode is what hid the bug.
+written=$(grep -m1 '^version' "$CARGO_TOML" | sed 's/.*"\(.*\)".*/\1/')
+if [ "$written" != "$new_version" ]; then
+    echo "pre-commit: failed to write version $new_version to $CARGO_TOML (still $written)" >&2
+    exit 1
+fi
+
+# Refresh Cargo.lock's entry for this package. `--workspace` limits it to our own
+# members: `cargo generate-lockfile` re-resolves the whole graph, which silently
+# swept unrelated third-party upgrades into commits that had nothing to do with them.
 if [ -f Cargo.lock ] && git ls-files --error-unmatch Cargo.lock &>/dev/null; then
-    cargo generate-lockfile --quiet 2>/dev/null || true
+    cargo update --workspace --quiet 2>/dev/null || true
     git add Cargo.lock
 fi
 
