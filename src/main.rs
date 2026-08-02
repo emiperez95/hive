@@ -73,7 +73,7 @@ fn main() -> Result<()> {
                 use std::os::unix::process::CommandExt;
                 let tmux = resolve_tmux_path();
                 let err = std::process::Command::new(&tmux)
-                    .args(["attach-session", "-t", &target])
+                    .args(["attach-session", "-t", &common::tmux::exact(&target)])
                     .exec();
                 bail!("exec failed: {}", err);
             }

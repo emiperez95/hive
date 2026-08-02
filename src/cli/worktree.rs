@@ -187,7 +187,13 @@ pub fn run_wt_new(
                 None => base_cmd,
             };
             let _ = std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &session_name, &full_cmd, "Enter"])
+                .args([
+                    "send-keys",
+                    "-t",
+                    &crate::common::tmux::exact(&session_name),
+                    &full_cmd,
+                    "Enter",
+                ])
                 .output();
         }
 

@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 285 tests (263 unit + 22 CLI smoke)
+cargo test                # 289 tests (267 unit + 22 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~482 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 263 unit + 22 smoke.
+> bin targets and run twice. Distinct tests: 267 unit + 22 smoke.
 
 ## The TUI (conversation-first)
 
@@ -809,13 +809,15 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-285 distinct tests. Run with `cargo test`.
+289 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~482 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 200 · bin 263 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 206 · bin 267 (the superset — adds cli/daemon/serve)
 > · smoke 22.
 
-**Unit tests (263)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (267)** — in-module `#[cfg(test)]` blocks:
+- `common/tmux.rs`: `exact`/`exact_window`/`exact_pane` target building — the `=` that stops
+  tmux prefix/fnmatch-matching a session name onto a longer one (see **Conventions**)
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
@@ -867,6 +869,14 @@ inputs as parameters, which is what makes them unit-testable.
   `state.json` as a complete list of live Claude windows**
 - **Gotcha**: `sysinfo`'s `cmd()` is empty for claude on macOS — use `ps` (`build_cmdline_map`)
   for argv, and note `is_claude_process` therefore keys off the version-string process *name*
+- **Gotcha — every tmux session-name target needs `tmux::exact`.** tmux resolves `-t <name>`
+  as exact match → fnmatch pattern → **prefix**, so `-t "📊 Avateen"` silently resolves to a
+  running `📊 Avateen Hub`. Bare targets meant `has-session` reported the wrong session alive
+  (new conversations opened in the *other* project), and `kill-session` / `rename-session`
+  acted on it. Wrap session names in `tmux::exact` (`=name`), window/pane targets in
+  `exact_window` / `exact_pane` — the `=` also stops the `[project]` in a worktree session
+  name being read as an fnmatch character class. Pane (`%12`) and window (`@34`) ids are
+  already unambiguous — never wrap those.
 - Prefer pure functions taking their environment as parameters (e.g. `build_active(reg, skipped,
   session_windows)`) so tmux-dependent logic stays unit-testable
 

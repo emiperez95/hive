@@ -304,8 +304,11 @@ pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -
         .or(fallback_session)
         .ok_or_else(|| anyhow!("no target session (no project match)"))?;
 
+    // Exact match — a bare `-t` prefix-matches a longer session name (see `tmux::exact`),
+    // which would resume the conversation inside a different project's session.
+    let tmux_target = crate::common::tmux::exact(&target);
     let alive = Command::new("tmux")
-        .args(["has-session", "-t", &target])
+        .args(["has-session", "-t", &tmux_target])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -313,7 +316,7 @@ pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -
     if alive {
         // Add a window to the existing session and resume in it.
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-window", "-t", &target, "-c", &c.cwd]);
+        cmd.args(["new-window", "-t", &tmux_target, "-c", &c.cwd]);
         for (k, v) in &env {
             cmd.arg("-e").arg(format!("{k}={v}"));
         }
@@ -326,7 +329,7 @@ pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -
             return Err(anyhow!("failed to open a new window in '{target}'"));
         }
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &target, &startup, "Enter"])
+            .args(["send-keys", "-t", &tmux_target, &startup, "Enter"])
             .output();
     } else if !ensure_tmux_session(&target, &c.cwd, Some(&startup), &env) {
         return Err(anyhow!("failed to create session '{target}'"));

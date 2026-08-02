@@ -147,7 +147,12 @@ impl FrozenState {
 /// Read `CLAUDE_CONFIG_DIR` from a live tmux session's environment, if set.
 fn capture_config_dir(session_name: &str) -> Option<String> {
     let out = Command::new("tmux")
-        .args(["show-environment", "-t", session_name, "CLAUDE_CONFIG_DIR"])
+        .args([
+            "show-environment",
+            "-t",
+            &crate::common::tmux::exact(session_name),
+            "CLAUDE_CONFIG_DIR",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -203,7 +208,7 @@ pub fn freeze_window(target: &FreezeTarget, note: &str) -> Result<String> {
 
     // Kill just this window — frees the Claude process. The conversation JSONL on disk is
     // untouched, so it stays resumable.
-    let win_target = format!("{}:{}", target.session_name, target.window_index);
+    let win_target = crate::common::tmux::exact_window(&target.session_name, &target.window_index);
     let killed = Command::new("tmux")
         .args(["kill-window", "-t", &win_target])
         .output()
@@ -233,8 +238,11 @@ pub fn thaw_window(key: &str) -> Result<String> {
         None => "claude -c".to_string(),
     };
 
+    // Exact match — a bare `-t` prefix-matches a longer session name (see `tmux::exact`),
+    // which would thaw the window into a different project's session.
+    let tmux_target = crate::common::tmux::exact(&entry.session_name);
     let session_alive = Command::new("tmux")
-        .args(["has-session", "-t", &entry.session_name])
+        .args(["has-session", "-t", &tmux_target])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -242,7 +250,7 @@ pub fn thaw_window(key: &str) -> Result<String> {
     if session_alive {
         // Add a new window to the existing session and resume in it.
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-window", "-t", &entry.session_name]);
+        cmd.args(["new-window", "-t", &tmux_target]);
         if !entry.window_name.is_empty() {
             cmd.args(["-n", &entry.window_name]);
         }
@@ -261,7 +269,7 @@ pub fn thaw_window(key: &str) -> Result<String> {
         }
         // new-window makes the new window active; send the resume command to it.
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &entry.session_name, &startup, "Enter"])
+            .args(["send-keys", "-t", &tmux_target, &startup, "Enter"])
             .output();
     } else {
         // Session is gone (last window was frozen) — recreate it with this window.

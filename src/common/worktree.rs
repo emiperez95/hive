@@ -125,9 +125,16 @@ impl WorktreeState {
                 &entry.branch,
             );
 
-            // Rename tmux session if it exists
+            // Rename tmux session if it exists. Exact target: a bare `-t` prefix-matches,
+            // so an old-format session that's NOT running would rename whichever live
+            // session happens to share its prefix (see `tmux::exact`).
             let _ = std::process::Command::new("tmux")
-                .args(["rename-session", "-t", &entry.session_name, &new_name])
+                .args([
+                    "rename-session",
+                    "-t",
+                    &crate::common::tmux::exact(&entry.session_name),
+                    &new_name,
+                ])
                 .output();
 
             renames.insert(entry.session_name.clone(), new_name.clone());

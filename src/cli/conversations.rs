@@ -42,7 +42,7 @@ use crate::common::registry::{
     Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
 };
 use crate::common::tmux::{
-    get_all_windows, get_current_tmux_session, get_current_tmux_session_names,
+    exact, exact_window, get_all_windows, get_current_tmux_session, get_current_tmux_session_names,
     get_current_tmux_window, select_window, switch_to_session,
 };
 use crate::common::types::ProcessInfo;
@@ -1542,7 +1542,7 @@ fn attach_or_switch(session: &str) {
         use std::os::unix::process::CommandExt;
         let tmux = crate::common::tmux::resolve_tmux_path();
         let _ = Command::new(tmux)
-            .args(["attach-session", "-t", session])
+            .args(["attach-session", "-t", &exact(session)])
             .exec();
     }
 }
@@ -4641,15 +4641,18 @@ fn new_conversation_in_worktree(project: &str, branch: &str) -> Result<String> {
 /// The shared half: open a `claude` window in `session` at `cwd`, creating the
 /// session if needed, then switch to it.
 fn open_new_conversation(session: &str, cwd: &str, env: &[(String, String)]) -> Result<String> {
+    // Exact target throughout: `-t "📊 Avateen"` prefix-matches "📊 Avateen Hub", which
+    // put the new window (and the switch) in the wrong project's session.
+    let target = exact(session);
     let alive = Command::new("tmux")
-        .args(["has-session", "-t", session])
+        .args(["has-session", "-t", &target])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     if alive {
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-window", "-t", session, "-c", cwd]);
+        cmd.args(["new-window", "-t", &target, "-c", cwd]);
         for (k, v) in env {
             cmd.arg("-e").arg(format!("{k}={v}"));
         }
@@ -4657,7 +4660,7 @@ fn open_new_conversation(session: &str, cwd: &str, env: &[(String, String)]) -> 
             return Err(anyhow!("failed to open a new window in '{session}'"));
         }
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", session, "claude", "Enter"])
+            .args(["send-keys", "-t", &target, "claude", "Enter"])
             .output();
     } else if !ensure_tmux_session(session, cwd, Some("claude"), env) {
         return Err(anyhow!("failed to create session '{session}'"));
@@ -4680,7 +4683,7 @@ fn connect_worktree(project: &str, branch: &str) -> Result<String> {
     let session = entry.session_name.clone();
 
     let alive = Command::new("tmux")
-        .args(["has-session", "-t", &session])
+        .args(["has-session", "-t", &exact(&session)])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -4751,15 +4754,16 @@ fn resolve_session_target(session: &str) -> Option<(String, Vec<(String, String)
 fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
     let startup = format!("claude {}", sh_quote(prompt));
     let target = resolve_session_target(session);
+    let tmux_target = exact(session);
     let alive = Command::new("tmux")
-        .args(["has-session", "-t", session])
+        .args(["has-session", "-t", &tmux_target])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     if alive {
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-window", "-t", session]);
+        cmd.args(["new-window", "-t", &tmux_target]);
         if let Some((cwd, env)) = &target {
             cmd.args(["-c", cwd]);
             for (k, v) in env {
@@ -4770,7 +4774,7 @@ fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
             return Err(anyhow!("failed to open a new window in '{session}'"));
         }
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", session, &startup, "Enter"])
+            .args(["send-keys", "-t", &tmux_target, &startup, "Enter"])
             .output();
     } else {
         let (cwd, env) = target.ok_or_else(|| {
@@ -4795,9 +4799,9 @@ fn close_conversation(conv: &Conversation) -> Result<String> {
         .as_ref()
         .ok_or_else(|| anyhow!("not running here"))?;
     let target = if p.window_index.is_empty() {
-        p.session_name.clone()
+        exact(&p.session_name)
     } else {
-        format!("{}:{}", p.session_name, p.window_index)
+        exact_window(&p.session_name, &p.window_index)
     };
     let ok = Command::new("tmux")
         .args(["kill-window", "-t", &target])

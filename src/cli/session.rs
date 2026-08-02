@@ -195,7 +195,7 @@ pub fn run_window_cycle(forward: bool, pane: Option<&str>) -> Result<()> {
     let mut command = std::process::Command::new(tmux);
     command.arg(cmd);
     if let Some(ref session) = session {
-        command.args(["-t", session]);
+        command.args(["-t", &crate::common::tmux::exact(session)]);
     }
     command.status().ok();
     // Focus is logged by the tmux `after-select-window` hook (covers this and native

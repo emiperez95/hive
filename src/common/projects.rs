@@ -250,8 +250,15 @@ pub fn ensure_tmux_session(
     startup_cmd: Option<&str>,
     env: &[(String, String)],
 ) -> bool {
+    // Exact match: a bare `-t` falls back to prefix matching, so "📊 Avateen" would
+    // report "already exists" on the strength of "📊 Avateen Hub" and never create
+    // the session (see `tmux::exact`).
     let exists = Command::new("tmux")
-        .args(["has-session", "-t", session_name])
+        .args([
+            "has-session",
+            "-t",
+            &crate::common::tmux::exact(session_name),
+        ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -272,7 +279,13 @@ pub fn ensure_tmux_session(
 
         if let Some(startup) = startup_cmd {
             let _ = Command::new("tmux")
-                .args(["send-keys", "-t", session_name, startup, "Enter"])
+                .args([
+                    "send-keys",
+                    "-t",
+                    &crate::common::tmux::exact(session_name),
+                    startup,
+                    "Enter",
+                ])
                 .output();
         }
     }

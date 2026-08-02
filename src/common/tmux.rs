@@ -6,6 +6,31 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::process::Command;
 
+/// Exact-match tmux target for a session name.
+///
+/// tmux resolves `-t <name>` in three steps: exact match, then fnmatch pattern, then
+/// **prefix**. So `-t "📊 Avateen"` silently resolves to `📊 Avateen Hub` whenever the
+/// former isn't running — new windows land in the wrong session, `switch-client` jumps
+/// to it, and `kill-session` kills it. A leading `=` forces a literal exact match; it
+/// also stops the `[project]` in a worktree session name being read as an fnmatch
+/// character class.
+///
+/// Every session-NAME target must go through this. Pane (`%12`) and window (`@34`) ids
+/// are already unambiguous — never wrap those.
+pub fn exact(session: &str) -> String {
+    format!("={session}")
+}
+
+/// Exact-match target for a window within a session (`=session:window`).
+pub fn exact_window(session: &str, window: &str) -> String {
+    format!("={session}:{window}")
+}
+
+/// Exact-match target for a pane within a session (`=session:window.pane`).
+pub fn exact_pane(session: &str, window: &str, pane: &str) -> String {
+    format!("={session}:{window}.{pane}")
+}
+
 /// Get all tmux sessions with their windows and panes
 pub fn get_tmux_sessions() -> Result<Vec<TmuxSession>> {
     let output = Command::new("tmux")
@@ -39,7 +64,7 @@ pub fn get_tmux_windows(session: &str) -> Result<Vec<TmuxWindow>> {
         .args([
             "list-windows",
             "-t",
-            session,
+            &exact(session),
             "-F",
             "#{window_index}:#{window_name}",
         ])
@@ -69,7 +94,7 @@ pub fn get_tmux_windows(session: &str) -> Result<Vec<TmuxWindow>> {
 
 /// Get all panes in a tmux window
 pub fn get_tmux_panes(session: &str, window_index: &str) -> Result<Vec<TmuxPane>> {
-    let target = format!("{}:{}", session, window_index);
+    let target = exact_window(session, window_index);
     let output = Command::new("tmux")
         .args([
             "list-panes",
@@ -111,13 +136,13 @@ pub fn switch_to_session(session_name: &str) {
     // `switch-client` and for native switches (`prefix s`, click, `switch-client` elsewhere)
     // alike — so no explicit focus log here.
     let _ = Command::new("tmux")
-        .args(["switch-client", "-t", session_name])
+        .args(["switch-client", "-t", &exact(session_name)])
         .output();
 }
 
 /// Select a window within a session (does not switch the attached client).
 pub fn select_window(session: &str, window_index: &str) {
-    let target = format!("{}:{}", session, window_index);
+    let target = exact_window(session, window_index);
     let _ = Command::new("tmux")
         .args(["select-window", "-t", &target])
         .output();
@@ -306,7 +331,7 @@ pub fn set_all_sessions_layout(mode: &str) {
             .args([
                 "list-windows",
                 "-t",
-                session,
+                &exact(session),
                 "-F",
                 "#{window_index}:#{window_panes}",
             ])
@@ -316,7 +341,7 @@ pub fn set_all_sessions_layout(mode: &str) {
             for line in window_list.lines() {
                 if let Some((idx, count_str)) = line.split_once(':') {
                     let pane_count: usize = count_str.parse().unwrap_or(0);
-                    let target = format!("{}:{}", session, idx);
+                    let target = exact_window(session, idx);
                     match pane_count {
                         2 => layout_2_panes(&target, mode),
                         3 => layout_3_panes(&target, mode),
@@ -373,7 +398,7 @@ pub fn send_text_to_pane(session: &str, window: &str, pane: &str, text: &str) {
     let target = if pane.starts_with('%') {
         pane.to_string()
     } else {
-        format!("{}:{}.{}", session, window, pane)
+        exact_pane(session, window, pane)
     };
     // Send the text literally (-l flag prevents interpretation of special keys)
     let _ = Command::new("tmux")
@@ -387,7 +412,7 @@ pub fn send_text_to_pane(session: &str, window: &str, pane: &str, text: &str) {
 
 /// Capture the visible text of a pane (`tmux capture-pane -p`). None on failure.
 pub fn capture_pane(session: &str, window: &str, pane: &str) -> Option<String> {
-    let target = format!("{}:{}.{}", session, window, pane);
+    let target = exact_pane(session, window, pane);
     let out = Command::new("tmux")
         .args(["capture-pane", "-p", "-t", &target])
         .output()
@@ -400,7 +425,7 @@ pub fn capture_pane(session: &str, window: &str, pane: &str) -> Option<String> {
 /// Kill a tmux session
 pub fn kill_tmux_session(name: &str) -> bool {
     let killed = Command::new("tmux")
-        .args(["kill-session", "-t", name])
+        .args(["kill-session", "-t", &exact(name)])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -505,7 +530,40 @@ pub fn clean_claude_title(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_claude_title;
+    use super::{clean_claude_title, exact, exact_pane, exact_window};
+
+    // tmux resolves a bare `-t` target by exact match, THEN fnmatch, THEN prefix — so
+    // "📊 Avateen" silently resolves to a running "📊 Avateen Hub". Every session-name
+    // target carries the `=` that forces a literal exact match.
+    #[test]
+    fn exact_prefixes_session_name() {
+        assert_eq!(exact("📊 Avateen"), "=📊 Avateen");
+    }
+
+    #[test]
+    fn exact_window_and_pane_targets() {
+        assert_eq!(exact_window("📊 Avateen", "2"), "=📊 Avateen:2");
+        assert_eq!(exact_pane("📊 Avateen", "2", "0"), "=📊 Avateen:2.0");
+    }
+
+    // Worktree session names embed `[project]`, which is an fnmatch character class in a
+    // bare target. `=` makes it literal.
+    #[test]
+    fn exact_makes_worktree_brackets_literal() {
+        assert_eq!(
+            exact("🌳 [clear-session] CSD-2527"),
+            "=🌳 [clear-session] CSD-2527"
+        );
+    }
+
+    // The prefix goes on exactly once, at the front — a name that already looks like a
+    // target is still just a name.
+    #[test]
+    fn exact_does_not_double_prefix_or_reorder() {
+        assert!(exact("a").starts_with('='));
+        assert_eq!(exact("=a"), "==a");
+        assert_eq!(exact(""), "=");
+    }
 
     #[test]
     fn strips_leading_glyph() {
