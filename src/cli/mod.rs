@@ -218,6 +218,9 @@ pub enum ProjectCommand {
         /// Custom hooks directory (defaults to ~/.hive/projects/{key}/hooks/)
         #[arg(long)]
         hooks_dir: Option<String>,
+        /// Claude auth profile (sets CLAUDE_CONFIG_DIR to ~/.claude-{name})
+        #[arg(long)]
+        auth_profile: Option<String>,
     },
     /// Remove a project from the registry
     Remove {

@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 289 tests (267 unit + 22 CLI smoke)
+cargo test                # 293 tests (270 unit + 23 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~482 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 267 unit + 22 smoke.
+> bin targets and run twice. Distinct tests: 270 unit + 23 smoke.
 
 ## The TUI (conversation-first)
 
@@ -70,7 +70,7 @@ hive cycle-free         # jump to next non-busy Claude window (current session f
 hive window-next        # switch to next tmux window in the current session
 hive window-prev        # switch to previous tmux window in the current session
 hive connect <key>      # create/attach tmux session for a registered project
-hive project add <key>  # add a project to the registry (supports all config flags)
+hive project add <key>  # add a project to the registry (all config flags, incl. --auth-profile)
 hive project remove <key> # remove a project from the registry
 hive project archive <key>   # archive a project (hide from picker + default list)
 hive project unarchive <key> # unarchive a project
@@ -96,6 +96,10 @@ hive web --port <N>                         # custom port (default: 8375)
 Per-project Claude credentials via `CLAUDE_CONFIG_DIR`. Each profile (`~/.claude-{name}/`) has its own OAuth identity and conversation history, with shared resources (agents, commands, hooks, skills, plugins, settings) symlinked back to `~/.claude/`.
 
 Set `auth_profile = "work"` on a project in `projects.toml` → hive passes `-e CLAUDE_CONFIG_DIR=~/.claude-work` to `tmux new-session` → Claude uses the work identity. Worktrees inherit the parent project's profile.
+
+Set it at registration with `hive project add <key> --auth-profile work` (it warns, without
+failing, when `~/.claude-{name}` doesn't exist yet — a missing dir makes Claude start as a fresh
+unauthenticated identity rather than erroring). The `N` wizard doesn't cover it.
 
 JSONL conversation lookup (`jsonl.rs`) searches across all `~/.claude*/projects/` dirs, so the TUI and web dashboard display conversations regardless of which profile created them.
 
@@ -408,12 +412,20 @@ the cwd's shared-prefix remainder just restates the project).
 | `Del` | close live conv (kill window) · discard frozen · archive project (Browse header) · delete worktree (confirm) |
 | `a` | project detail: archive / unarchive the project |
 | `A` | project detail: archive the selected conversation (prompts for a reason) / unarchive |
-| `L` `N` | iTerm spread/collapse · new-project wizard |
+| `L` `N` | iTerm spread/collapse · new-project wizard (key → emoji → path) |
 | `Ctrl+R` | Browse: reveal/hide archived |
 
 **Mute has three levels**: `m` per-session, `M` global, and `m` on a *project* (project detail)
 = a remembered preference in `muted-projects.txt` honored by the hook notifier, so future
 sessions of that project stay silent.
+
+**The new-project wizard (`N`) validates each step** instead of discarding silently. Enter only
+advances when the step is satisfied; otherwise the footer shows why, in red, next to the field
+(`wizard_key_error` / `wizard_path_error`): key required, key already registered (re-adding
+would clobber that project's auth profile / ports / worktrees dir with defaults), path required.
+A failed `reg.save()` puts the wizard back **with everything you typed** rather than dropping
+it. Emoji stays optional and defaults to 📁. It writes only key/emoji/path — for the full set
+(auth profile, worktrees, ports, hooks) use `hive project add`.
 
 ### Archived conversations (`A`)
 
@@ -809,13 +821,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-289 distinct tests. Run with `cargo test`.
+293 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~482 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 206 · bin 267 (the superset — adds cli/daemon/serve)
-> · smoke 22.
+> targets and run twice. Per target: lib 206 · bin 270 (the superset — adds cli/daemon/serve)
+> · smoke 23.
 
-**Unit tests (267)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (270)** — in-module `#[cfg(test)]` blocks:
 - `common/tmux.rs`: `exact`/`exact_window`/`exact_pane` target building — the `=` that stops
   tmux prefix/fnmatch-matching a session name onto a longer one (see **Conventions**)
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
@@ -837,7 +849,8 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   (hidden in `build_browse` unless live, `sort_project_convs` tail, `archived_from` /
   resume-last skipping them, `archive_reason_line`), frozen conversations sectioned above
   closed (`sort_project_convs` order, `frozen_from`/`closed_from`/`section_counts`, no header
-  on an all-frozen list), hint labels, `sh_quote`
+  on an all-frozen list), hint labels, `sh_quote`, new-project wizard validation
+  (`wizard_key_error` empty/duplicate, `wizard_path_error` empty)
 - `serve/metrics.rs`: Prometheus label escaping (reserved chars, emoji/space passthrough),
   `scalar` HELP/TYPE/sample shape, `render()` well-formedness (every non-comment line ends in a
   parseable numeric value) + registry series omitted without a snapshot, and `RegistrySnapshot`
@@ -845,12 +858,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   blocked-vs-working split, closed convs contributing no status/resources, auth-profile
   defaulting, payload-free status labels)
 
-**Integration tests (22)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (23)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
 - Todo full roundtrip (add → list → next → done → clear)
 - Project archive roundtrip (add → archive → list hides → `--all` shows → unarchive), isolated via a temp `$HOME`
+- `--auth-profile` persists to `projects.toml`, and is absent from the TOML when the flag is omitted
 
 No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test
 infrastructure) — hence the pure `build_active`/`build_browse` functions take their tmux/flag

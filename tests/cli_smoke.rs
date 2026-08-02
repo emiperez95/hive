@@ -361,3 +361,60 @@ fn project_archive_roundtrip() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// --- Auth profile flag (the field that used to need a hand-edit of projects.toml) ---
+
+#[test]
+fn project_add_persists_auth_profile() {
+    let home = std::env::temp_dir().join(format!("hive-smoke-auth-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let output = hive_cmd()
+        .args([
+            "project",
+            "add",
+            "workproj",
+            "--emoji",
+            "🧪",
+            "--path",
+            "/tmp/workproj",
+            "--auth-profile",
+            "work",
+        ])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let toml = std::fs::read_to_string(home.join(".hive/projects.toml")).unwrap();
+    assert!(
+        toml.contains(r#"auth_profile = "work""#),
+        "auth_profile not persisted: {}",
+        toml
+    );
+
+    // Omitting the flag leaves the field out entirely (it's skip_serializing_if None).
+    let output = hive_cmd()
+        .args([
+            "project",
+            "add",
+            "plainproj",
+            "--emoji",
+            "🧪",
+            "--path",
+            "/tmp/plainproj",
+        ])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let toml = std::fs::read_to_string(home.join(".hive/projects.toml")).unwrap();
+    assert_eq!(
+        toml.matches("auth_profile").count(),
+        1,
+        "only the profiled project should carry auth_profile: {}",
+        toml
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

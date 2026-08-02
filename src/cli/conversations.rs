@@ -270,11 +270,36 @@ struct NewProject {
     key: String,
     emoji: String,
     path: String,
+    /// Why the last Enter didn't go through. Rendered red in the footer and cleared
+    /// on the next keystroke — the wizard used to discard everything in silence when
+    /// a required field was blank, which read exactly like a successful create.
+    error: Option<String>,
+}
+
+/// Why the wizard's key step can't advance, if it can't. `exists` is whether the key
+/// is already registered — re-adding would clobber that project's config (auth
+/// profile, ports, worktrees dir) with defaults.
+fn wizard_key_error(key: &str, exists: bool) -> Option<String> {
+    let k = key.trim();
+    if k.is_empty() {
+        Some("key is required".to_string())
+    } else if exists {
+        Some(format!("project '{k}' already exists"))
+    } else {
+        None
+    }
+}
+
+/// Why the wizard's path step can't finish, if it can't.
+fn wizard_path_error(path: &str) -> Option<String> {
+    path.trim()
+        .is_empty()
+        .then(|| "path is required".to_string())
 }
 
 /// Register a new project in projects.toml (other fields default; edit the TOML or
 /// use `hive project add` for the full set).
-fn create_project(key: &str, emoji: &str, path: &str) {
+fn create_project(key: &str, emoji: &str, path: &str) -> Result<()> {
     let mut reg = ProjectRegistry::load();
     reg.add_project(
         key.to_string(),
@@ -288,7 +313,7 @@ fn create_project(key: &str, emoji: &str, path: &str) {
             ..Default::default()
         },
     );
-    let _ = reg.save();
+    reg.save()
 }
 
 /// Toggle a project's remembered mute preference and persist it.
@@ -2318,6 +2343,7 @@ fn conversations_loop(
             };
             format!(" new project — {label}: {val}")
         });
+        let wiz_error = wizard.as_ref().and_then(|w| w.error.clone());
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -2335,6 +2361,7 @@ fn conversations_loop(
                 hint_buf.as_deref(),
                 spreading,
                 wiz_prompt.as_deref(),
+                wiz_error.as_deref(),
             )
         })?;
 
@@ -2417,22 +2444,50 @@ fn conversations_loop(
         if wizard.is_some() {
             match key.code {
                 KeyCode::Esc => wizard = None,
+                // Enter advances a step — but only when the step is actually satisfied.
+                // A blank key or path holds the wizard where it is with a reason, and a
+                // failed save keeps everything you typed instead of dropping it.
                 KeyCode::Enter => {
                     let w = wizard.as_mut().unwrap();
-                    if w.step < 2 {
-                        w.step += 1;
-                    } else {
-                        let w = wizard.take().unwrap();
-                        let (k, p) = (w.key.trim(), w.path.trim());
-                        if !k.is_empty() && !p.is_empty() {
-                            create_project(k, w.emoji.trim(), p);
-                            (groups, convs, collapsed) =
-                                rebuild(&view, &reg, &flags.skipped, &query);
+                    w.error = None;
+                    match w.step {
+                        0 => {
+                            let exists =
+                                ProjectRegistry::load().projects.contains_key(w.key.trim());
+                            match wizard_key_error(&w.key, exists) {
+                                Some(e) => w.error = Some(e),
+                                None => w.step = 1,
+                            }
+                        }
+                        1 => w.step = 2, // emoji is optional — always advances
+                        _ if wizard_path_error(&w.path).is_some() => {
+                            w.error = wizard_path_error(&w.path);
+                        }
+                        _ => {
+                            let done = wizard.take().unwrap();
+                            match create_project(
+                                done.key.trim(),
+                                done.emoji.trim(),
+                                done.path.trim(),
+                            ) {
+                                Ok(()) => {
+                                    (groups, convs, collapsed) =
+                                        rebuild(&view, &reg, &flags.skipped, &query);
+                                }
+                                Err(e) => {
+                                    // Put it back, filled in, so the input isn't lost.
+                                    wizard = Some(NewProject {
+                                        error: Some(format!("save failed: {e}")),
+                                        ..done
+                                    });
+                                }
+                            }
                         }
                     }
                 }
                 KeyCode::Backspace => {
                     let w = wizard.as_mut().unwrap();
+                    w.error = None;
                     match w.step {
                         0 => w.key.pop(),
                         1 => w.emoji.pop(),
@@ -2441,6 +2496,7 @@ fn conversations_loop(
                 }
                 KeyCode::Char(c) => {
                     let w = wizard.as_mut().unwrap();
+                    w.error = None;
                     match w.step {
                         0 => w.key.push(c),
                         1 => w.emoji.push(c),
@@ -2637,6 +2693,7 @@ fn conversations_loop(
                     key: String::new(),
                     emoji: String::new(),
                     path: String::new(),
+                    error: None,
                 });
             }
             // Number keys 1-9 jump to the Nth visible switch target — a conversation
@@ -2871,6 +2928,7 @@ fn draw(
     hint_buf: Option<&str>,
     spread_prompt: bool,
     wiz_prompt: Option<&str>,
+    wiz_error: Option<&str>,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -3080,14 +3138,22 @@ fn draw(
 
     // Footer: wizard/spread prompt, hint-jump, freeze-note, search query, else hints.
     let footer_line = if let Some(w) = wiz_prompt {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(w.to_string(), Style::default().fg(Color::Green)),
             Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-            Span::styled(
-                "   Enter next/create · Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
+        ];
+        // The reason the last Enter didn't take, in red next to the field it belongs to.
+        if let Some(e) = wiz_error {
+            spans.push(Span::styled(
+                format!("  ⚠ {e}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        spans.push(Span::styled(
+            "   Enter next/create · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ));
+        Line::from(spans)
     } else if spread_prompt {
         Line::from(Span::styled(
             " spread how many sessions into panes? press 1-9 · any other key cancels",
@@ -4972,6 +5038,47 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
 mod tests {
     use super::*;
     use crate::common::registry::{ConversationId, Lifecycle};
+
+    // The `N` wizard used to discard everything in silence when a required field was
+    // blank — an empty Enter looked exactly like a successful create. Each step now
+    // reports why it won't advance.
+    #[test]
+    fn wizard_key_step_requires_a_key() {
+        assert_eq!(
+            wizard_key_error("", false).as_deref(),
+            Some("key is required")
+        );
+        assert_eq!(
+            wizard_key_error("   ", false).as_deref(),
+            Some("key is required")
+        );
+        assert!(wizard_key_error("avateen", false).is_none());
+    }
+
+    // Re-adding a registered key would overwrite its auth profile / ports / worktrees
+    // dir with defaults, so the wizard refuses rather than clobbering.
+    #[test]
+    fn wizard_key_step_rejects_duplicates() {
+        assert_eq!(
+            wizard_key_error("avateen", true).as_deref(),
+            Some("project 'avateen' already exists")
+        );
+        // The reported key is trimmed — it's what would actually be written.
+        assert_eq!(
+            wizard_key_error("  avateen  ", true).as_deref(),
+            Some("project 'avateen' already exists")
+        );
+    }
+
+    #[test]
+    fn wizard_path_step_requires_a_path() {
+        assert_eq!(wizard_path_error("").as_deref(), Some("path is required"));
+        assert_eq!(
+            wizard_path_error("  \t ").as_deref(),
+            Some("path is required")
+        );
+        assert!(wizard_path_error("~/Projects/avateen").is_none());
+    }
 
     /// Build a `session_windows` map (session → its `(index, name)` windows) for
     /// `build_active`, from a compact literal.

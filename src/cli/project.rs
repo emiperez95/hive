@@ -26,6 +26,7 @@ pub fn run_project_add(cmd: ProjectCommand) -> Result<()> {
         copy_files,
         symlink_files,
         hooks_dir,
+        auth_profile,
     } = cmd
     else {
         unreachable!()
@@ -38,6 +39,21 @@ pub fn run_project_add(cmd: ProjectCommand) -> Result<()> {
             "Project '{}' already exists. Remove it first to re-add.",
             key
         );
+    }
+
+    // An auth profile is only useful if ~/.claude-{name} exists: CLAUDE_CONFIG_DIR
+    // pointing at a missing directory makes Claude start as a fresh, unauthenticated
+    // identity rather than erroring. Warn instead of failing — the profile may be set
+    // up after registering.
+    if let Some(profile) = &auth_profile {
+        if let Some(dir) = dirs::home_dir().map(|h| h.join(format!(".claude-{profile}"))) {
+            if !dir.exists() {
+                eprintln!(
+                    "Warning: auth profile directory {} does not exist yet",
+                    dir.display()
+                );
+            }
+        }
     }
 
     let project_root = path.unwrap_or_else(|| {
@@ -69,7 +85,7 @@ pub fn run_project_add(cmd: ProjectCommand) -> Result<()> {
             symlink: symlink_files,
         },
         hooks_dir,
-        auth_profile: None,
+        auth_profile,
         archived: false,
     };
 
