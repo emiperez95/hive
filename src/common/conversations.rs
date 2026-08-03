@@ -328,8 +328,17 @@ pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -
         if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
             return Err(anyhow!("failed to open a new window in '{target}'"));
         }
+        // new-window made it the session's current window; type the resume into its
+        // active PANE. `exact` alone is a session target — send-keys rejects it and
+        // the window would sit at a bare shell (see `tmux::exact_active_pane`).
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &tmux_target, &startup, "Enter"])
+            .args([
+                "send-keys",
+                "-t",
+                &crate::common::tmux::exact_active_pane(&target),
+                &startup,
+                "Enter",
+            ])
             .output();
     } else if !ensure_tmux_session(&target, &c.cwd, Some(&startup), &env) {
         return Err(anyhow!("failed to create session '{target}'"));

@@ -190,7 +190,7 @@ pub fn run_wt_new(
                 .args([
                     "send-keys",
                     "-t",
-                    &crate::common::tmux::exact(&session_name),
+                    &crate::common::tmux::exact_active_pane(&session_name),
                     &full_cmd,
                     "Enter",
                 ])

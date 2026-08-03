@@ -42,8 +42,8 @@ use crate::common::registry::{
     Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
 };
 use crate::common::tmux::{
-    exact, exact_window, get_all_windows, get_current_tmux_session, get_current_tmux_session_names,
-    get_current_tmux_window, select_window, switch_to_session,
+    exact, exact_active_pane, exact_window, get_all_windows, get_current_tmux_session,
+    get_current_tmux_session_names, get_current_tmux_window, select_window, switch_to_session,
 };
 use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
@@ -4725,8 +4725,16 @@ fn open_new_conversation(session: &str, cwd: &str, env: &[(String, String)]) -> 
         if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
             return Err(anyhow!("failed to open a new window in '{session}'"));
         }
+        // Session target for new-window, ACTIVE-PANE target for send-keys: `=name`
+        // is not a pane and send-keys would fail, leaving a bare shell.
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "claude", "Enter"])
+            .args([
+                "send-keys",
+                "-t",
+                &exact_active_pane(session),
+                "claude",
+                "Enter",
+            ])
             .output();
     } else if !ensure_tmux_session(session, cwd, Some("claude"), env) {
         return Err(anyhow!("failed to create session '{session}'"));
@@ -4840,7 +4848,13 @@ fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
             return Err(anyhow!("failed to open a new window in '{session}'"));
         }
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &tmux_target, &startup, "Enter"])
+            .args([
+                "send-keys",
+                "-t",
+                &exact_active_pane(session),
+                &startup,
+                "Enter",
+            ])
             .output();
     } else {
         let (cwd, env) = target.ok_or_else(|| {

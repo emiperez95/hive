@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 293 tests (270 unit + 23 CLI smoke)
+cargo test                # 294 tests (271 unit + 23 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~482 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 270 unit + 23 smoke.
+> bin targets and run twice. Distinct tests: 271 unit + 23 smoke.
 
 ## The TUI (conversation-first)
 
@@ -821,15 +821,16 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-293 distinct tests. Run with `cargo test`.
+294 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~482 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 206 · bin 270 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 207 · bin 271 (the superset — adds cli/daemon/serve)
 > · smoke 23.
 
-**Unit tests (270)** — in-module `#[cfg(test)]` blocks:
-- `common/tmux.rs`: `exact`/`exact_window`/`exact_pane` target building — the `=` that stops
-  tmux prefix/fnmatch-matching a session name onto a longer one (see **Conventions**)
+**Unit tests (271)** — in-module `#[cfg(test)]` blocks:
+- `common/tmux.rs`: `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
+  the `=` that stops tmux prefix/fnmatch-matching a session name onto a longer one, and the
+  trailing `:` that makes a send-keys target a PANE (see **Conventions**)
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
@@ -891,6 +892,13 @@ inputs as parameters, which is what makes them unit-testable.
   `exact_window` / `exact_pane` — the `=` also stops the `[project]` in a worktree session
   name being read as an fnmatch character class. Pane (`%12`) and window (`@34`) ids are
   already unambiguous — never wrap those.
+- **Gotcha — `send-keys` takes a PANE target, so it needs `tmux::exact_active_pane`.**
+  `exact` produces `=name`, which is a *session* target: `send-keys -t "=name"` fails with
+  `can't find pane: =name` and the command is never typed. That's how "resume a conversation"
+  opened a window sitting at a bare shell — and it silently hit thaw, new-conversation, and
+  every session startup command too. `exact_active_pane` (`=name:`) keeps the `=` exactness
+  while the trailing `:` resolves to the current window's active pane, which is exactly the
+  window `new-window` just created.
 - Prefer pure functions taking their environment as parameters (e.g. `build_active(reg, skipped,
   session_windows)`) so tmux-dependent logic stays unit-testable
 

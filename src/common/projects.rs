@@ -278,11 +278,14 @@ pub fn ensure_tmux_session(
         }
 
         if let Some(startup) = startup_cmd {
+            // Active-pane target, not the bare session target: send-keys can't
+            // resolve `=name` (see `tmux::exact_active_pane`), which left every
+            // freshly-created session sitting at a shell with no startup command.
             let _ = Command::new("tmux")
                 .args([
                     "send-keys",
                     "-t",
-                    &crate::common::tmux::exact(session_name),
+                    &crate::common::tmux::exact_active_pane(session_name),
                     startup,
                     "Enter",
                 ])

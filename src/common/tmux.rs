@@ -31,6 +31,22 @@ pub fn exact_pane(session: &str, window: &str, pane: &str) -> String {
     format!("={session}:{window}.{pane}")
 }
 
+/// Exact-match target for the ACTIVE PANE of a session's current window
+/// (`=session:` — empty window means "current", empty pane means "active").
+///
+/// [`exact`] is a session target and is **not** a valid pane target: `send-keys -t
+/// "=name"` fails outright with `can't find pane: =name`, so the command is never
+/// typed. That silently broke every "open a window and type a command into it" path
+/// (resume a conversation, thaw, new conversation, startup commands) — the window
+/// appeared, running a bare shell.
+///
+/// The trailing `:` is what makes it a pane target while keeping the `=` exactness:
+/// `=foo:` still refuses to match a live `foo bar` (verified in an isolated server).
+/// Use this for every `send-keys` whose target is a session NAME.
+pub fn exact_active_pane(session: &str) -> String {
+    format!("={session}:")
+}
+
 /// Get all tmux sessions with their windows and panes
 pub fn get_tmux_sessions() -> Result<Vec<TmuxSession>> {
     let output = Command::new("tmux")
@@ -530,7 +546,7 @@ pub fn clean_claude_title(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_claude_title, exact, exact_pane, exact_window};
+    use super::{clean_claude_title, exact, exact_active_pane, exact_pane, exact_window};
 
     // tmux resolves a bare `-t` target by exact match, THEN fnmatch, THEN prefix — so
     // "📊 Avateen" silently resolves to a running "📊 Avateen Hub". Every session-name
@@ -544,6 +560,21 @@ mod tests {
     fn exact_window_and_pane_targets() {
         assert_eq!(exact_window("📊 Avateen", "2"), "=📊 Avateen:2");
         assert_eq!(exact_pane("📊 Avateen", "2", "0"), "=📊 Avateen:2.0");
+    }
+
+    // send-keys takes a PANE target, and `=name` is not one — tmux answers "can't find
+    // pane: =name" and the command is never typed, which left every resume / thaw /
+    // new-conversation / startup-command window sitting at a bare shell. The trailing
+    // `:` makes it the current window's active pane while keeping `=` exactness.
+    #[test]
+    fn exact_active_pane_is_a_pane_target() {
+        assert_eq!(exact_active_pane("📊 Avateen"), "=📊 Avateen:");
+        assert!(exact_active_pane("🐝 hive").starts_with('='));
+        assert!(
+            exact_active_pane("🐝 hive").ends_with(':'),
+            "without the trailing colon this is a session target, which send-keys rejects"
+        );
+        assert_ne!(exact_active_pane("🐝 hive"), exact("🐝 hive"));
     }
 
     // Worktree session names embed `[project]`, which is an fnmatch character class in a

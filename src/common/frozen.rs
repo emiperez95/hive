@@ -267,9 +267,16 @@ pub fn thaw_window(key: &str) -> Result<String> {
                 entry.session_name
             ));
         }
-        // new-window makes the new window active; send the resume command to it.
+        // new-window makes the new window active; send the resume command to its
+        // active PANE (`tmux_target` is a session target — send-keys rejects it).
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &tmux_target, &startup, "Enter"])
+            .args([
+                "send-keys",
+                "-t",
+                &crate::common::tmux::exact_active_pane(&entry.session_name),
+                &startup,
+                "Enter",
+            ])
             .output();
     } else {
         // Session is gone (last window was frozen) — recreate it with this window.

@@ -38,6 +38,19 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
 
 ### Fixed
 
+- **Resuming a conversation opened a window that never started Claude.** Enter on a closed
+  conversation added the tmux window and switched to it, then left it sitting at a bare shell.
+  The exact-match sweep (`=name` targets) had routed `send-keys` through `tmux::exact` too —
+  but `send-keys` takes a *pane* target, and `=name` is a session, so tmux answered `can't find
+  pane: =name` and the `claude --resume <id>` was never typed. The failure was silent because
+  the send was already best-effort.
+
+  The same line broke every path that opens a window and types into it: thaw (`z`), new
+  conversation (`n`), new task, `hive wt new`'s startup command, and **every session hive
+  creates** via `ensure_tmux_session` — projects with a startup command came up at a shell.
+  All six now use `tmux::exact_active_pane` (`=name:`), which keeps the `=` exactness (verified
+  it still refuses to prefix-match a longer live session) while resolving to the current
+  window's active pane — the window `new-window` just created.
 - **Frozen conversations were effectively invisible in the project detail.** They sorted below
   every plain closed conversation, so the one you froze in order to come back to it fell past
   the 5-row page cap — on the very screen whose title bar counts it. They now sort directly
