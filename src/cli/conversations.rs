@@ -37,7 +37,9 @@ use crate::common::persistence::{
 };
 use crate::common::ports::{get_listening_ports_for_pids, ListeningPort};
 use crate::common::process::get_process_info;
-use crate::common::projects::{ensure_tmux_session, expand_tilde, ProjectConfig, ProjectRegistry};
+use crate::common::projects::{
+    activate_project, ensure_tmux_session, expand_tilde, ProjectConfig, ProjectRegistry,
+};
 use crate::common::registry::{
     Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
 };
@@ -559,9 +561,15 @@ fn build_browse(
     }
     // Hide archived projects only on the FULL list (`include_empty` == no search),
     // matching the classic picker: they reappear as soon as you type a search, or
-    // when revealed via Ctrl+R.
+    // when revealed via Ctrl+R. A project with a LIVE conversation is never hidden —
+    // same rule as the conversation-level archive above, one level up: you can't
+    // hide something that's running. Without this, starting a conversation in an
+    // archived project (from a bare `claude` in a tmux window, which no unarchive-on-
+    // start hook can catch) dropped it off Browse entirely.
     if !reveal_archived && include_empty {
-        grouped.retain(|key, _| !is_archived(key));
+        grouped.retain(|key, convs| {
+            !is_archived(key) || convs.iter().any(|c| c.lifecycle.is_actionable_here())
+        });
     }
     // Searching: a project matched BY NAME surfaces even with zero conversations —
     // archived ones included, since the retain above is scoped to the full list.
@@ -576,8 +584,10 @@ fn build_browse(
     // with no conversations of its own. `worktrees` is already query-filtered by the
     // caller, so when searching this is exactly the branch-matched set; the archived
     // guard mirrors the retain above (which only runs on the full list).
+    // `!grouped.contains_key` is what the retain above just decided: an archived
+    // project that survived it (because something is live there) keeps its worktrees.
     for key in worktrees.keys() {
-        if include_empty && !reveal_archived && is_archived(key) {
+        if include_empty && !reveal_archived && is_archived(key) && !grouped.contains_key(key) {
             continue;
         }
         grouped.entry(key.clone()).or_default();
@@ -4680,6 +4690,8 @@ fn new_conversation(key: &str) -> Result<String> {
         .projects
         .get(key)
         .ok_or_else(|| anyhow!("unknown project '{key}'"))?;
+    // Starting a conversation here means the project is active again.
+    activate_project(key);
     let session = ProjectRegistry::session_name(key, config);
     let root = expand_tilde(&config.project_root)
         .to_string_lossy()
@@ -4701,6 +4713,7 @@ fn new_conversation_in_worktree(project: &str, branch: &str) -> Result<String> {
         .get(project)
         .map(|c| c.tmux_env())
         .unwrap_or_default();
+    activate_project(project);
     open_new_conversation(&entry.session_name, &entry.path, &env)
 }
 
@@ -4771,8 +4784,10 @@ fn connect_worktree(project: &str, branch: &str) -> Result<String> {
         }
     }
     // Opening a worktree is an explicit choice to work there — put it back in the
-    // cycle, same as switching to a conversation does.
+    // cycle, same as switching to a conversation does, and put its project back on
+    // the Browse list (the session's startup command is usually `claude`).
     unskip_session(&session);
+    activate_project(project);
     attach_or_switch(&session);
     Ok(format!(
         "{} {session}",
@@ -5232,6 +5247,56 @@ mod tests {
         // Revealed → shown regardless.
         let (g, _) = build_browse(&reg, &projects, true, true, &none, &no_wts);
         assert!(has(&g, "arch"), "archived shown when revealed");
+    }
+
+    #[test]
+    fn test_build_browse_shows_archived_project_with_a_live_conversation() {
+        // You can't hide something that's running — the project-level twin of
+        // `test_build_browse_shows_archived_conversation_that_is_live`. Starting a
+        // conversation in an archived project (e.g. plain `claude` in a tmux window,
+        // which bypasses every unarchive-on-start hook) must not make it invisible.
+        let mut projects = ProjectRegistry::default();
+        projects.projects.insert(
+            "arch".into(),
+            ProjectConfig {
+                archived: true,
+                ..Default::default()
+            },
+        );
+        let none = HashSet::new();
+        let mut wts: HashMap<String, Vec<BrowseWt>> = HashMap::new();
+        wts.insert(
+            "arch".into(),
+            vec![BrowseWt {
+                project: "arch".into(),
+                branch: "b".into(),
+                session_live: false,
+                live: 0,
+                last_activity: None,
+            }],
+        );
+        let has = |g: &[Group], k: &str| g.iter().any(|x| x.key == k);
+
+        // Closed conversation only → still hidden on the full list.
+        let mut reg = ConversationRegistry::default();
+        reg.conversations.insert(
+            "a".into(),
+            mk("a", Lifecycle::Closed, Some("arch"), Some("2026-07-01")),
+        );
+        let (g, _) = build_browse(&reg, &projects, true, false, &none, &wts);
+        assert!(!has(&g, "arch"), "no live work → archived stays hidden");
+
+        // One live conversation → the project (and its worktrees) come back.
+        reg.conversations.insert(
+            "b".into(),
+            mk("b", Lifecycle::Live, Some("arch"), Some("2026-07-02")),
+        );
+        let (g, _) = build_browse(&reg, &projects, true, false, &none, &wts);
+        let group = g
+            .iter()
+            .find(|x| x.key == "arch")
+            .expect("archived project with a live conversation shows on the full list");
+        assert_eq!(group.worktrees.len(), 1, "its worktrees come with it");
     }
 
     #[test]

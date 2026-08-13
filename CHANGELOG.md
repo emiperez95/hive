@@ -38,6 +38,14 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
 
 ### Fixed
 
+- **An archived project could hide a live conversation.** Archiving is meant to be a display
+  preference, but `build_browse` dropped the whole group from the unfiltered Browse list — so a
+  conversation started in an archived project was invisible, live rows and all. Two independent
+  guards now cover it: `projects::activate_project` clears the flag wherever work starts (new
+  conversation in a project or worktree, resume/thaw — so the web's `/api/resume` is covered too —
+  `connect_worktree`, `hive connect`, `hive wt new`), and `build_browse` never hides an archived
+  project that has a live conversation. The second is what catches a bare `claude` run in a tmux
+  window, which no unarchive-on-start hook can observe; its worktree rows come back with it.
 - **Resuming a conversation opened a window that never started Claude.** Enter on a closed
   conversation added the tmux window and switched to it, then left it sitting at a bare shell.
   The exact-match sweep (`=name` targets) had routed `send-keys` through `tmux::exact` too —

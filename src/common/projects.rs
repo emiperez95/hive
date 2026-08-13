@@ -238,6 +238,34 @@ impl ProjectRegistry {
             None => false,
         }
     }
+
+    /// Clear the archived flag for a project key OR a worktree key
+    /// (`project/branch` — a worktree belongs to its project). Returns true only
+    /// when something actually changed, so callers can skip the write on the
+    /// common path.
+    pub fn unarchive(&mut self, key: &str) -> bool {
+        let key = key.split('/').next().unwrap_or(key);
+        match self.projects.get_mut(key) {
+            Some(config) if config.archived => {
+                config.archived = false;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Starting work in a project puts it back in play: clear its `archived` flag.
+/// Mirrors the two rules hive already follows — opening an archived CONVERSATION
+/// unarchives it, and switching to a skipped session un-skips it — so a project
+/// can't stay hidden from Browse while you're actively working in it. Accepts a
+/// worktree key (`project/branch`) too. Best-effort and silent: unknown key or
+/// already-active project writes nothing.
+pub fn activate_project(key: &str) {
+    let mut registry = ProjectRegistry::load();
+    if registry.unarchive(key) {
+        let _ = registry.save();
+    }
 }
 
 /// Ensure a tmux session exists, creating it at the given path if needed.
@@ -616,6 +644,29 @@ project_root = "~/projects/hive"
         assert!(registry.set_archived("hive", true));
         assert!(registry.projects["hive"].archived);
         assert!(!registry.set_archived("nonexistent", true));
+    }
+
+    #[test]
+    fn test_unarchive_reports_only_real_changes() {
+        // `unarchive` is what starting work in a project calls, on every new
+        // conversation / resume / connect — so it must report "nothing changed" for
+        // the common case (already active, or unknown key) to avoid a pointless
+        // rewrite of projects.toml, and must accept a worktree key.
+        let toml_str = r#"
+[projects.hive]
+emoji = "🐝"
+project_root = "~/projects/hive"
+archived = true
+"#;
+        let mut registry: ProjectRegistry = toml::from_str(toml_str).unwrap();
+        assert!(!registry.unarchive("nonexistent"), "unknown key: no change");
+
+        // A worktree key resolves to its project.
+        assert!(registry.unarchive("hive/CSD-1"), "worktree key unarchives");
+        assert!(!registry.projects["hive"].archived);
+
+        // Already active → no change, so no write.
+        assert!(!registry.unarchive("hive"), "already active: no change");
     }
 
     #[test]

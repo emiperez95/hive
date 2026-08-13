@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 
 use crate::common::persistence::{load_auto_approve_sessions, save_auto_approve_sessions};
-use crate::common::projects::{expand_tilde, ProjectRegistry};
+use crate::common::projects::{activate_project, expand_tilde, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session};
 use crate::common::worktree::*;
 
@@ -208,6 +208,10 @@ pub fn run_wt_new(
         let _ = delete_git_worktree(&project_root, &worktree_path, branch, true, true);
         return Err(e);
     }
+
+    // Branching off a project is work starting there: put it back on the Browse
+    // list if it had been archived (same rule as starting a conversation in it).
+    activate_project(project);
 
     println!("Ready: session '{}'", session_name);
 

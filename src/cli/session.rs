@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::common::persistence::{load_skipped_sessions, save_skipped_sessions};
-use crate::common::projects::{connect_project, ProjectRegistry};
+use crate::common::projects::{activate_project, connect_project, ProjectRegistry};
 use crate::common::tmux::{
     display_message_for_pane, get_current_tmux_session, get_current_tmux_session_names,
     get_current_tmux_window, get_other_client_sessions, select_window, switch_to_session,
@@ -249,6 +249,9 @@ pub fn run_connect(key: &str) -> Result<()> {
     if !connect_project(&session_name) {
         anyhow::bail!("Failed to create/connect session for '{}'", key);
     }
+    // Connecting is choosing to work here: unskip the session (below) and unarchive
+    // the project, whose startup command is usually `claude`.
+    activate_project(key);
     // Unskip if it was skipped — user explicitly chose to connect
     let mut skipped = load_skipped_sessions();
     if skipped.remove(&session_name) {

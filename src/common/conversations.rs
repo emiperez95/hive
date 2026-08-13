@@ -18,7 +18,7 @@ use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{build_cmdline_map, get_process_info, parse_resume_id};
-use crate::common::projects::{ensure_tmux_session, ProjectRegistry};
+use crate::common::projects::{activate_project, ensure_tmux_session, ProjectRegistry};
 use crate::common::registry::{
     self, Conversation, ConversationRegistry, ConversationSidecar, ConversationStatus,
     TmuxPlacement,
@@ -286,6 +286,12 @@ pub fn target_session(c: &Conversation) -> Option<String> {
 /// must not). `fallback_session` is used when the conversation has no resolvable
 /// parent (the TUI passes the current tmux session; the web passes None).
 pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -> Result<String> {
+    // Resuming work in a project un-archives it — same rule as opening an archived
+    // conversation, one level up. Shared by the TUI and the web's /api/resume.
+    if let Some(parent) = c.parent.as_deref() {
+        activate_project(parent);
+    }
+
     // Frozen conversations thaw through the existing frozen path, which recreates
     // the window/session, resumes (`--resume <id>` or `claude -c` for id-less
     // legacy entries), and removes the frozen.json entry.

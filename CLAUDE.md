@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 294 tests (271 unit + 23 CLI smoke)
+cargo test                # 296 tests (273 unit + 23 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~482 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 271 unit + 23 smoke.
+> `cargo test` prints ~484 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 273 unit + 23 smoke.
 
 ## The TUI (conversation-first)
 
@@ -457,6 +457,25 @@ Two consequences worth knowing:
   otherwise it would run while invisible in Browse. `r` (resume-last) skips archived ones, so
   archiving the newest conversation doesn't make `r` reopen the thing you just set aside.
 
+### Archived projects — starting work un-archives them
+
+The same rule, one level up. An archived PROJECT (`a` in the project detail, `Del` on a Browse
+header, or `hive project archive`) is hidden from the unfiltered Browse list, so a conversation
+started in one used to be invisible: the group was dropped whole, live conversations and all.
+Two independent guards now prevent that:
+
+- **`projects::activate_project(key)` clears the flag whenever work starts there** — new
+  conversation (project or worktree), resume/thaw (`common::conversations::reopen_conversation`,
+  so the web's `/api/resume` is covered too), `connect_worktree`, `hive connect`, `hive wt new`.
+  It accepts a worktree key (`project/branch`) and writes nothing when the project is already
+  active, so it costs one registry read on the common path.
+- **`build_browse` never hides an archived project that has a live conversation** — "you can't
+  hide something that's running", the project-level twin of the conversation rule above. This is
+  the guard that matters for a conversation started *outside* hive (a bare `claude` in a tmux
+  window), which no unarchive-on-start hook can see. Its worktree rows come back with it.
+
+Archiving stays a display preference, never a bound on the registry — same as for conversations.
+
 ### How a live conversation is resolved (the tricky part)
 
 `gather_conversations_inner()` must map each running Claude **window** to its conversation UUID.
@@ -821,25 +840,27 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-294 distinct tests. Run with `cargo test`.
+296 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints ~482 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 207 · bin 271 (the superset — adds cli/daemon/serve)
+> `cargo test` prints ~484 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 208 · bin 273 (the superset — adds cli/daemon/serve)
 > · smoke 23.
 
-**Unit tests (271)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (273)** — in-module `#[cfg(test)]` blocks:
 - `common/tmux.rs`: `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
   the `=` that stops tmux prefix/fnmatch-matching a session name onto a longer one, and the
   trailing `:` that makes a send-keys target a PANE (see **Conventions**)
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
-  `parse_resume_id`), persistence (escape/unescape, set/todo file roundtrips), registry
+  `parse_resume_id`), projects (incl. `unarchive` — worktree key, no-op when already active),
+  persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
   frozen, activity (incl. `entry_line` single-line/one-syscall invariant), config
   (`[web]` parse, defaults-off, legacy `[defaults]` ignored)
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
 - `cli/conversations.rs`: `build_active` bucketing (normal/other/skipped), bare-session
-  surfacing, covered-window exclusion, `build_browse` archived visibility + name-matched
+  surfacing, covered-window exclusion, `build_browse` archived visibility (project hidden on
+  the full list, but never while one of its conversations is live) + name-matched
   (conversation-less) projects surfacing first, `projects_matching`, `browse_worktrees`
   (branch/session/path filtering, project-named pass-through, live-conversation counts,
   recency ordering) + `visible_rows` section paging (cap, per-section expand, Active uncapped) +
