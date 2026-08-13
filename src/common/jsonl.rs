@@ -450,14 +450,38 @@ pub fn find_jsonl_by_session_id(cwd: &str, session_id: &str) -> Option<PathBuf> 
         .find(|p| p.is_file())
 }
 
-/// Resolve the jsonl path for a conversation. When `session_id` is known, prefer the exact
-/// `<session_id>.jsonl`; otherwise (or if that file is missing) fall back to the most recently
-/// modified jsonl for the cwd.
+/// Find `<session_id>.jsonl` in any of `dirs`. Path-injectable half of
+/// [`find_jsonl_by_session_id_anywhere`], so the cwd-independent lookup is unit-testable
+/// without touching a real home dir.
+pub fn find_jsonl_by_session_id_in(dirs: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+    let filename = format!("{session_id}.jsonl");
+    dirs.iter()
+        .map(|dir| dir.join(&filename))
+        .find(|p| p.is_file())
+}
+
+/// Find `<session_id>.jsonl` anywhere under `~/.claude*/projects/`, ignoring the cwd.
+///
+/// The conversation id is stable; the cwd is not. Claude names the transcript's directory
+/// after the dir it was *launched* in, but reports its *current* shell dir in hook payloads —
+/// and the agent's own `cd` moves that. Once they diverge, every cwd-derived path is wrong
+/// while the id still resolves. One `is_file()` per slug dir, so this is cheap enough to
+/// run on the miss path.
+pub fn find_jsonl_by_session_id_anywhere(session_id: &str) -> Option<PathBuf> {
+    find_jsonl_by_session_id_in(&claude_slug_dirs(), session_id)
+}
+
+/// Resolve the jsonl path for a conversation.
+///
+/// With a known `session_id`: the cwd's own profile dirs first (the common case, one stat),
+/// then the same id anywhere on disk (covers a cwd that has drifted from the launch dir).
+/// A known id that resolves to nothing returns `None` — **never** the recency fallback, which
+/// would silently serve a *different* conversation that happens to share the directory.
+/// Without an id there's nothing to be exact about, so the newest transcript for the cwd stands.
 pub fn resolve_jsonl_path(cwd: &str, session_id: Option<&str>) -> Option<PathBuf> {
     if let Some(sid) = session_id {
-        if let Some(path) = find_jsonl_by_session_id(cwd, sid) {
-            return Some(path);
-        }
+        return find_jsonl_by_session_id(cwd, sid)
+            .or_else(|| find_jsonl_by_session_id_anywhere(sid));
     }
     find_latest_jsonl_for_cwd(cwd)
 }
@@ -1318,6 +1342,35 @@ mod tests {
         );
         assert_eq!(def.len(), 1);
         assert_eq!(def[0].config_dir, None); // default profile → no CLAUDE_CONFIG_DIR
+    }
+
+    #[test]
+    fn test_find_jsonl_by_session_id_in_survives_cwd_drift() {
+        // The transcript is filed under the dir Claude was LAUNCHED in. When the agent cd's
+        // into a subdir, the cwd-derived slug points at a sibling that holds no transcript —
+        // but Claude does create a same-named *directory* there for its own sidecars, so the
+        // lookup must insist on a file. (The `experiment-crisis-colombia` blank-page bug.)
+        let base = std::env::temp_dir().join(format!("hive-drift-{}", std::process::id()));
+        let launch = base.join(".claude").join("projects").join("-w-proj");
+        let drifted = base.join(".claude").join("projects").join("-w-proj-sub");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(drifted.join("conv-1.jsonl")).unwrap(); // a DIRECTORY
+        std::fs::write(
+            launch.join("conv-1.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"/w/proj\"}\n",
+        )
+        .unwrap();
+
+        // Drifted dir first: the id must still resolve to the real transcript behind it.
+        let dirs = vec![drifted.clone(), launch.clone()];
+        let found = find_jsonl_by_session_id_in(&dirs, "conv-1");
+        let missing = find_jsonl_by_session_id_in(&dirs, "conv-2");
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(found, Some(launch.join("conv-1.jsonl")));
+        // A known id that isn't on disk resolves to nothing — it never substitutes the
+        // neighbouring transcript, which is how the wrong conversation would get served.
+        assert_eq!(missing, None);
     }
 
     #[test]

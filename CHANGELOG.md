@@ -38,6 +38,21 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
 
 ### Fixed
 
+- **A `cd` inside a session blanked its conversation view.** The web dashboard showed an empty
+  page for a live session whose agent had moved into a subdirectory. Two different things are
+  called "cwd" and hive conflated them: the directory Claude was *launched* in, which fixes the
+  transcript's path for the life of the conversation, and the agent's *current* shell directory,
+  which every `cd` moves and which Claude reports in its hook payloads. hive stored the second and
+  reconstructed the transcript path from it, so once they diverged both the exact `<id>.jsonl`
+  check and the recency fallback searched a directory the transcript was never in.
+  `resolve_jsonl_path` now falls back to the conversation id, which never drifts:
+  `find_jsonl_by_session_id_anywhere` scans every `~/.claude*/projects/*/`, one `is_file()` per
+  slug dir and only on the miss path. The same resolver backs `get_claude_status_from_jsonl_for`,
+  so the TUI's transcript tail had the identical blind spot.
+
+  A known id that resolves to nothing now returns `None` instead of the newest transcript for the
+  cwd. That fallback was worse than the blank page it was covering: asked for an id that exists
+  nowhere, it answered with an unrelated session's transcript and nothing marked the substitution.
 - **An archived project could hide a live conversation.** Archiving is meant to be a display
   preference, but `build_browse` dropped the whole group from the unfiltered Browse list — so a
   conversation started in an archived project was invisible, live rows and all. Two independent
