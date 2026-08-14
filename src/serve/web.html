@@ -1409,6 +1409,25 @@
     color: #5b6168;
   }
   .list-tab.active { background: var(--surface-container-lowest); color: var(--primary); }
+  /* Offline banner: the list keeps rendering its last good data when polls fail, so
+     without this the page looks live while showing minutes-old state. */
+  .offline-banner {
+    margin: 8px 16px 0; padding: 10px 12px; border-radius: 10px;
+    background: color-mix(in srgb, var(--error) 12%, var(--surface-container-lowest));
+    border: 1px solid color-mix(in srgb, var(--error) 35%, transparent);
+    color: var(--error); font-size: 12.5px; font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .offline-banner[hidden] { display: none; }
+  .offline-banner .material-symbols-outlined { font-size: 18px; }
+  .offline-banner .stale { font-weight: 500; opacity: 0.8; }
+  /* Retry affordance for a list that has nothing to show because the fetch failed. */
+  .retry-load { text-align: center; padding: 28px 16px; color: var(--on-surface-variant); font-size: 13px; }
+  .retry-load button {
+    display: block; margin: 10px auto 0; padding: 8px 18px; border-radius: 8px;
+    border: 1px solid var(--outline-variant, #d8dce0); background: var(--surface-container-lowest);
+    color: var(--primary); font-size: 13px; font-weight: 600; cursor: pointer;
+  }
   /* Resume (closed/resumable) conversation rows */
   .resume-item .resume-time { font-size: 11px; color: var(--on-surface-variant); font-weight: 600; white-space: nowrap; }
   .resume-item .resume-icon { color: var(--primary); font-size: 26px; align-self: center; margin-left: 4px; }
@@ -1795,6 +1814,10 @@
       <button class="list-tab active" data-tab="active" onclick="switchListTab('active')">Active</button>
       <button class="list-tab" data-tab="resume" onclick="switchListTab('resume')">Resume</button>
     </div>
+    <div class="offline-banner" id="offlineBanner" hidden>
+      <span class="material-symbols-outlined">cloud_off</span>
+      <span>Can't reach hive<span class="stale" id="offlineStale"></span></span>
+    </div>
     <div class="session-list" id="sessionList">
       <div class="loading"><span class="dot-pulse">Loading sessions...</span></div>
     </div>
@@ -1916,6 +1939,7 @@ let sessions = [];
 let frozenList = []; // frozen Claude windows (from /api/frozen)
 let conversations = []; // closed/resumable conversations (from /api/conversations)
 let conversationsLoaded = false;
+let conversationsFailed = false; // last fetch threw and we have nothing to show
 let listTab = 'active'; // 'active' (live sessions) | 'resume' (closed conversations)
 let selectedSession = null;
 let selectedWindow = null; // pane id (e.g. "%1") when a specific window is selected
@@ -2453,7 +2477,11 @@ function renderFrozenItem(f) {
 function renderResumeList() {
   const el = document.getElementById('sessionList');
   if (!conversationsLoaded) {
-    el.innerHTML = '<div class="loading"><span class="dot-pulse">Loading conversations...</span></div>';
+    // Distinguish "still fetching" from "the fetch failed". Conflating them is what made a
+    // dead network look like a broken tab — the spinner never ended and never explained itself.
+    el.innerHTML = conversationsFailed
+      ? '<div class="retry-load">Couldn\'t load conversations.<button onclick="retryConversations()">Retry</button></div>'
+      : '<div class="loading"><span class="dot-pulse">Loading conversations...</span></div>';
     return;
   }
   const items = conversations.filter(c => c.lifecycle === 'closed' && !c.frozen);
@@ -2806,13 +2834,44 @@ let lastSessionsJson = '';
 let lastFrozenJson = '';
 let lastConversationsJson = '';
 
+// --- Connection state ---
+// A failed poll leaves the last good `sessions` on screen, so nothing about the list
+// says "this is stale". Track failures and surface them: one blip is ignored, a second
+// consecutive miss raises the banner with the age of what you're actually looking at.
+let pollFailures = 0;
+let lastSyncAt = 0;
+const OFFLINE_AFTER = 2;
+
+function markOnline() {
+  pollFailures = 0;
+  lastSyncAt = Date.now();
+  document.getElementById('connDot').style.background = 'var(--secondary)';
+  document.querySelector('.conn-label').textContent = 'Connected';
+  document.getElementById('offlineBanner').hidden = true;
+}
+
+function markOffline() {
+  pollFailures++;
+  document.getElementById('connDot').style.background = 'var(--error)';
+  document.querySelector('.conn-label').textContent = 'Offline';
+  if (pollFailures < OFFLINE_AFTER) return;
+  const banner = document.getElementById('offlineBanner');
+  // Only worth stating once the data is actually old — "from just now" is noise.
+  const stale = lastSyncAt && Date.now() - lastSyncAt > 60000;
+  const age = stale ? relativeTime(new Date(lastSyncAt).toISOString()) : '';
+  document.getElementById('offlineStale').textContent = age ? ` · showing data from ${age}` : '';
+  banner.hidden = false;
+  // A list that never loaded has nothing to keep showing — offer a way back.
+  if (listTab === 'resume' && !conversationsLoaded) renderList();
+}
+
 async function fetchSessions() {
   try {
     // Active view now comes from the conversation model (/api/active). Same
     // SessionView shape as the old /api/sessions, so rendering is unchanged.
     const res = await fetch('/api/active');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     const json = await res.text();
-    document.getElementById('connDot').style.background = 'var(--secondary)';
 
     // Frozen windows are polled alongside sessions (cheap on localhost).
     let frJson = '[]';
@@ -2820,6 +2879,9 @@ async function fetchSessions() {
 
     sessions = JSON.parse(json);
     frozenList = JSON.parse(frJson);
+    // Only after a parse that actually yielded data — a reachable server returning
+    // garbage is not "connected", and marking it so would suppress the banner forever.
+    markOnline();
 
     // Only re-render the list when either set actually changed. (The Resume tab
     // renders from `conversations`, refreshed separately by fetchConversations.)
@@ -2839,7 +2901,7 @@ async function fetchSessions() {
       if (obj) updateDetailBadges(obj);
     }
   } catch (e) {
-    document.getElementById('connDot').style.background = 'var(--error)';
+    markOffline();
   }
 }
 
@@ -2849,11 +2911,25 @@ async function fetchConversations() {
     const json = await (await fetch('/api/conversations')).text();
     conversations = JSON.parse(json);
     conversationsLoaded = true;
+    conversationsFailed = false;
     if (json !== lastConversationsJson) {
       lastConversationsJson = json;
       if (listTab === 'resume') renderList();
     }
-  } catch (e) { /* keep last */ }
+  } catch (e) {
+    // Keep any list we already have (the banner reports the staleness). With nothing
+    // loaded there's no list to keep, and silently returning here is what left the
+    // Resume tab spinning forever — so record the failure and let it render a retry.
+    conversationsFailed = true;
+    if (listTab === 'resume' && !conversationsLoaded) renderList();
+  }
+}
+
+// Retry button on the Resume tab: back to the spinner, then try again.
+function retryConversations() {
+  conversationsFailed = false;
+  renderList();
+  fetchConversations();
 }
 
 // Switch the session list between the live Active view and the Resume view.
@@ -3675,6 +3751,9 @@ updateAppHeight();
 // Start polling
 fetchSessions();
 pollTimer = setInterval(fetchSessions, 1500);
+// Warm the resumable set once at startup so the Resume tab paints on first tap
+// instead of opening on a spinner. It's only refetched while that tab is showing.
+fetchConversations();
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>

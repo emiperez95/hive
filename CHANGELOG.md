@@ -38,6 +38,16 @@ All notable changes to hive are recorded here. Format loosely follows [Keep a Ch
 
 ### Fixed
 
+- **The web dashboard rendered stale data as live, and the Resume tab spun forever.** With the
+  server unreachable — a dead WireGuard tunnel, in the case that surfaced it — every poll failed
+  into an empty `catch`, so the last good session list kept rendering: statuses, CPU, todos, all
+  minutes old, with a single 8px dot turning red as the only signal. The Resume tab was the one
+  view that can't fake it, since it needs a fresh fetch before it can render anything, so it sat
+  on "Loading conversations…" indefinitely with no error and no retry — which read as a broken
+  tab rather than a broken network. Failed polls now flip the header pill to `OFFLINE` and, on a
+  second consecutive miss, raise a banner naming the age of what's on screen; the Resume tab
+  distinguishes "loading" from "failed" and offers a Retry. The resumable set is also fetched
+  once at startup, so the tab paints on first tap instead of opening on a spinner.
 - **A `cd` inside a session blanked its conversation view.** The web dashboard showed an empty
   page for a live session whose agent had moved into a subdirectory. Two different things are
   called "cwd" and hive conflated them: the directory Claude was *launched* in, which fixes the
