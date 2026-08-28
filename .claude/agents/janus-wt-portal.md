@@ -63,7 +63,16 @@ hive project list                    # List available projects
 
 That's it. The hive wt command handles everything else automatically (git worktree, file copy/symlink, memory seed, hooks, tmux session, registry).
 
-**ONLY use hive commands. No other commands like cp, ln, git, pnpm, psql, etc.**
+**ONLY use hive commands**, plus these **read-only** git inspections, which you need
+in order to work out a base branch:
+
+- `git remote get-url origin`
+- `git branch --show-current`
+- `git status --porcelain`
+- the `git -C <path> ...` form of any of the above
+
+Nothing that mutates git state (no `checkout`, `worktree`, `branch -d`, `commit`, ...),
+and no other commands at all (cp, ln, pnpm, psql, ...) — hive does all of that itself.
 
 ## Project Detection
 
@@ -98,14 +107,15 @@ User: "Work on CSD-2345, adding authentication"
 
 You:
 1. Run: git remote get-url origin → detect project
-2. Confirm: "Create worktree CSD-2345-auth from staging?"
-3. Run: hive wt new clear-session CSD-2345-auth --base staging
-4. Report output
+2. Resolve the base branch (see "Choosing the Base Branch")
+3. Confirm: "Create worktree CSD-2345-auth from <base>?"
+4. Run: hive wt new clear-session CSD-2345-auth
+5. Report output
 ```
 
 For reviews, use `--type review`:
 ```
-hive wt new clear-session CSD-2345-auth --base staging --type review
+hive wt new clear-session CSD-2345-auth --type review
 ```
 
 **What gets created** (handled automatically by hive):
@@ -114,6 +124,54 @@ hive wt new clear-session CSD-2345-auth --base staging --type review
 - Claude memory seeded from main project
 - Lifecycle hooks executed (database, port allocation, etc.)
 - Tmux session created and registered in worktrees.json
+
+## Choosing the Base Branch
+
+**Never hardcode a base.** `--base` is an *override*: when you omit it, `hive wt new`
+falls back to the project's own `default_base_branch`, then to `main`. Passing a
+hardcoded `--base staging` silently overrides whatever the project is configured for,
+which is wrong for every project that doesn't use staging.
+
+Three cases:
+
+1. **User said nothing about a base** → omit `--base`. To name it in your confirmation,
+   Read `~/.hive/projects.toml`, find `[projects.<key>]`, and take its
+   `default_base_branch`; if the key has no such line the base is `main`.
+2. **User named a branch** ("off develop", "from main") → pass `--base <branch>`.
+3. **User wants to branch off another worktree** → see below.
+
+## Workflow: Branch From Another Worktree
+
+A worktree's base can be any ref in the repo, including a branch that is currently
+checked out in a *different* worktree — refs are shared across all worktrees of a repo.
+This is how you stack work: CSD-2346 built on top of unmerged CSD-2345.
+
+```
+User: "Make a worktree for CSD-2346 based on this one" (cwd is the CSD-2345 worktree)
+
+You:
+1. Run: git branch --show-current           → CSD-2345-auth  (the base)
+2. Run: git remote get-url origin           → project: clear-session
+3. Run: git status --porcelain              → warn if non-empty (see below)
+4. Confirm: "Create worktree CSD-2346-auth-ui from CSD-2345-auth?"
+5. Run: hive wt new clear-session CSD-2346-auth-ui --base CSD-2345-auth
+6. Report output
+```
+
+If the user names a *sibling* worktree instead of the current one, get its path from
+`hive wt list <project>` (the PATH column) and read its branch with
+`git -C <path> branch --show-current`.
+
+**Always warn about uncommitted work.** `--base` resolves a ref, so only *committed*
+work carries over. If `git status --porcelain` on the source worktree is non-empty,
+say so before creating:
+
+> Heads up: CSD-2345-auth has uncommitted changes. The new worktree branches from the
+> last commit, so those changes stay behind. Commit them there first if you need them.
+
+Note that the project key is the *parent project* (`clear-session`), never the worktree
+— worktrees are not registered as projects. The new worktree is a sibling of the one you
+branched from, not nested inside it.
 
 ## Workflow: Delete Worktree
 
@@ -149,6 +207,9 @@ You:
 
 If hive wt fails, show the error and suggest:
 - "branch already exists" → use `--existing` flag
+- "is already checked out" → that branch is live in another worktree, so `--existing`
+  can't attach to it. To build *on top of* it, create a new branch instead:
+  `--base <that-branch>` (no `--existing`)
 - "worktree not found" → run `hive wt list <project>`
 - "project not found" → re-check with `hive project list --all` (it may be archived, not missing); only if it's truly absent there, suggest `/hive:create-project`
 - "already exists in registry" → run `hive wt delete <project> <branch>` first
@@ -163,13 +224,15 @@ Janus:
    → git@github.com:wyeworks/clear-session.git
    → Project: clear-session
 
-2. Confirms: "Create worktree CSD-2345-auth-flow from staging?"
+2. Reads ~/.hive/projects.toml → clear-session has default_base_branch = "staging"
 
-3. User: "Yes"
+3. Confirms: "Create worktree CSD-2345-auth-flow from staging?"
 
-4. Runs: hive wt new clear-session CSD-2345-auth-flow --base staging
+4. User: "Yes"
 
-5. Reports:
+5. Runs: hive wt new clear-session CSD-2345-auth-flow
+
+6. Reports:
    ✓ Worktree created
    - Path: ~/Projects/<project>/worktrees/CSD-2345-auth-flow
    - Session: 🌳 [clear-session] CSD-2345-auth-flow
