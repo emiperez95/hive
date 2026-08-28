@@ -3277,7 +3277,7 @@ fn draw_project_detail(
         title_spans.push(Span::styled(
             "[archived]",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -4254,13 +4254,17 @@ fn header_line(
         format!("{icon}{}  ({n}, {live} live){mute_mark}{arch_mark}", g.key)
     };
     let mut style = if archived {
-        // Archived (only shown when revealed): dim gray, clearly set aside.
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM)
+        // Archived (only shown when revealed): plain gray — set apart from an active
+        // header (which is bold cyan/green) without DIM-on-DarkGray, which many
+        // themes render nearly black and so illegible on a dark background.
+        Style::default().fg(Color::Gray)
     } else if skipped {
-        // Dim blue: toned down from an active header, but still legible.
-        Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
+        // Toned down from an active header, but still legible: DIM over the base
+        // `Blue` came out near-black on a dark background, so dim the LIGHT blue
+        // instead — same recessive intent, two steps lighter.
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::DIM)
     } else {
         let color = if green_when_live && live > 0 {
             Color::Green
