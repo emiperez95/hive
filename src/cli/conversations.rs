@@ -352,6 +352,13 @@ fn set_conversation_pin(id: &str, pinned: bool) {
     edit_overlay(id, |o| o.pinned = pinned);
 }
 
+/// Set (or clear) a conversation's mute override (persisted overlay). With it on,
+/// the hook notifier rings for this conversation even under global / project /
+/// session mute — see `cli::hook::should_notify`.
+fn set_conversation_notify_override(id: &str, on: bool) {
+    edit_overlay(id, |o| o.notify_override = on);
+}
+
 /// Set (or clear) a conversation's free-text note (persisted overlay).
 fn set_conversation_note(id: &str, note: &str) {
     edit_overlay(id, |o| o.note = note.trim().to_string());
@@ -2003,6 +2010,18 @@ fn conversations_loop(
                     cd.editing_note = true;
                     cd.input = cd.conv.note.clone();
                 }
+                // `M` — ring for THIS conversation even while muted (see the list).
+                KeyCode::Char('M') => {
+                    let cd = conv_detail.as_mut().unwrap();
+                    let id = cd.conv.id.as_str().to_string();
+                    let on = !cd.conv.notify_override;
+                    set_conversation_notify_override(&id, on);
+                    cd.conv.notify_override = on;
+                    if let Some(c) = reg.conversations.get_mut(&id) {
+                        c.notify_override = on;
+                    }
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                }
                 // Session-level flags on the conversation's session (live only), and
                 // `z` freezes its window — matching the classic detail view.
                 KeyCode::Char('v')
@@ -2294,6 +2313,25 @@ fn conversations_loop(
                         } else {
                             d.archive_input = Some((c.id.as_str().to_string(), String::new()));
                         }
+                    }
+                }
+                // `M` overrides mute for the selected conversation — it rings even
+                // while the session / project / everything is muted.
+                KeyCode::Char('M') => {
+                    let d = detail.as_ref().unwrap();
+                    if let Some(c) = d.selected_conv() {
+                        let id = c.id.as_str().to_string();
+                        let on = !c.notify_override;
+                        set_conversation_notify_override(&id, on);
+                        if let Some(cc) = reg.conversations.get_mut(&id) {
+                            cc.notify_override = on;
+                        }
+                        let (key, sel, show_all) = (d.key.clone(), d.sel, d.show_all);
+                        detail = Some(build_group_detail(&key, &reg));
+                        let d = detail.as_mut().unwrap();
+                        d.show_all = show_all;
+                        d.sel = sel.min(d.num_items().saturating_sub(1));
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                     }
                 }
                 // `w` creates a worktree (prompts for a branch); `x` deletes the
@@ -2871,10 +2909,25 @@ fn conversations_loop(
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 }
             }
-            // Shift-M toggles GLOBAL mute (all notifications), distinct from the
+            // `G` toggles GLOBAL mute (all notifications), distinct from the
             // per-session `m` above. Persisted as the shared `muted-global` flag the
-            // hook notifier checks, so it affects the classic TUI and web too.
-            KeyCode::Char('M') => set_global_mute(!is_globally_muted()),
+            // hook notifier checks, so it affects the web too.
+            KeyCode::Char('G') => set_global_mute(!is_globally_muted()),
+            // Shift-M overrides mute for the selected CONVERSATION: it keeps ringing
+            // even under global / project / session mute. Pairs with the lowercase
+            // `m` (mute this session) — same key, opposite direction. Per-conversation,
+            // so it lives in the overlay next to pin/note rather than in any mute file.
+            KeyCode::Char('M') => {
+                if let Some(c) = selected_conv(&rows, &convs) {
+                    let id = c.id.as_str().to_string();
+                    let on = !c.notify_override;
+                    set_conversation_notify_override(&id, on);
+                    if let Some(cc) = reg.conversations.get_mut(&id) {
+                        cc.notify_override = on;
+                    }
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                }
+            }
             // `P` pins/unpins the selected conversation (persisted overlay). A pinned
             // conversation sorts to the top of its group and survives age-bounding.
             KeyCode::Char('P') => {
@@ -2960,7 +3013,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · f jump · z freeze · P pin · Del close · v★ m ! s · M mute-all · / search · ? · q",
+            " → detail · Enter switch · f jump · z freeze · P pin · Del close · v★ m ! s · M ring · G mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -3598,14 +3651,14 @@ fn draw_project_detail(
     } else if let Some(w) = &state.wt_info {
         Line::from(Span::styled(
             format!(
-                " Enter switch / start-todo · → detail · Tab show-all · Del close · n new in {} · r resume · x delete-wt · A archive-conv · Esc back",
+                " Enter switch / start-todo · → detail · Tab show-all · Del close · n new in {} · r resume · x delete-wt · M ring · A archive-conv · Esc back",
                 w.branch
             ),
             Style::default().fg(Color::DarkGray),
         ))
     } else {
         Line::from(Span::styled(
-            " Enter open wt / switch conv / start-todo · → detail · Tab show-all · Del close-conv / delete-wt · n new · r resume · w worktree · x delete-wt · m mute · a archive-project · A archive-conv · Esc back",
+            " Enter open wt / switch conv / start-todo · → detail · Tab show-all · Del close-conv / delete-wt · n new · r resume · w worktree · x delete-wt · m mute · M ring · a archive-project · A archive-conv · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -3841,8 +3894,10 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState, flags: &Fl
             ));
         }
     }
-    // Session flags (favorite / mute / auto-approve / skip), if any are set.
-    if let Some(session) = cd.session() {
+    // Session flags (favorite / mute / auto-approve / skip), if any are set, plus
+    // the conversation's own mute override — which has no session to hang off, so
+    // it shows even for a closed conversation.
+    {
         let mut fs: Vec<Span> = Vec::new();
         let tag = |fs: &mut Vec<Span<'static>>, on: bool, text: &'static str, col: Color| {
             if on {
@@ -3850,29 +3905,37 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState, flags: &Fl
                 fs.push(Span::raw(" "));
             }
         };
+        if let Some(session) = cd.session() {
+            tag(
+                &mut fs,
+                flags.favorite.contains(session),
+                "★fav",
+                Color::Yellow,
+            );
+            tag(
+                &mut fs,
+                flags.auto_approve.contains(session),
+                "[auto]",
+                Color::Green,
+            );
+            tag(
+                &mut fs,
+                flags.muted.contains(session),
+                "[muted]",
+                Color::DarkGray,
+            );
+            tag(
+                &mut fs,
+                flags.skipped.contains(session),
+                "[skip]",
+                Color::DarkGray,
+            );
+        }
         tag(
             &mut fs,
-            flags.favorite.contains(session),
-            "★fav",
+            c.notify_override,
+            "🔔 notify-override",
             Color::Yellow,
-        );
-        tag(
-            &mut fs,
-            flags.auto_approve.contains(session),
-            "[auto]",
-            Color::Green,
-        );
-        tag(
-            &mut fs,
-            flags.muted.contains(session),
-            "[muted]",
-            Color::DarkGray,
-        );
-        tag(
-            &mut fs,
-            flags.skipped.contains(session),
-            "[skip]",
-            Color::DarkGray,
         );
         if !fs.is_empty() {
             lines.push(field("flags", fs));
@@ -3947,7 +4010,7 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState, flags: &Fl
         ))
     } else {
         Line::from(Span::styled(
-            " Enter switch · v★ m ! s · z freeze · P pin · e note · a/1-9/d todo · o chrome · Del close · Esc back",
+            " Enter switch · v★ m ! s · z freeze · P pin · M ring · e note · a/1-9/d todo · o chrome · Del close · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -4158,7 +4221,11 @@ fn help_lines() -> Vec<Line<'static>> {
             "m",
             "In a project detail: mute the whole project (remembered)",
         ),
-        key("M", "Toggle global mute (silence all notifications)"),
+        key(
+            "M",
+            "Mute override 🔔 — this conversation notifies even while muted",
+        ),
+        key("G", "Toggle global mute (silence all notifications)"),
         key(
             "P",
             "Pin/unpin a conversation (sorts to top, survives bounding)",
@@ -4568,6 +4635,16 @@ fn conv_line(
     spans.extend(tag(muted, "  [muted]", Color::DarkGray));
     spans.extend(tag(skip, "  [skip]", Color::DarkGray));
     spans.extend(tag(c.archived, "  [archived]", Color::DarkGray));
+    // The mute override — shown next to [muted] because that's the pair that
+    // explains itself: silenced session, but this conversation still rings.
+    if c.notify_override {
+        let col = if selected {
+            base
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        spans.push(Span::styled("  🔔", col));
+    }
     // Overlay: a pin marker and the free-text note (persisted per-conversation).
     if c.pinned {
         let col = if selected {
@@ -5628,6 +5705,7 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            notify_override: false,
             archive_reason: None,
             archived_at: None,
             title: None,

@@ -551,6 +551,7 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            notify_override: false,
             archive_reason: None,
             archived_at: None,
             title: None,

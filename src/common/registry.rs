@@ -122,6 +122,11 @@ pub struct Conversation {
     /// Hive overlay: hidden from default listings (still listed in project detail).
     #[serde(default)]
     pub archived: bool,
+    /// Hive overlay: notify even while muted. Mute (global / project / session) is
+    /// coarse — this is the per-conversation escape hatch that wins over all three,
+    /// so one conversation can still ring while everything else stays silent.
+    #[serde(default)]
+    pub notify_override: bool,
     /// Hive overlay: why it was archived — free text captured when archiving.
     #[serde(default)]
     pub archive_reason: Option<String>,
@@ -200,6 +205,10 @@ pub struct ConversationOverlay {
     pub pinned: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// Notify even while muted — the per-conversation override that beats global,
+    /// project and session mute (see `Conversation::notify_override`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notify_override: bool,
     /// Why it was archived, and when — captured at archive time so the project
     /// detail can explain a hidden conversation instead of just dropping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,6 +262,16 @@ impl ConversationSidecar {
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+
+    /// Whether this conversation opted out of mute. Read by the hook notifier, which
+    /// knows the conversation UUID (it *is* the hook's `session_id`) but never builds
+    /// a registry — so the sidecar is consulted directly.
+    pub fn notify_override(&self, id: &str) -> bool {
+        self.conversations
+            .get(id)
+            .map(|o| o.notify_override)
+            .unwrap_or(false)
+    }
 }
 
 /// The in-memory joined view: every known `Conversation` keyed by its UUID.
@@ -304,6 +323,7 @@ impl ConversationRegistry {
             let note = overlay.map(|o| o.note.clone()).unwrap_or_default();
             let pinned = overlay.map(|o| o.pinned).unwrap_or(false);
             let archived = overlay.map(|o| o.archived).unwrap_or(false);
+            let notify_override = overlay.map(|o| o.notify_override).unwrap_or(false);
             let archive_reason = overlay.and_then(|o| o.archive_reason.clone());
             let archived_at = overlay.and_then(|o| o.archived_at.clone());
             conversations.insert(
@@ -320,6 +340,7 @@ impl ConversationRegistry {
                     note,
                     pinned,
                     archived,
+                    notify_override,
                     archive_reason,
                     archived_at,
                     title: None,
@@ -373,6 +394,7 @@ impl ConversationRegistry {
                             note: String::new(),
                             pinned: false,
                             archived: false,
+                            notify_override: false,
                             archive_reason: None,
                             archived_at: None,
                             title,
@@ -515,6 +537,7 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            notify_override: false,
             archive_reason: None,
             archived_at: None,
             title: None,
@@ -644,6 +667,7 @@ mod tests {
                 note: "wip".to_string(),
                 pinned: true,
                 archived: false,
+                notify_override: false,
                 archive_reason: None,
                 archived_at: None,
                 parent: Some("hive/CSD-1".to_string()),
@@ -800,6 +824,7 @@ mod tests {
             note: note.to_string(),
             pinned,
             archived: false,
+            notify_override: false,
             archive_reason: None,
             archived_at: None,
             parent: parent.map(|s| s.to_string()),
@@ -822,6 +847,53 @@ mod tests {
         assert_eq!(s.note, "wip");
         assert!(s.pinned);
         assert_eq!(s.parent.as_deref(), Some("hive/CSD-1"));
+    }
+
+    #[test]
+    fn test_from_shadow_applies_notify_override() {
+        // The mute override is per-conversation overlay state, like note/pinned.
+        let hook = HookState::default();
+        let disk = vec!["abc-123".to_string(), "def-456".to_string()];
+        let mut sidecar = ConversationSidecar::default();
+        sidecar.conversations.insert(
+            "abc-123".to_string(),
+            ConversationOverlay {
+                notify_override: true,
+                ..Default::default()
+            },
+        );
+        let reg = ConversationRegistry::from_shadow(&hook, &disk, &HashMap::new(), &sidecar);
+        assert!(reg.conversations["abc-123"].notify_override);
+        // No overlay entry ⇒ no override (mute keeps applying).
+        assert!(!reg.conversations["def-456"].notify_override);
+    }
+
+    #[test]
+    fn test_sidecar_notify_override_lookup_and_serde() {
+        // The hook notifier reads the flag by id without building a registry, and
+        // an unset override must not bloat the file.
+        let mut sc = ConversationSidecar::default();
+        assert!(!sc.notify_override("abc-123"));
+        sc.conversations.insert(
+            "abc-123".to_string(),
+            ConversationOverlay {
+                notify_override: true,
+                ..Default::default()
+            },
+        );
+        assert!(sc.notify_override("abc-123"));
+        assert!(!sc.notify_override("nope"));
+
+        let json = serde_json::to_string(&sc).unwrap();
+        assert!(json.contains("notify_override"));
+        let off = ConversationSidecar {
+            conversations: [("abc-123".to_string(), ConversationOverlay::default())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(!serde_json::to_string(&off)
+            .unwrap()
+            .contains("notify_override"));
     }
 
     #[test]
@@ -892,6 +964,7 @@ mod tests {
             note: String::new(),
             pinned: false,
             archived: false,
+            notify_override: false,
             archive_reason: None,
             archived_at: None,
             title: None,

@@ -10,6 +10,20 @@ use crate::daemon::hooks::handle_hook_event;
 use crate::daemon::notifier::notify_needs_attention;
 use crate::ipc::messages::{HookEvent, HookState, SessionStatus};
 
+/// Should this needs-attention event ring?
+///
+/// Mute has three coarse levels (global `M`, project, session) and one fine
+/// escape hatch: a conversation's `notify_override`, which wins over all of them.
+/// That's the whole point — silence everything, then let one conversation through.
+fn should_notify(
+    global_mute: bool,
+    project_muted: bool,
+    session_muted: bool,
+    notify_override: bool,
+) -> bool {
+    notify_override || !(global_mute || project_muted || session_muted)
+}
+
 /// Process a hook event from stdin
 pub fn run_hook(event_type: &str) -> Result<()> {
     use std::io::BufRead;
@@ -222,7 +236,15 @@ pub fn run_hook(event_type: &str) -> Result<()> {
                     .unwrap_or(false)
             };
 
-            if !global_mute && !project_muted && !muted.contains(session_name) {
+            // The per-conversation override beats every mute level. Only consulted
+            // when something would otherwise silence this event, so the unmuted
+            // common path never touches conversations.json.
+            let session_muted = muted.contains(session_name);
+            let override_notify = (global_mute || project_muted || session_muted)
+                && crate::common::registry::ConversationSidecar::load()
+                    .notify_override(&updated_session.session_id);
+
+            if should_notify(global_mute, project_muted, session_muted, override_notify) {
                 let status_text = match &updated_session.status {
                     SessionStatus::NeedsPermission { tool_name, .. } => {
                         format!("needs permission: {}", tool_name)
@@ -233,6 +255,13 @@ pub fn run_hook(event_type: &str) -> Result<()> {
                     SessionStatus::PlanReview => "plan ready".to_string(),
                     SessionStatus::QuestionAsked => "question asked".to_string(),
                     _ => "needs attention".to_string(),
+                };
+                // Say so when the only reason this rang is the override — otherwise a
+                // notification arriving under global mute reads like a bug.
+                let status_text = if override_notify {
+                    format!("🔔 {status_text}")
+                } else {
+                    status_text
                 };
                 notify_needs_attention(session_name, &status_text);
             }
@@ -246,4 +275,30 @@ pub fn run_hook(event_type: &str) -> Result<()> {
     state.save()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_notify;
+
+    #[test]
+    fn test_notifies_when_nothing_is_muted() {
+        assert!(should_notify(false, false, false, false));
+    }
+
+    #[test]
+    fn test_each_mute_level_silences() {
+        assert!(!should_notify(true, false, false, false)); // global
+        assert!(!should_notify(false, true, false, false)); // project
+        assert!(!should_notify(false, false, true, false)); // session
+    }
+
+    #[test]
+    fn test_override_beats_every_mute_level() {
+        // The point of the override: silence everything, let one conversation ring.
+        assert!(should_notify(true, false, false, true));
+        assert!(should_notify(false, true, false, true));
+        assert!(should_notify(false, false, true, true));
+        assert!(should_notify(true, true, true, true));
+    }
 }

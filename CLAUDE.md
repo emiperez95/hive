@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 296 tests (273 unit + 23 CLI smoke)
+cargo test                # 302 tests (279 unit + 23 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~484 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 273 unit + 23 smoke.
+> `cargo test` prints ~513 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 279 unit + 23 smoke.
 
 ## The TUI (conversation-first)
 
@@ -172,8 +172,8 @@ and `docs/permission-approve-reject.md`.)
 
 - `Conversation` (common/registry.rs) — the base entity, keyed by the Claude conversation UUID
   (the `<uuid>.jsonl` basename): id, cwd, lifecycle, status, last_activity, placement, parent,
-  frozen, note, pinned, archived (+ `archive_reason`/`archived_at`), title, auth_config_dir,
-  and runtime-only `cpu`/`mem_kb`
+  frozen, note, pinned, archived (+ `archive_reason`/`archived_at`), notify_override, title,
+  auth_config_dir, and runtime-only `cpu`/`mem_kb`
 - `ConversationId` — newtype over the UUID (machine-independent, unlike tmux names)
 - `Lifecycle` — `Live` | `Closed`. **A live tmux placement is the SOLE discriminator** for Live
 - `TmuxPlacement` — where a conversation currently runs (session_name, window_index, window_name,
@@ -182,7 +182,8 @@ and `docs/permission-approve-reject.md`.)
   `from_shadow(hook, disk_ids, live_placements, sidecar)` — a left-join over state.json + a disk
   scan + the overlay sidecar
 - `ConversationSidecar` / `ConversationOverlay` — writable per-conversation overlay
-  (note/pinned/archived + `archive_reason`/`archived_at`), persisted to `conversations.json`
+  (note/pinned/archived + `archive_reason`/`archived_at`, notify_override), persisted to
+  `conversations.json`
 - `ClaudeInstance` (common/instances.rs) — one running Claude **window** (session, window_index,
   window_name, pane, cwd, pids, session_id, `cwd_shared`)
 
@@ -216,7 +217,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 │   ├── state.json             # hook state (session statuses) — PRUNED after 10min idle
 │   ├── worktrees.json         # registered worktrees
 │   ├── frozen.json            # frozen (hibernated) Claude windows — resume metadata + notes
-│   ├── conversations.json     # per-conversation overlay sidecar: note / pinned / archived (+ reason, when)
+│   ├── conversations.json     # per-conversation overlay: note / pinned / archived (+ reason, when) / mute override
 │   ├── conversation-scan.json # mtime-keyed transcript scan cache (warm gather ~6x faster)
 │   ├── activity.jsonl         # append-only lifecycle/focus event log (feeds `hive stats`)
 │   ├── open-windows.json      # snapshot of currently-open windows (recovery projection)
@@ -407,7 +408,7 @@ the cwd's shared-prefix remainder just restates the project).
 | `Enter`/`→` on `… N more` | reveal the rest of that section (5 shown by default) / fold it back |
 | `Enter`/`→` on a worktree row | project detail: open that worktree's own detail (`Esc` pops back) |
 | `v` `m` `s` `!` | favorite · mute · skip · auto-approve (session-level) |
-| `M` | global mute · `P` pin conversation · `e` edit note |
+| `M` | mute override 🔔 (per conversation) · `G` global mute · `P` pin conversation · `e` edit note |
 | `z`/`Z` | freeze a Claude window (prompts for a note) |
 | `Del` | close live conv (kill window) · discard frozen · archive project (Browse header) · delete worktree (confirm) |
 | `a` | project detail: archive / unarchive the project |
@@ -415,9 +416,27 @@ the cwd's shared-prefix remainder just restates the project).
 | `L` `N` | iTerm spread/collapse · new-project wizard (key → emoji → path) |
 | `Ctrl+R` | Browse: reveal/hide archived |
 
-**Mute has three levels**: `m` per-session, `M` global, and `m` on a *project* (project detail)
+**Mute has three levels**: `m` per-session, `G` global, and `m` on a *project* (project detail)
 = a remembered preference in `muted-projects.txt` honored by the hook notifier, so future
 sessions of that project stay silent.
+
+**…and one override, per CONVERSATION** (`M`): `notify_override` in the conversation's overlay
+(`conversations.json`) makes the hook notify for that conversation *even under global, project
+or session mute*. All three mute levels are coarse — they silence a whole session, project or
+machine — so without an escape hatch "silence everything except the one run I'm waiting on" was
+impossible. The rule is one line, `cli::hook::should_notify`: `override || !(global || project ||
+session)`. An overridden notification is prefixed `🔔` — a popup arriving under global mute
+otherwise reads as a bug.
+
+The sidecar is only read when something *would* have silenced the event, so the unmuted common
+path never touches `conversations.json`. Toggling lives where per-conversation actions already
+do: the Active list, the project detail, and the conversation detail (rendered as a trailing
+`🔔` on the row / a `flags` entry in the detail). **Not in Browse** — that view is always in
+search mode, so letters are query text (same constraint as `P` and `A`).
+
+> The key is `M` so it pairs with the lowercase `m` — same letter, opposite direction: `m`
+> silences this session, `M` makes this conversation ring anyway. Global mute moved off `M`
+> onto **`G`** to free it.
 
 **The new-project wizard (`N`) validates each step** instead of discarding silently. Enter only
 advances when the step is satisfied; otherwise the footer shows why, in red, next to the field
@@ -840,24 +859,27 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-296 distinct tests. Run with `cargo test`.
+302 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints ~484 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 208 · bin 273 (the superset — adds cli/daemon/serve)
+> `cargo test` prints ~513 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 211 · bin 279 (the superset — adds cli/daemon/serve)
 > · smoke 23.
 
-**Unit tests (273)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (279)** — in-module `#[cfg(test)]` blocks:
 - `common/tmux.rs`: `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
   the `=` that stops tmux prefix/fnmatch-matching a session name onto a longer one, and the
   trailing `:` that makes a send-keys target a PANE (see **Conventions**)
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
   `parse_resume_id`), projects (incl. `unarchive` — worktree key, no-op when already active),
   persistence (escape/unescape, set/todo file roundtrips), registry
-  (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay), instances,
+  (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay,
+  `notify_override` applied from the sidecar + its by-id lookup / serde omission), instances,
   frozen, activity (incl. `entry_line` single-line/one-syscall invariant), config
   (`[web]` parse, defaults-off, legacy `[defaults]` ignored)
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
+- `cli/hook.rs`: `should_notify` — each mute level silences, and the per-conversation
+  override beats all of them (see **Mute**)
 - `cli/conversations.rs`: `build_active` bucketing (normal/other/skipped), bare-session
   surfacing, covered-window exclusion, `build_browse` archived visibility (project hidden on
   the full list, but never while one of its conversations is live) + name-matched
