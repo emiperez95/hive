@@ -1023,9 +1023,22 @@ impl ProjectDetailState {
         (frozen, closed)
     }
 
+    /// The 💤 screen — the one detail that isn't a project's working set but a
+    /// shelf of parked windows. It renders three-line cards instead of one-row
+    /// `conv_line`s, and it never pages (see `visible_convs`).
+    fn is_freeze_screen(&self) -> bool {
+        self.key == FROZEN_GROUP
+    }
+
     /// How many conversations the list shows: all of them, or the latest page.
+    ///
+    /// The 💤 screen is **never** capped. Paging exists so a project's config,
+    /// todos and worktrees aren't pushed off by a long conversation list — but
+    /// that screen has none of those competing for the space, the parked list is
+    /// the entire reason to open it, and a `… N more` row would hide exactly the
+    /// entry you froze in order not to forget it.
     fn visible_convs(&self) -> usize {
-        if self.show_all {
+        if self.show_all || self.is_freeze_screen() {
             self.convs.len()
         } else {
             self.convs.len().min(BROWSE_PAGE)
@@ -3318,8 +3331,15 @@ fn draw_project_detail(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
+        // On the 💤 screen every row is frozen, so "0 live · 6 closed" is both
+        // wrong (parked isn't closed) and redundant with the 💤 badge that used
+        // to follow it. One honest count instead.
         Span::styled(
-            format!("{live} live · {closed} closed"),
+            if state.key == FROZEN_GROUP {
+                format!("{} parked", state.convs.len())
+            } else {
+                format!("{live} live · {closed} closed")
+            },
             Style::default().add_modifier(Modifier::DIM),
         ),
     ];
@@ -3334,7 +3354,7 @@ fn draw_project_detail(
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if frozen > 0 {
+    if frozen > 0 && state.key != FROZEN_GROUP {
         title_spans.push(Span::raw("   "));
         title_spans.push(Span::styled(
             format!("💤 {frozen} frozen"),
@@ -3456,9 +3476,16 @@ fn draw_project_detail(
         }
     }
 
+    // The 💤 screen gets its own heading and the three-line card layout below.
+    // Every other screen keeps the uniform one-row `conv_line`.
+    let cards = state.is_freeze_screen();
     display.push(Line::raw(""));
     display.push(Line::from(Span::styled(
-        "  Conversations",
+        if cards {
+            format!("  Parked ({})", state.convs.len())
+        } else {
+            "  Conversations".to_string()
+        },
         Style::default().add_modifier(Modifier::BOLD),
     )));
     if state.convs.is_empty() {
@@ -3521,6 +3548,28 @@ fn draw_project_detail(
             let selected = state.sel == state.todos.len() + i;
             // On a bucket the rows span projects, so each says where it lives.
             let project = state.bucket.then(|| project_label(c, projects)).flatten();
+            if cards {
+                // Blank separator *between* cards only — one above the first would
+                // just double the gap under the section header.
+                if i > 0 {
+                    display.push(Line::raw(""));
+                }
+                display.extend(frozen_card(
+                    c,
+                    projects,
+                    selected,
+                    num,
+                    chunks[1].width as usize,
+                ));
+                // Anchor the item on the card's LAST line so scrolling down to it
+                // brings the whole card on screen, not just its headline (the same
+                // trick `archive_reason_line` needs below).
+                if let Some(reason) = archive_reason_line(c, selected) {
+                    display.push(reason);
+                }
+                *item_pos.last_mut().unwrap() = display.len() - 1;
+                continue;
+            }
             display.push(conv_line(
                 c,
                 &state.path,
@@ -3539,12 +3588,19 @@ fn draw_project_detail(
                 *item_pos.last_mut().unwrap() = display.len() - 1;
             }
         }
-        if let Some(more) = detail_more_line(
-            state.convs.len(),
-            state.visible_convs(),
-            "conversations",
-            state.show_all,
-        ) {
+        // No `… N more` row on the 💤 screen — `visible_convs` already drew the
+        // whole list there.
+        if let Some(more) = (!cards)
+            .then(|| {
+                detail_more_line(
+                    state.convs.len(),
+                    state.visible_convs(),
+                    "conversations",
+                    state.show_all,
+                )
+            })
+            .flatten()
+        {
             display.push(more);
         }
     }
@@ -3643,9 +3699,14 @@ fn draw_project_detail(
         ])
     } else if state.bucket {
         // A bucket owns nothing: no project to mute/archive, no worktrees to make,
-        // no "new conversation" target. Only the per-row actions apply.
+        // no "new conversation" target. Only the per-row actions apply. The 💤
+        // screen also drops `Tab show-all` — it has nothing left to reveal.
         Line::from(Span::styled(
-            " Enter thaw / switch · → detail · Tab show-all · Del discard · Esc back",
+            if state.is_freeze_screen() {
+                " Enter thaw / switch · → detail · Del discard · Esc back"
+            } else {
+                " Enter thaw / switch · → detail · Tab show-all · Del discard · Esc back"
+            },
             Style::default().fg(Color::DarkGray),
         ))
     } else if let Some(w) = &state.wt_info {
@@ -4451,6 +4512,172 @@ fn archive_reason_line(c: &Conversation, selected: bool) -> Option<Line<'static>
     };
     Some(Line::from(Span::styled(text, style)))
 }
+
+/// Left gutter of a frozen card: `  N  ` / `     `, the same 5 cells `conv_line`
+/// spends on its favourite star + quick-jump number, so both screens' markers
+/// land in the same column.
+const CARD_GUTTER: usize = 5;
+/// Where a card's text starts: the gutter plus the `💤 ` marker (2 cells + space).
+const CARD_INDENT: usize = CARD_GUTTER + 3;
+
+/// The note a frozen card leads with: the freeze note first (what you typed at
+/// `Z` time — the reason this is parked), then the generic overlay note, and
+/// failing both an explicit placeholder. The line is never dropped: a missing
+/// reason is information, and keeping all three lines keeps every card the same
+/// height, so the eye can scan down a column instead of re-finding it per row.
+fn card_note(c: &Conversation) -> (String, bool) {
+    let frozen = c.frozen.as_ref().map(|f| f.note.trim()).unwrap_or("");
+    if !frozen.is_empty() {
+        return (frozen.to_string(), true);
+    }
+    let overlay = c.note.trim();
+    if !overlay.is_empty() {
+        return (overlay.to_string(), true);
+    }
+    ("(no note)".to_string(), false)
+}
+
+/// A frozen conversation as a **three-line card**, for the `💤 frozen` screen
+/// only. Every other list renders conversations through `conv_line`, which packs
+/// the same fields onto one row — and on this screen that ordering is upside
+/// down: the note is the last column, so at popup width (`display-popup -w 80%`,
+/// ~100 cells) the terminal truncates away the one field that says *why* the
+/// window is parked, which is the entire reason freeze exists.
+///
+/// So this list gets its own shape, reading top-down in the order you ask the
+/// questions: **where it lives**, **why you parked it**, **what it was**.
+///
+/// ```text
+///   1  💤 📊 Avateen / sos-avatar                       [work]  frozen 45m ago
+///         SOS: Waiting for approval
+///         Branch from experiment crisis colombia · 4a44b59a
+/// ```
+///
+/// `width` is the body's cell width: the profile + age tail is right-aligned
+/// against it and the project label is fitted to whatever is left, so the tail
+/// stays readable instead of being the first thing cut.
+fn frozen_card(
+    c: &Conversation,
+    projects: &ProjectRegistry,
+    selected: bool,
+    num: Option<usize>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+
+    let head_base = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let col = |c: Color| {
+        if selected {
+            head_base
+        } else {
+            Style::default().fg(c)
+        }
+    };
+
+    // ── line 1: where it lives ────────────────────────────────────────────
+    let num_prefix = match num {
+        Some(n) => format!("{n} "),
+        None => "  ".to_string(),
+    };
+    let profile = env_label(c).map(|e| format!("[{e}]  ")).unwrap_or_default();
+    // Age is measured from the freeze, not the last message: on a parked window
+    // "I set this down 35 days ago" is the number that decides whether to thaw it
+    // or discard it. `last_activity` is the fallback for a synthetic entry.
+    let when = c
+        .frozen
+        .as_ref()
+        .map(|f| f.frozen_at.as_str())
+        .or(c.last_activity.as_deref())
+        .map(|t| format!("frozen {}", relative_time(t)))
+        .unwrap_or_else(|| "frozen".to_string());
+    let tail_w = profile.width() + when.width() + 1;
+    let label_w = width
+        .saturating_sub(CARD_INDENT + tail_w)
+        .max(MIN_CARD_LABEL);
+    let label = project_label(c, projects).unwrap_or_else(|| abbrev_home(&c.cwd));
+
+    let mut head = vec![
+        Span::styled(format!("  {num_prefix} "), head_base),
+        Span::styled("💤 ", head_base),
+        Span::styled(fit_cells(&label, label_w), col(Color::Cyan)),
+    ];
+    if !profile.is_empty() {
+        head.push(Span::styled(profile, col(Color::Magenta)));
+    }
+    head.push(Span::styled(
+        when,
+        if selected {
+            head_base
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        },
+    ));
+
+    // ── lines 2 & 3: why, then what ───────────────────────────────────────
+    // The selected card is marked by the reversed headline plus a bar in the
+    // gutter of its continuation lines — a three-row block of inverse video for
+    // one selection reads as a wall, and the bar is what ties the rows together
+    // as one card either way.
+    let bar = || -> Span<'static> {
+        if selected {
+            Span::styled("  ▌     ", Style::default().fg(Color::Blue))
+        } else {
+            Span::raw(" ".repeat(CARD_INDENT))
+        }
+    };
+    let body_w = width.saturating_sub(CARD_INDENT + 1);
+
+    let (note, has_note) = card_note(c);
+    let note_style = match (selected, has_note) {
+        // The note is the headline of the card's meaning — brightest row of the
+        // three when it exists, quiet and italic when it's the placeholder.
+        (true, _) => Style::default().add_modifier(Modifier::BOLD),
+        (false, true) => Style::default(),
+        (false, false) => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    };
+    let note_line = Line::from(vec![
+        bar(),
+        Span::styled(ellipsize(&note, body_w), note_style),
+    ]);
+
+    let title = c.title.as_deref().unwrap_or("").trim();
+    let title = if title.is_empty() {
+        "(untitled)"
+    } else {
+        title
+    };
+    // The id closes the card: it's what `claude --resume <id>` takes, so it's
+    // worth keeping — just not in the first column, where it was.
+    let id = short_id(c.id.as_str());
+    let conv = ellipsize(title, body_w.saturating_sub(id.width() + 3));
+    let conv_style = if selected {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    let conv_line = Line::from(vec![
+        bar(),
+        Span::styled(conv, conv_style),
+        Span::styled(
+            format!(" · {id}"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    ]);
+
+    vec![Line::from(head), note_line, conv_line]
+}
+
+/// Floor for the project column on a frozen card, so a narrow popup shrinks the
+/// label instead of collapsing it to nothing.
+const MIN_CARD_LABEL: usize = 12;
 
 #[allow(clippy::too_many_arguments)]
 fn conv_line(
@@ -5904,6 +6131,126 @@ mod tests {
         c
     }
 
+    /// Flatten a rendered `Line` back to its plain text, for asserting layout.
+    fn text_of(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Display width of a rendered line, in terminal cells (emoji count as two).
+    fn cells(s: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(s)
+    }
+
+    #[test]
+    fn test_card_note_prefers_the_freeze_reason() {
+        // The freeze note is what you typed at `Z` time — the reason this window
+        // is parked — so it wins over the generic overlay note. With neither, the
+        // line still renders: a missing reason is itself the answer, and dropping
+        // it would make cards different heights.
+        let mut c = mk_frozen("a", Some("hive"), None);
+        c.note = "overlay".to_string();
+        assert_eq!(card_note(&c), ("postponed".to_string(), true));
+
+        c.frozen.as_mut().unwrap().note = "   ".to_string();
+        assert_eq!(
+            card_note(&c),
+            ("overlay".to_string(), true),
+            "a blank freeze note falls through to the overlay note"
+        );
+
+        c.note = String::new();
+        assert_eq!(card_note(&c), ("(no note)".to_string(), false));
+    }
+
+    #[test]
+    fn test_frozen_card_is_three_lines_project_note_conversation() {
+        let mut reg = ProjectRegistry::default();
+        reg.projects.insert(
+            "hive".to_string(),
+            ProjectConfig {
+                emoji: "🐝".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut c = mk_frozen("4a44b59aXXXX", Some("hive"), None);
+        c.title = Some("Branch from experiment crisis colombia".to_string());
+
+        let card = frozen_card(&c, &reg, false, Some(1), 100);
+        assert_eq!(
+            card.len(),
+            3,
+            "always three lines, so cards scan as a column"
+        );
+
+        let lines: Vec<String> = card.iter().map(text_of).collect();
+        // Line 1 = where it lives, line 2 = why it's parked, line 3 = what it was.
+        assert!(
+            lines[0].contains("🐝 hive"),
+            "line 1 names the project: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("frozen "),
+            "line 1 carries the freeze age"
+        );
+        assert!(!lines[0].contains("postponed"), "the note is NOT on line 1");
+        assert_eq!(lines[1].trim(), "postponed");
+        assert!(lines[2].contains("Branch from experiment crisis colombia"));
+        assert!(
+            lines[2].contains("4a44b59a"),
+            "the resume id closes the card"
+        );
+
+        // The profile + age tail is right-aligned against the body width, so it's
+        // the project label that gives, never the age.
+        assert!(
+            cells(&lines[0]) <= 100,
+            "line 1 fits the given width: {} cells",
+            cells(&lines[0])
+        );
+    }
+
+    #[test]
+    fn test_frozen_card_falls_back_to_cwd_and_untitled() {
+        // No resolvable parent (an unregistered dir) and no transcript title: the
+        // card still says *something* locating in every slot rather than blanking.
+        let c = mk_frozen("b", None, None);
+        let lines: Vec<String> = frozen_card(&c, &ProjectRegistry::default(), false, None, 100)
+            .iter()
+            .map(text_of)
+            .collect();
+        assert!(
+            lines[0].contains("/home/u/hive"),
+            "falls back to the cwd: {:?}",
+            lines[0]
+        );
+        assert!(lines[2].contains("(untitled)"));
+    }
+
+    #[test]
+    fn test_frozen_card_keeps_the_age_readable_when_narrow() {
+        // The bug this layout exists to fix: at popup width the one-line row cut
+        // the note off. Here the project label shrinks to its floor and the tail
+        // survives instead.
+        let mut c = mk_frozen("c", Some("some-very-long-project-key-indeed"), None);
+        c.title = Some("t".to_string());
+        let lines: Vec<String> = frozen_card(&c, &ProjectRegistry::default(), false, Some(1), 44)
+            .iter()
+            .map(text_of)
+            .collect();
+        assert!(
+            lines[0].ends_with("ago"),
+            "the age survives: {:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains('…'), "the project label is what gives");
+        assert_eq!(
+            lines[1].trim(),
+            "postponed",
+            "the note is never truncated away"
+        );
+    }
+
     #[test]
     fn test_frozen_convs_sort_above_closed_and_section_off() {
         // Frozen == pending work you parked on purpose. Sorted below the closed pile
@@ -5971,6 +6318,47 @@ mod tests {
         state.convs = all.iter().filter(|c| c.is_frozen()).cloned().collect();
         assert_eq!(state.frozen_from(), None);
         assert_eq!(state.section_counts(), (1, 0));
+    }
+
+    #[test]
+    fn test_freeze_screen_is_never_capped() {
+        // Paging protects a project detail's config/todos/worktrees from a long
+        // conversation list. The 💤 screen has none of those competing for the
+        // space and exists solely to show the parked set, so it draws all of it —
+        // a `… N more` row there would hide the entry you froze *to remember it*.
+        let mut state = ProjectDetailState {
+            key: FROZEN_GROUP.to_string(),
+            worktrees: Vec::new(),
+            convs: (0..29)
+                .map(|i| mk_frozen(&format!("c{i}"), Some("cs"), None))
+                .collect(),
+            path: String::new(),
+            todos: Vec::new(),
+            sel: 0,
+            wt_input: None,
+            archive_input: None,
+            show_all: false,
+            wt_info: None,
+            bucket: true,
+        };
+        assert!(state.is_freeze_screen());
+        assert_eq!(
+            state.visible_convs(),
+            29,
+            "uncapped even with show_all off — Tab has nothing to reveal"
+        );
+        // The cursor reaches the last card, so every parked window is selectable.
+        assert_eq!(state.num_items(), 29);
+        state.sel = 28;
+        assert_eq!(
+            state.selected_conv().map(|c| c.id.as_str().to_string()),
+            Some("c28".to_string())
+        );
+
+        // A normal project detail with the same list still pages.
+        state.key = "cs".to_string();
+        assert!(!state.is_freeze_screen());
+        assert_eq!(state.visible_convs(), BROWSE_PAGE);
     }
 
     #[test]

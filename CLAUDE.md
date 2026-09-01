@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 302 tests (279 unit + 23 CLI smoke)
+cargo test                # 310 tests (287 unit + 23 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~513 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 279 unit + 23 smoke.
+> `cargo test` prints ~524 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 287 unit + 23 smoke.
 
 ## The TUI (conversation-first)
 
@@ -557,6 +557,45 @@ count. Enter on a frozen row thaws + switches to it; `Del` discards a frozen ent
 stays on disk). Frozen rows sit alongside the parent session row (which may still be live), not
 in place of it.
 
+### The 💤 screen is the one list that isn't one row per conversation
+
+Opening the `💤 frozen` bucket gives each entry a **three-line card** (`frozen_card`) instead of
+the shared one-row `conv_line`. It is the only screen that diverges, gated on
+`state.key == FROZEN_GROUP`; the `💤 Frozen (n)` section *inside* a normal project detail keeps
+one-liners, so frozen rows still read uniformly next to their live siblings.
+
+```
+  1  💤 📊 Avateen / sos-avatar                          [work]  frozen 45m ago
+  ▌     SOS: Waiting for approval
+  ▌     Branch from experiment crisis colombia · 4a44b59a
+```
+
+Top-down in the order you ask the questions: **where it lives**, **why you parked it**, **what it
+was**. `conv_line` puts the note last, so at popup width (`display-popup -w 80%`, ~100 cells) the
+terminal truncated away the one field that says why the window is parked — the entire reason
+freeze exists. You got `📝 SOS: W`.
+
+- The **profile + age tail is right-aligned** against the body width and the project label is
+  fitted (`fit_cells`) to what's left, so the label gives before the age does. Age comes from
+  `FrozenInfo::frozen_at`, not `last_activity` — on parked work "I set this down 35 days ago" is
+  the number that decides thaw-vs-discard.
+- **All three lines always render** (`card_note` falls back freeze note → overlay note →
+  `(no note)`; title falls back to `(untitled)`, project to the cwd). Fixed height is what lets
+  the eye scan a column instead of re-finding each field per row.
+- Selection is the **reversed headline plus a blue `▌` in the continuation lines' gutter** — three
+  rows of inverse video for one selection reads as a wall, and the bar binds the card either way.
+- `item_pos` anchors on the card's **last** line (the `archive_reason_line` trick), so scrolling
+  down to an entry brings the whole card on screen rather than just its headline.
+- The title bar reads `N parked` here, not `0 live · N closed` — parked isn't closed, and the
+  count made the `💤 N frozen` badge next to it redundant. The section heading is `Parked (n)`.
+- **It never pages.** `visible_convs()` returns the whole list when `is_freeze_screen()`, so
+  there's no `BROWSE_PAGE` cap, no `… N more` row, and `Tab show-all` is dropped from the footer
+  (it has nothing left to reveal). Paging exists to stop a long conversation list pushing a
+  project's config, todos and worktrees off screen — this screen has none of those competing for
+  the space, and hiding entries behind a More row would hide exactly the window you froze in
+  order not to forget it. `num_items()` follows, so the cursor reaches the last card and
+  scrolling brings it up whole.
+
 **Web**: same `frozen.rs` layer via `/api/frozen` (list), `/api/freeze`, `/api/thaw`,
 `/api/discard-frozen`. The info modal shows a per-window Freeze button (the window identity
 comes from the live `/api/active` `windows` array); a `FROZEN` section in the session list
@@ -859,13 +898,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-302 distinct tests. Run with `cargo test`.
+310 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints ~513 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 211 · bin 279 (the superset — adds cli/daemon/serve)
+> `cargo test` prints ~524 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 214 · bin 287 (the superset — adds cli/daemon/serve)
 > · smoke 23.
 
-**Unit tests (279)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (287)** — in-module `#[cfg(test)]` blocks:
 - `common/tmux.rs`: `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
   the `=` that stops tmux prefix/fnmatch-matching a session name onto a longer one, and the
   trailing `:` that makes a send-keys target a PANE (see **Conventions**)
@@ -893,7 +932,12 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   (hidden in `build_browse` unless live, `sort_project_convs` tail, `archived_from` /
   resume-last skipping them, `archive_reason_line`), frozen conversations sectioned above
   closed (`sort_project_convs` order, `frozen_from`/`closed_from`/`section_counts`, no header
-  on an all-frozen list), hint labels, `sh_quote`, new-project wizard validation
+  on an all-frozen list), the 💤 screen's three-line cards (`frozen_card` line order +
+  fixed height, cwd/`(untitled)` fallbacks, right-aligned age surviving a narrow width;
+  `card_note` preferring the freeze reason over the overlay note) and its uncapped list
+  (`is_freeze_screen` ⇒ `visible_convs`/`num_items` ignore `BROWSE_PAGE`, while a normal
+  project detail with the same list still pages), hint labels, `sh_quote`,
+  new-project wizard validation
   (`wizard_key_error` empty/duplicate, `wizard_path_error` empty)
 - `serve/metrics.rs`: Prometheus label escaping (reserved chars, emoji/space passthrough),
   `scalar` HELP/TYPE/sample shape, `render()` well-formedness (every non-comment line ends in a
