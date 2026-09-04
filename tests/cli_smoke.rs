@@ -109,6 +109,16 @@ fn wt_help_exits_zero() {
     }
 }
 
+/// `wt new` switches you into the new session; `--no-switch` is the opt-out that
+/// `/hive:fork-to-worktree` depends on, so the flag must stay on the help page.
+#[test]
+fn wt_new_help_lists_no_switch() {
+    let output = hive_cmd().args(["wt", "new", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--no-switch"), "Missing --no-switch flag");
+}
+
 #[test]
 fn todo_help_exits_zero() {
     let output = hive_cmd().args(["todo", "--help"]).output().unwrap();

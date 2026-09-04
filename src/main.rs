@@ -97,16 +97,27 @@ fn main() -> Result<()> {
                     prompt,
                     no_startup,
                     auto_approve,
-                } => cli::worktree::run_wt_new(
-                    &project,
-                    &branch,
-                    base.as_deref(),
-                    existing,
-                    &wt_type,
-                    prompt.as_deref(),
-                    auto_approve,
-                    no_startup,
-                ),
+                    no_switch,
+                } => {
+                    let session = cli::worktree::run_wt_new(
+                        &project,
+                        &branch,
+                        base.as_deref(),
+                        existing,
+                        &wt_type,
+                        prompt.as_deref(),
+                        auto_approve,
+                        no_startup,
+                    )?;
+                    // Branching off is choosing to work there, so land in it. Only when
+                    // we're inside tmux: `switch-client` with no current client falls back
+                    // to tmux's best guess, and yanking a client we aren't sitting at
+                    // (a script, a CI run, a bare terminal) is action at a distance.
+                    if !no_switch && std::env::var_os("TMUX").is_some() {
+                        crate::common::tmux::switch_to_session(&session);
+                    }
+                    Ok(())
+                }
                 WtCommand::Delete {
                     project,
                     branch,

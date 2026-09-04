@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 310 tests (287 unit + 23 CLI smoke)
+cargo test                # 311 tests (287 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~524 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 287 unit + 23 smoke.
+> bin targets and run twice. Distinct tests: 287 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -75,7 +75,8 @@ hive project remove <key> # remove a project from the registry
 hive project archive <key>   # archive a project (hide from picker + default list)
 hive project unarchive <key> # unarchive a project
 hive project list [--all]    # list configured projects (--all includes archived)
-hive wt new <project> <branch>  # create worktree + tmux session (with hooks)
+hive wt new <project> <branch>  # create worktree + tmux session (hooks), switch into it
+hive wt new <project> <branch> --no-switch  # …and stay where you are
 hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
 hive todo list [--session <name>] [--done]  # list active (or completed) todos
@@ -104,6 +105,26 @@ unauthenticated identity rather than erroring). The `N` wizard doesn't cover it.
 JSONL conversation lookup (`jsonl.rs`) searches across all `~/.claude*/projects/` dirs, so the TUI and web dashboard display conversations regardless of which profile created them.
 
 See `docs/claude-auth-profiles.md` for full setup guide.
+
+## Worktree creation switches you into it
+
+`hive wt new` ends by switching the tmux client to the session it just made — creating a
+worktree is choosing to work there, the same as `hive connect` or any TUI "start work
+here" action, and it's usually run *from another Claude window* (the janus agent), where
+being left behind in the window you asked from is the wrong place to be. `run_wt_new`
+returns the final session name for that: a `post-copy` hook can rename the session
+through the metadata protocol, so the caller can't derive it.
+
+Two guards keep it from acting at a distance:
+
+- **Only inside tmux** (`$TMUX` set). `switch-client` with no current client falls back to
+  tmux's best guess, so a script, a CI run, or a bare terminal would otherwise yank
+  whichever client happens to be attached.
+- **`--no-switch`** opts out — used by `/hive:fork-to-worktree`, whose whole contract is
+  that the conversation you forked from stays put.
+
+The TUI's `w` goes through `attach_or_switch` instead, so creating a worktree from a
+picker launched outside tmux (`hive start`) attaches rather than no-ops.
 
 ## Janus WT Portal
 
@@ -160,7 +181,7 @@ src/
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
 └── tests/
-    └── cli_smoke.rs        22 integration tests: CLI arg parsing, read-only commands, todo roundtrip
+    └── cli_smoke.rs        24 integration tests: CLI arg parsing, read-only commands, todo roundtrip
 ```
 
 (The classic session-first TUI lived in `src/tui/` — removed in the cutover; see git history
@@ -898,11 +919,11 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-310 distinct tests. Run with `cargo test`.
+311 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~524 passing: `common/` + `ipc/` compile into **both** the lib and bin
 > targets and run twice. Per target: lib 214 · bin 287 (the superset — adds cli/daemon/serve)
-> · smoke 23.
+> · smoke 24.
 
 **Unit tests (287)** — in-module `#[cfg(test)]` blocks:
 - `common/tmux.rs`: `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
@@ -946,13 +967,14 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   blocked-vs-working split, closed convs contributing no status/resources, auth-profile
   defaulting, payload-free status labels)
 
-**Integration tests (23)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (24)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
 - Todo full roundtrip (add → list → next → done → clear)
 - Project archive roundtrip (add → archive → list hides → `--all` shows → unarchive), isolated via a temp `$HOME`
 - `--auth-profile` persists to `projects.toml`, and is absent from the TOML when the flag is omitted
+- `wt new --help` still lists `--no-switch` (the opt-out `/hive:fork-to-worktree` relies on)
 
 No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test
 infrastructure) — hence the pure `build_active`/`build_browse` functions take their tmux/flag

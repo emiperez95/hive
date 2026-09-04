@@ -1642,9 +1642,14 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
         }
         Action::Spread(n) => crate::cli::session::run_spread(n)?,
         Action::Collapse => crate::cli::session::run_collapse()?,
-        Action::WtNew(project, branch) => crate::cli::worktree::run_wt_new(
-            &project, &branch, None, false, "worktree", None, false, false,
-        )?,
+        Action::WtNew(project, branch) => {
+            // A worktree you just created is where you meant to go — land in it, the
+            // same as every other "start work here" action in this view.
+            let session = crate::cli::worktree::run_wt_new(
+                &project, &branch, None, false, "worktree", None, false, false,
+            )?;
+            attach_or_switch(&session);
+        }
         Action::WtDelete(project, branch) => {
             crate::cli::worktree::run_wt_delete(&project, &branch, false, false)?
         }

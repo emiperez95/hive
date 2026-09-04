@@ -148,9 +148,14 @@ hive project list
 
 ```bash
 hive wt new <project> <branch>    # create worktree + tmux session (with hooks)
+hive wt new <project> <branch> --no-switch  # don't switch into the new session
 hive wt delete <project> <branch> # delete worktree + session + branch
 hive wt list [project]            # list registered worktrees with status
 ```
+
+Creating a worktree switches your tmux client into its session once it's ready (only when
+you're inside tmux — `--no-switch` opts out).
+
 
 ### Todos
 

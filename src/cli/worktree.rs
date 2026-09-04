@@ -7,7 +7,11 @@ use crate::common::projects::{activate_project, expand_tilde, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session};
 use crate::common::worktree::*;
 
-/// Create a new worktree: full 12-step workflow with hooks
+/// Create a new worktree: full 12-step workflow with hooks.
+///
+/// Returns the final tmux session name — a `post-copy` hook can override it via the
+/// metadata protocol, so the caller can't derive it — which is what lets callers
+/// switch you into the worktree once it's ready.
 #[allow(clippy::too_many_arguments)]
 pub fn run_wt_new(
     project: &str,
@@ -18,7 +22,7 @@ pub fn run_wt_new(
     prompt: Option<&str>,
     auto_approve: bool,
     no_startup: bool,
-) -> Result<()> {
+) -> Result<String> {
     use anyhow::Context;
 
     // 1. Load project config, resolve worktrees dir, build default session name
@@ -215,7 +219,7 @@ pub fn run_wt_new(
 
     println!("Ready: session '{}'", session_name);
 
-    Ok(())
+    Ok(session_name)
 }
 
 /// Delete a worktree: full 7-step workflow with hooks

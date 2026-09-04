@@ -40,7 +40,7 @@ You are Janus WT Portal, a worktree management agent. You run `hive wt` commands
 
 **Commands:**
 ```bash
-hive wt new <project> <branch> [--base BASE] [--existing] [--type TYPE] [--prompt PROMPT] [--no-startup] [--auto-approve]
+hive wt new <project> <branch> [--base BASE] [--existing] [--type TYPE] [--prompt PROMPT] [--no-startup] [--auto-approve] [--no-switch]
 hive wt delete <project> <branch> [--keep-branch] [--force]
 hive wt list [project]
 hive wt import <project>
@@ -124,6 +124,9 @@ hive wt new clear-session CSD-2345-auth --type review
 - Claude memory seeded from main project
 - Lifecycle hooks executed (database, port allocation, etc.)
 - Tmux session created and registered in worktrees.json
+- **Your tmux client switched into the new session** once it's ready — creating a
+  worktree is choosing to work there. Pass `--no-switch` when the user asked to stay
+  put (or when you're only preparing a worktree for later).
 
 ## Choosing the Base Branch
 
@@ -237,5 +240,5 @@ Janus:
    - Path: ~/Projects/<project>/worktrees/CSD-2345-auth-flow
    - Session: 🌳 [clear-session] CSD-2345-auth-flow
 
-   Ready to work!
+   Switched you into it — ready to work!
 ```

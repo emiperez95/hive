@@ -271,6 +271,9 @@ pub enum WtCommand {
         /// Enable auto-approve for the new session
         #[arg(long)]
         auto_approve: bool,
+        /// Stay where you are instead of switching the tmux client to the new session
+        #[arg(long)]
+        no_switch: bool,
     },
     /// Delete a worktree and its associated resources
     Delete {
