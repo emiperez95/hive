@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 311 tests (287 unit + 24 CLI smoke)
+cargo test                # 317 tests (293 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~524 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 287 unit + 24 smoke.
+> `cargo test` prints ~537 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 293 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -570,6 +570,29 @@ Freeze works because Claude persists every conversation to JSONL on disk.
 Window enumeration at freeze time uses `instances::instances_for_session` (builds the process
 table + hook index on demand — fine for a one-shot action).
 
+### Thaw restores by CWD, not by the recorded session name
+
+`FrozenEntry.session_name` is where the window was *running* when frozen — that is what
+`kill-window` must target, so freeze records it as observed. It is **not** where thaw puts the
+window back. `restore_session_name` resolves the parent that owns `entry.cwd`
+(`registry::resolve_parent_session_name` → the worktree's registered `session_name`, else the
+project's derived one) and only falls back to the recorded name for a cwd nothing claims.
+
+Two ways the two diverge:
+
+- The pair is built from two different sources and nothing forces them to agree —
+  `freeze_target_of` takes `session_name`/`window_index` from the live **tmux placement** and
+  `cwd` from the **hook payload**. A pane sitting in one worktree's session with its shell cwd
+  in another (or a window opened in the wrong session) is recorded faithfully, then replayed:
+  right transcript, right directory, wrong session. That is the bug this fixes — a sos-avatar
+  conversation reopening inside `📊 [avateen] live-avatar`.
+- An entry can sit parked for weeks while sessions around it are killed, recreated and
+  renamed, so a name captured at freeze time is stale by construction. The cwd is durable.
+
+Freeze logs the divergence via `debug_log` at the moment it appears (`--debug`), since that is
+the point where it is diagnosable; the entry itself keeps the observed name as the record of
+where the window actually was.
+
 **TUI**: `Z` in the detail view freezes a Claude window — if the session has several, a window
 picker (`FreezeWindowPick`) appears first; then a note prompt (`FreezeNote`). Frozen windows
 are pinned as a `💤 … [frozen]` group at the top of the search picker (`/`), showing
@@ -919,13 +942,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-311 distinct tests. Run with `cargo test`.
+317 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints ~524 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 214 · bin 287 (the superset — adds cli/daemon/serve)
+> `cargo test` prints ~537 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 220 · bin 293 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
-**Unit tests (287)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (293)** — in-module `#[cfg(test)]` blocks:
 - `common/tmux.rs`: `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
   the `=` that stops tmux prefix/fnmatch-matching a session name onto a longer one, and the
   trailing `:` that makes a send-keys target a PANE (see **Conventions**)
@@ -933,8 +956,11 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   `parse_resume_id`), projects (incl. `unarchive` — worktree key, no-op when already active),
   persistence (escape/unescape, set/todo file roundtrips), registry
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay,
-  `notify_override` applied from the sidecar + its by-id lookup / serde omission), instances,
-  frozen, activity (incl. `entry_line` single-line/one-syscall invariant), config
+  `notify_override` applied from the sidecar + its by-id lookup / serde omission,
+  `resolve_parent_session_name` — the worktree's registered name over the project's,
+  subdirectories, unclaimed cwd), instances, frozen (incl. `restore_session_name`: the
+  cwd's owner beats the recorded session name, agreeing entries unchanged, unclaimed cwd
+  falls back), activity (incl. `entry_line` single-line/one-syscall invariant), config
   (`[web]` parse, defaults-off, legacy `[defaults]` ignored)
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle

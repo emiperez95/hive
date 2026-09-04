@@ -199,6 +199,24 @@ pub fn freeze_window(target: &FreezeTarget, note: &str) -> Result<String> {
     state.frozen.insert(key.clone(), entry);
     state.save()?;
 
+    // `session_name` here is where the window is RUNNING (the live tmux placement) — that
+    // is what `kill-window` below must target, so it is recorded as observed. When it
+    // disagrees with the parent that owns the cwd, say so: thaw restores by the cwd's
+    // owner (see `restore_session_name`), and this is the moment the divergence appears.
+    let owner = crate::common::registry::resolve_parent_session_name(
+        &target.cwd,
+        &crate::common::worktree::WorktreeState::load(),
+        &crate::common::projects::ProjectRegistry::load(),
+    );
+    if let Some(owner) = owner {
+        if owner != target.session_name {
+            crate::common::debug::debug_log(&format!(
+                "freeze: window is in session '{}' but cwd '{}' belongs to '{}' — thaw will restore to the owner",
+                target.session_name, target.cwd, owner
+            ));
+        }
+    }
+
     // This window now lives in frozen.json; drop it from the "currently open" recovery
     // snapshot so it isn't double-listed, and log the freeze.
     if let Some(sid) = &target.claude_session_id {
@@ -222,6 +240,30 @@ pub fn freeze_window(target: &FreezeTarget, note: &str) -> Result<String> {
     Ok(key)
 }
 
+/// Where a frozen window should be restored TO.
+///
+/// `entry.session_name` records where the window happened to be *running* when it was
+/// frozen, which is not always where the conversation belongs: a pane can sit in one
+/// worktree's tmux session with its shell cwd in another (freeze captures the session
+/// from the live tmux placement and the cwd from the hook payload, and nothing forces
+/// them to agree). Restoring by that name reopens the conversation under a sibling
+/// worktree — the right transcript, the right directory, the wrong session. The name
+/// also simply goes stale: an entry can sit parked for weeks while sessions are killed,
+/// recreated and renamed around it.
+///
+/// The cwd is the durable fact, so the owning parent's session name wins; the recorded
+/// name stays as the fallback for a cwd no project or worktree claims.
+///
+/// Pure (states passed in) so the divergent case is unit-testable without tmux.
+pub fn restore_session_name(
+    entry: &FrozenEntry,
+    worktrees: &crate::common::worktree::WorktreeState,
+    projects: &crate::common::projects::ProjectRegistry,
+) -> String {
+    crate::common::registry::resolve_parent_session_name(&entry.cwd, worktrees, projects)
+        .unwrap_or_else(|| entry.session_name.clone())
+}
+
 /// Thaw a frozen window: re-add it to its session (or recreate the session) and resume.
 ///
 /// Returns the session name to switch to. The entry is removed only on success.
@@ -233,6 +275,20 @@ pub fn thaw_window(key: &str) -> Result<String> {
         .cloned()
         .ok_or_else(|| anyhow!("no frozen window for key '{key}'"))?;
 
+    // Restore by the cwd's owner, not by where the window happened to live at freeze
+    // time — see `restore_session_name`.
+    let session_name = restore_session_name(
+        &entry,
+        &crate::common::worktree::WorktreeState::load(),
+        &crate::common::projects::ProjectRegistry::load(),
+    );
+    if session_name != entry.session_name {
+        crate::common::debug::debug_log(&format!(
+            "thaw: '{}' owns cwd '{}'; frozen entry recorded session '{}' — restoring to the owner",
+            session_name, entry.cwd, entry.session_name
+        ));
+    }
+
     let startup = match &entry.claude_session_id {
         Some(id) => format!("claude --resume {id}"),
         None => "claude -c".to_string(),
@@ -240,7 +296,7 @@ pub fn thaw_window(key: &str) -> Result<String> {
 
     // Exact match — a bare `-t` prefix-matches a longer session name (see `tmux::exact`),
     // which would thaw the window into a different project's session.
-    let tmux_target = crate::common::tmux::exact(&entry.session_name);
+    let tmux_target = crate::common::tmux::exact(&session_name);
     let session_alive = Command::new("tmux")
         .args(["has-session", "-t", &tmux_target])
         .output()
@@ -264,7 +320,7 @@ pub fn thaw_window(key: &str) -> Result<String> {
         if !ok {
             return Err(anyhow!(
                 "Failed to add window to session '{}'",
-                entry.session_name
+                session_name
             ));
         }
         // new-window makes the new window active; send the resume command to its
@@ -273,7 +329,7 @@ pub fn thaw_window(key: &str) -> Result<String> {
             .args([
                 "send-keys",
                 "-t",
-                &crate::common::tmux::exact_active_pane(&entry.session_name),
+                &crate::common::tmux::exact_active_pane(&session_name),
                 &startup,
                 "Enter",
             ])
@@ -284,20 +340,17 @@ pub fn thaw_window(key: &str) -> Result<String> {
             Some(dir) => vec![("CLAUDE_CONFIG_DIR".to_string(), dir.clone())],
             None => Vec::new(),
         };
-        if !ensure_tmux_session(&entry.session_name, &entry.cwd, Some(&startup), &env) {
-            return Err(anyhow!(
-                "Failed to recreate session '{}'",
-                entry.session_name
-            ));
+        if !ensure_tmux_session(&session_name, &entry.cwd, Some(&startup), &env) {
+            return Err(anyhow!("Failed to recreate session '{}'", session_name));
         }
     }
 
     state.frozen.remove(key);
     state.save()?;
     if let Some(sid) = &entry.claude_session_id {
-        crate::common::activity::log_window_thaw(sid, &entry.session_name);
+        crate::common::activity::log_window_thaw(sid, &session_name);
     }
-    Ok(entry.session_name)
+    Ok(session_name)
 }
 
 /// Discard a frozen window without restoring it (conversation history stays on disk).
@@ -330,6 +383,67 @@ pub fn relative_time(rfc3339: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::common::projects::{ProjectConfig, ProjectRegistry};
+    use crate::common::worktree::{WorktreeEntry, WorktreeState};
+
+    /// Two worktrees of one project, each with its own registered tmux session — the
+    /// shape that produced the real mis-restore (a sos-avatar conversation frozen from
+    /// a window living in the live-avatar session).
+    fn avateen_worktrees() -> WorktreeState {
+        let mut w = WorktreeState::default();
+        for branch in ["sos-avatar", "live-avatar"] {
+            let e: WorktreeEntry = serde_json::from_str(&format!(
+                r#"{{"project_key":"avateen","branch":"{branch}","worktree_type":"worktree","path":"/home/u/wt/avateen/{branch}","session_name":"📊 [avateen] {branch}","created_at":""}}"#
+            ))
+            .unwrap();
+            w.worktrees
+                .insert(WorktreeState::make_key("avateen", branch), e);
+        }
+        w
+    }
+
+    fn avateen_projects() -> ProjectRegistry {
+        let mut r = ProjectRegistry::default();
+        let c: ProjectConfig =
+            serde_json::from_str(r#"{"emoji":"📊","project_root":"/home/u/avateen"}"#).unwrap();
+        r.projects.insert("avateen".to_string(), c);
+        r
+    }
+
+    #[test]
+    fn test_restore_session_prefers_cwd_owner_over_recorded_session() {
+        // Recorded: running in live-avatar's session. Real home: sos-avatar (the cwd).
+        // Restoring by the recorded name reopens the conversation under the wrong
+        // worktree — the whole point of resolving from the cwd instead.
+        let mut e = entry("📊 [avateen] live-avatar", "1", Some("abc"), "");
+        e.cwd = "/home/u/wt/avateen/sos-avatar".to_string();
+        assert_eq!(
+            restore_session_name(&e, &avateen_worktrees(), &avateen_projects()),
+            "📊 [avateen] sos-avatar"
+        );
+    }
+
+    #[test]
+    fn test_restore_session_agreeing_entry_is_unchanged() {
+        let mut e = entry("📊 [avateen] sos-avatar", "1", Some("abc"), "");
+        e.cwd = "/home/u/wt/avateen/sos-avatar/avatar-lab".to_string();
+        assert_eq!(
+            restore_session_name(&e, &avateen_worktrees(), &avateen_projects()),
+            "📊 [avateen] sos-avatar"
+        );
+    }
+
+    #[test]
+    fn test_restore_session_falls_back_when_cwd_unclaimed() {
+        // No project or worktree owns the cwd — the recorded name is all we have.
+        let mut e = entry("scratch", "1", Some("abc"), "");
+        e.cwd = "/totally/foreign/path".to_string();
+        assert_eq!(
+            restore_session_name(&e, &avateen_worktrees(), &avateen_projects()),
+            "scratch"
+        );
+    }
 
     fn entry(session: &str, window_idx: &str, sid: Option<&str>, ts: &str) -> FrozenEntry {
         FrozenEntry {

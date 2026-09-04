@@ -468,6 +468,32 @@ pub fn resolve_parent(
         .map(|(_, _, key)| key)
 }
 
+/// Resolve a cwd to the tmux session name of the parent that OWNS it: the registered
+/// worktree's session name (authoritative — a `post-copy` hook may have renamed it),
+/// else the project's derived session name. `None` for a cwd no parent claims.
+///
+/// This answers "where does work in this directory belong?", which is a different
+/// question from "where was this window running?" — a pane can sit in one worktree's
+/// session with its shell cwd in another. Callers restoring work (see
+/// [`crate::common::frozen::restore_session_name`]) want ownership, not the last
+/// observed placement.
+pub fn resolve_parent_session_name(
+    cwd: &str,
+    worktrees: &WorktreeState,
+    projects: &ProjectRegistry,
+) -> Option<String> {
+    let key = resolve_parent(cwd, worktrees, projects)?;
+    // Worktrees first: a worktree key (`project/branch`) can't collide with a project
+    // key, and its stored session_name outranks anything we could rebuild.
+    if let Some(entry) = worktrees.worktrees.get(&key) {
+        return Some(entry.session_name.clone());
+    }
+    projects
+        .projects
+        .get(&key)
+        .map(|config| ProjectRegistry::session_name(&key, config))
+}
+
 /// The persisted parent is authoritative; the local resolver is a fallback only,
 /// so a session's parent, once cached, is never re-derived from a shifting cwd.
 pub fn effective_parent(
@@ -1002,6 +1028,66 @@ mod tests {
             r.projects.insert(key.to_string(), project(root));
         }
         r
+    }
+
+    /// Like `wts_with`, but with each worktree's registered tmux session name — the
+    /// field `resolve_parent_session_name` returns.
+    fn wts_named(entries: &[(&str, &str, &str, &str)]) -> WorktreeState {
+        let mut w = WorktreeState::default();
+        for (pk, br, path, session) in entries {
+            let mut e = worktree(pk, br, path);
+            e.session_name = session.to_string();
+            w.worktrees.insert(WorktreeState::make_key(pk, br), e);
+        }
+        w
+    }
+
+    #[test]
+    fn test_parent_session_name_prefers_worktree_registered_name() {
+        // The stored session_name wins: a `post-copy` hook may have renamed it, so it
+        // can't be rebuilt from the project config.
+        let wts = wts_named(&[
+            (
+                "avateen",
+                "sos-avatar",
+                "/home/u/wt/avateen/sos-avatar",
+                "📊 [avateen] sos-avatar",
+            ),
+            (
+                "avateen",
+                "live-avatar",
+                "/home/u/wt/avateen/live-avatar",
+                "📊 [avateen] live-avatar",
+            ),
+        ]);
+        let projs = projs_with(&[("avateen", "/home/u/avateen")]);
+        assert_eq!(
+            resolve_parent_session_name("/home/u/wt/avateen/sos-avatar", &wts, &projs),
+            Some("📊 [avateen] sos-avatar".to_string())
+        );
+        // A subdirectory resolves to the same owner (component-wise prefix).
+        assert_eq!(
+            resolve_parent_session_name("/home/u/wt/avateen/sos-avatar/avatar-lab", &wts, &projs),
+            Some("📊 [avateen] sos-avatar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parent_session_name_falls_back_to_project() {
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            resolve_parent_session_name("/home/u/hive/src", &WorktreeState::default(), &projs),
+            Some("🐝 hive".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parent_session_name_none_for_unclaimed_cwd() {
+        let projs = projs_with(&[("hive", "/home/u/hive")]);
+        assert_eq!(
+            resolve_parent_session_name("/totally/foreign/path", &WorktreeState::default(), &projs),
+            None
+        );
     }
 
     #[test]
