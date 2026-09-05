@@ -12,7 +12,7 @@ use crate::common::persistence::{
 use crate::common::projects::{connect_project, ProjectRegistry};
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
 use crate::serve::server::{build_conversation_views, gather_active_views};
-use crate::serve::web_types::{ConversationMessage, ConversationView, SessionView, ToolSummary};
+use crate::serve::web_types::{ConversationMessage, ConversationView, SessionView};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -275,26 +275,27 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         });
 
                     if let Some((cwd, session_id)) = source {
-                        let messages: Vec<ConversationMessage> =
+                        let mut messages: Vec<ConversationMessage> =
                             crate::common::jsonl::get_conversation_messages_for(
                                 &cwd,
                                 session_id.as_deref(),
                             )
                             .into_iter()
-                            .map(|m| ConversationMessage {
-                                role: m.role,
-                                text: m.text,
-                                tools: m
-                                    .tools
-                                    .into_iter()
-                                    .map(|t| ToolSummary {
-                                        name: t.name,
-                                        summary: t.summary,
-                                        detail: t.detail,
-                                    })
-                                    .collect(),
-                            })
+                            .map(ConversationMessage::from)
                             .collect();
+                        // In-flight launches have no transcript entry, so they ride along
+                        // as synthetic trailing entries — the live cards at the end of the
+                        // chat. Only for a session we just resolved as live: an unmatched
+                        // launch is otherwise permanent (a killed Claude never sends its
+                        // notification) and would claim "running" forever.
+                        messages.extend(
+                            crate::common::jsonl::get_running_tasks_for(
+                                &cwd,
+                                session_id.as_deref(),
+                            )
+                            .into_iter()
+                            .map(ConversationMessage::running_card),
+                        );
                         serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string())
                     } else {
                         "[]".to_string()

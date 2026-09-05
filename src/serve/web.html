@@ -429,6 +429,67 @@
     text-align: right;
   }
 
+  /* Workflow cards. A background launch and its completion are the two ends of one
+     thing that can be hours apart in the scroll, so they share a look: the launch and
+     the running card sit where they belong chronologically, and the completion lands
+     where the notification actually arrived. Full width — these are reports, not
+     something anyone said, so they don't belong in either speech lane. */
+  .chat-msg.workflow, .chat-msg.report { align-self: stretch; max-width: 100%; }
+  .wf-card {
+    border: 1px solid rgba(194, 198, 214, 0.28);
+    border-radius: 12px;
+    background: var(--surface-container-lowest);
+    padding: 12px 14px;
+  }
+  .wf-card.running {
+    background: color-mix(in srgb, var(--primary) 7%, var(--surface-container-lowest));
+    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
+  }
+  .wf-card.failed {
+    background: color-mix(in srgb, var(--error) 7%, var(--surface-container-lowest));
+    border-color: color-mix(in srgb, var(--error) 38%, transparent);
+  }
+  .wf-head { display: flex; align-items: center; gap: 8px; }
+  .wf-name { font-weight: 700; font-size: 13.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wf-elapsed { font-size: 11px; font-weight: 600; color: var(--on-surface-variant); font-variant-numeric: tabular-nums; }
+  .wf-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--primary); flex: none;
+    animation: wf-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .wf-pill {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 2px 8px; border-radius: 999px; flex: none;
+    background: color-mix(in srgb, var(--secondary) 18%, transparent); color: var(--secondary);
+  }
+  .wf-pill.failed, .wf-pill.killed { background: color-mix(in srgb, var(--error) 15%, transparent); color: var(--error); }
+  /* A workflow reports "completed" with dead agents inside it — the one thing in the
+     usage block with no other surface anywhere in hive. */
+  .wf-warn {
+    font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 999px; flex: none;
+    background: color-mix(in srgb, var(--error) 14%, transparent); color: var(--error);
+  }
+  .wf-desc { font-size: 12.5px; color: var(--on-surface-variant); margin-top: 6px; line-height: 1.45; }
+  .wf-stats { font-size: 11.5px; color: var(--on-surface-variant); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .wf-phases { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+  .wf-phase {
+    font-size: 10.5px; font-weight: 600; padding: 3px 9px; border-radius: 6px;
+    background: var(--surface-container); color: var(--on-surface-variant);
+  }
+  .wf-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .wf-btn {
+    flex: 1; padding: 7px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid rgba(194, 198, 214, 0.35); background: var(--surface-container-lowest);
+    color: var(--primary); font-size: 12px; font-weight: 600;
+  }
+  .wf-result h2 { font-size: 14px; margin: 14px 0 6px; }
+  .wf-result h2:first-child { margin-top: 0; }
+  .wf-result .wf-key {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--primary); margin: 16px 0 6px;
+  }
+  .wf-result .wf-key:first-child { margin-top: 0; }
+
   .chat-empty {
     flex: 1;
     display: flex;
@@ -2163,15 +2224,140 @@ function renderToolCards(tools) {
   return tools.map((t) => {
     const id = 'td_' + Math.random().toString(36).slice(2, 10);
     toolDetailStore[id] = { name: t.name, detail: t.detail };
+    // A Workflow launch names the workflow and lists the plan it's about to run.
+    // Same card + click delegation as any tool, so tapping still opens the detail —
+    // which for a workflow is the script rather than the input JSON.
+    const phases = t.workflow && t.workflow.phases && t.workflow.phases.length
+      ? `<div class="wf-phases">${t.workflow.phases.map(p => `<span class="wf-phase">${esc(p.title)}</span>`).join('')}</div>`
+      : '';
+    const title = t.workflow ? `Workflow · ${esc(t.workflow.name)}` : esc(t.name);
     return `<div class="tool-card" data-tool-id="${id}">
       <div class="tool-icon ${toolIconClass(t.name)}"><span class="material-symbols-outlined">${toolIconName(t.name)}</span></div>
       <div class="tool-info">
-        <div class="tool-name">${esc(t.name)}</div>
+        <div class="tool-name">${title}</div>
         <div class="tool-summary">${esc(t.summary)}</div>
+        ${phases}
       </div>
       <span class="material-symbols-outlined tool-chevron">chevron_right</span>
     </div>`;
   }).join('');
+}
+
+// --- Workflow / background-task cards ---
+const wfResultStore = {};
+
+function wfDuration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  return h + 'h' + String(m % 60).padStart(2, '0') + 'm';
+}
+
+function wfTokens(n) {
+  if (!n) return '';
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (n >= 1e3) return Math.round(n / 1e3) + 'k';
+  return String(n);
+}
+
+// The notification summary reads `Dynamic workflow "<the real title>" completed`.
+function wfTitleFrom(summary) {
+  const m = summary && summary.match(/"([^"]{3,})"/);
+  return m ? m[1] : (summary || 'Background task');
+}
+
+// A launch that hasn't reported back. No transcript entry exists for it, so the
+// server appends it after the last message — see ConversationMessage.role.
+function renderRunningCard(r) {
+  if (!r) return '';
+  const progress = r.agents_started != null
+    ? `${r.agents_done || 0} / ${r.agents_started} agents`
+    : '';
+  const phases = (r.phases || []).map(p => `<span class="wf-phase">${esc(p.title)}</span>`).join('');
+  return `<div class="chat-msg workflow">
+    <div class="wf-card running">
+      <div class="wf-head">
+        <span class="wf-dot"></span>
+        <span class="wf-name">${esc(r.label || r.kind || 'workflow')}</span>
+        <span class="wf-elapsed" data-start="${esc(r.started_at || '')}"></span>
+      </div>
+      ${r.description ? `<div class="wf-desc">${esc(r.description)}</div>` : ''}
+      ${progress ? `<div class="wf-stats">${esc(progress)}</div>` : ''}
+      ${phases ? `<div class="wf-phases">${phases}</div>` : ''}
+    </div>
+  </div>`;
+}
+
+// The completion report, in place of the ~10KB of raw <task-notification> XML that
+// used to render here as a chat bubble.
+function renderTaskCard(t) {
+  const status = (t.status || '').toLowerCase();
+  const bad = status === 'failed' || status === 'killed';
+  const u = t.usage;
+  const warn = u && u.agents_error
+    ? `<span class="wf-warn">${u.agents_error} failed</span>` : '';
+  const stats = u ? [
+    u.agent_count ? `${u.agent_count} agent${u.agent_count === 1 ? '' : 's'}` : '',
+    u.agents_done ? `${u.agents_done} done` : '',
+    u.subagent_tokens ? wfTokens(u.subagent_tokens) + ' tokens' : '',
+    u.tool_uses ? `${u.tool_uses} tool calls` : '',
+    u.duration_ms ? wfDuration(u.duration_ms) : '',
+  ].filter(Boolean).join(' · ') : '';
+  const id = 'wf_' + Math.random().toString(36).slice(2, 10);
+  wfResultStore[id] = t;
+  return `<div class="chat-msg report">
+    <div class="wf-card ${bad ? 'failed' : ''}">
+      <div class="wf-head">
+        <span class="wf-pill ${bad ? status : ''}">${esc(t.status || 'done')}</span>
+        <span class="wf-name">${esc(wfTitleFrom(t.summary))}</span>
+        ${warn}
+      </div>
+      ${stats ? `<div class="wf-stats">${esc(stats)}</div>` : ''}
+      ${t.result ? `<div class="wf-actions"><button class="wf-btn" onclick="openWfResult('${id}')">View result</button></div>` : ''}
+    </div>
+  </div>`;
+}
+
+// Elapsed ticks client-side from the launch timestamp. Deliberately NOT sent by the
+// server: fetchMessages skips re-rendering when the JSON is byte-identical, and a
+// server-side clock would differ every 2s and re-render the whole chat each poll.
+function tickElapsed() {
+  for (const el of document.querySelectorAll('.wf-elapsed[data-start]')) {
+    const t = Date.parse(el.dataset.start);
+    el.textContent = isNaN(t) ? '' : wfDuration(Date.now() - t);
+  }
+}
+setInterval(tickElapsed, 1000);
+
+function openWfResult(id) {
+  const t = wfResultStore[id];
+  if (!t) return;
+  document.getElementById('modalTitle').textContent = 'Workflow result';
+  const mc = document.getElementById('modalContent');
+  let html = '';
+  let parsed = null;
+  try { parsed = JSON.parse(t.result); } catch (e) { /* plain text result */ }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    // A workflow returns an object whose values are usually markdown reports —
+    // render each key as its own section rather than dumping JSON.
+    html = Object.entries(parsed).map(([k, v]) => {
+      const body = typeof v === 'string'
+        ? renderMarkdown(v)
+        : `<pre>${esc(JSON.stringify(v, null, 2))}</pre>`;
+      return `<div class="wf-key">${esc(k)}</div>${body}`;
+    }).join('');
+  } else {
+    html = t.result ? renderMarkdown(t.result) : '<div class="loading">No result payload</div>';
+  }
+  if (t.output_file) {
+    html += `<div class="stats-note">Full output: ${esc(t.output_file)}</div>`;
+  }
+  mc.innerHTML = `<div class="wf-result">${html}</div>`;
+  if (window.Prism) Prism.highlightAllUnder(mc);
+  document.getElementById('toolModal').classList.add('active');
+  history.pushState({ view: 'modal' }, '');
 }
 
 // Compute unified diff between two arrays of lines using LCS
@@ -2213,6 +2399,11 @@ function unifiedDiffHtml(oldLines, newLines) {
 
 function renderModalContent(name, detail) {
   const toolType = name.toLowerCase();
+
+  if (toolType === 'workflow') {
+    // The script itself — the plan in its most literal form.
+    return `<pre><code class="language-javascript">${esc(detail)}</code></pre>`;
+  }
 
   if (toolType === 'bash' || toolType === 'task') {
     return `<div class="tool-section-header">
@@ -2624,6 +2815,10 @@ function renderMessages() {
   } else {
     let prevRole = '';
     chatArea.innerHTML = currentMessages.map((m, idx) => {
+      // Neither of these is something a participant said, so they render full width
+      // and reset the role run — the next real message re-labels itself.
+      if (m.role === 'workflow') { prevRole = ''; return renderRunningCard(m.running); }
+      if (m.task) { prevRole = ''; return renderTaskCard(m.task); }
       const showLabel = m.role !== prevRole;
       prevRole = m.role;
       const roleLabel = m.role === 'assistant' ? 'Claude' : 'You';
@@ -2651,6 +2846,9 @@ function renderMessages() {
   } else {
     ttsBar.classList.remove('visible');
   }
+
+  // Paint the running cards' clocks immediately (the 1s tick takes over after).
+  tickElapsed();
 
   // Syntax highlight code blocks
   if (window.Prism) Prism.highlightAllUnder(chatArea);

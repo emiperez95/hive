@@ -5,6 +5,7 @@
 //! `/api/active`; `ConversationView` by `build_conversation_views()` for
 //! `/api/conversations`. `ConversationMessage` is returned by `/api/messages`.
 
+use crate::common::jsonl;
 use crate::ipc::messages::SessionStatus;
 use serde::{Deserialize, Serialize};
 
@@ -170,6 +171,12 @@ pub struct PlacementView {
 }
 
 /// One message in the conversation (user or assistant text).
+///
+/// `role` is `user` | `assistant`, plus one synthetic value: **`workflow`**, carrying
+/// `running` — a background launch that hasn't reported back. Those have no transcript
+/// entry of their own (the launch is wherever Claude called the tool, often hundreds of
+/// messages earlier), so the server appends them after the last real message and the
+/// chat renders them as live cards at the end.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub role: String,
@@ -179,6 +186,13 @@ pub struct ConversationMessage {
     /// Tool uses in this assistant message
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSummary>,
+    /// Set when this entry is a `<task-notification>`: the parsed completion report.
+    /// The raw markup is stripped from `text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskNotificationView>,
+    /// Set on synthetic `role: "workflow"` entries: a launch still in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<RunningTaskView>,
 }
 
 /// Compact summary of a tool use for the dashboard.
@@ -190,6 +204,179 @@ pub struct ToolSummary {
     pub summary: String,
     /// Full detail for modal view (full command, content, etc.)
     pub detail: String,
+    /// `Workflow` launches only: the script's `meta`, so the card can show the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowMetaView>,
+}
+
+/// A workflow's declared `meta` — name and the phases it will run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowMetaView {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<WorkflowPhaseView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowPhaseView {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// A background launch's completion report (`<task-notification>`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNotificationView {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub result: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TaskUsageView>,
+}
+
+/// Per-run totals from a workflow notification. `agents_error` is the one that
+/// matters most and has no other surface: a workflow reports `completed` while
+/// some of its agents failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskUsageView {
+    pub agent_count: u32,
+    pub agents_done: u32,
+    pub agents_error: u32,
+    pub agents_skipped: u32,
+    pub subagent_tokens: u64,
+    pub tool_uses: u32,
+    pub duration_ms: u64,
+}
+
+/// An in-flight background launch, rendered as a live card at the end of the chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningTaskView {
+    /// `workflow` | `agent` | `bash`
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// ISO 8601. The elapsed clock ticks client-side from this: a server-rendered
+    /// duration would differ on every 2s poll and defeat the chat's re-render guard.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<WorkflowPhaseView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_started: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_done: Option<u32>,
+}
+
+// ── jsonl → wire conversions ────────────────────────────────────────────────
+// The parsing lives in `common::jsonl` (shared with the TUI); these are the
+// serializable projections of it.
+
+impl From<jsonl::WorkflowPhase> for WorkflowPhaseView {
+    fn from(p: jsonl::WorkflowPhase) -> Self {
+        Self {
+            title: p.title,
+            detail: p.detail,
+        }
+    }
+}
+
+impl From<jsonl::WorkflowMeta> for WorkflowMetaView {
+    fn from(m: jsonl::WorkflowMeta) -> Self {
+        Self {
+            name: m.name,
+            description: m.description,
+            phases: m.phases.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<jsonl::TaskUsage> for TaskUsageView {
+    fn from(u: jsonl::TaskUsage) -> Self {
+        Self {
+            agent_count: u.agent_count,
+            agents_done: u.agents_done,
+            agents_error: u.agents_error,
+            agents_skipped: u.agents_skipped,
+            subagent_tokens: u.subagent_tokens,
+            tool_uses: u.tool_uses,
+            duration_ms: u.duration_ms,
+        }
+    }
+}
+
+impl From<jsonl::TaskNotification> for TaskNotificationView {
+    fn from(n: jsonl::TaskNotification) -> Self {
+        Self {
+            status: n.status,
+            summary: n.summary,
+            result: n.result,
+            output_file: n.output_file,
+            usage: n.usage.map(Into::into),
+        }
+    }
+}
+
+impl From<jsonl::ToolSummary> for ToolSummary {
+    fn from(t: jsonl::ToolSummary) -> Self {
+        Self {
+            name: t.name,
+            summary: t.summary,
+            detail: t.detail,
+            workflow: t.workflow.map(Into::into),
+        }
+    }
+}
+
+impl From<jsonl::ConversationMessage> for ConversationMessage {
+    fn from(m: jsonl::ConversationMessage) -> Self {
+        Self {
+            role: m.role,
+            text: m.text,
+            tools: m.tools.into_iter().map(Into::into).collect(),
+            task: m.task.map(Into::into),
+            running: None,
+        }
+    }
+}
+
+impl From<jsonl::RunningTask> for RunningTaskView {
+    fn from(t: jsonl::RunningTask) -> Self {
+        Self {
+            kind: match t.kind {
+                jsonl::BackgroundKind::Workflow => "workflow",
+                jsonl::BackgroundKind::Agent => "agent",
+                jsonl::BackgroundKind::Bash => "bash",
+            }
+            .to_string(),
+            label: t.label,
+            description: t.description,
+            started_at: t.started_at,
+            phases: t.phases.into_iter().map(Into::into).collect(),
+            agents_started: t.agents_started,
+            agents_done: t.agents_done,
+        }
+    }
+}
+
+impl ConversationMessage {
+    /// Wrap an in-flight launch as the synthetic trailing entry the chat renders as a
+    /// live card. Not a transcript message — see the `role` note on this struct.
+    pub fn running_card(task: jsonl::RunningTask) -> Self {
+        Self {
+            role: "workflow".to_string(),
+            text: String::new(),
+            tools: Vec::new(),
+            task: None,
+            running: Some(task.into()),
+        }
+    }
 }
 
 /// Minimal process info for the dashboard.

@@ -666,6 +666,10 @@ pub struct ConversationMessage {
     pub role: String,
     pub text: String,
     pub tools: Vec<ToolSummary>,
+    /// A parsed `<task-notification>`, when this user entry is the harness reporting a
+    /// background launch's outcome. The raw XML is stripped from `text` — it is ~10KB
+    /// of markup per notification and unreadable as a chat bubble.
+    pub task: Option<TaskNotification>,
 }
 
 /// Compact summary of a tool use.
@@ -674,6 +678,77 @@ pub struct ToolSummary {
     pub name: String,
     pub summary: String,
     pub detail: String,
+    /// Set for `Workflow` launches: the script's `meta` block, so the card can name the
+    /// workflow and list its phases instead of showing 30KB of escaped JavaScript.
+    pub workflow: Option<WorkflowMeta>,
+}
+
+/// A workflow's `export const meta = {…}`, read from the launch's script source.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowMeta {
+    pub name: String,
+    pub description: String,
+    pub phases: Vec<WorkflowPhase>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowPhase {
+    pub title: String,
+    pub detail: String,
+}
+
+/// The harness's completion report for a background launch, parsed out of the
+/// `<task-notification>` block it injects into the main transcript.
+#[derive(Debug, Clone, Default)]
+pub struct TaskNotification {
+    pub task_id: String,
+    /// Matches the launching `tool_use` block's id.
+    pub tool_use_id: String,
+    /// `completed` | `failed` | `killed` | …
+    pub status: String,
+    pub summary: String,
+    /// The launch's return value — JSON for a workflow, plain text otherwise.
+    pub result: String,
+    /// Path holding the untruncated output, when the inline result was cut.
+    pub output_file: String,
+    pub usage: Option<TaskUsage>,
+}
+
+/// The `<usage>` block of a workflow notification. Everything here is otherwise
+/// invisible in the UI — `agents_error` most of all: a workflow reports `completed`
+/// while some of its agents died.
+#[derive(Debug, Clone, Default)]
+pub struct TaskUsage {
+    pub agent_count: u32,
+    pub agents_done: u32,
+    pub agents_error: u32,
+    pub agents_skipped: u32,
+    pub subagent_tokens: u64,
+    pub tool_uses: u32,
+    pub duration_ms: u64,
+}
+
+/// A background launch with no `<task-notification>` yet — i.e. still running.
+///
+/// There is no transcript entry for it (the launch is wherever Claude called the tool,
+/// often hundreds of messages back), so the web renders these as synthetic cards
+/// appended after the last message: the only honest place for work with no end time.
+#[derive(Debug, Clone)]
+pub struct RunningTask {
+    pub tool_use_id: String,
+    pub kind: BackgroundKind,
+    /// Workflow name from `meta`, or the launch description.
+    pub label: String,
+    pub description: String,
+    /// ISO 8601 launch time. The elapsed clock is computed client-side from this —
+    /// a server-rendered duration would change on every poll and defeat the chat's
+    /// byte-comparison re-render guard.
+    pub started_at: String,
+    pub phases: Vec<WorkflowPhase>,
+    /// Agents spawned / finished, counted from the run's journal. Absent for
+    /// non-workflow launches and for a run whose journal isn't readable.
+    pub agents_started: Option<u32>,
+    pub agents_done: Option<u32>,
 }
 
 /// Extract text content from a JSONL content field.
@@ -816,6 +891,21 @@ fn extract_tools_from_content(content: &serde_json::Value) -> Vec<ToolSummary> {
                     .unwrap_or("");
                 (desc.to_string(), truncate_str(prompt, 2000))
             }
+            "Workflow" => {
+                // The card names the workflow and lists its phases (see `workflow`
+                // below); the detail is the script itself rather than the input JSON,
+                // which renders as one escaped line tens of KB long.
+                let meta = workflow_meta_from_input(input);
+                let summary = if meta.description.is_empty() {
+                    meta.name.clone()
+                } else {
+                    meta.description.clone()
+                };
+                (
+                    summary,
+                    input_str(input, "script").unwrap_or("").to_string(),
+                )
+            }
             _ => {
                 // Generic: show first string field from input as summary
                 let summary = input
@@ -832,10 +922,12 @@ fn extract_tools_from_content(content: &serde_json::Value) -> Vec<ToolSummary> {
             }
         };
 
+        let workflow = (name == "Workflow").then(|| workflow_meta_from_input(input));
         tools.push(ToolSummary {
             name,
             summary,
             detail,
+            workflow,
         });
     }
 
@@ -881,15 +973,26 @@ pub fn extract_conversation_messages(
             None => continue,
         };
 
-        let text = extract_text_from_content(&content).unwrap_or_default();
+        let mut text = extract_text_from_content(&content).unwrap_or_default();
         let tools = if entry.entry_type == "assistant" {
             extract_tools_from_content(&content)
         } else {
             Vec::new()
         };
 
-        // Skip entries with no text and no tools
-        if text.is_empty() && tools.is_empty() {
+        // A completion report, not something the user said: lift it into `task` and
+        // drop the markup from `text`. In a workflow-heavy conversation these blocks
+        // are ~10KB each and were being rendered verbatim as chat bubbles.
+        let task = if entry.entry_type == "user" && text.contains("<task-notification>") {
+            let parsed = parse_task_notification(&text);
+            text = strip_task_notification(&text);
+            parsed
+        } else {
+            None
+        };
+
+        // Skip entries with nothing to show
+        if text.is_empty() && tools.is_empty() && task.is_none() {
             continue;
         }
 
@@ -897,6 +1000,7 @@ pub fn extract_conversation_messages(
             role: entry.entry_type,
             text,
             tools,
+            task,
         });
     }
 
@@ -1060,22 +1164,128 @@ fn content_search_text(content: &serde_json::Value) -> String {
     serde_json::to_string(content).unwrap_or_default()
 }
 
-/// Extract a workflow's `meta.name` from its script source (best effort).
-fn extract_js_meta_name(script: &str) -> Option<String> {
-    let idx = script.find("name:")?;
-    let after = script[idx + "name:".len()..].trim_start();
-    let q = after.chars().next()?;
+/// The quoted string following the first `key` at or after `from` in a JS object
+/// literal, plus the offset just past the closing quote (so a scan can continue).
+/// Deliberately loose — this reads a `meta` block, not JavaScript.
+fn js_string_field(src: &str, key: &str, from: usize) -> Option<(String, usize)> {
+    let rel = src.get(from..)?.find(key)?;
+    let mut i = from + rel + key.len();
+    while i < src.len() && src.as_bytes()[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let q = src[i..].chars().next()?;
     if q != '\'' && q != '"' && q != '`' {
         return None;
     }
-    let rest = &after[q.len_utf8()..];
-    let end = rest.find(q)?;
-    let name = rest[..end].trim();
+    i += q.len_utf8();
+    let end = src[i..].find(q)?;
+    Some((src[i..i + end].trim().to_string(), i + end + q.len_utf8()))
+}
+
+/// Extract a workflow's `meta.name` from its script source (best effort).
+fn extract_js_meta_name(script: &str) -> Option<String> {
+    let (name, _) = js_string_field(script, "name:", 0)?;
     if name.is_empty() || name.len() > 80 {
         None
     } else {
-        Some(name.to_string())
+        Some(name)
     }
+}
+
+/// Extract `meta.phases` — the workflow's plan, which is what makes a launch card
+/// worth reading. Bounded to the first `]` after `phases:`; a detail string
+/// containing a bracket just truncates the list, which beats scanning JS properly.
+fn extract_js_meta_phases(script: &str) -> Vec<WorkflowPhase> {
+    let Some(start) = script.find("phases:") else {
+        return Vec::new();
+    };
+    let end = script[start..]
+        .find(']')
+        .map(|i| start + i)
+        .unwrap_or(script.len());
+    let slice = &script[start..end];
+
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some((title, next)) = js_string_field(slice, "title:", cursor) {
+        // A `detail` belongs to this phase only if it precedes the next `title`.
+        let next_title = slice[next..].find("title:").map(|i| next + i);
+        let detail_at = slice[next..].find("detail:").map(|i| next + i);
+        let detail = match (detail_at, next_title) {
+            (Some(d), Some(t)) if d > t => String::new(),
+            (Some(_), _) => js_string_field(slice, "detail:", next)
+                .map(|(v, _)| v)
+                .unwrap_or_default(),
+            (None, _) => String::new(),
+        };
+        out.push(WorkflowPhase { title, detail });
+        cursor = next;
+        if out.len() >= 16 {
+            break;
+        }
+    }
+    out
+}
+
+/// The workflow `meta` behind a `Workflow` launch's script input.
+fn workflow_meta_from_input(input: Option<&serde_json::Value>) -> WorkflowMeta {
+    let script = input_str(input, "script").unwrap_or("");
+    WorkflowMeta {
+        name: extract_js_meta_name(script)
+            .or_else(|| input_str(input, "name").map(str::to_string))
+            .unwrap_or_else(|| "workflow".to_string()),
+        description: input_str(input, "description").unwrap_or("").to_string(),
+        phases: extract_js_meta_phases(script),
+    }
+}
+
+/// The first `<tag>…</tag>` value in `text`, untrimmed of inner markup.
+fn tag_value(text: &str, tag: &str) -> Option<String> {
+    extract_tagged(text, tag).into_iter().next()
+}
+
+fn tag_num<T: std::str::FromStr + Default>(text: &str, tag: &str) -> T {
+    tag_value(text, tag)
+        .and_then(|v| v.trim().parse::<T>().ok())
+        .unwrap_or_default()
+}
+
+/// Parse a `<task-notification>` block. Returns None when `text` has no such block.
+pub fn parse_task_notification(text: &str) -> Option<TaskNotification> {
+    let block = tag_value(text, "task-notification")?;
+    let usage = tag_value(&block, "usage").map(|u| TaskUsage {
+        agent_count: tag_num(&u, "agent_count"),
+        agents_done: tag_num(&u, "agents_done"),
+        agents_error: tag_num(&u, "agents_error"),
+        agents_skipped: tag_num(&u, "agents_skipped"),
+        subagent_tokens: tag_num(&u, "subagent_tokens"),
+        tool_uses: tag_num(&u, "tool_uses"),
+        duration_ms: tag_num(&u, "duration_ms"),
+    });
+    Some(TaskNotification {
+        task_id: tag_value(&block, "task-id").unwrap_or_default(),
+        tool_use_id: tag_value(&block, "tool-use-id").unwrap_or_default(),
+        status: tag_value(&block, "status").unwrap_or_default(),
+        summary: tag_value(&block, "summary").unwrap_or_default(),
+        result: tag_value(&block, "result").unwrap_or_default(),
+        output_file: tag_value(&block, "output-file").unwrap_or_default(),
+        usage,
+    })
+}
+
+/// `text` with the `<task-notification>…</task-notification>` block removed. What's
+/// left is whatever the harness wrote around it (usually nothing).
+fn strip_task_notification(text: &str) -> String {
+    let (Some(start), Some(end)) = (
+        text.find("<task-notification>"),
+        text.find("</task-notification>"),
+    ) else {
+        return text.to_string();
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&text[end + "</task-notification>".len()..]);
+    out.trim().to_string()
 }
 
 fn input_str<'a>(input: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
@@ -1196,6 +1406,146 @@ pub fn background_tasks_summary(tasks: &[BackgroundTask]) -> String {
             }
         }
     }
+}
+
+/// The run's transcript dir, named by the launch's tool_result stub:
+/// `Workflow launched in background. Task ID: … \n Transcript dir: <path> \n Script file: …`.
+/// This is the only place the runId appears while the workflow is still in flight —
+/// the run record (`workflows/wf_<id>.json`) isn't written until it finishes.
+fn transcript_dir_from_stub(body: &str) -> Option<String> {
+    const KEY: &str = "Transcript dir:";
+    let idx = body.find(KEY)?;
+    let rest = &body[idx + KEY.len()..];
+    // `body` may be a JSON-serialized block, so the line can end at an escaped
+    // newline and carry a closing quote.
+    let line = rest.lines().next()?;
+    let line = line.split("\\n").next().unwrap_or(line);
+    let dir = line.trim().trim_end_matches(['"', ',']).trim();
+    (!dir.is_empty()).then(|| dir.to_string())
+}
+
+/// Agents spawned / finished for a workflow run, from its journal — one `started`
+/// line per agent launched and one `result` line per agent that returned.
+pub fn journal_progress(run_dir: &Path) -> Option<(u32, u32)> {
+    let content = fs::read_to_string(run_dir.join("journal.jsonl")).ok()?;
+    let (mut started, mut done) = (0, 0);
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("started") => started += 1,
+            Some("result") => done += 1,
+            _ => {}
+        }
+    }
+    Some((started, done))
+}
+
+/// Background launches with no `<task-notification>` yet, enriched for display:
+/// workflow name and phases from the script, launch time, and agent progress read
+/// from the run's journal. Same launch/completion pairing as
+/// [`detect_active_background_tasks`] — see that function for why it is windowing-safe.
+pub fn detect_running_tasks(entries: &[JsonlEntry]) -> Vec<RunningTask> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut launched: Vec<RunningTask> = Vec::new();
+    let mut done: HashSet<String> = HashSet::new();
+    let mut run_dirs: HashMap<String, String> = HashMap::new();
+
+    for entry in entries {
+        let Some(content) = entry.message.as_ref().and_then(|m| m.content.as_ref()) else {
+            continue;
+        };
+        match entry.entry_type.as_str() {
+            "assistant" => {
+                let Some(blocks) = content.as_array() else {
+                    continue;
+                };
+                for block in blocks {
+                    let Ok(tool) = serde_json::from_value::<ToolUse>(block.clone()) else {
+                        continue;
+                    };
+                    let (Some(id), Some(task)) =
+                        (tool.id.clone(), background_task_from_tool_use(&tool))
+                    else {
+                        continue;
+                    };
+                    let input = tool.input.as_ref();
+                    let (label, description, phases) = if task.kind == BackgroundKind::Workflow {
+                        let meta = workflow_meta_from_input(input);
+                        (meta.name, meta.description, meta.phases)
+                    } else {
+                        let desc = input_str(input, "description").unwrap_or("").to_string();
+                        (task.label.clone(), desc, Vec::new())
+                    };
+                    launched.push(RunningTask {
+                        tool_use_id: id,
+                        kind: task.kind,
+                        label,
+                        description,
+                        started_at: entry.timestamp.clone().unwrap_or_default(),
+                        phases,
+                        agents_started: None,
+                        agents_done: None,
+                    });
+                }
+            }
+            "user" => {
+                let text = content_search_text(content);
+                if text.contains("<task-notification>") {
+                    for id in extract_tagged(&text, "tool-use-id") {
+                        done.insert(id);
+                    }
+                }
+                let Some(blocks) = content.as_array() else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let body = block
+                        .get("content")
+                        .map(content_search_text)
+                        .unwrap_or_default();
+                    if let Some(dir) = transcript_dir_from_stub(&body) {
+                        run_dirs.insert(id.to_string(), dir);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    launched.retain(|t| !done.contains(&t.tool_use_id));
+    for task in &mut launched {
+        if let Some(dir) = run_dirs.get(&task.tool_use_id) {
+            if let Some((started, finished)) = journal_progress(Path::new(dir)) {
+                task.agents_started = Some(started);
+                task.agents_done = Some(finished);
+            }
+        }
+    }
+    launched
+}
+
+/// Read the transcript tail and return in-flight background launches for display.
+pub fn get_running_tasks_for(cwd: &str, session_id: Option<&str>) -> Vec<RunningTask> {
+    let Some(path) = resolve_jsonl_path(cwd, session_id) else {
+        return Vec::new();
+    };
+    // Same bounded tail as the status detection: a running launch is near the end by
+    // definition, and this runs on every 2s chat poll.
+    let lines = read_tail_lines(&path, 256 * 1024);
+    let entries: Vec<JsonlEntry> = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    detect_running_tasks(&entries)
 }
 
 /// Read the transcript tail and return in-flight background tasks for a conversation.
@@ -1342,6 +1692,83 @@ mod tests {
         );
         assert_eq!(def.len(), 1);
         assert_eq!(def[0].config_dir, None); // default profile → no CLAUDE_CONFIG_DIR
+    }
+
+    #[test]
+    fn test_parse_task_notification_reads_usage_and_ignores_prose() {
+        let text = "<task-notification>\n<task-id>w1</task-id>\n<tool-use-id>toolu_a</tool-use-id>\
+            \n<status>completed</status>\n<summary>Dynamic workflow \"Ship it\" completed</summary>\
+            \n<result>{\"a\":1}</result>\n<usage><agent_count>5</agent_count><agents_done>4</agents_done>\
+            <agents_error>1</agents_error><subagent_tokens>1274902</subagent_tokens>\
+            <tool_uses>598</tool_uses><duration_ms>10327450</duration_ms></usage>\n</task-notification>";
+        let n = parse_task_notification(text).expect("parses");
+        assert_eq!(n.tool_use_id, "toolu_a");
+        assert_eq!(n.status, "completed");
+        assert_eq!(n.result, "{\"a\":1}");
+        let u = n.usage.expect("usage block");
+        assert_eq!(u.agent_count, 5);
+        // Reported "completed" with a dead agent inside — the number with no other surface.
+        assert_eq!(u.agents_error, 1);
+        assert_eq!(u.subagent_tokens, 1_274_902);
+        assert_eq!(u.duration_ms, 10_327_450);
+        assert!(
+            strip_task_notification(text).is_empty(),
+            "markup leaves the bubble"
+        );
+
+        // A skill's instructions that merely *mention* the tag must not be mistaken for
+        // one (the corpus has such a message): no closing tag, so nothing parses and
+        // nothing is stripped.
+        let prose = "the harness injects a <task-notification> when the task finishes";
+        assert!(parse_task_notification(prose).is_none());
+        assert_eq!(strip_task_notification(prose), prose);
+    }
+
+    #[test]
+    fn test_detect_running_tasks_until_the_notification_arrives() {
+        let launch = r#"{"type":"assistant","timestamp":"2026-08-14T01:00:00Z","message":{"content":[{"type":"tool_use","id":"toolu_wf1","name":"Workflow","input":{"description":"Sweep the rewrite","script":"export const meta = {\n  name: 'spa-sweep',\n  phases: [{ title: 'Build', detail: 'do it' }, { title: 'Review' }],\n}\n"}}]}}"#;
+        // The launch's tool_result stub is the only place the run dir appears while the
+        // workflow is in flight — the run record isn't written until it finishes.
+        let stub = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_wf1","content":"Workflow launched in background. Task ID: w1\nTranscript dir: /tmp/hive-no-such-run\nScript file: /tmp/x.js"}]}}"#;
+        let notif = r#"{"type":"user","message":{"content":"<task-notification><tool-use-id>toolu_wf1</tool-use-id><status>completed</status></task-notification>"}}"#;
+
+        let running = detect_running_tasks(&[parse_entry(launch), parse_entry(stub)]);
+        assert_eq!(running.len(), 1);
+        let t = &running[0];
+        assert_eq!(t.label, "spa-sweep", "name comes from the script's meta");
+        assert_eq!(t.description, "Sweep the rewrite");
+        assert_eq!(
+            t.started_at, "2026-08-14T01:00:00Z",
+            "the client's elapsed clock"
+        );
+        let titles: Vec<&str> = t.phases.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["Build", "Review"]);
+        assert_eq!(t.phases[0].detail, "do it");
+        assert_eq!(t.phases[1].detail, "", "a phase without a detail gets none");
+        assert!(
+            t.agents_started.is_none(),
+            "no journal on disk → no agent counts"
+        );
+
+        let after =
+            detect_running_tasks(&[parse_entry(launch), parse_entry(stub), parse_entry(notif)]);
+        assert!(after.is_empty(), "a notified launch is no longer running");
+    }
+
+    #[test]
+    fn test_journal_progress_counts_spawned_and_returned() {
+        let dir = std::env::temp_dir().join(format!("hive-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("journal.jsonl"),
+            "{\"type\":\"started\",\"agentId\":\"a1\"}\n\
+             {\"type\":\"started\",\"agentId\":\"a2\"}\n\
+             {\"type\":\"result\",\"agentId\":\"a1\",\"result\":{}}\n",
+        )
+        .unwrap();
+        let got = journal_progress(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got, Some((2, 1)), "2 spawned, 1 returned → 1 still running");
     }
 
     #[test]
