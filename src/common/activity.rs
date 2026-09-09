@@ -8,12 +8,14 @@
 //! conversation JSONL survives on disk, but *which* conversations were open, grouped into
 //! which sessions, and their **titles** (which live only on the live tmux pane title) do not.
 //!
-//! The snapshot is a write-through current-state view, not a replay of events: each Claude
-//! hook upserts the window's latest title + `last_seen`, and hive removes a window when it
-//! cleanly closes, is frozen (it moves to `frozen.json`), or its session is killed. A crash
-//! fires no removal, so a crashed window simply lingers — which is exactly the recovery
-//! candidate we want. Entries are pruned by age so a never-recovered window doesn't linger
-//! forever.
+//! The snapshot is a write-through current-state view, not a replay of events. Its writer is
+//! [`sync_open_windows`], driven by the registry gather, which reconciles the file to the
+//! live set each refresh — adding what appeared and dropping what vanished. Hooks
+//! ([`record_window_seen`]) and the explicit removals (clean close, freeze, kill-session)
+//! still top it up, but they can only ever report presence; only the gather sees a window
+//! stop existing. A crash fires no removal *and* stops the gather, so what is left on disk
+//! is the frame that was open at that moment. Entries are pruned by age so a never-recovered
+//! window doesn't linger forever.
 //!
 //! Entries deliberately mirror [`crate::common::frozen::FrozenEntry`] so that Phase 2 restore
 //! can reuse the same recreate-session + `claude --resume` path.
@@ -206,6 +208,99 @@ pub fn remove_windows_for_session(session_name: &str) {
     if state.remove_for_session(session_name) {
         let _ = state.save();
     }
+}
+
+/// The snapshot the live set implies, or `None` when the file already says it.
+///
+/// Pure half of [`sync_open_windows`] — takes the current entries and the live set so the
+/// reconcile rules are unit-testable without touching the real `open-windows.json`.
+///
+/// Every live window is stamped with the same `now`. That is what makes the file a coherent
+/// frame rather than a pile of independent sightings: after a crash, one `last_seen`
+/// describes the whole set. Hook-written entries cannot have that property — each carries
+/// whenever *that* window last fired.
+pub fn reconcile_open_windows(
+    before: &HashMap<String, OpenWindow>,
+    live: &[WindowSeen],
+    now: DateTime<Utc>,
+) -> Option<HashMap<String, OpenWindow>> {
+    // An empty live set teaches us nothing and would destroy everything: the state right
+    // after a reboot is "no Claude running", and the first gather would otherwise wipe the
+    // frame we are about to recover from. Deliberately closing every window instead leaves a
+    // stale frame that ages out on its own — the harmless direction to be wrong in.
+    if live.is_empty() {
+        return None;
+    }
+
+    let now_str = now.to_rfc3339();
+    let mut next: HashMap<String, OpenWindow> = HashMap::new();
+    for seen in live {
+        if seen.claude_session_id.is_empty() || seen.claude_session_id == "unknown" {
+            continue;
+        }
+        // Carry `first_seen` across for a window we already knew — it is the only field
+        // that must survive the rebuild.
+        let first_seen = before
+            .get(&seen.claude_session_id)
+            .map(|w| w.first_seen.clone())
+            .unwrap_or_else(|| now_str.clone());
+        next.insert(
+            seen.claude_session_id.clone(),
+            OpenWindow {
+                session_name: seen.session_name.clone(),
+                window_name: seen.window_name.clone(),
+                window_index: seen.window_index.clone(),
+                cwd: seen.cwd.clone(),
+                claude_session_id: seen.claude_session_id.clone(),
+                claude_config_dir: seen.claude_config_dir.clone(),
+                first_seen,
+                last_seen: now_str.clone(),
+            },
+        );
+    }
+
+    // `last_seen` moves every second, so comparing whole entries would write every tick.
+    // What matters is the SET, and each window's placement and title within it.
+    let unchanged = before.len() == next.len()
+        && next.iter().all(|(id, w)| {
+            before.get(id).is_some_and(|b| {
+                b.session_name == w.session_name
+                    && b.window_index == w.window_index
+                    && b.window_name == w.window_name
+                    && b.cwd == w.cwd
+                    && b.claude_config_dir == w.claude_config_dir
+            })
+        });
+
+    (!unchanged).then_some(next)
+}
+
+/// Reconcile the recovery snapshot to the set of Claude windows that are live right now.
+///
+/// This is the snapshot's real writer; [`record_window_seen`] only tops it up. A hook fires
+/// from inside a running Claude, so it can report **presence** and nothing else: a window
+/// that hasn't run a turn since it opened never fires one and stays invisible. That failure
+/// peaks exactly when it matters — right after a restore, every window is idle by
+/// definition.
+///
+/// The gather sees the whole live set each refresh, so it also sees **absence**. A window
+/// that is no longer there was closed while hive was watching, and it leaves the snapshot.
+/// What remains is therefore always "what is open now" — and when hive dies *with* the
+/// machine, no removal runs, so the last write left behind is the frame that was open at
+/// that moment. Nothing has to detect the shutdown; a reboot is just the mirror going still.
+///
+/// Best-effort and cheap on the common path: an unchanged set never touches the disk, which
+/// matters because this runs on a 1s refresh loop.
+pub fn sync_open_windows(live: &[WindowSeen]) -> bool {
+    let mut state = OpenWindowsState::load();
+    let now = Utc::now();
+    let Some(next) = reconcile_open_windows(&state.windows, live, now) else {
+        return false;
+    };
+    state.windows = next;
+    state.prune(now);
+    let _ = state.save();
+    true
 }
 
 // ─── Append-only activity log (metrics) ───────────────────────────────────────
@@ -729,6 +824,95 @@ mod tests {
         // The latest title wins.
         assert_eq!(w.window_name, "Plan activity log");
         assert_eq!(state.windows.len(), 1);
+    }
+
+    /// The guard that protects the whole feature: right after a reboot nothing is running,
+    /// so the first gather sees an empty live set. Writing it through would erase the frame
+    /// we are about to recover *from*.
+    #[test]
+    fn empty_live_set_never_overwrites_the_frame() {
+        let mut before = HashMap::new();
+        let now = ts("2026-09-05T21:30:00Z");
+        let seeded =
+            reconcile_open_windows(&before, &[seen("sid-1", "🐝 hive", "1", "work")], now).unwrap();
+        before = seeded;
+
+        assert!(
+            reconcile_open_windows(&before, &[], ts("2026-09-06T09:00:00Z")).is_none(),
+            "a post-reboot gather must not wipe what it is meant to restore"
+        );
+    }
+
+    /// The half a hook can never report: a window that stopped existing while hive watched
+    /// was closed on purpose, so it leaves the frame.
+    #[test]
+    fn a_vanished_window_leaves_and_first_seen_survives() {
+        let now = ts("2026-09-05T21:30:00Z");
+        let before = reconcile_open_windows(
+            &HashMap::new(),
+            &[
+                seen("sid-1", "🐝 hive", "1", "work"),
+                seen("sid-2", "🐝 hive", "2", "other"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let later = ts("2026-09-05T22:00:00Z");
+        let next = reconcile_open_windows(&before, &[seen("sid-1", "🐝 hive", "1", "work")], later)
+            .expect("the set shrank, so it must be written");
+        assert_eq!(next.len(), 1);
+        assert!(!next.contains_key("sid-2"), "closed window drops out");
+        // A window that persisted keeps the moment it was first seen…
+        assert_eq!(next["sid-1"].first_seen, now.to_rfc3339());
+        // …while last_seen tracks the frame.
+        assert_eq!(next["sid-1"].last_seen, later.to_rfc3339());
+    }
+
+    /// One `last_seen` across the whole set is what lets recovery say "these 11 were open
+    /// together, 3 hours ago". Hook-written entries are stamped independently and can't.
+    #[test]
+    fn every_live_window_shares_one_timestamp() {
+        let now = ts("2026-09-05T21:30:00Z");
+        let next = reconcile_open_windows(
+            &HashMap::new(),
+            &[
+                seen("sid-1", "🐝 hive", "1", "a"),
+                seen("sid-2", "📁 thesis", "1", "b"),
+                seen("sid-3", "📊 Avateen", "2", "c"),
+            ],
+            now,
+        )
+        .unwrap();
+        let stamps: std::collections::HashSet<&str> =
+            next.values().map(|w| w.last_seen.as_str()).collect();
+        assert_eq!(stamps.len(), 1, "the frame has a single 'as of' moment");
+    }
+
+    /// This runs on a 1s loop, so the steady state must not touch the disk — even though
+    /// `last_seen` would differ on every tick.
+    #[test]
+    fn an_unchanged_set_is_not_rewritten() {
+        let live = [
+            seen("sid-1", "🐝 hive", "1", "work"),
+            seen("sid-2", "📁 thesis", "1", "paper"),
+        ];
+        let before =
+            reconcile_open_windows(&HashMap::new(), &live, ts("2026-09-05T21:30:00Z")).unwrap();
+
+        assert!(
+            reconcile_open_windows(&before, &live, ts("2026-09-05T21:30:01Z")).is_none(),
+            "same set one second later → no write"
+        );
+        // …but a retitled or moved window is a real change and must land.
+        let renamed = [
+            seen("sid-1", "🐝 hive", "1", "work"),
+            seen("sid-2", "📁 thesis", "3", "paper"),
+        ];
+        assert!(
+            reconcile_open_windows(&before, &renamed, ts("2026-09-05T21:30:02Z")).is_some(),
+            "a window that moved must be rewritten"
+        );
     }
 
     #[test]

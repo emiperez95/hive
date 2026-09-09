@@ -189,21 +189,42 @@ pub fn read_conversation_meta(path: &Path) -> (Option<String>, Option<String>) {
 
     // Head: cwd (stamped on early entries) + any titles set near the start
     // (resumed sessions re-stamp their title at the top of the transcript).
+    //
+    // Bounded by BYTES, not by a line count. A transcript can open with a long
+    // metadata preamble — `file-history-snapshot`, `mode`, `agent-name` and friends
+    // carry no cwd — and a fixed window then misses the cwd entirely. That was real:
+    // one conversation's first cwd sat on line 45 behind 35 snapshot entries, so it
+    // scanned as cwd-less, which leaves it unplaceable (no parent → "(unassigned)")
+    // and unrecoverable (nothing to `-c` into). Keep reading past the preamble, but
+    // stop as soon as the cwd is known and the title window is behind us.
+    const HEAD_BYTES: usize = 256 * 1024;
+    const TITLE_LINES: usize = 40;
     if let Ok(file) = fs::File::open(path) {
-        for line in BufReader::new(file).lines().take(40).map_while(Result::ok) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if cwd.is_none() {
-                if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
-                    cwd = Some(c.to_string());
+        let mut budget = HEAD_BYTES;
+        for (i, line) in BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .enumerate()
+        {
+            budget = budget.saturating_sub(line.len() + 1);
+            if budget == 0 {
+                break;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if cwd.is_none() {
+                    if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                        cwd = Some(c.to_string());
+                    }
+                }
+                if let Some(t) = title_field(&v, "custom-title", "customTitle") {
+                    custom = Some(t);
+                }
+                if let Some(t) = title_field(&v, "ai-title", "aiTitle") {
+                    ai = Some(t);
                 }
             }
-            if let Some(t) = title_field(&v, "custom-title", "customTitle") {
-                custom = Some(t);
-            }
-            if let Some(t) = title_field(&v, "ai-title", "aiTitle") {
-                ai = Some(t);
+            if cwd.is_some() && i >= TITLE_LINES {
+                break;
             }
         }
     }
@@ -290,10 +311,21 @@ pub fn scan_all_disk_conversations() -> Vec<DiskConversation> {
     scan_disk_conversations_in(&claude_slug_dirs())
 }
 
+/// Bump whenever the parse changes what a scan *yields* from an unchanged transcript.
+///
+/// Reuse is keyed on the transcript's mtime, which answers "did the file change?" — not
+/// "did our reading of it change?". Without this, a parser fix is invisible on exactly the
+/// conversations it repairs: the file is untouched, so the stale result is served forever.
+/// (v2: the head scan is byte-bounded, so a cwd behind a long metadata preamble is found.)
+const SCAN_PARSER_VERSION: u32 = 2;
+
 /// The on-disk scan cache: id → last scan result. Keyed reuse hinges on `mtime`
 /// (== `last_activity`), so an unchanged transcript is never re-parsed.
 #[derive(Default, Serialize, Deserialize)]
 struct DiskScanCache {
+    /// [`SCAN_PARSER_VERSION`] that produced `entries`; a mismatch discards them.
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     entries: std::collections::HashMap<String, DiskConversation>,
 }
@@ -309,7 +341,13 @@ fn load_scan_cache() -> DiskScanCache {
     let Ok(content) = fs::read_to_string(&path) else {
         return DiskScanCache::default();
     };
-    serde_json::from_str(&content).unwrap_or_default()
+    let cache: DiskScanCache = serde_json::from_str(&content).unwrap_or_default();
+    // Results from an older parser are discarded wholesale — cheaper and more honest than
+    // trying to work out which fields the change affected.
+    if cache.version != SCAN_PARSER_VERSION {
+        return DiskScanCache::default();
+    }
+    cache
 }
 
 fn save_scan_cache(cache: &DiskScanCache) {
@@ -388,6 +426,7 @@ pub fn scan_all_disk_conversations_cached() -> Vec<DiskConversation> {
             out.push(dc);
         }
     }
+    next.version = SCAN_PARSER_VERSION;
     save_scan_cache(&next);
     out
 }
@@ -1659,6 +1698,34 @@ mod tests {
 
         assert_eq!(cwd.as_deref(), Some("/home/u/eve"));
         assert_eq!(title.as_deref(), Some("Market watcher"));
+    }
+
+    #[test]
+    fn test_read_conversation_meta_looks_past_a_metadata_preamble() {
+        // A transcript can open with dozens of `file-history-snapshot` entries before the
+        // first one carrying a cwd. Observed in the wild: the first cwd on line 45, behind
+        // 35 snapshot entries — the old 40-line head window stopped just short, so the
+        // conversation scanned as cwd-less and became unplaceable AND unrecoverable.
+        let dir = std::env::temp_dir().join(format!("hive-preamble-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preamble.jsonl");
+        let mut body = String::new();
+        body.push_str("{\"type\":\"ai-title\",\"aiTitle\":\"Claude code artifact review\"}\n");
+        for _ in 0..44 {
+            body.push_str("{\"type\":\"file-history-snapshot\",\"snapshot\":{}}\n");
+        }
+        body.push_str("{\"type\":\"user\",\"cwd\":\"/home/u/wt/live-avatar/voice-agent\"}\n");
+        std::fs::write(&path, body).unwrap();
+
+        let (cwd, title) = read_conversation_meta(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            cwd.as_deref(),
+            Some("/home/u/wt/live-avatar/voice-agent"),
+            "cwd must be found behind the preamble"
+        );
+        assert_eq!(title.as_deref(), Some("Claude code artifact review"));
     }
 
     #[test]

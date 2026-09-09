@@ -337,3 +337,37 @@ Sleep is now handled **precisely** by reading the OS power log (no daemon). The 
 true **absence-of-event** cases (hard shutdown/crash/network-drop log nothing) — bounded by the
 2h cap. A launchd sleep/wake agent is therefore unnecessary. Cost: `pmset -g log` takes ~1.2s,
 run once per report (on-demand `hive stats` / `/api/stats`), never on the refresh path.
+
+## Status — Phase 2 (recovery screen) shipped
+
+The doc above assumed Phase 2 meant "extract the restore half of `thaw_window` into a shared
+`restore_window(entry)`". That turned out to be already done, by a different route:
+`common/conversations.rs::reopen_conversation` is the shared restore path, and it is *better*
+than the entry-based one planned here — it takes a `Conversation` and resolves the destination
+from its parent, so it never replays a session name captured before a reboot.
+
+So Phase 2 became the half that was actually broken: **capture**.
+
+- `activity::sync_open_windows` / `reconcile_open_windows` — the snapshot's real writer,
+  driven by the registry gather from the web data thread and the TUI refresh loop. The hook
+  only ever reported presence; the gather reports absence too, which is what makes the file a
+  mirror of the live set instead of a pile of sightings. Measured before the change: 4 entries
+  recorded against 11 live windows.
+- Guards: an empty live set never overwrites the frame (the post-reboot state would otherwise
+  erase what it is about to restore), and an unchanged set never touches the disk.
+- `cli/conversations.rs` — `RecoverState` / `build_recover` / `recover_rows` / `draw_recover`:
+  a multi-select screen (`R`, auto-opened when nothing is live) that reopens the ticked set
+  through `reopen_conversation`. Restored rows drop out optimistically, since Claude takes
+  seconds to come up and an immediate re-gather still reports it Closed.
+- The Phase 1 TUI surface described above (a `🕘` group in the picker) was lost in the
+  conversation-first cutover; this replaces it with a screen of its own rather than a group.
+
+Fixed on the way, both prerequisites for recovery working at all:
+
+- `read_conversation_meta` bounds its head scan by bytes, so a `cwd` behind a long
+  metadata preamble is found. Without it the conversation is unplaceable and unrecoverable.
+- The scan cache carries a parser version, so that fix reaches transcripts whose mtime hasn't
+  changed.
+
+Still open: `hive recover` as a non-interactive CLI, and the two-writer case (two hive
+instances watching different tmux servers reconcile the frame to their own view).

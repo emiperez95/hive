@@ -178,6 +178,11 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             // Taken from the FULL registry, not `conversations` — that view drops archived
             // entries, which the backlog counts must still see.
             let snapshot = crate::serve::metrics::RegistrySnapshot::from_registry(&reg);
+            // Keep the recovery frame current. This thread is hive's most reliable observer
+            // — it autostarts (`__hive_web`) and outlives every popup — so it is what makes
+            // "what was open when the machine died" a complete answer rather than the subset
+            // that happened to fire a hook.
+            crate::common::conversations::sync_recovery_frame(&reg);
 
             if let Ok(mut data) = active_for_thread.lock() {
                 *data = active;

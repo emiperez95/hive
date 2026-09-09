@@ -22,10 +22,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::common::activity::OpenWindowsState;
 use crate::common::chrome::{
     focus_all_matched_tabs, get_chrome_tabs, match_tabs_to_ports, ChromeTab,
 };
-use crate::common::conversations::{gather_conversations, gather_conversations_stats};
+use crate::common::conversations::{
+    gather_conversations, gather_conversations_stats, reopen_conversation,
+};
 use crate::common::frozen::{discard_frozen, freeze_window, relative_time, FreezeTarget};
 use crate::common::instances;
 use crate::common::jsonl;
@@ -41,7 +44,7 @@ use crate::common::projects::{
     activate_project, ensure_tmux_session, expand_tilde, ProjectConfig, ProjectRegistry,
 };
 use crate::common::registry::{
-    Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar,
+    Conversation, ConversationOverlay, ConversationRegistry, ConversationSidecar, Lifecycle,
 };
 use crate::common::tmux::{
     exact, exact_active_pane, exact_window, get_all_windows, get_current_tmux_session,
@@ -209,6 +212,85 @@ const BROWSE_PAGE: usize = 5;
 
 /// Header key for the pinned group that enumerates all frozen conversations.
 const FROZEN_GROUP: &str = "💤 frozen";
+
+/// The recovery screen: conversations the last frame says were open, that aren't now.
+///
+/// The set comes from `open-windows.json`, which the gather keeps reconciled to the live
+/// windows (see [`crate::common::activity::sync_open_windows`]). While hive is watching, a
+/// window that closes leaves the file; when hive dies *with* the machine nothing is removed,
+/// so what is left is the frame that was open at that moment.
+///
+/// Rows are the registry's own `Conversation`s, not snapshot entries: that is what lets the
+/// restore go through [`reopen_conversation`], which resolves the destination from the
+/// conversation's PARENT rather than from a recorded session name. A name captured before a
+/// reboot is a guess about a world that no longer exists — the mistake that once put a
+/// thawed conversation in the wrong worktree's session (`f51860b`).
+struct RecoverState {
+    /// Restore candidates in (session, window index) order, so replaying them rebuilds the
+    /// layout you left rather than an arbitrary permutation.
+    rows: Vec<Conversation>,
+    /// Ids ticked for restore. Everything starts ticked: after a reboot you usually want the
+    /// whole frame back, and un-ticking three is less work than ticking eleven.
+    checked: HashSet<String>,
+    sel: usize,
+    /// When the frame was last observed. Deliberately "last seen", not "when the machine
+    /// died" — hive cannot know the latter, and claiming it would be a lie on any machine
+    /// that sat idle before going down.
+    last_seen: Option<String>,
+    /// Restore failures from the last `Enter`, shown in place of the footer hint.
+    errors: Vec<String>,
+}
+
+/// Build the recovery screen from the frame on disk, or `None` when there is nothing to
+/// offer — which is the normal state, and not an error: it means everything that was open
+/// still is.
+fn build_recover(reg: &ConversationRegistry) -> Option<RecoverState> {
+    let snap = OpenWindowsState::load();
+    let rows = recover_rows(&snap.windows, reg);
+    if rows.is_empty() {
+        return None;
+    }
+    let last_seen = snap.windows.values().map(|w| w.last_seen.clone()).max();
+    let checked: HashSet<String> = rows.iter().map(|c| c.id.as_str().to_string()).collect();
+    Some(RecoverState {
+        rows,
+        checked,
+        sel: 0,
+        last_seen,
+        errors: Vec::new(),
+    })
+}
+
+/// Pure core of [`build_recover`]: the restore candidates a frame implies, in the order they
+/// should be replayed. Takes the entries so the rules stay unit-testable without an
+/// `open-windows.json` on disk.
+///
+/// A candidate is an entry that is **not currently live**. Reconciling against the registry
+/// — rather than, say, the `--resume` id in a process's argv — is what makes the screen
+/// idempotent: open it twice and the second pass has nothing to do. argv would not serve, as
+/// it holds the id a window was LAUNCHED with, which goes stale the moment that window
+/// starts a different conversation.
+fn recover_rows(
+    windows: &HashMap<String, crate::common::activity::OpenWindow>,
+    reg: &ConversationRegistry,
+) -> Vec<Conversation> {
+    let mut rows: Vec<(&str, u32, Conversation)> = Vec::new();
+    for (id, w) in windows {
+        let Some(c) = reg.conversations.get(id) else {
+            // Bounded out of the registry (too old, no parent, unpinned) — there is nothing
+            // to resume it *with*, so it cannot honestly be offered.
+            continue;
+        };
+        if c.lifecycle == Lifecycle::Live {
+            continue;
+        }
+        // Parse the index so "10" sorts after "9" rather than between "1" and "2".
+        let idx = w.window_index.parse::<u32>().unwrap_or(u32::MAX);
+        rows.push((w.session_name.as_str(), idx, c.clone()));
+    }
+    rows.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
+    rows.into_iter().map(|(_, _, c)| c).collect()
+}
 
 /// Home-row alphabet for hint-jump labels (9 keys → 81 two-char labels).
 const HINT_ALPHABET: &[u8] = b"asdfghjkl";
@@ -1687,6 +1769,23 @@ fn conversations_loop(
     let mut sys = System::new_all();
     sys.refresh_all();
     let mut reg = gather_conversations_stats(&mut sys);
+    // The TUI is one of hive's two continuous observers of the live set (the web data thread
+    // is the other). Syncing here keeps the recovery frame current for anyone who hasn't
+    // turned on the web autostart — opening the popup is enough to top it up.
+    crate::common::conversations::sync_recovery_frame(&reg);
+    // Nothing live + a frame on disk is the post-reboot state, and the one moment the
+    // recovery screen is what you opened hive FOR — so offer it without being asked. It only
+    // ever offers: nothing reopens until you press Enter. During normal use it stays out of
+    // the way behind `R`.
+    let mut recover: Option<RecoverState> = if reg
+        .conversations
+        .values()
+        .any(|c| c.lifecycle == Lifecycle::Live)
+    {
+        None
+    } else {
+        build_recover(&reg)
+    };
     let mut flags = Flags::load();
     let projects = ProjectRegistry::load();
     // Default to the Active view (live conversations by session); `/` browses all.
@@ -2105,6 +2204,106 @@ fn conversations_loop(
             continue;
         }
 
+        // ── Recovery screen ─────────────────────────────────────────────────
+        // Owns the frame + input while open. Multi-select: Space/digits toggle a row,
+        // Enter reopens the ticked set through `reopen_conversation`.
+        if recover.is_some() {
+            {
+                let r = recover.as_ref().unwrap();
+                terminal.draw(|frame| draw_recover(frame, r, &projects))?;
+            }
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let r = recover.as_mut().unwrap();
+            let toggle = |r: &mut RecoverState, i: usize| {
+                if let Some(c) = r.rows.get(i) {
+                    let id = c.id.as_str().to_string();
+                    if !r.checked.remove(&id) {
+                        r.checked.insert(id);
+                    }
+                }
+            };
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => recover = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if r.sel + 1 < r.rows.len() {
+                        r.sel += 1;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => r.sel = r.sel.saturating_sub(1),
+                KeyCode::Char(' ') => {
+                    let i = r.sel;
+                    toggle(r, i);
+                }
+                KeyCode::Char('a') => {
+                    r.checked = r.rows.iter().map(|c| c.id.as_str().to_string()).collect();
+                }
+                KeyCode::Char('n') => r.checked.clear(),
+                KeyCode::Char(d @ '1'..='9') => {
+                    let i = d as usize - '1' as usize;
+                    if i < r.rows.len() {
+                        r.sel = i;
+                        toggle(r, i);
+                    }
+                }
+                KeyCode::Enter => {
+                    // Rows are already in (session, window index) order, so replaying them
+                    // rebuilds the layout you left rather than an arbitrary permutation.
+                    let mut errors = Vec::new();
+                    let mut restored: HashSet<String> = HashSet::new();
+                    let picked: Vec<Conversation> = r
+                        .rows
+                        .iter()
+                        .filter(|c| r.checked.contains(c.id.as_str()))
+                        .cloned()
+                        .collect();
+                    for c in &picked {
+                        // No fallback session: recovery must place a conversation via its own
+                        // parent, never "wherever the cursor happens to be".
+                        match reopen_conversation(c, None) {
+                            Ok(_) => {
+                                restored.insert(c.id.as_str().to_string());
+                            }
+                            Err(e) => {
+                                let title = c
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| c.id.as_str().chars().take(8).collect());
+                                errors.push(format!("{title}: {e}"));
+                            }
+                        }
+                    }
+                    // Drop what we launched instead of re-deriving the list from a fresh
+                    // gather: Claude takes seconds to come up, so an immediate re-gather
+                    // still reports it Closed and the row would linger as if nothing had
+                    // happened. A failed row stays put, carrying its error.
+                    r.rows.retain(|c| !restored.contains(c.id.as_str()));
+                    r.checked.retain(|id| !restored.contains(id));
+                    r.sel = r.sel.min(r.rows.len().saturating_sub(1));
+                    r.errors = errors;
+                    let done = r.rows.is_empty();
+                    // Refresh the list underneath so backing out lands on current state.
+                    reg = gather_conversations_stats(&mut sys);
+                    flags = Flags::load();
+                    (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    // The list changed shape; other handlers reset the cursor the same way.
+                    sel = 0;
+                    if done {
+                        recover = None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         // ── Project detail sub-screen ───────────────────────────────────────
         // When drilled into a project, this fully owns the frame + input; Esc/q
         // backs out to the list, Enter/n/r return an Action that exits the TUI.
@@ -2443,6 +2642,7 @@ fn conversations_loop(
                     _ => None,
                 };
                 reg = gather_conversations_stats(&mut sys);
+                crate::common::conversations::sync_recovery_frame(&reg);
                 flags = Flags::load();
                 (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 if let Some(id) = keep {
@@ -2931,6 +3131,9 @@ fn conversations_loop(
             // per-session `m` above. Persisted as the shared `muted-global` flag the
             // hook notifier checks, so it affects the web too.
             KeyCode::Char('G') => set_global_mute(!is_globally_muted()),
+            // `R` reopens the last frame — the windows that were open when hive last saw
+            // the machine. Nothing to show is not an error; it means nothing is missing.
+            KeyCode::Char('R') => recover = build_recover(&reg),
             // Shift-M overrides mute for the selected CONVERSATION: it keeps ringing
             // even under global / project / session mute. Pairs with the lowercase
             // `m` (mute this session) — same key, opposite direction. Per-conversation,
@@ -3284,6 +3487,130 @@ fn draw(
 /// Render the project detail sub-screen: config, worktrees, and the project's
 /// conversations (the only navigable rows). `n` starts a new one, `r` resumes the
 /// last, Enter switches/resumes the selected one.
+/// The recovery screen: pick which of the last frame's windows to reopen.
+///
+/// Multi-select rather than all-or-nothing because restoring is not free — every row is a
+/// Claude process and its context — and the set you want after a crash mid-week is rarely
+/// the set you want after a clean reboot.
+fn draw_recover(frame: &mut ratatui::Frame, state: &RecoverState, projects: &ProjectRegistry) {
+    let area = frame.area();
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    let picked = state.checked.len();
+    let mut title = vec![
+        Span::styled(
+            " 🕘 Last session",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{} windows · {picked} selected", state.rows.len()),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ];
+    if let Some(seen) = &state.last_seen {
+        title.push(Span::raw("   "));
+        // "last seen", not "as of shutdown": the frame stops updating when hive dies, so
+        // this is the last moment hive OBSERVED the set — which on a machine that idled
+        // before going down is meaningfully earlier than the crash itself.
+        title.push(Span::styled(
+            format!("last seen {}", relative_time(seen)),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+    title.push(Span::styled(
+        "   ( Esc back )",
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(title)), chunks[0]);
+
+    let mut display: Vec<Line> = Vec::new();
+    display.push(Line::raw(""));
+    let mut item_pos: Vec<usize> = Vec::new();
+
+    for (i, c) in state.rows.iter().enumerate() {
+        let on = state.checked.contains(c.id.as_str());
+        let selected = i == state.sel;
+        item_pos.push(display.len());
+
+        // Digits only reach the first nine rows; the rest are cursor + Space.
+        let num = if i < 9 {
+            format!("{} ", i + 1)
+        } else {
+            "  ".to_string()
+        };
+        let label = project_label(c, projects).unwrap_or_default();
+        let title_text = c
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "(untitled)".to_string());
+
+        let base = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let body = if on {
+            base
+        } else {
+            base.add_modifier(Modifier::DIM)
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("  {}", if on { "[x]" } else { "[ ]" }),
+                if on {
+                    base.fg(Color::Green)
+                } else {
+                    base.add_modifier(Modifier::DIM)
+                },
+            ),
+            Span::styled(format!(" {num}"), base.add_modifier(Modifier::DIM)),
+            // Padded by display CELLS — an emoji is one char but two columns, so `{:<n}`
+            // would stagger every row whose project has an icon.
+            Span::styled(format!("{} ", fit_cells(&label, 22)), body),
+            Span::styled(format!("{} ", fit_cells(&title_text, 34)), body),
+            Span::styled(abbrev_home(&c.cwd), body.add_modifier(Modifier::DIM)),
+        ];
+        if c.auth_config_dir.is_some() {
+            spans.push(Span::styled("  [work]", body.fg(Color::Magenta)));
+        }
+        display.push(Line::from(spans));
+    }
+
+    let h = chunks[1].height as usize;
+    let sel_display = item_pos.get(state.sel).copied().unwrap_or(0);
+    let offset = if sel_display >= h {
+        sel_display + 1 - h
+    } else {
+        0
+    };
+    let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    // Failures replace the hint: a restore that silently did nothing is worse than one that
+    // says so.
+    let footer = if state.errors.is_empty() {
+        Line::from(Span::styled(
+            format!(" Space toggle · a all · n none · Enter recover {picked} · Esc back"),
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(" {}", state.errors.join(" · ")),
+            Style::default().fg(Color::Red),
+        ))
+    };
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
 fn draw_project_detail(
     frame: &mut ratatui::Frame,
     state: &ProjectDetailState,
@@ -5922,6 +6249,86 @@ mod tests {
         assert_eq!(m("clear"), vec!["cs"], "matches the display name");
         assert!(m("").is_empty(), "empty query matches nothing");
         assert!(m("zzz").is_empty());
+    }
+
+    fn open_window(sid: &str, session: &str, idx: &str) -> crate::common::activity::OpenWindow {
+        crate::common::activity::OpenWindow {
+            session_name: session.to_string(),
+            window_name: String::new(),
+            window_index: idx.to_string(),
+            cwd: "/home/u/hive".to_string(),
+            claude_session_id: sid.to_string(),
+            claude_config_dir: None,
+            first_seen: "2026-09-05T21:00:00Z".to_string(),
+            last_seen: "2026-09-05T21:30:00Z".to_string(),
+        }
+    }
+
+    fn registry_of(convs: Vec<Conversation>) -> ConversationRegistry {
+        ConversationRegistry {
+            conversations: convs
+                .into_iter()
+                .map(|c| (c.id.as_str().to_string(), c))
+                .collect(),
+        }
+    }
+
+    /// What makes the screen idempotent: a window that is already running is not a restore
+    /// candidate, so opening it twice has nothing to do the second time. Reconciling against
+    /// the REGISTRY is the point — a process's `--resume` argv holds the id it was launched
+    /// with, which goes stale as soon as that window starts a different conversation.
+    #[test]
+    fn recover_rows_skips_what_is_already_live() {
+        let reg = registry_of(vec![
+            mk("live", Lifecycle::Live, Some("hive"), None),
+            mk("closed", Lifecycle::Closed, Some("hive"), None),
+        ]);
+        let windows = HashMap::from([
+            ("live".to_string(), open_window("live", "🐝 hive", "1")),
+            ("closed".to_string(), open_window("closed", "🐝 hive", "2")),
+        ]);
+
+        let rows = recover_rows(&windows, &reg);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_str(), "closed");
+    }
+
+    /// Replay order rebuilds the layout you left, so window index must sort NUMERICALLY —
+    /// as strings, "10" lands between "1" and "2" and the windows come back shuffled.
+    #[test]
+    fn recover_rows_orders_by_session_then_numeric_window_index() {
+        let ids = ["a", "b", "c", "d"];
+        let reg = registry_of(
+            ids.iter()
+                .map(|i| mk(i, Lifecycle::Closed, Some("hive"), None))
+                .collect(),
+        );
+        let windows = HashMap::from([
+            ("a".to_string(), open_window("a", "📁 thesis", "2")),
+            ("b".to_string(), open_window("b", "🐝 hive", "10")),
+            ("c".to_string(), open_window("c", "🐝 hive", "9")),
+            ("d".to_string(), open_window("d", "📁 thesis", "1")),
+        ]);
+
+        let rows = recover_rows(&windows, &reg);
+        let order: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
+        // 🐝 hive before 📁 thesis (byte order), and 9 before 10 within the session.
+        assert_eq!(order, ["c", "b", "d", "a"]);
+    }
+
+    /// A frame entry the registry has bounded out (too old, no parent, unpinned) has nothing
+    /// to resume it *with*, so offering it would be a button that cannot work.
+    #[test]
+    fn recover_rows_drops_entries_the_registry_no_longer_knows() {
+        let reg = registry_of(vec![mk("known", Lifecycle::Closed, Some("hive"), None)]);
+        let windows = HashMap::from([
+            ("known".to_string(), open_window("known", "🐝 hive", "1")),
+            ("gone".to_string(), open_window("gone", "🐝 hive", "2")),
+        ]);
+
+        let rows = recover_rows(&windows, &reg);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_str(), "known");
     }
 
     fn mk(id: &str, lc: Lifecycle, parent: Option<&str>, last: Option<&str>) -> Conversation {

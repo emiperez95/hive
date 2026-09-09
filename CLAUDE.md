@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 317 tests (293 unit + 24 CLI smoke)
+cargo test                # 325 tests (301 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~537 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 293 unit + 24 smoke.
+> bin targets and run twice. Distinct tests: 301 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -241,7 +241,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 │   ├── conversations.json     # per-conversation overlay: note / pinned / archived (+ reason, when) / mute override
 │   ├── conversation-scan.json # mtime-keyed transcript scan cache (warm gather ~6x faster)
 │   ├── activity.jsonl         # append-only lifecycle/focus event log (feeds `hive stats`)
-│   ├── open-windows.json      # snapshot of currently-open windows (recovery projection)
+│   ├── open-windows.json      # the RECOVERY FRAME: live windows, reconciled by the gather
 │   ├── favorites.txt          # favorite session names
 │   ├── todos.txt              # per-session todo lists (active)
 │   ├── todos-done.txt         # per-session completed todos
@@ -431,6 +431,7 @@ the cwd's shared-prefix remainder just restates the project).
 | `v` `m` `s` `!` | favorite · mute · skip · auto-approve (session-level) |
 | `M` | mute override 🔔 (per conversation) · `G` global mute · `P` pin conversation · `e` edit note |
 | `z`/`Z` | freeze a Claude window (prompts for a note) |
+| `R` | recovery screen — reopen the windows that were open when hive last saw the machine |
 | `Del` | close live conv (kill window) · discard frozen · archive project (Browse header) · delete worktree (confirm) |
 | `a` | project detail: archive / unarchive the project |
 | `A` | project detail: archive the selected conversation (prompts for a reason) / unarchive |
@@ -542,6 +543,79 @@ hold the jsonl open). Exact wherever argv has `--resume`.
 (`conversation-scan.json`) by transcript mtime: it stats every transcript but only re-parses
 changed ones. Warm gather **0.43s → 0.07s (~6x)**. The list auto-refreshes on a 2s idle tick,
 preserving selection by conversation id.
+
+The cache also carries a **`SCAN_PARSER_VERSION`**; a mismatch discards it wholesale. The
+mtime key answers "did the file change?", not "did our *reading* of it change?" — so without
+this, a parser fix stays invisible on exactly the conversations it repairs. Bump it whenever
+the parse yields something different from an unchanged transcript.
+
+> **Gotcha — `read_conversation_meta` bounds the head by BYTES, not lines.** A transcript can
+> open with a long metadata preamble (`file-history-snapshot`, `mode`, `agent-name`) that
+> carries no `cwd`, and the old 40-line window stopped short of it: one conversation's first
+> cwd sat on line 45 behind 35 snapshot entries, so it scanned as cwd-less. An empty cwd means
+> no `resolve_parent`, which means the conversation shows under `(unassigned)` **and** cannot
+> be recovered — there is nothing to `-c` into.
+
+## Recovery — reopening the windows a restart wiped (`R`)
+
+A reboot kills every tmux session and with it every running Claude. The conversations survive
+on disk, so the hard part was never *restoring* one — `common/conversations.rs::reopen_conversation`
+already does that (resolves the target session from the conversation's PARENT, passes the auth
+profile, `tmux::exact` targeting, delegates frozen entries to `thaw_window`). The hard part is
+knowing **which** conversations to reopen.
+
+### The frame is a mirror, not a log
+
+`open-windows.json` is continuously reconciled to *the set of live Claude windows right now* —
+add on appear, drop on disappear. Nothing detects a shutdown: a reboot is just the mirror
+going still, so the last write left on disk is the frame that was open at that moment.
+
+The writer is **`activity::sync_open_windows`, driven by the registry gather** — called from
+the web data thread (`serve/web.rs`, autostarted as `__hive_web`) and the TUI's refresh loop.
+It is *not* the hook, and that distinction is the whole feature:
+
+> A hook fires from inside a running Claude, so it can only report **presence**. A window that
+> hasn't run a turn since it opened never fires one and stays invisible — and that failure
+> peaks exactly when it matters, because right after a restore every window is idle by
+> definition. Measured on a live machine: **the hook-written file held 4 entries while 11
+> Claude windows were running.** The gather sees all 11, and it also sees **absence**, which
+> is what lets a deliberately-closed window leave the frame.
+
+Two guarantees worth keeping:
+
+- **An empty live set never overwrites the frame** (`reconcile_open_windows` returns `None`).
+  The state right after a reboot is "nothing running", and the first gather would otherwise
+  erase exactly what it is about to restore. Closing every window by hand instead leaves a
+  stale frame that ages out on its own — the harmless direction to be wrong in.
+- **An unchanged set is not rewritten**, since this runs on a 1s loop. Only the set and each
+  window's placement/title count as change; `last_seen` alone does not.
+
+### The screen (`R`, or automatic when nothing is live)
+
+`build_recover` offers every frame entry that is **not currently live**, ordered by
+(session, numeric window index) so replaying rebuilds the layout you left. Reconciling against
+the registry — not against a process's `--resume` argv — is what makes it idempotent: argv
+holds the id a window was *launched* with, which goes stale the moment that window starts a
+different conversation (observed: a window advertising `--resume beb3e754` while actually
+running `ad96d075`).
+
+Rows are the registry's own `Conversation`s, so restore goes through `reopen_conversation` and
+inherits its parent-based session resolution. A session name captured before a reboot is a
+guess about a world that no longer exists — the same mistake behind the thaw bug in `f51860b`.
+
+- Everything starts ticked; `Space`/`1`-`9` toggle, `a` all, `n` none, `Enter` reopens the set.
+- Restored rows are dropped from the list **optimistically**, not by re-gathering: Claude takes
+  seconds to come up, so an immediate re-gather still reports it Closed and the row would
+  linger as if nothing happened. A failed row stays put and carries its error in the footer.
+- The header says "last seen", never "as of shutdown" — hive knows when it last *observed* the
+  set, not when the machine died, and on a box that idled first those differ.
+- It auto-opens when nothing is live (the post-reboot state) and otherwise hides behind `R`.
+  It only ever *offers*; nothing reopens until Enter.
+
+**Known limitation**: the mirror is only honest while something is gathering. With no web
+autostart and the TUI closed, a window closed in that gap stays in the frame and will be
+offered. Relatedly, two hive instances watching *different* tmux servers will fight over the
+file, each reconciling it to its own server's windows.
 
 ## Frozen Windows (Freeze / Thaw)
 
@@ -942,10 +1016,10 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-317 distinct tests. Run with `cargo test`.
+325 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~537 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 220 · bin 293 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 225 · bin 301 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
 **Unit tests (293)** — in-module `#[cfg(test)]` blocks:

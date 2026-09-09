@@ -13,6 +13,7 @@ use std::process::Command;
 use anyhow::{anyhow, Result};
 use sysinfo::System;
 
+use crate::common::activity::{self, WindowSeen};
 use crate::common::frozen::FrozenState;
 use crate::common::instances;
 use crate::common::jsonl;
@@ -20,7 +21,7 @@ use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{build_cmdline_map, get_process_info, parse_resume_id};
 use crate::common::projects::{activate_project, ensure_tmux_session, ProjectRegistry};
 use crate::common::registry::{
-    self, Conversation, ConversationRegistry, ConversationSidecar, ConversationStatus,
+    self, Conversation, ConversationRegistry, ConversationSidecar, ConversationStatus, Lifecycle,
     TmuxPlacement,
 };
 use crate::common::types::ClaudeStatus;
@@ -259,6 +260,53 @@ fn status_needs_attention(s: &SessionStatus) -> bool {
             | SessionStatus::PlanReview
             | SessionStatus::QuestionAsked
     )
+}
+
+// ── Recovery frame ──────────────────────────────────────────────────────────
+
+/// The registry's live windows, shaped as recovery-snapshot input.
+///
+/// The gather already resolves every running Claude window to its conversation id (hook id →
+/// `--resume` from argv → recency fill), which is strictly more than the hooks see: a window
+/// that hasn't run a turn since it opened fires no hook, so it is missing from the
+/// hook-written snapshot while being perfectly visible here. Feeding this to
+/// [`activity::sync_open_windows`] is what makes the recovery frame complete.
+pub fn live_windows(reg: &ConversationRegistry) -> Vec<WindowSeen> {
+    let mut out: Vec<WindowSeen> = reg
+        .conversations
+        .values()
+        .filter(|c| c.lifecycle == Lifecycle::Live)
+        .filter_map(|c| {
+            let p = c.placement.as_ref()?;
+            Some(WindowSeen {
+                claude_session_id: c.id.as_str().to_string(),
+                session_name: p.session_name.clone(),
+                window_index: p.window_index.clone(),
+                // The tmux window name mirrors the Claude title while it runs; the stored
+                // title is the fallback for a window whose name hasn't synced yet.
+                window_name: if p.window_name.is_empty() {
+                    c.title.clone().unwrap_or_default()
+                } else {
+                    p.window_name.clone()
+                },
+                // Claude's own cwd, never the pane's shell cwd — they diverge whenever the
+                // shell has been `cd`'d, and restoring to the wrong one silently changes
+                // what the resumed conversation can see.
+                cwd: c.cwd.clone(),
+                claude_config_dir: c.auth_config_dir.clone(),
+            })
+        })
+        .collect();
+    // Stable order so the file's diff is meaningful when read by a human.
+    out.sort_by(|a, b| a.claude_session_id.cmp(&b.claude_session_id));
+    out
+}
+
+/// Reconcile the recovery snapshot against a freshly gathered registry. Call from the
+/// long-running refresh loops (the TUI and the web data thread) — never from a one-shot
+/// command, whose single observation says nothing about what closed.
+pub fn sync_recovery_frame(reg: &ConversationRegistry) {
+    activity::sync_open_windows(&live_windows(reg));
 }
 
 // ── Reopen (resume a closed conversation) ───────────────────────────────────
