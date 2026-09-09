@@ -611,6 +611,9 @@ guess about a world that no longer exists — the same mistake behind the thaw b
   set, not when the machine died, and on a box that idled first those differ.
 - It auto-opens when nothing is live (the post-reboot state) and otherwise hides behind `R`.
   It only ever *offers*; nothing reopens until Enter.
+- `R` with nothing to recover says so in the footer for 4s rather than doing nothing. That is
+  the COMMON case — during normal use the frame equals the live set — and silence there reads
+  as a broken key.
 
 **Known limitation**: the mirror is only honest while something is gathering. With no web
 autostart and the TUI closed, a window closed in that gap stays in the frame and will be

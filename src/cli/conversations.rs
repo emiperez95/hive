@@ -1864,6 +1864,9 @@ fn conversations_loop(
     // Live auto-refresh: re-gather on idle ticks so status/CPU stay current without
     // a keypress (the classic TUI refreshes on a 1s background timer).
     let mut last_refresh = Instant::now();
+    // Transient footer message (e.g. `R` with nothing to recover). Expires on its own so it
+    // never becomes permanent chrome.
+    let mut notice: Option<(String, Instant)> = None;
     // Spread prompt (`L` with ≤1 iTerm pane): typing a digit spreads N sessions.
     let mut spreading = false;
     // New-project wizard (`N`): Some while stepping through key → emoji → path.
@@ -2627,6 +2630,12 @@ fn conversations_loop(
                 spreading,
                 wiz_prompt.as_deref(),
                 wiz_error.as_deref(),
+                // Expire the notice rather than clearing it on the next keypress: a
+                // message that outlives its moment turns into permanent chrome.
+                notice
+                    .as_ref()
+                    .filter(|(_, at)| at.elapsed() < Duration::from_secs(4))
+                    .map(|(m, _)| m.as_str()),
             )
         })?;
 
@@ -3133,7 +3142,17 @@ fn conversations_loop(
             KeyCode::Char('G') => set_global_mute(!is_globally_muted()),
             // `R` reopens the last frame — the windows that were open when hive last saw
             // the machine. Nothing to show is not an error; it means nothing is missing.
-            KeyCode::Char('R') => recover = build_recover(&reg),
+            KeyCode::Char('R') => {
+                recover = build_recover(&reg);
+                // Silence here reads as a broken key, and this is the COMMON case: during
+                // normal use the frame equals the live set, so there is nothing to restore.
+                if recover.is_none() {
+                    notice = Some((
+                        "nothing to recover — every window hive last saw is still open".to_string(),
+                        Instant::now(),
+                    ));
+                }
+            }
             // Shift-M overrides mute for the selected CONVERSATION: it keeps ringing
             // even under global / project / session mute. Pairs with the lowercase
             // `m` (mute this session) — same key, opposite direction. Per-conversation,
@@ -3213,6 +3232,8 @@ fn draw(
     spread_prompt: bool,
     wiz_prompt: Option<&str>,
     wiz_error: Option<&str>,
+    // Transient one-line message, shown in place of the key hints.
+    notice: Option<&str>,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -3234,7 +3255,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · f jump · z freeze · P pin · Del close · v★ m ! s · M ring · G mute-all · / search · ? · q",
+            " → detail · Enter switch · f jump · z freeze · R recover · P pin · Del close · v★ m ! s · M ring · G mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -3478,6 +3499,11 @@ fn draw(
                 Style::default().fg(Color::DarkGray),
             ),
         ])
+    } else if let Some(msg) = notice {
+        Line::from(Span::styled(
+            format!(" {msg}"),
+            Style::default().fg(Color::Yellow),
+        ))
     } else {
         Line::from(Span::styled(footer, Style::default().fg(Color::DarkGray)))
     };
