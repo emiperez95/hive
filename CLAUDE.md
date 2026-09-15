@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 325 tests (301 unit + 24 CLI smoke)
+cargo test                # 327 tests (303 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~537 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 301 unit + 24 smoke.
+> bin targets and run twice. Distinct tests: 303 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -604,6 +604,12 @@ inherits its parent-based session resolution. A session name captured before a r
 guess about a world that no longer exists — the same mistake behind the thaw bug in `f51860b`.
 
 - Everything starts ticked; `Space`/`1`-`9` toggle, `a` all, `n` none, `Enter` reopens the set.
+- **A clean restore exits hive and lands you in the work** — the most recently active restored
+  conversation (`landing_target`), on its exact window. Its window index is captured the moment
+  `reopen_conversation` returns, because a later restore into the same session becomes that
+  session's current window. Goes through `Action::SwitchWindow`: `switch-client` inside tmux,
+  `select-window` + `attach` from a bare terminal (the post-reboot `hive start`). Any failure
+  keeps you on the screen instead, since the footer is where errors are shown.
 - Restored rows are dropped from the list **optimistically**, not by re-gathering: Claude takes
   seconds to come up, so an immediate re-gather still reports it Closed and the row would
   linger as if nothing happened. A failed row stays put and carries its error in the footer.
@@ -1019,10 +1025,10 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-325 distinct tests. Run with `cargo test`.
+327 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~537 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 225 · bin 301 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 225 · bin 303 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
 **Unit tests (293)** — in-module `#[cfg(test)]` blocks:

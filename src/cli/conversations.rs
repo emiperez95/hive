@@ -261,6 +261,21 @@ fn build_recover(reg: &ConversationRegistry) -> Option<RecoverState> {
     })
 }
 
+/// Which of the ticked conversations recovery should drop you into: the most recently active
+/// one, i.e. what you were last working on before the machine went down. Ties keep replay
+/// order (the earlier row wins). Not the cursor row — every row starts ticked and the cursor
+/// starts on row 1, so "the cursor" would mean "alphabetically first session" for anyone who
+/// just pressed Enter.
+fn landing_target(picked: &[Conversation]) -> Option<&Conversation> {
+    picked.iter().reduce(|best, c| {
+        if c.last_activity > best.last_activity {
+            c
+        } else {
+            best
+        }
+    })
+}
+
 /// Pure core of [`build_recover`]: the restore candidates a frame implies, in the order they
 /// should be replayed. Takes the entries so the rules stay unit-testable without an
 /// `open-windows.json` on disk.
@@ -1751,6 +1766,10 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
                 switch_to_session(&session);
                 select_window(&session, &window);
             } else {
+                // `attach` shows the session's current window, so set it first — otherwise
+                // a cold start (`hive start` after a reboot) lands on whichever window was
+                // created last rather than the one chosen.
+                select_window(&session, &window);
                 attach_or_switch(&session);
             }
         }
@@ -2267,11 +2286,23 @@ fn conversations_loop(
                         .filter(|c| r.checked.contains(c.id.as_str()))
                         .cloned()
                         .collect();
+                    let landing_id = landing_target(&picked).map(|c| c.id.as_str().to_string());
+                    let mut landing: Option<(String, String)> = None;
                     for c in &picked {
                         // No fallback session: recovery must place a conversation via its own
                         // parent, never "wherever the cursor happens to be".
                         match reopen_conversation(c, None) {
-                            Ok(_) => {
+                            Ok(session) => {
+                                // Capture the window NOW: `new-window` just made it the session's
+                                // current one, but a later restore into the same session takes
+                                // that over, so asking after the loop would land on the wrong row.
+                                if landing_id.as_deref() == Some(c.id.as_str()) {
+                                    landing = crate::common::tmux::display_message_for_pane(
+                                        &crate::common::tmux::exact_active_pane(&session),
+                                        "#{window_index}",
+                                    )
+                                    .map(|idx| (session.clone(), idx));
+                                }
                                 restored.insert(c.id.as_str().to_string());
                             }
                             Err(e) => {
@@ -2290,6 +2321,16 @@ fn conversations_loop(
                     r.rows.retain(|c| !restored.contains(c.id.as_str()));
                     r.checked.retain(|id| !restored.contains(id));
                     r.sel = r.sel.min(r.rows.len().saturating_sub(1));
+                    // A clean restore ends where every other "start work here" action does:
+                    // in the work. Staying in the TUI left you with detached sessions and no
+                    // client on any of them — you had to quit hive and reattach by hand.
+                    // Failures keep you here instead, since the footer is the only place
+                    // they're reported.
+                    if errors.is_empty() {
+                        if let Some((session, window)) = landing {
+                            return Ok(Action::SwitchWindow(session, window));
+                        }
+                    }
                     r.errors = errors;
                     let done = r.rows.is_empty();
                     // Refresh the list underneath so backing out lands on current state.
@@ -6340,6 +6381,44 @@ mod tests {
         let order: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
         // 🐝 hive before 📁 thesis (byte order), and 9 before 10 within the session.
         assert_eq!(order, ["c", "b", "d", "a"]);
+    }
+
+    /// Recovery lands you in what you were last doing, not in whatever row sorts first.
+    #[test]
+    fn landing_target_is_the_most_recently_active_conversation() {
+        let picked = vec![
+            mk(
+                "hive",
+                Lifecycle::Closed,
+                Some("hive"),
+                Some("2026-09-05T10:00:00Z"),
+            ),
+            mk(
+                "thesis",
+                Lifecycle::Closed,
+                Some("thesis"),
+                Some("2026-09-05T21:29:00Z"),
+            ),
+            mk(
+                "eve",
+                Lifecycle::Closed,
+                Some("eve"),
+                Some("2026-09-05T18:00:00Z"),
+            ),
+        ];
+        assert_eq!(landing_target(&picked).unwrap().id.as_str(), "thesis");
+    }
+
+    /// No activity anywhere (or a tie) keeps replay order: the first row wins, so the
+    /// choice is deterministic rather than hash-order.
+    #[test]
+    fn landing_target_ties_keep_replay_order() {
+        let picked = vec![
+            mk("first", Lifecycle::Closed, Some("hive"), None),
+            mk("second", Lifecycle::Closed, Some("hive"), None),
+        ];
+        assert_eq!(landing_target(&picked).unwrap().id.as_str(), "first");
+        assert!(landing_target(&[]).is_none());
     }
 
     /// A frame entry the registry has bounded out (too old, no parent, unpinned) has nothing
