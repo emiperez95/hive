@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 327 tests (303 unit + 24 CLI smoke)
+cargo test                # 329 tests (305 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~537 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 303 unit + 24 smoke.
+> bin targets and run twice. Distinct tests: 305 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -537,6 +537,18 @@ Resolution order per window:
 best-effort guess, not a true window↔transcript link (none exists off-process: claude doesn't
 hold the jsonl open). Exact wherever argv has `--resume`.
 
+> **Gotcha — a conversation's cwd is its LAUNCH dir, not the hook's.** `registry::home_cwd`
+> makes the transcript's first `cwd` win over the hook payload's for every conversation;
+> the hook cwd only fills in for a transcript that has none yet. The hook reports where the
+> process is *now*, and a background Workflow moves that into a Claude-managed agent worktree,
+> `<main checkout>/.claude/worktrees/wf_*` — the harness stamps it on hook events and on the
+> `<task-notification>`. Because that path sits under the MAIN checkout, longest-prefix
+> `resolve_parent` re-homed a `worktrees/avateen/test-harness` conversation into main
+> `avateen`, and recovery then restored it into `📊 Avateen`. Ordinary `cd api/` drift never
+> changed a parent (measured: 0 of the live hook entries), which is why this stayed invisible.
+> Note `effective_parent`'s "never re-derived from a shifting cwd" is not enforced by anything
+> — no code persists a parent — so the cwd is the only thing keeping grouping stable.
+
 ### Performance
 
 `jsonl::scan_all_disk_conversations_cached()` keys an on-disk cache
@@ -1025,10 +1037,10 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-327 distinct tests. Run with `cargo test`.
+329 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~537 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 225 · bin 303 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 227 · bin 305 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
 **Unit tests (293)** — in-module `#[cfg(test)]` blocks:

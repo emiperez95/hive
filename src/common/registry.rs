@@ -428,6 +428,27 @@ fn component_prefix_len(cwd: &Path, candidate: &Path) -> Option<usize> {
     Some(matched)
 }
 
+/// The directory that defines where a conversation LIVES — what its parent is resolved from
+/// and what a restore reopens it in.
+///
+/// That is the transcript's launch directory (the first `cwd` Claude stamped, and the dir it
+/// files the transcript under), not the cwd the latest hook reported. The hook cwd is where
+/// the conversation's process happens to be *right now*, and it drifts. Usually harmlessly —
+/// a `cd api/` stays inside the same worktree — but not always: a background Workflow runs in
+/// a Claude-managed agent worktree (`<main checkout>/.claude/worktrees/wf_*`), and the
+/// harness stamps that path on the conversation's hook events and on its
+/// `<task-notification>`. That path sits under the MAIN checkout, so longest-prefix matching
+/// re-homed a `worktrees/avateen/test-harness` conversation into main `avateen`, and recovery
+/// restored it there.
+///
+/// Falls back to the hook cwd only for a transcript with no cwd yet (a brand-new conversation).
+pub fn home_cwd<'a>(hook_cwd: &'a str, launch_cwd: Option<&'a str>) -> &'a str {
+    match launch_cwd {
+        Some(launch) if !launch.is_empty() => launch,
+        _ => hook_cwd,
+    }
+}
+
 /// Resolve a cwd to its logical parent key (Invariant #2) by longest component-
 /// wise path prefix: the deepest matching worktree wins, else the project root,
 /// else `None` (a foreign/remote cwd must not false-match). Host-local best-effort.
@@ -541,6 +562,25 @@ pub fn should_surface_closed(
 mod tests {
     use super::*;
     use crate::ipc::messages::{HookState, SessionState, SessionStatus};
+
+    /// The launch dir wins over whatever the latest hook reported; the hook cwd only fills in
+    /// for a transcript that has no cwd yet.
+    #[test]
+    fn home_cwd_prefers_the_launch_dir_over_the_drifting_hook_cwd() {
+        let wf = "/u/Projects/avateen/.claude/worktrees/wf_f6a1f785-126-1";
+        let launch = "/u/Projects/worktrees/avateen/test-harness";
+        assert_eq!(home_cwd(wf, Some(launch)), launch);
+        assert_eq!(
+            home_cwd(wf, None),
+            wf,
+            "new conversation: nothing better to use"
+        );
+        assert_eq!(
+            home_cwd(wf, Some("")),
+            wf,
+            "an empty launch cwd is no answer"
+        );
+    }
 
     fn sample(id: &str) -> Conversation {
         Conversation {
@@ -1106,6 +1146,29 @@ mod tests {
         assert_eq!(
             resolve_parent("/home/u/hive/src", &WorktreeState::default(), &projs),
             Some("hive".to_string())
+        );
+    }
+
+    /// The trap `home_cwd` exists for. A hive worktree lives OUTSIDE its project root, while a
+    /// Claude-managed agent worktree (where a background Workflow runs) lives INSIDE it — so a
+    /// conversation whose latest hook reported the agent worktree resolves to the main project.
+    /// Resolving from the launch dir instead keeps it in the worktree it belongs to.
+    #[test]
+    fn test_agent_worktree_cwd_rehomes_unless_the_launch_dir_wins() {
+        let wts = wts_with(&[("avateen", "test-harness", "/u/wt/avateen/test-harness")]);
+        let projs = projs_with(&[("avateen", "/u/avateen")]);
+        let agent_wt = "/u/avateen/.claude/worktrees/wf_f6a1f785-126-1";
+        let launch = "/u/wt/avateen/test-harness";
+
+        assert_eq!(
+            resolve_parent(agent_wt, &wts, &projs),
+            Some("avateen".to_string()),
+            "the bug: the hook cwd alone lands in the MAIN project"
+        );
+        assert_eq!(
+            resolve_parent(home_cwd(agent_wt, Some(launch)), &wts, &projs),
+            Some("avateen/test-harness".to_string()),
+            "the fix: the launch dir keeps it in its worktree"
         );
     }
 

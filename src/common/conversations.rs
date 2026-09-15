@@ -120,18 +120,16 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
 
     let mut reg = ConversationRegistry::from_shadow(&hook, &disk_ids, &live_placements, &sidecar);
 
-    // Enrich disk-only (Closed) conversations with cwd + last-activity + title
-    // from the transcript — the hook side had none, so without this they can't
-    // be placed or bounded.
+    // Enrich every conversation from its transcript: last-activity and title where the hook
+    // side has none, and — for ALL of them — the home cwd. The transcript's launch dir beats
+    // the hook's cwd (see `registry::home_cwd`): a hook reports where the process is right
+    // now, which a background Workflow moves into an agent worktree under the MAIN checkout,
+    // and parent resolution below would follow it there.
     let disk_map: HashMap<&str, &jsonl::DiskConversation> =
         disk.iter().map(|d| (d.id.as_str(), d)).collect();
     for (id, c) in reg.conversations.iter_mut() {
         if let Some(d) = disk_map.get(id.as_str()) {
-            if c.cwd.is_empty() {
-                if let Some(cwd) = &d.cwd {
-                    c.cwd = cwd.clone();
-                }
-            }
+            c.cwd = registry::home_cwd(&c.cwd, d.cwd.as_deref()).to_string();
             if c.last_activity.is_none() {
                 c.last_activity = d.last_activity.clone();
             }
@@ -289,9 +287,11 @@ pub fn live_windows(reg: &ConversationRegistry) -> Vec<WindowSeen> {
                 } else {
                     p.window_name.clone()
                 },
-                // Claude's own cwd, never the pane's shell cwd — they diverge whenever the
-                // shell has been `cd`'d, and restoring to the wrong one silently changes
-                // what the resumed conversation can see.
+                // The conversation's HOME — its transcript's launch dir (`registry::home_cwd`)
+                // — never the pane's shell cwd or the latest hook cwd. Both drift: the shell
+                // with every `cd`, the hook into a background Workflow's agent worktree under
+                // the main checkout. A restore replays this value, so drift here re-homes the
+                // conversation into the wrong session.
                 cwd: c.cwd.clone(),
                 claude_config_dir: c.auth_config_dir.clone(),
             })
