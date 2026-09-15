@@ -282,6 +282,11 @@ impl ConversationSidecar {
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRegistry {
     pub conversations: HashMap<String, Conversation>,
+    /// `(id, parent)` pairs this gather established or refined, waiting to be written to the
+    /// overlay. The gather only records them — it stays read-only, since one-shot commands
+    /// call it too — and `conversations::persist_parents` writes them from the long-running
+    /// loops. Empty in the steady state: a parent is persisted once, not every refresh.
+    pub pending_parents: Vec<(String, String)>,
 }
 
 impl ConversationRegistry {
@@ -352,7 +357,10 @@ impl ConversationRegistry {
                 },
             );
         }
-        ConversationRegistry { conversations }
+        ConversationRegistry {
+            conversations,
+            pending_parents: Vec::new(),
+        }
     }
 
     /// Surface every frozen window from a `FrozenState`. Freeze == a pinned, noted
@@ -515,17 +523,71 @@ pub fn resolve_parent_session_name(
         .map(|config| ProjectRegistry::session_name(&key, config))
 }
 
-/// The persisted parent is authoritative; the local resolver is a fallback only,
-/// so a session's parent, once cached, is never re-derived from a shifting cwd.
-pub fn effective_parent(
-    session: &Conversation,
-    worktrees: &WorktreeState,
-    projects: &ProjectRegistry,
-) -> Option<String> {
-    if session.parent.is_some() {
-        return session.parent.clone();
+/// A conversation's parent, settled against the one it was last persisted with.
+#[derive(Debug, PartialEq)]
+pub struct SettledParent {
+    /// The parent to use for this gather.
+    pub parent: Option<String>,
+    /// A parent to write back to the overlay — set only when this settle established one
+    /// for the first time, replaced a dead one, or refined one.
+    pub persist: Option<String>,
+}
+
+/// Settle a conversation's parent so that, once known, it is **never re-derived from a
+/// shifting cwd**.
+///
+/// - `persisted` — the parent cached in the overlay, if any.
+/// - `from_launch` — the parent the transcript's LAUNCH dir resolves to (stable per
+///   conversation; see [`home_cwd`]).
+/// - `from_hook` — the parent the hook cwd resolves to, used only when the transcript has no
+///   cwd yet (a brand-new conversation).
+/// - `registered` — whether a project or worktree key is still registered.
+///
+/// Rules, each for a reason:
+///
+/// 1. **A cached parent wins while its owner is still registered.** Nothing about the cwd
+///    can move it: not a hook reporting a background Workflow's agent worktree, not a parser
+///    change that reads a different first cwd, not a newly registered project whose root
+///    happens to contain the launch dir.
+/// 2. **…except to refine it into its own worktree.** A cached `avateen` whose launch dir now
+///    resolves to `avateen/test-harness` upgrades — that's a worktree registered after the
+///    conversation was first seen, not a re-homing. A different project never takes over.
+/// 3. **A cached parent whose owner is gone is ignored.** Otherwise a pruned worktree's
+///    conversations would keep a parent forever, and `should_surface_closed` exempts anything
+///    parented from the age bound — they would never age out.
+/// 4. **Only a launch-dir resolution is ever persisted.** The hook-cwd fallback is used for
+///    this gather but not cached: caching it would make a transient cwd permanent, which is
+///    exactly the bug this guards against.
+pub fn settle_parent(
+    persisted: Option<&str>,
+    from_launch: Option<&str>,
+    from_hook: Option<&str>,
+    registered: impl Fn(&str) -> bool,
+) -> SettledParent {
+    if let Some(p) = persisted.filter(|p| registered(p)) {
+        let refines =
+            from_launch.filter(|r| r.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')));
+        return match refines {
+            Some(r) => SettledParent {
+                parent: Some(r.to_string()),
+                persist: Some(r.to_string()),
+            },
+            None => SettledParent {
+                parent: Some(p.to_string()),
+                persist: None,
+            },
+        };
     }
-    resolve_parent(&session.cwd, worktrees, projects)
+    match from_launch {
+        Some(r) => SettledParent {
+            parent: Some(r.to_string()),
+            persist: Some(r.to_string()),
+        },
+        None => SettledParent {
+            parent: from_hook.map(str::to_string),
+            persist: None,
+        },
+    }
 }
 
 /// Policy bounding which Closed sessions to surface (the on-disk set is unbounded).
@@ -1235,17 +1297,95 @@ mod tests {
         );
     }
 
+    fn registered(keys: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |k| keys.contains(&k)
+    }
+
+    /// The guarantee itself: a cached parent is not re-derived from a cwd that now resolves
+    /// somewhere else — whether that cwd is a hook's or a launch dir another project claims.
     #[test]
-    fn test_persisted_parent_not_reresolved() {
-        // A session with a cached parent is NOT re-derived from its cwd, even
-        // though that cwd would resolve to a different local key.
-        let mut s = closed("abc", None);
-        s.cwd = "/home/u/hive/src".to_string();
-        s.parent = Some("preset/CSD-9".to_string());
-        let projs = projs_with(&[("hive", "/home/u/hive")]);
+    fn test_settle_parent_keeps_a_registered_cached_parent() {
+        let reg = registered(&["hive", "avateen", "avateen/test-harness"]);
         assert_eq!(
-            effective_parent(&s, &WorktreeState::default(), &projs),
-            Some("preset/CSD-9".to_string())
+            settle_parent(Some("avateen/test-harness"), Some("avateen"), None, &reg),
+            SettledParent {
+                parent: Some("avateen/test-harness".into()),
+                persist: None
+            },
+            "a coarser launch resolution does not demote it"
+        );
+        assert_eq!(
+            settle_parent(Some("hive"), Some("avateen"), None, &reg),
+            SettledParent {
+                parent: Some("hive".into()),
+                persist: None
+            },
+            "another project never takes it over"
+        );
+    }
+
+    /// Registering a worktree under a conversation's cached project refines the parent; that
+    /// is new information about the same owner, not a re-homing. A key that merely shares a
+    /// prefix is not a descendant.
+    #[test]
+    fn test_settle_parent_refines_into_its_own_worktree_only() {
+        let reg = registered(&["avateen", "avateen/test-harness", "avateen-hub"]);
+        assert_eq!(
+            settle_parent(Some("avateen"), Some("avateen/test-harness"), None, &reg),
+            SettledParent {
+                parent: Some("avateen/test-harness".into()),
+                persist: Some("avateen/test-harness".into()),
+            }
+        );
+        assert_eq!(
+            settle_parent(Some("avateen"), Some("avateen-hub"), None, &reg).parent,
+            Some("avateen".into()),
+            "`avateen-hub` is not inside `avateen`"
+        );
+    }
+
+    /// A pruned worktree's cached parent must not keep its conversations parented forever —
+    /// `should_surface_closed` exempts parented conversations from the age bound.
+    #[test]
+    fn test_settle_parent_ignores_a_cached_parent_whose_owner_is_gone() {
+        let reg = registered(&["avateen"]);
+        assert_eq!(
+            settle_parent(Some("avateen/pruned"), None, None, &reg),
+            SettledParent {
+                parent: None,
+                persist: None
+            },
+            "nothing resolves → unparented, so it ages out like before"
+        );
+        assert_eq!(
+            settle_parent(Some("avateen/pruned"), Some("avateen"), None, &reg),
+            SettledParent {
+                parent: Some("avateen".into()),
+                persist: Some("avateen".into())
+            },
+            "a live resolution replaces the dead key"
+        );
+    }
+
+    /// Only a launch-dir resolution is cached. The hook fallback is used, never persisted —
+    /// caching it would freeze a transient cwd (a background Workflow's agent worktree) in.
+    #[test]
+    fn test_settle_parent_persists_launch_resolutions_only() {
+        let reg = registered(&["avateen", "avateen/test-harness"]);
+        assert_eq!(
+            settle_parent(None, Some("avateen/test-harness"), Some("avateen"), &reg),
+            SettledParent {
+                parent: Some("avateen/test-harness".into()),
+                persist: Some("avateen/test-harness".into()),
+            }
+        );
+        assert_eq!(
+            settle_parent(None, None, Some("avateen"), &reg),
+            SettledParent {
+                parent: Some("avateen".into()),
+                persist: None
+            },
+            "new conversation: use the hook's answer, don't cache it"
         );
     }
 

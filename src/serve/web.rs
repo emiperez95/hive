@@ -183,6 +183,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             // "what was open when the machine died" a complete answer rather than the subset
             // that happened to fire a hook.
             crate::common::conversations::sync_recovery_frame(&reg);
+            crate::common::conversations::persist_parents(&reg);
 
             if let Ok(mut data) = active_for_thread.lock() {
                 *data = active;

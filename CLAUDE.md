@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 329 tests (305 unit + 24 CLI smoke)
+cargo test                # 332 tests (308 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints ~537 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 305 unit + 24 smoke.
+> bin targets and run twice. Distinct tests: 308 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -203,7 +203,7 @@ and `docs/permission-approve-reject.md`.)
   `from_shadow(hook, disk_ids, live_placements, sidecar)` — a left-join over state.json + a disk
   scan + the overlay sidecar
 - `ConversationSidecar` / `ConversationOverlay` — writable per-conversation overlay
-  (note/pinned/archived + `archive_reason`/`archived_at`, notify_override), persisted to
+  (note/pinned/archived + `archive_reason`/`archived_at`, notify_override, cached `parent`), persisted to
   `conversations.json`
 - `ClaudeInstance` (common/instances.rs) — one running Claude **window** (session, window_index,
   window_name, pane, cwd, pids, session_id, `cwd_shared`)
@@ -238,7 +238,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 │   ├── state.json             # hook state (session statuses) — PRUNED after 10min idle
 │   ├── worktrees.json         # registered worktrees
 │   ├── frozen.json            # frozen (hibernated) Claude windows — resume metadata + notes
-│   ├── conversations.json     # per-conversation overlay: note / pinned / archived (+ reason, when) / mute override
+│   ├── conversations.json     # per-conversation overlay: note / pinned / archived (+ reason, when) / mute override / cached parent
 │   ├── conversation-scan.json # mtime-keyed transcript scan cache (warm gather ~6x faster)
 │   ├── activity.jsonl         # append-only lifecycle/focus event log (feeds `hive stats`)
 │   ├── open-windows.json      # the RECOVERY FRAME: live windows, reconciled by the gather
@@ -258,8 +258,8 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
         └── lib/               # shared shell libraries for hooks
 ```
 
-Files are created on demand — `conversations.json` / `muted-projects.txt` only exist once you
-pin/note a conversation or mute a project. (Old installs may also have stale `parked.txt` /
+Files are created on demand — `muted-projects.txt` only exists once you mute a project, and
+`conversations.json` once a TUI or web loop has cached a parent (or you pin/note a conversation). (Old installs may also have stale `parked.txt` /
 `remote-*.json` on disk; no current code reads them.)
 
 ## Platform Guards
@@ -546,8 +546,17 @@ hold the jsonl open). Exact wherever argv has `--resume`.
 > `resolve_parent` re-homed a `worktrees/avateen/test-harness` conversation into main
 > `avateen`, and recovery then restored it into `📊 Avateen`. Ordinary `cd api/` drift never
 > changed a parent (measured: 0 of the live hook entries), which is why this stayed invisible.
-> Note `effective_parent`'s "never re-derived from a shifting cwd" is not enforced by anything
-> — no code persists a parent — so the cwd is the only thing keeping grouping stable.
+>
+> **A parent, once known, is cached and never re-derived from a shifting cwd** —
+> `registry::settle_parent`, applied by the gather against the overlay's `parent`. A cached
+> parent wins while its owner is still registered; it may only *refine* into its own worktree
+> (`avateen` → `avateen/test-harness`, registered later), never move to another project; a
+> cached parent whose owner was pruned is ignored, so those conversations still age out
+> (`should_surface_closed` exempts anything parented); and only a LAUNCH-dir resolution is ever
+> cached, never the hook-cwd fallback, which would make a transient cwd permanent. The gather
+> only records new parents in `ConversationRegistry::pending_parents`; `persist_parents` writes
+> them from the TUI and web loops, merging into a freshly loaded sidecar so it can't undo a
+> pin/note made in between.
 
 ### Performance
 
@@ -1037,10 +1046,10 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-329 distinct tests. Run with `cargo test`.
+332 distinct tests. Run with `cargo test`.
 
 > `cargo test` prints ~537 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 227 · bin 305 (the superset — adds cli/daemon/serve)
+> targets and run twice. Per target: lib 230 · bin 308 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
 **Unit tests (293)** — in-module `#[cfg(test)]` blocks:
@@ -1053,7 +1062,9 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   (from_shadow left-join, `resolve_parent` determinism, bounding, frozen overlay,
   `notify_override` applied from the sidecar + its by-id lookup / serde omission,
   `resolve_parent_session_name` — the worktree's registered name over the project's,
-  subdirectories, unclaimed cwd), instances, frozen (incl. `restore_session_name`: the
+  subdirectories, unclaimed cwd; `settle_parent` — a registered cached parent is kept, it
+  refines only into its own worktree, a pruned owner is ignored, only launch-dir resolutions
+  persist; `home_cwd` launch-dir-over-hook + the agent-worktree re-homing trap), instances, frozen (incl. `restore_session_name`: the
   cwd's owner beats the recorded session name, agreeing entries unchanged, unclaimed cwd
   falls back), activity (incl. `entry_line` single-line/one-syscall invariant), config
   (`[web]` parse, defaults-off, legacy `[defaults]` ignored)

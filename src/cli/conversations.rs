@@ -858,6 +858,7 @@ fn filter_registry(
         return reg.clone();
     }
     ConversationRegistry {
+        pending_parents: Vec::new(),
         conversations: reg
             .conversations
             .iter()
@@ -1792,6 +1793,7 @@ fn conversations_loop(
     // is the other). Syncing here keeps the recovery frame current for anyone who hasn't
     // turned on the web autostart — opening the popup is enough to top it up.
     crate::common::conversations::sync_recovery_frame(&reg);
+    crate::common::conversations::persist_parents(&reg);
     // Nothing live + a frame on disk is the post-reboot state, and the one moment the
     // recovery screen is what you opened hive FOR — so offer it without being asked. It only
     // ever offers: nothing reopens until you press Enter. During normal use it stays out of
@@ -2693,6 +2695,7 @@ fn conversations_loop(
                 };
                 reg = gather_conversations_stats(&mut sys);
                 crate::common::conversations::sync_recovery_frame(&reg);
+                crate::common::conversations::persist_parents(&reg);
                 flags = Flags::load();
                 (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 if let Some(id) = keep {
@@ -6333,6 +6336,7 @@ mod tests {
 
     fn registry_of(convs: Vec<Conversation>) -> ConversationRegistry {
         ConversationRegistry {
+            pending_parents: Vec::new(),
             conversations: convs
                 .into_iter()
                 .map(|c| (c.id.as_str().to_string(), c))

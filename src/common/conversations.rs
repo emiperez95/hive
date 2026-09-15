@@ -178,14 +178,35 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
         }
     }
 
-    // Resolve a logical parent for any conversation without one cached.
+    // Settle each conversation's parent against the one cached in the overlay (see
+    // `registry::settle_parent`): a cached parent is never re-derived from a shifting cwd.
+    // New or refined parents are only RECORDED here — the gather stays read-only — and
+    // `persist_parents` writes them from the long-running loops.
     let worktrees = WorktreeState::load();
     let projects = ProjectRegistry::load();
-    for c in reg.conversations.values_mut() {
-        if c.parent.is_none() {
-            c.parent = registry::resolve_parent(&c.cwd, &worktrees, &projects);
+    let registered =
+        |k: &str| worktrees.worktrees.contains_key(k) || projects.projects.contains_key(k);
+    let mut pending = Vec::new();
+    for (id, c) in reg.conversations.iter_mut() {
+        let launch = disk_map.get(id.as_str()).and_then(|d| d.cwd.as_deref());
+        let from_launch = launch.and_then(|l| registry::resolve_parent(l, &worktrees, &projects));
+        let from_hook = if launch.is_none() {
+            registry::resolve_parent(&c.cwd, &worktrees, &projects)
+        } else {
+            None
+        };
+        let settled = registry::settle_parent(
+            c.parent.as_deref(),
+            from_launch.as_deref(),
+            from_hook.as_deref(),
+            registered,
+        );
+        c.parent = settled.parent;
+        if let Some(p) = settled.persist {
+            pending.push((id.clone(), p));
         }
     }
+    reg.pending_parents = pending;
 
     // Overlay the frozen facet (note + timestamp) so frozen windows read as
     // Closed+frozen (💤). Must run BEFORE bounding, since a pinned freeze is one
@@ -307,6 +328,32 @@ pub fn live_windows(reg: &ConversationRegistry) -> Vec<WindowSeen> {
 /// command, whose single observation says nothing about what closed.
 pub fn sync_recovery_frame(reg: &ConversationRegistry) {
     activity::sync_open_windows(&live_windows(reg));
+}
+
+/// Write the parents a gather established or refined into the overlay, so the next gather
+/// treats them as settled. Call from the long-running loops (TUI, web data thread), next to
+/// [`sync_recovery_frame`]; the gather itself stays read-only.
+///
+/// Merges into a FRESHLY loaded sidecar rather than one captured at gather time: the TUI
+/// edits the same file (pin, note, archive), and saving a stale copy would silently undo an
+/// edit made in between. Only `parent` fields are touched, and nothing is written when every
+/// pending parent is already on disk.
+pub fn persist_parents(reg: &ConversationRegistry) {
+    if reg.pending_parents.is_empty() {
+        return;
+    }
+    let mut sidecar = ConversationSidecar::load();
+    let mut changed = false;
+    for (id, parent) in &reg.pending_parents {
+        let overlay = sidecar.conversations.entry(id.clone()).or_default();
+        if overlay.parent.as_deref() != Some(parent.as_str()) {
+            overlay.parent = Some(parent.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = sidecar.save();
+    }
 }
 
 // ── Reopen (resume a closed conversation) ───────────────────────────────────
