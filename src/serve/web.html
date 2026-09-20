@@ -304,6 +304,111 @@
   }
 
   /* ============================================
+     SIDEBAR MODE (?sidebar=1) — the iTerm2 Toolbelt panel
+     One row per CONVERSATION (not per session), blocked ones first: at panel
+     width the only question worth answering instantly is "who needs me".
+     Phone-only chrome (tabs, FAB, stats button) is hidden.
+     ============================================ */
+  body.sidebar .list-tabs,
+  body.sidebar .fab,
+  body.sidebar .hdr-btn,
+  body.sidebar .conn-label { display: none; }
+
+  body.sidebar .header { padding: 8px 10px; min-height: 34px; }
+  body.sidebar .header h1 { font-size: 11px; font-weight: 800; letter-spacing: 0.06em; }
+  body.sidebar .header .header-icon { font-size: 17px; }
+  body.sidebar .session-list { padding: 4px 8px 16px; }
+
+  body.sidebar .sb-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 8px;
+    border-left: 3px solid transparent;
+    border-radius: 6px;
+    background: var(--surface-container-lowest);
+    margin-bottom: 4px;
+    cursor: pointer;
+  }
+  body.sidebar .sb-row:hover { background: var(--surface-container); }
+  body.sidebar .sb-row:active { transform: scale(0.985); }
+  /* where the attached tmux client is looking right now */
+  body.sidebar .sb-row.current {
+    border-left-color: var(--primary);
+    background: var(--primary-fixed);
+  }
+  body.sidebar .sb-row.current .sb-title { font-weight: 800; color: var(--on-primary-fixed); }
+
+  /* One group per tmux session — which is one project, or one worktree. */
+  body.sidebar .sb-group { margin-bottom: 10px; }
+  body.sidebar .sb-group-head {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 10px; font-weight: 800; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--on-surface-variant);
+    padding: 2px 2px 5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  body.sidebar .sb-group-emoji { font-size: 12px; }
+
+  /* A worktree inside its project: indented under the project header, with a
+     rule down the left so a long tail still reads as "belonging to" above. */
+  body.sidebar .sb-wt {
+    margin-left: 7px; padding-left: 7px;
+    border-left: 1px solid var(--outline-variant);
+  }
+  body.sidebar .sb-wt-head {
+    font-size: 10px; font-weight: 700; color: var(--on-surface-variant);
+    padding: 3px 2px 4px; opacity: 0.85;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* blocked — the one state that should catch your eye from across the room */
+  body.sidebar .sb-row.need {
+    border-left-color: var(--tertiary-container);
+    background: var(--tertiary-fixed);
+  }
+  body.sidebar .sb-row.skip { background: var(--surface-container-high); opacity: 0.7; }
+  body.sidebar .sb-row.frozen { background: var(--surface-container-low); }
+
+  body.sidebar .sb-dot {
+    width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  }
+  body.sidebar .sb-dot.frozen-dot {
+    width: auto; height: auto; border-radius: 0;
+    font-size: 11px; background: none !important;
+  }
+  /* The title is the only thing that gives: age and state keep their width so
+     the right-hand columns stay aligned down the whole panel. */
+  body.sidebar .sb-title {
+    flex: 1; min-width: 0;
+    font-size: 12px; font-weight: 600; color: var(--on-surface);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  body.sidebar .sb-age {
+    flex-shrink: 0; font-size: 10px; color: var(--on-surface-variant);
+    font-variant-numeric: tabular-nums; text-align: right; min-width: 22px;
+  }
+  body.sidebar .sb-state {
+    font-size: 9px; font-weight: 800; text-transform: uppercase;
+    letter-spacing: 0.05em; flex-shrink: 0;
+    text-align: right; min-width: 30px;
+  }
+
+  body.sidebar .sb-sect-head {
+    display: flex; align-items: center; gap: 1px;
+    font-size: 10px; font-weight: 800; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--on-surface-variant);
+    padding: 12px 2px 6px; cursor: pointer; user-select: none;
+  }
+  body.sidebar .sb-caret { font-size: 14px; transition: transform 0.15s; }
+  body.sidebar .sb-sect.open .sb-caret { transform: rotate(90deg); }
+  body.sidebar .sb-sect-body { display: none; }
+  body.sidebar .sb-sect.open .sb-sect-body { display: block; }
+  body.sidebar .sb-empty {
+    font-size: 11px; color: var(--on-surface-variant);
+    padding: 16px 4px; text-align: center;
+  }
+
+  /* ============================================
      DETAIL VIEW
      ============================================ */
   .detail-view {
@@ -2010,6 +2115,16 @@ let pollTimer = null;
 let msgPollTimer = null;
 let wasAtBottom = true;
 
+// Sidebar mode: the same data, rendered as a narrow always-visible column for
+// the iTerm2 Toolbelt panel. Opt in with ?sidebar=1 so the phone dashboard at
+// "/" is untouched.
+const SIDEBAR = new URLSearchParams(location.search).has('sidebar');
+if (SIDEBAR) document.body.classList.add('sidebar');
+// Skipped and frozen start folded — they're reference, not attention.
+let sbCollapsed = { skipped: true, frozen: true };
+let currentFocus = {};      // {session, window_index} of the attached tmux client
+let lastFocusJson = '';
+
 // --- Markdown renderer ---
 function renderTable(tableLines) {
   const parseRow = line => line.split('|').slice(1, -1).map(c => c.trim());
@@ -2622,7 +2737,244 @@ function renderWindowRow(s, w) {
   </div>`;
 }
 
+// --- Sidebar mode rendering ---
+
+// esc() escapes markup but NOT quotes, so it is unsafe for an attribute value —
+// and session names are user data ("📊 [avateen] live-avatar").
+function escAttr(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Compact state vocabulary, matching the TUI's: idle / work / flow / perm /
+// plan / ask / edit. The dashboard's longer labels ("Edit Approval") don't fit
+// a panel column.
+function sbStateWord(s) {
+  const st = s && s.status;
+  if (!st) return '—';
+  if (st === 'Waiting') return 'idle';
+  if (st === 'Working') return 'work';
+  if (st === 'QuestionAsked') return 'ask';
+  if (st === 'PlanReview') return 'plan';
+  if (typeof st === 'object') {
+    if (st.NeedsPermission) return 'perm';
+    if (st.EditApproval) return 'edit';
+    if (st.RunningWorkflow) return 'flow';
+  }
+  return 'work';
+}
+
+function sbAge(iso) {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return '';
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return 'now';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  if (s < 86400) return Math.floor(s / 3600) + 'h';
+  return Math.floor(s / 86400) + 'd';
+}
+
+// Switch the attached tmux client to a conversation's window. This — not
+// opening the transcript in a 300px column — is what clicking a sidebar row is
+// for: the panel is a way INTO the work, not a place to read it.
+async function sbSwitch(session, windowIndex) {
+  // Optimistic: move the marker now, so the panel feels instant instead of
+  // waiting out the next poll.
+  currentFocus = { session, window_index: String(windowIndex == null ? '' : windowIndex) };
+  renderList();
+  try {
+    await fetch('/api/switch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session, window_index: String(windowIndex == null ? '' : windowIndex) }),
+    });
+  } catch (e) { /* the next poll re-syncs the marker */ }
+}
+
+function sbIsCurrent(sessionName, windowIndex) {
+  return !!currentFocus && currentFocus.session === sessionName &&
+    String(currentFocus.window_index) === String(windowIndex);
+}
+
+// One row per CONVERSATION. A session hosting three of them contributes three
+// rows — in the sidebar the conversation is the unit, not the session.
+function sbConvRows(s, isSkipped) {
+  const named = w => w && w.window_name && !/^[0-9.]+$/.test(w.window_name);
+  const { rest } = extractEmoji(s.name);
+  const proj = rest || s.name;
+  const wins = s.windows || [];
+  if (!wins.length) {
+    return [{ title: proj, src: s, isSkipped, session: s.name, windowIndex: null }];
+  }
+  return wins.map(w => ({
+    title: named(w) ? w.window_name : ('Window ' + w.window_index),
+    src: w,
+    isSkipped,
+    session: s.name,
+    windowIndex: w.window_index,
+  }));
+}
+
+function sbRowHtml(r) {
+  const si = statusInfo(r.src);
+  const current = sbIsCurrent(r.session, r.windowIndex);
+  const cls = (si.needsAction ? ' need' : '') + (r.isSkipped ? ' skip' : '') + (current ? ' current' : '');
+  const age = sbAge(r.src && r.src.last_activity);
+  // Session names carry spaces, emoji and `[project]` tags — they go in data
+  // attributes (quote-escaped), never interpolated into an onclick expression.
+  return `<div class="sb-row${cls}" onclick="sbRowClick(this)"
+      data-session="${escAttr(r.session)}" data-window="${escAttr(r.windowIndex == null ? '' : r.windowIndex)}">
+    <span class="sb-dot" style="background:${si.dotColor}"></span>
+    <div class="sb-title">${esc(r.title)}</div>
+    <span class="sb-age">${esc(age)}</span>
+    <span class="sb-state" style="color:${si.color}">${sbStateWord(r.src)}</span>
+  </div>`;
+}
+
+function sbRowClick(el) {
+  sbSwitch(el.dataset.session, el.dataset.window === '' ? null : el.dataset.window);
+}
+
+// --- Project / worktree nesting (skipped + frozen) ---
+//
+// Live stays one group per session. Skipped and frozen are long tails where the
+// same project's worktrees scatter across many top-level groups, so those nest:
+// project, then its worktrees.
+
+let sbProjectsBySession = {};
+let sbProjectsByKey = {};
+
+async function sbLoadProjects() {
+  try {
+    const list = await (await fetch('/api/projects')).json();
+    sbProjectsBySession = {};
+    sbProjectsByKey = {};
+    list.forEach(p => { sbProjectsBySession[p.session_name] = p; sbProjectsByKey[p.key] = p; });
+    renderList();
+  } catch (e) { /* falls back to the raw session name */ }
+}
+
+// Where a session lives, from its name (see "Session Naming" in CLAUDE.md):
+//   "📊 [avateen] live-avatar" -> project avateen, worktree live-avatar
+//   "📊 Avateen"               -> project avateen, no worktree
+// The registry supplies the display name; a worktree whose project isn't
+// registered still groups correctly, just labelled by its key.
+function sbPlaceOf(sessionName) {
+  const name = String(sessionName || '');
+  const m = name.match(/^(\S+)?\s*\[([^\]]+)\]\s*(.*)$/);
+  if (m) {
+    const key = m[2];
+    const p = sbProjectsByKey[key];
+    return {
+      key,
+      label: p ? p.display_name : key,
+      emoji: (p && p.emoji) || m[1] || '',
+      branch: m[3] || '(worktree)',
+    };
+  }
+  const p = sbProjectsBySession[name];
+  if (p) return { key: p.key, label: p.display_name, emoji: p.emoji, branch: null };
+  const { emoji, rest } = extractEmoji(name);
+  return { key: name, label: rest || name, emoji, branch: null };
+}
+
+// entries: [{ sessionName, html }] — source order preserved at every level.
+function sbNestedHtml(entries) {
+  const order = [];
+  const byKey = new Map();
+  entries.forEach(e => {
+    const place = sbPlaceOf(e.sessionName);
+    if (!byKey.has(place.key)) {
+      byKey.set(place.key, { place, own: [], wtOrder: [], wt: new Map() });
+      order.push(place.key);
+    }
+    const g = byKey.get(place.key);
+    if (place.branch == null) { g.own.push(e.html); return; }
+    if (!g.wt.has(place.branch)) { g.wt.set(place.branch, []); g.wtOrder.push(place.branch); }
+    g.wt.get(place.branch).push(e.html);
+  });
+  return order.map(k => {
+    const g = byKey.get(k);
+    const worktrees = g.wtOrder.map(b => `<div class="sb-wt">
+        <div class="sb-wt-head">${esc(b)}</div>
+        ${g.wt.get(b).join('')}
+      </div>`).join('');
+    return `<div class="sb-group">
+      <div class="sb-group-head"><span class="sb-group-emoji">${g.place.emoji || '\u{1F4BB}'}</span>${esc(g.place.label)}</div>
+      ${g.own.join('')}${worktrees}
+    </div>`;
+  }).join('');
+}
+
+// A session = a project or a worktree, so grouping by session name is the
+// worktree grouping ("📊 [avateen] live-avatar") for free.
+function sbGroupHtml(s, isSkipped) {
+  const { emoji, rest } = extractEmoji(s.name);
+  const rows = sbConvRows(s, isSkipped).map(sbRowHtml).join('');
+  return `<div class="sb-group">
+    <div class="sb-group-head"><span class="sb-group-emoji">${emoji || '\u{1F4BB}'}</span>${esc(rest || s.name)}</div>
+    ${rows}
+  </div>`;
+}
+
+function sbFrozenHtml(f) {
+  // The note is why you parked it — that's the headline, as on the TUI's 💤 screen.
+  // The project now lives in the group header, so the row stays one line.
+  const title = f.note || f.window_label || f.session_name;
+  // "4d ago" -> "4d": the column is all ages, so the word is redundant.
+  const age = String(f.relative || '').replace(/\s*ago$/, '');
+  return `<div class="sb-row frozen" onclick="thawFrozen('${encodeURIComponent(f.key)}')">
+    <span class="sb-dot frozen-dot">\u{1F4A4}</span>
+    <div class="sb-title">${esc(title)}</div>
+    <span class="sb-age">${esc(age)}</span>
+  </div>`;
+}
+
+function sbSection(key, label, count, body) {
+  const open = !sbCollapsed[key] ? ' open' : '';
+  return `<div class="sb-sect${open}">
+    <div class="sb-sect-head" onclick="sbToggle('${key}')">
+      <span class="material-symbols-outlined sb-caret">chevron_right</span>${esc(label)} (${count})
+    </div>
+    <div class="sb-sect-body">${body}</div>
+  </div>`;
+}
+
+function sbToggle(key) {
+  sbCollapsed[key] = !sbCollapsed[key];
+  renderList();
+}
+
+function renderSidebarList() {
+  const el = document.getElementById('sessionList');
+  // Source order, deliberately: the sidebar must list conversations in the same
+  // order as the list view, so the two never disagree about "the third one down".
+  const active = sessions.filter(s => !s.skipped);
+  const skipped = sessions.filter(s => s.skipped);
+
+  const liveRows = active.reduce((n, s) => n + sbConvRows(s, false).length, 0);
+  const need = active.reduce((n, s) =>
+    n + sbConvRows(s, false).filter(r => statusInfo(r.src).needsAction).length, 0);
+  const h1 = document.querySelector('#listView .header h1');
+  if (h1) h1.textContent = `${liveRows} LIVE${need ? ' · ' + need + ' NEED YOU' : ''}`;
+
+  let html = active.length
+    ? active.map(s => sbGroupHtml(s, false)).join('')
+    : '<div class="sb-empty">No live conversations</div>';
+  if (skipped.length) {
+    html += sbSection('skipped', 'Skipped', skipped.length, sbNestedHtml(
+      skipped.map(s => ({ sessionName: s.name, html: sbConvRows(s, true).map(sbRowHtml).join('') }))));
+  }
+  if (frozenList.length) {
+    html += sbSection('frozen', 'Frozen', frozenList.length, sbNestedHtml(
+      frozenList.map(f => ({ sessionName: f.session_name, html: sbFrozenHtml(f) }))));
+  }
+  el.innerHTML = html;
+}
+
 function renderList() {
+  if (SIDEBAR) { renderSidebarList(); return; }
   if (listTab === 'resume') { renderResumeList(); return; }
   const el = document.getElementById('sessionList');
   if (!sessions.length) {
@@ -3075,6 +3427,16 @@ async function fetchSessions() {
     let frJson = '[]';
     try { frJson = await (await fetch('/api/frozen')).text(); } catch (e) { /* keep last */ }
 
+    // Where the attached tmux client is looking, so the sidebar can mark "you are
+    // here". Sidebar-only: the phone has no client to be "at".
+    let focusJson = lastFocusJson;
+    if (SIDEBAR) {
+      try {
+        focusJson = await (await fetch('/api/current-focus')).text();
+        currentFocus = JSON.parse(focusJson);
+      } catch (e) { /* keep last */ }
+    }
+
     sessions = JSON.parse(json);
     frozenList = JSON.parse(frJson);
     // Only after a parse that actually yielded data — a reachable server returning
@@ -3083,9 +3445,10 @@ async function fetchSessions() {
 
     // Only re-render the list when either set actually changed. (The Resume tab
     // renders from `conversations`, refreshed separately by fetchConversations.)
-    if (listTab === 'active' && (json !== lastSessionsJson || frJson !== lastFrozenJson)) {
+    if (listTab === 'active' && (json !== lastSessionsJson || frJson !== lastFrozenJson || focusJson !== lastFocusJson)) {
       renderList();
     }
+    lastFocusJson = focusJson;
     lastSessionsJson = json;
     lastFrozenJson = frJson;
 
@@ -3945,6 +4308,10 @@ if (window.visualViewport) {
 }
 window.addEventListener('resize', updateAppHeight);
 updateAppHeight();
+
+// Project registry: only used to label the sidebar's project groups, and it
+// changes rarely, so it's fetched once rather than polled.
+if (SIDEBAR) sbLoadProjects();
 
 // Start polling
 fetchSessions();

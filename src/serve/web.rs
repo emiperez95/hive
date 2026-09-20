@@ -203,9 +203,14 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     for mut request in server.incoming_requests() {
         let url = request.url().to_string();
         let method = request.method().clone();
+        // The page is also served with a query string (`/?sidebar=1` selects the
+        // Toolbelt panel layout), and tiny_http hands us path+query as one string —
+        // so the root arm matches on the path alone. Every other arm keeps matching
+        // the full URL, because the API endpoints parse their own query params.
+        let path = url.split('?').next().unwrap_or("/");
 
         match (method, url.as_str()) {
-            (Method::Get, "/") => {
+            (Method::Get, _) if path == "/" => {
                 let html = get_html(&dev_path);
                 let header =
                     Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
@@ -577,6 +582,60 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
                 });
                 let json = serde_json::to_string(&projects).unwrap_or_else(|_| "[]".to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // Which window the attached client is looking at, so a remote surface can
+            // mark "you are here". One ~4ms `list-clients`; no registry gather.
+            (Method::Get, "/api/current-focus") => {
+                let clients = crate::common::tmux::list_clients();
+                let json = match crate::common::tmux::pick_client(&clients) {
+                    Some(c) => serde_json::json!({
+                        "session": c.session,
+                        "window_index": c.window_index,
+                        "tty": c.tty,
+                    }),
+                    None => serde_json::json!({}),
+                }
+                .to_string();
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // Move the attached tmux client to a conversation's window.
+            //
+            // Resolves a concrete client rather than using a bare `switch-client`: this
+            // server runs inside the detached `__hive_web` session, so "the current
+            // client" is nobody. Focus is logged by the `after-select-window` hook, so
+            // there is deliberately no `log_focus` call here — it would double-count.
+            (Method::Post, "/api/switch") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let session = req.get("session")?.as_str()?;
+                    let window = req.get("window_index").and_then(|w| {
+                        w.as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| w.as_u64().map(|n| n.to_string()))
+                    });
+                    let clients = crate::common::tmux::list_clients();
+                    let Some(client) = crate::common::tmux::pick_client(&clients) else {
+                        return Some(
+                            r#"{"ok":false,"error":"no attached tmux client"}"#.to_string(),
+                        );
+                    };
+                    let tty = client.tty.clone();
+                    let ok =
+                        crate::common::tmux::switch_client_to(&tty, session, window.as_deref());
+                    Some(format!(
+                        r#"{{"ok":{},"client":{}}}"#,
+                        ok,
+                        serde_json::Value::from(tty)
+                    ))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
