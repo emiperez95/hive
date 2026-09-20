@@ -474,7 +474,7 @@ pub fn list_jsonls_for_cwd_by_recency(cwd: &str) -> Vec<String> {
             }
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.1));
     entries.into_iter().map(|(id, _)| id).collect()
 }
 

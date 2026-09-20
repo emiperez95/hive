@@ -653,7 +653,7 @@ fn accumulate_time(
         .into_iter()
         .map(|(session, secs)| SessionTime { session, secs })
         .collect();
-    per.sort_by(|a, b| b.secs.cmp(&a.secs));
+    per.sort_by_key(|a| std::cmp::Reverse(a.secs));
     (per, total)
 }
 
