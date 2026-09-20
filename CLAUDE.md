@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 332 tests (308 unit + 24 CLI smoke)
+cargo test                # 338 tests (314 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints ~537 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 308 unit + 24 smoke.
+> `cargo test` prints 574 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 314 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -60,7 +60,7 @@ hive stats [--days N]   # usage summary from the activity log (default 7 days)
 hive start              # auto-attach to first available session (or fall through to picker)
 hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
-hive setup              # register hooks, agent, and tmux keybindings
+hive setup              # register hooks, agent, tmux keybindings, iTerm sidebar panel
 hive uninstall          # remove hooks + tmux keybindings
 hive update             # update to latest version from GitHub + re-run setup
 hive --version          # print current version
@@ -140,7 +140,7 @@ src/
 ├── lib.rs                  exports common + ipc modules for the bench binary
 ├── bin/bench.rs            benchmark tool
 ├── cli/
-│   ├── mod.rs              Args, Command, subcommand enums, PostAction
+│   ├── mod.rs              Args, Command, subcommand enums
 │   ├── conversations.rs    ★ conversation-first TUI (self-contained: gather, views, render, keys) — ~3.9k lines
 │   ├── hook.rs             run_hook(): parse stdin JSON, update state, notify (honors muted projects)
 │   ├── setup.rs            run_setup(), run_uninstall(), is_hive_hook_command()
@@ -782,7 +782,10 @@ Auto-attach to a tmux session. Designed as iTerm2's startup command for new tabs
 2. If all non-skipped sessions are attached, attach to **any** non-skipped session (duplicates are fine)
 3. If no sessions exist at all → fall through to TUI picker (search mode)
 
-When the picker is used (case 3), selecting a session returns `PostAction::Attach(name)` which `exec`s into tmux after the TUI is cleaned up.
+When the picker is used (case 3), selecting a session returns an `Action` which
+`run_conversations_tui` executes **after** `ratatui::restore()` — `attach_or_switch`
+`exec`s into tmux once the TUI is cleaned up. (There is no `PostAction` type; the
+TUI's own `Action` enum is the only post-exit dispatch.)
 
 ## `hive spread/collapse`
 
@@ -892,6 +895,10 @@ into explicitly.
 | POST | `/api/freeze` | Freeze one window: `{"session","window_index","window_name","cwd","session_id","note"}` |
 | POST | `/api/thaw` | Thaw a frozen window by key: `{"key": "..."}` |
 | POST | `/api/discard-frozen` | Discard a frozen window (no restore): `{"key": "..."}` |
+| GET | `/api/ambient` | Sidebar ambient state: the attached client's session/window, `global_mute`, `muted_projects` |
+| POST | `/api/switch` | Move the attached tmux client: `{"session","window_index"}` |
+| POST | `/api/toggle-mute` | Toggle global mute (`muted-global`) |
+| POST | `/api/toggle-project-mute` | Toggle a project's mute: `{"key": "..."}` |
 | GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
 | GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
 
@@ -952,6 +959,85 @@ into explicitly.
 - Edit HTML/CSS/JS → refresh phone browser → see changes (no recompile needed)
 - Falls back to embedded HTML if file not found
 - For web development without affecting installed binary: `cargo run -- web --dev`
+
+## Sidebar — the iTerm2 Toolbelt panel (`/?sidebar=1`)
+
+The always-visible counterpart to the TUI, which is a popup and so is gone the
+moment you pick something. A narrow column of live conversations, what each is
+doing, and which one you're on. It is **the same `web.html`** in a `body.sidebar`
+mode, served by the dashboard that already autostarts — not a second frontend.
+
+**Why the Toolbelt and not a pane.** A TUI in an iTerm split needs AppleScript
+pane tagging plus teaching `collapse_panes` to spare it, and being a pane *inside*
+the terminal forces a focus round-trip on every click. The Toolbelt is iTerm's own
+extension point (`iterm2.tool.async_register_web_view_tool`). Forking a terminal
+was considered and rejected: the generic "scriptable sidebar" already exists in
+iTerm2, kitty and WezTerm alike.
+
+**There is no daemon.** iTerm stores the registration in its own prefs
+(`NoSyncDynamicTools`), so the panel keeps working after the registering script
+exits. `hive setup` installs `assets/iterm-sidebar.py` to
+`~/Library/Application Support/iTerm2/Scripts/AutoLaunch/hive_sidebar.py`; it
+registers and exits. Requires a one-time "Enable Python API" in iTerm's settings.
+
+> **Gotcha — the webview never reloads on its own.** An already-registered tool
+> keeps serving the page it first loaded, so a shipped change is invisible. The
+> URL therefore carries hive's version (`&v=0.1.27`), and re-registering with the
+> changed URL is what forces the reload — which is why the AutoLaunch script runs
+> every launch even though the registration persists. `hive uninstall` removes the
+> script, but iTerm has **no API to unregister a tool identifier**, so `hive` stays
+> in the Toolbelt's tool list to be unticked by hand.
+
+**Two views**, switched by a header button whose position is fixed (see below):
+
+- **Live** — conversations grouped by session, then folded `Skipped` / `Frozen`
+  sections. One row per CONVERSATION, not per session: a session hosting three of
+  them must not collapse to one line. Rows are single-line — the title elides while
+  age and state hold fixed right-aligned columns.
+- **Projects** — every registered project, layered project → worktree →
+  conversation, collapsible one project at a time (the other sections fold as a
+  unit; this one can't, since 54 projects would dump at once). It merges live,
+  skipped *and* frozen, so a project shows everything hive knows about it.
+  Projects with conversations sort first with a count, the rest alphabetically.
+
+**Archived projects** are hidden behind a header toggle (33 of 54 here, so it's the
+difference between a 21- and a 54-row list). `/api/projects` reports `archived` and
+does **not** filter on it — archived is a display preference and each surface
+decides, the same rule the registry follows for conversations. A project with
+conversations is never hidden even when archived: you can't hide what's running.
+
+**Mute is surfaced here** because it is invisible and sticky — the flag had been on
+for nine days unnoticed when this was built. The header carries global mute and
+every project header its own, writing the same `muted-global` / `muted-projects.txt`
+the TUI's `G` and project `m` write. Muted renders as the same icon in red: no
+label, no background change, or a tinted pill per project would stripe the panel.
+
+**Header control order is archived · view · mute**, in a flex box that carries the
+`margin-left: auto`. The view button is the way back, and hanging the auto margin
+off whichever button came first meant revealing the archived filter shoved it
+sideways — a way back that moves is the one control you can't afford to hunt for.
+
+### Clicking a row switches the tmux client
+
+`POST /api/switch` resolves a concrete client and runs
+`switch-client -c <tty> -t =session:window`. It cannot use a bare `switch-client`:
+that acts on "the current client" as derived from the caller's `$TMUX`, and this
+server runs inside the detached `__hive_web` session where that is nobody. Focus is
+logged by the `after-select-window` hook, so there is deliberately no `log_focus`
+call — it would double-count.
+
+> **Gotcha — `display-message -c <tty>` does NOT report that client's position.**
+> `-c` only chooses which client the message is shown to; the format is still
+> evaluated against the CALLER's context, so from a pane in another session it
+> confidently returns the wrong window. Measured: it claimed `🐝 hive:1` while the
+> client was on `📁 00-main:2`. `tmux::list_clients` evaluates each format in its
+> own client's context and is the only honest source for "where is this client" —
+> which is also why its fields are tab-separated, since session names carry spaces,
+> emoji and `[project]` tags.
+
+`tmux::pick_client` is the whole multi-client rule: skip control-mode clients (a
+`tmux -C` connection is a tool, not a person — switching it moves nobody's screen),
+then take the most recently active, which is also right after `hive spread`.
 
 ## Metrics (`GET /metrics`)
 
@@ -1046,14 +1132,16 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-332 distinct tests. Run with `cargo test`.
+338 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints ~537 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 230 · bin 308 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 574 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 236 · bin 314 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
 **Unit tests (293)** — in-module `#[cfg(test)]` blocks:
-- `common/tmux.rs`: `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
+- `common/tmux.rs`: `parse_clients`/`pick_client` (tab-separated fields, control clients
+  never a switch target, most-recent-activity wins) and
+  `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —
   the `=` that stops tmux prefix/fnmatch-matching a session name onto a longer one, and the
   trailing `:` that makes a send-keys target a PANE (see **Conventions**)
 - `common/`: types, projects, worktree, jsonl, chrome, process (claude detection,
