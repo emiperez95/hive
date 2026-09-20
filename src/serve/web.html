@@ -335,6 +335,11 @@
   /* muted: red strokes, background untouched */
   body.sidebar .sb-mute.muted,
   body.sidebar .sb-pmute.muted { color: var(--error); opacity: 1; }
+  /* an engaged header toggle (projects view, archived shown) */
+  body.sidebar .sb-mute.on { color: var(--primary); }
+  /* the header controls sit together at the right, in a fixed order */
+  body.sidebar .sb-ctrls { margin-left: auto; display: flex; align-items: center; gap: 1px; }
+  body.sidebar .sb-ctrls .sb-mute { margin-left: 0; }
   body.sidebar .header h1 { font-size: 11px; font-weight: 800; letter-spacing: 0.06em; }
   body.sidebar .header .header-icon { font-size: 17px; }
   body.sidebar .session-list { padding: 4px 8px 16px; }
@@ -426,6 +431,35 @@
   body.sidebar .sb-sect.open .sb-caret { transform: rotate(90deg); }
   body.sidebar .sb-sect-body { display: none; }
   body.sidebar .sb-sect.open .sb-sect-body { display: block; }
+  /* Projects view: one collapsible project per row. The header is a wider tap
+     target than a group head because it's a control, not just a label. */
+  body.sidebar .sb-proj-head {
+    display: flex; align-items: center; gap: 4px;
+    padding: 5px 2px; cursor: pointer; user-select: none;
+    font-size: 10px; font-weight: 800; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--on-surface-variant);
+    border-radius: 4px;
+  }
+  body.sidebar .sb-proj-head:hover { background: var(--surface-container); }
+  body.sidebar .sb-proj.open > .sb-proj-head { color: var(--on-surface); }
+  body.sidebar .sb-proj.open > .sb-proj-head .sb-caret { transform: rotate(90deg); }
+  body.sidebar .sb-proj-body { display: none; padding-left: 9px; }
+  body.sidebar .sb-proj.open > .sb-proj-body { display: block; }
+  body.sidebar .sb-proj-count {
+    flex-shrink: 0; font-size: 9px; font-weight: 800;
+    color: var(--on-surface-variant); opacity: 0.7;
+  }
+  body.sidebar .sb-proj.archived > .sb-proj-head { opacity: 0.55; }
+  body.sidebar .sb-arch-tag {
+    flex-shrink: 0; font-size: 8px; font-weight: 800; letter-spacing: 0.06em;
+    padding: 1px 4px; border-radius: 3px;
+    background: var(--surface-container-high); color: var(--on-surface-variant);
+  }
+  body.sidebar .sb-proj-note {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--on-surface-variant); opacity: 0.65; padding: 2px 2px 8px;
+  }
+
   body.sidebar .sb-empty {
     font-size: 11px; color: var(--on-surface-variant);
     padding: 16px 4px; text-align: center;
@@ -2145,6 +2179,9 @@ const SIDEBAR = new URLSearchParams(location.search).has('sidebar');
 if (SIDEBAR) document.body.classList.add('sidebar');
 // Skipped and frozen start folded — they're reference, not attention.
 let sbCollapsed = { skipped: true, frozen: true };
+// Two views: 'live' (what's running) and 'projects' (what exists).
+let sbView = 'live';
+let sbShowArchived = false;
 let currentFocus = {};      // {session, window_index} of the attached tmux client
 let lastFocusJson = '';
 
@@ -2868,9 +2905,12 @@ function sbRowClick(el) {
 let sbProjectsBySession = {};
 let sbProjectsByKey = {};
 
+let sbProjectList = [];
+
 async function sbLoadProjects() {
   try {
     const list = await (await fetch('/api/projects')).json();
+    sbProjectList = list;
     sbProjectsBySession = {};
     sbProjectsByKey = {};
     list.forEach(p => { sbProjectsBySession[p.session_name] = p; sbProjectsByKey[p.key] = p; });
@@ -2902,30 +2942,42 @@ function sbPlaceOf(sessionName) {
   return { key: name, label: rest || name, emoji, branch: null };
 }
 
-// entries: [{ sessionName, html }] — source order preserved at every level.
-function sbNestedHtml(entries) {
+// Bucket entries by project, then worktree. entries: [{ sessionName, html }];
+// source order is preserved at every level.
+function sbNest(entries) {
   const order = [];
   const byKey = new Map();
   entries.forEach(e => {
     const place = sbPlaceOf(e.sessionName);
     if (!byKey.has(place.key)) {
-      byKey.set(place.key, { place, own: [], wtOrder: [], wt: new Map() });
+      byKey.set(place.key, { place, own: [], wtOrder: [], wt: new Map(), count: 0 });
       order.push(place.key);
     }
     const g = byKey.get(place.key);
+    g.count += e.count == null ? 1 : e.count;
     if (place.branch == null) { g.own.push(e.html); return; }
     if (!g.wt.has(place.branch)) { g.wt.set(place.branch, []); g.wtOrder.push(place.branch); }
     g.wt.get(place.branch).push(e.html);
   });
+  return { order, byKey };
+}
+
+// The layered body of one project: its own conversations, then each worktree.
+function sbProjectBodyHtml(g) {
+  const worktrees = g.wtOrder.map(b => `<div class="sb-wt">
+      <div class="sb-wt-head">${esc(b)}</div>
+      ${g.wt.get(b).join('')}
+    </div>`).join('');
+  return g.own.join('') + worktrees;
+}
+
+function sbNestedHtml(entries) {
+  const { order, byKey } = sbNest(entries);
   return order.map(k => {
     const g = byKey.get(k);
-    const worktrees = g.wtOrder.map(b => `<div class="sb-wt">
-        <div class="sb-wt-head">${esc(b)}</div>
-        ${g.wt.get(b).join('')}
-      </div>`).join('');
     return `<div class="sb-group">
       <div class="sb-group-head"><span class="sb-group-emoji">${g.place.emoji || '\u{1F4BB}'}</span><span class="sb-group-name">${esc(g.place.label)}</span>${sbProjectMuteHtml(g.place.key)}</div>
-      ${g.own.join('')}${worktrees}
+      ${sbProjectBodyHtml(g)}
     </div>`;
   }).join('');
 }
@@ -2972,16 +3024,71 @@ function sbToggle(key) {
 // Global mute, shown in the header and toggleable from there. Worth surfacing
 // because the flag is invisible and sticky: it is the answer to "why did nothing
 // notify me", and the TUI's `G` is the only other place it appears.
-function sbRenderMute() {
+// Header controls, created once and kept in sync: view switch, archived filter
+// (projects view only), global mute.
+function sbHeaderBtn(id, cls, onclick, parent) {
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement('button');
+    el.id = id;
+    el.className = cls;
+    el.onclick = onclick;
+    parent.appendChild(el);
+  }
+  return el;
+}
+
+function sbSetView(v) {
+  sbView = v;
+  renderList();
+}
+
+function sbToggleArchived() {
+  sbShowArchived = !sbShowArchived;
+  renderList();
+}
+
+function sbRenderControls() {
   const left = document.querySelector('#listView .header .header-left');
   if (!left) return;
+  let box = document.getElementById('sbCtrls');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'sbCtrls';
+    box.className = 'sb-ctrls';
+    left.appendChild(box);
+  }
+  // Order is archived, then view, then mute — so the VIEW button keeps the same
+  // spot whether or not the archived filter is showing. It's the way back, and a
+  // way back that moves depending on the view is the one control you can't afford
+  // to have to look for.
+  const projects = sbView === 'projects';
+
+  const arch = sbHeaderBtn('sbArchBtn', 'sb-mute', sbToggleArchived, box);
+  arch.style.display = projects ? '' : 'none';
+  arch.classList.toggle('on', sbShowArchived);
+  arch.title = sbShowArchived ? 'Showing archived projects — click to hide' : 'Archived projects hidden — click to show';
+  arch.innerHTML = `<span class="material-symbols-outlined">${sbShowArchived ? 'inventory_2' : 'archive'}</span>`;
+
+  const view = sbHeaderBtn('sbViewBtn', 'sb-mute', () => sbSetView(projects ? 'live' : 'projects'), box);
+  view.onclick = () => sbSetView(sbView === 'live' ? 'projects' : 'live');
+  view.classList.toggle('on', projects);
+  view.title = projects ? 'Showing all projects — click for live conversations' : 'Showing live conversations — click for all projects';
+  view.innerHTML = `<span class="material-symbols-outlined">${projects ? 'sensors' : 'folder'}</span>`;
+
+  sbRenderMute(box);
+}
+
+function sbRenderMute(parent) {
+  const box = parent || document.getElementById('sbCtrls');
+  if (!box) return;
   let el = document.getElementById('sbMute');
   if (!el) {
     el = document.createElement('button');
     el.id = 'sbMute';
     el.className = 'sb-mute';
     el.onclick = sbToggleMute;
-    left.appendChild(el);
+    box.appendChild(el);
   }
   const muted = !!currentFocus.global_mute;
   el.classList.toggle('muted', muted);
@@ -3026,6 +3133,78 @@ async function sbToggleProjectMute(el) {
   } catch (e) { /* the next poll re-syncs */ }
 }
 
+// --- Projects view ---
+//
+// Every registered project, layered project -> worktree -> conversation and
+// collapsible one project at a time. The other sections answer "what is running";
+// this one answers "what exists", so it includes projects with nothing in them
+// and is the only section that lists all 50-odd at once — hence per-project
+// collapse rather than the single fold the other sections use.
+
+let sbExpandedProjects = new Set();
+
+function sbToggleProject(key) {
+  if (sbExpandedProjects.has(key)) sbExpandedProjects.delete(key);
+  else sbExpandedProjects.add(key);
+  renderList();
+}
+
+function sbProjectsHtml() {
+  // Everything hive knows about, live and parked alike.
+  const entries = [];
+  sessions.forEach(s => entries.push({
+    sessionName: s.name,
+    html: sbConvRows(s, !!s.skipped).map(sbRowHtml).join(''),
+    count: sbConvRows(s, !!s.skipped).length,
+  }));
+  frozenList.forEach(f => entries.push({ sessionName: f.session_name, html: sbFrozenHtml(f) }));
+  const { order, byKey } = sbNest(entries);
+
+  // Archived is a display preference: hidden by default, revealed by the header
+  // toggle. A project with conversations is never hidden — you can't hide
+  // something that's running (the same rule the TUI's Browse follows).
+  const archived = new Set((sbProjectList || []).filter(p => p.archived).map(p => p.key));
+  const visible = k => sbShowArchived || !archived.has(k);
+
+  // Projects that have something come first, in list order; the rest follow
+  // alphabetically. Otherwise the 40-odd empty ones bury the active few.
+  const seen = new Set(order);
+  const empties = (sbProjectList || [])
+    .filter(p => !seen.has(p.key) && visible(p.key))
+    .sort((a, b) => String(a.display_name).localeCompare(String(b.display_name)));
+
+  const head = (key, place, count) => {
+    const open = sbExpandedProjects.has(key);
+    const isArch = archived.has(key);
+    return `<div class="sb-proj${open ? ' open' : ''}${isArch ? ' archived' : ''}">
+      <div class="sb-proj-head" onclick="sbToggleProject('${escAttr(key).replace(/'/g, '&#39;')}')">
+        <span class="material-symbols-outlined sb-caret">chevron_right</span>
+        <span class="sb-group-emoji">${place.emoji || '\u{1F4BB}'}</span>
+        <span class="sb-group-name">${esc(place.label)}</span>
+        ${isArch ? '<span class="sb-arch-tag">arch</span>' : ''}
+        ${count ? `<span class="sb-proj-count">${count}</span>` : ''}
+        ${sbProjectMuteHtml(key)}
+      </div>`;
+  };
+
+  const withWork = order.map(k => {
+    const g = byKey.get(k);
+    return head(k, g.place, g.count) +
+      `<div class="sb-proj-body">${sbProjectBodyHtml(g)}</div></div>`;
+  }).join('');
+
+  const without = empties.map(p =>
+    head(p.key, { emoji: p.emoji, label: p.display_name }, 0) +
+    `<div class="sb-proj-body"><div class="sb-empty">No conversations</div></div></div>`
+  ).join('');
+
+  const total = order.length + empties.length;
+  const hidden = archived.size - (sbShowArchived ? archived.size : 0);
+  const note = `<div class="sb-proj-note">${total} project${total === 1 ? '' : 's'}${
+    !sbShowArchived && hidden ? ` · ${hidden} archived hidden` : ''}</div>`;
+  return note + withWork + without;
+}
+
 function renderSidebarList() {
   const el = document.getElementById('sessionList');
   // Source order, deliberately: the sidebar must list conversations in the same
@@ -3037,8 +3216,19 @@ function renderSidebarList() {
   const need = active.reduce((n, s) =>
     n + sbConvRows(s, false).filter(r => statusInfo(r.src).needsAction).length, 0);
   const h1 = document.querySelector('#listView .header h1');
-  if (h1) h1.textContent = `${liveRows} LIVE${need ? ' · ' + need + ' NEED YOU' : ''}`;
-  sbRenderMute();
+  if (h1) {
+    h1.textContent = sbView === 'projects'
+      ? 'PROJECTS'
+      : `${liveRows} LIVE${need ? ' · ' + need + ' NEED YOU' : ''}`;
+  }
+  sbRenderControls();
+
+  if (sbView === 'projects') {
+    el.innerHTML = sbProjectList.length
+      ? sbProjectsHtml()
+      : '<div class="sb-empty">No projects registered</div>';
+    return;
+  }
 
   let html = active.length
     ? active.map(s => sbGroupHtml(s, false)).join('')

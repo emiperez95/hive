@@ -571,6 +571,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             "display_name": config.display_name.as_deref().unwrap_or(key),
                             "session_name": session_name,
                             "exists": existing.contains(&session_name),
+                            // Archived is a display preference, never a filter here: the
+                            // endpoint reports it and each surface decides what to hide.
+                            "archived": config.archived,
                         })
                     })
                     .collect();
