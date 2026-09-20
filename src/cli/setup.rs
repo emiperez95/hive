@@ -9,6 +9,35 @@ const JANUS_AGENT_CONTENT: &str = include_str!("../../.claude/agents/janus-wt-po
 const CREATE_PROJECT_CMD_CONTENT: &str =
     include_str!("../../.claude/commands/hive/create-project.md");
 
+/// Bundled iTerm2 AutoLaunch script that registers the Toolbelt sidebar panel.
+const ITERM_SIDEBAR_SCRIPT: &str = include_str!("../../assets/iterm-sidebar.py");
+
+/// The AutoLaunch script, with the configured web port and this build's version
+/// baked in. The version is what makes an upgrade reload the panel: iTerm's
+/// webview does not refresh on its own, so a changed URL is the only way a new
+/// release's page reaches an already-registered tool.
+fn iterm_sidebar_script() -> String {
+    let port = crate::common::config::HiveConfig::load().web.port;
+    ITERM_SIDEBAR_SCRIPT
+        .replace("__PORT__", &port.to_string())
+        .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
+}
+
+/// Where iTerm2 looks for scripts to run at launch.
+fn iterm_sidebar_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("iTerm2")
+        .join("Scripts")
+        .join("AutoLaunch")
+        .join("hive_sidebar.py")
+}
+
+/// Only offer the panel where it can actually work.
+fn iterm_installed() -> bool {
+    cfg!(target_os = "macos") && std::path::Path::new("/Applications/iTerm.app").exists()
+}
+
 /// Check if a hook command belongs to hive
 pub(crate) fn is_hive_hook_command(cmd: &str) -> bool {
     let is_hive_event = cmd.ends_with(" hook Stop")
@@ -409,6 +438,25 @@ pub fn run_setup(yes: bool) -> Result<()> {
         "missing"
     };
 
+    // iTerm2 Toolbelt sidebar (macOS + iTerm only)
+    let sidebar_dest = iterm_sidebar_path(&home);
+    let sidebar_wanted = iterm_sidebar_script();
+    let sidebar_status = if !iterm_installed() {
+        "n/a"
+    } else if !sidebar_dest.exists() {
+        "missing"
+    } else if fs::read_to_string(&sidebar_dest).unwrap_or_default() == sidebar_wanted {
+        "ok"
+    } else {
+        "update"
+    };
+    match sidebar_status {
+        "ok" => println!("  [ok]      iTerm2 sidebar panel"),
+        "update" => println!("  [update]  iTerm2 sidebar panel (port or version changed)"),
+        "missing" => println!("  [missing] iTerm2 sidebar panel"),
+        _ => {}
+    }
+
     match agent_status {
         "ok" => println!("  [ok]      janus-wt-portal agent"),
         "update" => println!("  [update]  janus-wt-portal agent (content differs)"),
@@ -671,6 +719,26 @@ pub fn run_setup(yes: bool) -> Result<()> {
         }
     }
 
+    // Install the iTerm2 Toolbelt sidebar panel
+    if sidebar_status == "missing" || sidebar_status == "update" {
+        println!();
+        print!("Install the iTerm2 Toolbelt sidebar panel? [Y/n] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        if read_yn(yes)? {
+            if let Some(parent) = sidebar_dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&sidebar_dest, &sidebar_wanted)?;
+            println!("Sidebar script installed to {:?}", sidebar_dest);
+            println!("  Enable it once: iTerm2 > Settings > General > Magic > 'Enable Python API'");
+            println!("  Then restart iTerm2 (or run Scripts > AutoLaunch > hive_sidebar),");
+            println!("  and show it with Cmd+Shift+B.");
+        } else {
+            println!("Skipped iTerm2 sidebar panel.");
+        }
+    }
+
     // Install janus-wt-portal agent
     if agent_needs_install {
         println!();
@@ -872,6 +940,25 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
         println!("Tmux focus hooks removed (live hooks, ~/.tmux.conf line, and hook file).");
     } else {
         println!("Skipped focus-hook removal.");
+    }
+
+    // --- iTerm2 Toolbelt sidebar ------------------------------------
+    let sidebar_path = iterm_sidebar_path(&home);
+    if sidebar_path.exists() {
+        println!();
+        print!("Remove the iTerm2 sidebar AutoLaunch script? [Y/n] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        if read_yn(yes)? {
+            fs::remove_file(&sidebar_path)?;
+            println!("Removed {:?}", sidebar_path);
+            // iTerm2 has no API to unregister a tool identifier, so the entry
+            // stays in the Toolbelt's tool list. Untick it there; without this
+            // script it will not re-register and the panel stays empty.
+            println!("  Note: iTerm keeps 'hive' in its Toolbelt tool list — untick it there.");
+        } else {
+            println!("Skipped sidebar removal.");
+        }
     }
 
     // --- janus-wt-portal agent --------------------------------------
