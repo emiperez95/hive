@@ -281,6 +281,96 @@ pub fn display_message_for_pane(pane_id: &str, format: &str) -> Option<String> {
         })
 }
 
+/// One attached tmux client.
+///
+/// `session`/`window_index` are where that client is looking *right now* — the
+/// "you are here" the sidebar marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientInfo {
+    pub tty: String,
+    pub session: String,
+    pub window_index: String,
+    pub activity: i64,
+    pub control: bool,
+}
+
+/// Parse `list-clients` output. Split out from the command for unit testing.
+pub(crate) fn parse_clients(output: &str) -> Vec<ClientInfo> {
+    output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut f = line.split('\t');
+            let tty = f.next()?.trim().to_string();
+            let session = f.next()?.trim().to_string();
+            let window_index = f.next()?.trim().to_string();
+            let activity = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let control = f.next().unwrap_or("0").trim() == "1";
+            if tty.is_empty() {
+                return None;
+            }
+            Some(ClientInfo {
+                tty,
+                session,
+                window_index,
+                activity,
+                control,
+            })
+        })
+        .collect()
+}
+
+/// Every attached tmux client, with the window each one is currently on.
+///
+/// **This is the only honest source for a client's position.** `display-message
+/// -c <tty>` does *not* scope format evaluation to that client — `-c` only picks
+/// where the message is shown, so `#{session_name}` there resolves against the
+/// CALLER's `$TMUX` (or the server's guess) and silently reports the wrong
+/// window. `list-clients` evaluates each format in its own client's context.
+pub fn list_clients() -> Vec<ClientInfo> {
+    let out = Command::new("tmux")
+        .args([
+            "list-clients",
+            "-F",
+            "#{client_tty}\t#{client_session}\t#{window_index}\t#{client_activity}\t#{client_control_mode}",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    parse_clients(&out)
+}
+
+/// The client a remote surface (sidebar, web dashboard) should drive.
+///
+/// Control-mode clients are tools, never people, so they are never a switch
+/// target; among the rest the most recently active one wins, which is the right
+/// answer both for the single-client case and after `hive spread`.
+pub fn pick_client(clients: &[ClientInfo]) -> Option<&ClientInfo> {
+    clients
+        .iter()
+        .filter(|c| !c.control)
+        .max_by_key(|c| c.activity)
+}
+
+/// Move one specific client to a session + window.
+///
+/// Needed because a bare `switch-client` acts on "the current client", which is
+/// derived from the caller's `$TMUX` — and the web server runs inside the
+/// detached `__hive_web` session, where that resolves to nothing.
+/// `window_index: None` switches to the session's current window.
+pub fn switch_client_to(client_tty: &str, session: &str, window_index: Option<&str>) -> bool {
+    let target = match window_index {
+        Some(w) => exact_window(session, w),
+        None => exact(session),
+    };
+    Command::new("tmux")
+        .args(["switch-client", "-c", client_tty, "-t", &target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Get session names attached to tmux clients other than the caller's.
 pub fn get_other_client_sessions() -> HashSet<String> {
     let my_tty = Command::new("tmux")
@@ -546,7 +636,59 @@ pub fn clean_claude_title(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_claude_title, exact, exact_active_pane, exact_pane, exact_window};
+    use super::{
+        clean_claude_title, exact, exact_active_pane, exact_pane, exact_window, parse_clients,
+        pick_client,
+    };
+
+    #[test]
+    fn parse_clients_reads_tab_separated_fields() {
+        let out = "/dev/ttys000\t📁 00-main\t2\t1789908696\t0\n";
+        let c = parse_clients(out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].tty, "/dev/ttys000");
+        assert_eq!(c[0].session, "📁 00-main");
+        assert_eq!(c[0].window_index, "2");
+        assert_eq!(c[0].activity, 1789908696);
+        assert!(!c[0].control);
+    }
+
+    // A session name can contain spaces and `[project]` tags, so the fields are
+    // tab-separated and must not be split on whitespace.
+    #[test]
+    fn parse_clients_keeps_spaces_in_session_names() {
+        let c = parse_clients("/dev/ttys1\t📊 [avateen] live-avatar\t3\t5\t0\n");
+        assert_eq!(c[0].session, "📊 [avateen] live-avatar");
+        assert_eq!(c[0].window_index, "3");
+    }
+
+    #[test]
+    fn parse_clients_skips_blank_and_malformed_lines() {
+        let c = parse_clients("\n\t\t\t\t\ngarbage\n/dev/ttys2\ts\t1\t9\t1\n");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].tty, "/dev/ttys2");
+        assert!(c[0].control);
+    }
+
+    // A control-mode client is a tool (our own `tmux -C`, an editor integration),
+    // never a person — switching it would move nobody's screen.
+    #[test]
+    fn pick_client_never_picks_a_control_client() {
+        let c = parse_clients("/dev/ttys1\ta\t1\t900\t1\n/dev/ttys2\tb\t1\t100\t0\n");
+        assert_eq!(pick_client(&c).unwrap().tty, "/dev/ttys2");
+    }
+
+    #[test]
+    fn pick_client_prefers_most_recently_active() {
+        let c = parse_clients("/dev/ttys1\ta\t1\t100\t0\n/dev/ttys2\tb\t1\t900\t0\n");
+        assert_eq!(pick_client(&c).unwrap().tty, "/dev/ttys2");
+    }
+
+    #[test]
+    fn pick_client_is_none_when_only_control_clients_or_empty() {
+        assert!(pick_client(&parse_clients("/dev/ttys1\ta\t1\t1\t1\n")).is_none());
+        assert!(pick_client(&[]).is_none());
+    }
 
     // tmux resolves a bare `-t` target by exact match, THEN fnmatch, THEN prefix — so
     // "📊 Avateen" silently resolves to a running "📊 Avateen Hub". Every session-name
