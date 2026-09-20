@@ -315,6 +315,26 @@
   body.sidebar .conn-label { display: none; }
 
   body.sidebar .header { padding: 8px 10px; min-height: 34px; }
+  /* Mute buttons (global, in the header; per-project, on each group header).
+     Muted shows the same shape in red — the icon carries the state, so no label
+     and no background change. */
+  body.sidebar .sb-mute,
+  body.sidebar .sb-pmute {
+    display: inline-flex; align-items: center;
+    padding: 2px; border: 0; border-radius: 4px; cursor: pointer;
+    background: transparent; color: var(--outline);
+    font-family: inherit;
+  }
+  body.sidebar .sb-mute { margin-left: auto; }
+  body.sidebar .sb-pmute { margin-left: auto; opacity: 0.45; }
+  body.sidebar .sb-group-head:hover .sb-pmute { opacity: 1; }
+  body.sidebar .sb-mute .material-symbols-outlined,
+  body.sidebar .sb-pmute .material-symbols-outlined { font-size: 14px; }
+  body.sidebar .sb-mute:hover,
+  body.sidebar .sb-pmute:hover { background: var(--surface-container); }
+  /* muted: red strokes, background untouched */
+  body.sidebar .sb-mute.muted,
+  body.sidebar .sb-pmute.muted { color: var(--error); opacity: 1; }
   body.sidebar .header h1 { font-size: 11px; font-weight: 800; letter-spacing: 0.06em; }
   body.sidebar .header .header-icon { font-size: 17px; }
   body.sidebar .session-list { padding: 4px 8px 16px; }
@@ -346,7 +366,10 @@
     font-size: 10px; font-weight: 800; letter-spacing: 0.06em;
     text-transform: uppercase; color: var(--on-surface-variant);
     padding: 2px 2px 5px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* Only the name gives; the mute button holds its place at the right edge. */
+  body.sidebar .sb-group-name {
+    min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   body.sidebar .sb-group-emoji { font-size: 12px; }
 
@@ -2901,7 +2924,7 @@ function sbNestedHtml(entries) {
         ${g.wt.get(b).join('')}
       </div>`).join('');
     return `<div class="sb-group">
-      <div class="sb-group-head"><span class="sb-group-emoji">${g.place.emoji || '\u{1F4BB}'}</span>${esc(g.place.label)}</div>
+      <div class="sb-group-head"><span class="sb-group-emoji">${g.place.emoji || '\u{1F4BB}'}</span><span class="sb-group-name">${esc(g.place.label)}</span>${sbProjectMuteHtml(g.place.key)}</div>
       ${g.own.join('')}${worktrees}
     </div>`;
   }).join('');
@@ -2913,7 +2936,7 @@ function sbGroupHtml(s, isSkipped) {
   const { emoji, rest } = extractEmoji(s.name);
   const rows = sbConvRows(s, isSkipped).map(sbRowHtml).join('');
   return `<div class="sb-group">
-    <div class="sb-group-head"><span class="sb-group-emoji">${emoji || '\u{1F4BB}'}</span>${esc(rest || s.name)}</div>
+    <div class="sb-group-head"><span class="sb-group-emoji">${emoji || '\u{1F4BB}'}</span><span class="sb-group-name">${esc(rest || s.name)}</span>${sbProjectMuteHtml(sbPlaceOf(s.name).key)}</div>
     ${rows}
   </div>`;
 }
@@ -2946,6 +2969,63 @@ function sbToggle(key) {
   renderList();
 }
 
+// Global mute, shown in the header and toggleable from there. Worth surfacing
+// because the flag is invisible and sticky: it is the answer to "why did nothing
+// notify me", and the TUI's `G` is the only other place it appears.
+function sbRenderMute() {
+  const left = document.querySelector('#listView .header .header-left');
+  if (!left) return;
+  let el = document.getElementById('sbMute');
+  if (!el) {
+    el = document.createElement('button');
+    el.id = 'sbMute';
+    el.className = 'sb-mute';
+    el.onclick = sbToggleMute;
+    left.appendChild(el);
+  }
+  const muted = !!currentFocus.global_mute;
+  el.classList.toggle('muted', muted);
+  el.title = muted ? 'Notifications muted — click to unmute' : 'Notifications on — click to mute';
+  el.innerHTML = `<span class="material-symbols-outlined">${muted ? 'notifications_off' : 'notifications'}</span>`;
+}
+
+async function sbToggleMute() {
+  try {
+    const r = await (await fetch('/api/toggle-mute', { method: 'POST' })).json();
+    currentFocus = Object.assign({}, currentFocus, { global_mute: !!r.global_mute });
+    sbRenderMute();
+  } catch (e) { /* the next poll re-syncs */ }
+}
+
+function sbProjectMuted(key) {
+  return Array.isArray(currentFocus.muted_projects) && currentFocus.muted_projects.includes(key);
+}
+
+// Mute button on a project group header. Keyed by PROJECT key, so muting from a
+// worktree's group silences the whole project — which is what project-level mute
+// means, and matches the TUI's project detail `m`.
+function sbProjectMuteHtml(key) {
+  const muted = sbProjectMuted(key);
+  return `<button class="sb-pmute${muted ? ' muted' : ''}" onclick="event.stopPropagation();sbToggleProjectMute(this)"
+    data-key="${escAttr(key)}" title="${muted ? 'Project muted — click to unmute' : 'Mute this project'}"
+    ><span class="material-symbols-outlined">${muted ? 'notifications_off' : 'notifications'}</span></button>`;
+}
+
+async function sbToggleProjectMute(el) {
+  const key = el.dataset.key;
+  try {
+    const r = await (await fetch('/api/toggle-project-mute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    })).json();
+    const set = new Set(currentFocus.muted_projects || []);
+    if (r.muted) set.add(key); else set.delete(key);
+    currentFocus = Object.assign({}, currentFocus, { muted_projects: [...set] });
+    renderList();
+  } catch (e) { /* the next poll re-syncs */ }
+}
+
 function renderSidebarList() {
   const el = document.getElementById('sessionList');
   // Source order, deliberately: the sidebar must list conversations in the same
@@ -2958,6 +3038,7 @@ function renderSidebarList() {
     n + sbConvRows(s, false).filter(r => statusInfo(r.src).needsAction).length, 0);
   const h1 = document.querySelector('#listView .header h1');
   if (h1) h1.textContent = `${liveRows} LIVE${need ? ' · ' + need + ' NEED YOU' : ''}`;
+  sbRenderMute();
 
   let html = active.length
     ? active.map(s => sbGroupHtml(s, false)).join('')
@@ -3427,12 +3508,13 @@ async function fetchSessions() {
     let frJson = '[]';
     try { frJson = await (await fetch('/api/frozen')).text(); } catch (e) { /* keep last */ }
 
-    // Where the attached tmux client is looking, so the sidebar can mark "you are
-    // here". Sidebar-only: the phone has no client to be "at".
+    // Ambient panel state: where the attached tmux client is looking (so the
+    // sidebar can mark "you are here") plus the mute flags. Sidebar-only — the
+    // phone has no client to be "at".
     let focusJson = lastFocusJson;
     if (SIDEBAR) {
       try {
-        focusJson = await (await fetch('/api/current-focus')).text();
+        focusJson = await (await fetch('/api/ambient')).text();
         currentFocus = JSON.parse(focusJson);
       } catch (e) { /* keep last */ }
     }

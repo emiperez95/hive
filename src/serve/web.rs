@@ -586,18 +586,26 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
-            // Which window the attached client is looking at, so a remote surface can
-            // mark "you are here". One ~4ms `list-clients`; no registry gather.
-            (Method::Get, "/api/current-focus") => {
+            // Ambient state a remote surface polls: which window the attached client is
+            // looking at (so it can mark "you are here"), and whether notifications are
+            // globally muted. One ~4ms `list-clients` plus a file-existence check; no
+            // registry gather.
+            (Method::Get, "/api/ambient") => {
                 let clients = crate::common::tmux::list_clients();
-                let json = match crate::common::tmux::pick_client(&clients) {
-                    Some(c) => serde_json::json!({
-                        "session": c.session,
-                        "window_index": c.window_index,
-                        "tty": c.tty,
-                    }),
-                    None => serde_json::json!({}),
-                }
+                let muted = crate::common::persistence::is_globally_muted();
+                let mut muted_projects: Vec<String> =
+                    crate::common::persistence::load_muted_projects()
+                        .into_iter()
+                        .collect();
+                muted_projects.sort();
+                let client = crate::common::tmux::pick_client(&clients);
+                let json = serde_json::json!({
+                    "session": client.map(|c| c.session.clone()),
+                    "window_index": client.map(|c| c.window_index.clone()),
+                    "tty": client.map(|c| c.tty.clone()),
+                    "global_mute": muted,
+                    "muted_projects": muted_projects,
+                })
                 .to_string();
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let _ = request.respond(Response::from_string(json).with_header(header));
@@ -636,6 +644,41 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     ))
                 })()
                 .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // Toggle a PROJECT's mute — a remembered preference in `muted-projects.txt`,
+            // keyed by project key, honoured by the hook notifier for future sessions of
+            // that project. Same file the TUI's project-detail `m` writes.
+            (Method::Post, "/api/toggle-project-mute") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let key = req.get("key")?.as_str()?.to_string();
+                    let mut muted = crate::common::persistence::load_muted_projects();
+                    let now = if muted.contains(&key) {
+                        muted.remove(&key);
+                        false
+                    } else {
+                        muted.insert(key);
+                        true
+                    };
+                    crate::common::persistence::save_muted_projects(&muted);
+                    Some(format!(r#"{{"ok":true,"muted":{}}}"#, now))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // Toggle the global mute flag — the same `muted-global` file the TUI's `G`
+            // writes and the hook notifier reads, so the two surfaces agree.
+            (Method::Post, "/api/toggle-mute") => {
+                let now = !crate::common::persistence::is_globally_muted();
+                crate::common::persistence::set_global_mute(now);
+                let json = format!(r#"{{"ok":true,"global_mute":{}}}"#, now);
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
