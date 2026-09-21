@@ -465,6 +465,25 @@
     padding: 16px 4px; text-align: center;
   }
 
+  /* --- Attention view --------------------------------------------------
+     Tier headings, and the project emoji standing in for the status dot on an
+     ungrouped row. The emoji keeps the dot's exact footprint so rows stay on one
+     line and the title's elide budget is untouched. */
+  body.sidebar .sb-tier-head {
+    display: flex; align-items: center; gap: 5px;
+    padding: 2px 4px 4px;
+    font-size: 10px; font-weight: 800;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--on-surface-variant);
+  }
+  body.sidebar .sb-tier-head.t0 { color: var(--error); }
+  body.sidebar .sb-tier-head.t1 { color: var(--primary); }
+  /* Same escape the frozen marker uses: the 7x7 dot box would clip a glyph. */
+  body.sidebar .sb-dot.sb-emoji {
+    width: auto; height: auto; border-radius: 0;
+    font-size: 11px; line-height: 1; background: none !important;
+  }
+
   /* --- Stats pane (sidebar only) ---------------------------------------
      A second horizontal band under the list, showing spend for whichever
      conversation the tmux client is on. The list keeps `flex: 1` and scrolls;
@@ -2298,9 +2317,13 @@ let wasAtBottom = true;
 const SIDEBAR = new URLSearchParams(location.search).has('sidebar');
 if (SIDEBAR) document.body.classList.add('sidebar');
 // Skipped and frozen start folded — they're reference, not attention.
-let sbCollapsed = { skipped: true, frozen: true };
+let sbCollapsed = { skipped: true, frozen: true, tier3: true };
 // Two views: 'live' (what's running) and 'projects' (what exists).
 let sbView = 'live';
+try {
+  const v = localStorage.getItem('hiveSbView');
+  if (v === 'attention' || v === 'projects' || v === 'live') sbView = v;
+} catch (e) { /* private mode — the default is fine */ }
 let sbShowArchived = false;
 let currentFocus = {};      // {session, window_index} of the attached tmux client
 let lastFocusJson = '';
@@ -2996,16 +3019,28 @@ function sbConvRows(s, isSkipped) {
   }));
 }
 
-function sbRowHtml(r) {
+// `flat` marks a row in the ungrouped attention view, where no session header says
+// where the row lives. It swaps the status dot for the project's emoji — the dot's
+// job (status) is already done twice over by the coloured state word and the `.need`
+// styling, while "which project" would otherwise have to eat into the title's elide
+// budget. The full place goes in a native tooltip.
+function sbRowHtml(r, flat) {
   const si = statusInfo(r.src);
   const current = sbIsCurrent(r.session, r.windowIndex);
   const cls = (si.needsAction ? ' need' : '') + (r.isSkipped ? ' skip' : '') + (current ? ' current' : '');
   const age = sbAge(r.src && r.src.last_activity);
+  const place = flat ? sbPlaceOf(r.session) : null;
+  const marker = place
+    ? `<span class="sb-dot sb-emoji">${esc(place.emoji || '•')}</span>`
+    : `<span class="sb-dot" style="background:${si.dotColor}"></span>`;
+  const tip = place
+    ? ` title="${escAttr([place.label, place.branch].filter(Boolean).join(' · ') + ' — ' + si.label)}"`
+    : '';
   // Session names carry spaces, emoji and `[project]` tags — they go in data
   // attributes (quote-escaped), never interpolated into an onclick expression.
-  return `<div class="sb-row${cls}" onclick="sbRowClick(this)"
+  return `<div class="sb-row${cls}" onclick="sbRowClick(this)"${tip}
       data-session="${escAttr(r.session)}" data-window="${escAttr(r.windowIndex == null ? '' : r.windowIndex)}">
-    <span class="sb-dot" style="background:${si.dotColor}"></span>
+    ${marker}
     <div class="sb-title">${esc(r.title)}</div>
     <span class="sb-age">${esc(age)}</span>
     <span class="sb-state" style="color:${si.color}">${sbStateWord(r.src)}</span>
@@ -3106,7 +3141,7 @@ function sbNestedHtml(entries) {
 // worktree grouping ("📊 [avateen] live-avatar") for free.
 function sbGroupHtml(s, isSkipped) {
   const { emoji, rest } = extractEmoji(s.name);
-  const rows = sbConvRows(s, isSkipped).map(sbRowHtml).join('');
+  const rows = sbConvRows(s, isSkipped).map(r => sbRowHtml(r)).join('');
   return `<div class="sb-group">
     <div class="sb-group-head"><span class="sb-group-emoji">${emoji || '\u{1F4BB}'}</span><span class="sb-group-name">${esc(rest || s.name)}</span>${sbProjectMuteHtml(sbPlaceOf(s.name).key)}</div>
     ${rows}
@@ -3160,6 +3195,9 @@ function sbHeaderBtn(id, cls, onclick, parent) {
 
 function sbSetView(v) {
   sbView = v;
+  // The Toolbelt webview reloads whenever hive's version changes, and a view that
+  // resets itself every reload reads as the feature not working.
+  try { localStorage.setItem('hiveSbView', v); } catch (e) { /* private mode */ }
   renderList();
 }
 
@@ -3190,8 +3228,19 @@ function sbRenderControls() {
   arch.title = sbShowArchived ? 'Showing archived projects — click to hide' : 'Archived projects hidden — click to show';
   arch.innerHTML = `<span class="material-symbols-outlined">${sbShowArchived ? 'inventory_2' : 'archive'}</span>`;
 
+  // Attention sits between archived and view. The box is right-aligned, so only the
+  // LEFTMOST control moves when another is hidden — putting it here keeps view and
+  // mute exactly where they were, which is the same reason archived is first.
+  const attn = sbHeaderBtn('sbAttnBtn', 'sb-mute', null, box);
+  attn.onclick = () => sbSetView(sbView === 'attention' ? 'live' : 'attention');
+  attn.classList.toggle('on', sbView === 'attention');
+  attn.title = sbView === 'attention'
+    ? 'Ordered by what needs you — click for conversations by session'
+    : 'Order by what needs you';
+  attn.innerHTML = `<span class="material-symbols-outlined">priority_high</span>`;
+
   const view = sbHeaderBtn('sbViewBtn', 'sb-mute', () => sbSetView(projects ? 'live' : 'projects'), box);
-  view.onclick = () => sbSetView(sbView === 'live' ? 'projects' : 'live');
+  view.onclick = () => sbSetView(projects ? 'live' : 'projects');
   view.classList.toggle('on', projects);
   view.title = projects ? 'Showing all projects — click for live conversations' : 'Showing live conversations — click for all projects';
   view.innerHTML = `<span class="material-symbols-outlined">${projects ? 'sensors' : 'folder'}</span>`;
@@ -3274,7 +3323,7 @@ function sbProjectsHtml() {
   const entries = [];
   sessions.forEach(s => entries.push({
     sessionName: s.name,
-    html: sbConvRows(s, !!s.skipped).map(sbRowHtml).join(''),
+    html: sbConvRows(s, !!s.skipped).map(r => sbRowHtml(r)).join(''),
     count: sbConvRows(s, !!s.skipped).length,
   }));
   frozenList.forEach(f => entries.push({ sessionName: f.session_name, html: sbFrozenHtml(f) }));
@@ -3525,6 +3574,86 @@ function sbRenderStats() {
     sbWorktreeHtml(d.worktree);
 }
 
+// --- Attention view ---------------------------------------------------------
+//
+// The same conversations, ordered by how much they want a human instead of by which
+// tmux session happens to host them. The tier itself is computed in Rust and arrives
+// on the wire as `attention` — there is deliberately no second definition of "blocked"
+// here, where nothing could test it.
+
+const SB_TIERS = [
+  { n: 0, key: 'tier0', label: 'Needs you' },
+  { n: 1, key: 'tier1', label: 'Ready for review' },
+  { n: 2, key: 'tier2', label: 'Working' },
+  { n: 3, key: 'tier3', label: 'Idle' },
+];
+
+function sbTierOf(r) {
+  const a = r.src && r.src.attention;
+  return typeof a === 'number' ? a : 3;
+}
+
+// Total and stable. The trailing session/window keys matter as much as the tier: an
+// order that is merely "mostly sorted" reshuffles between 1.5s polls, and a row that
+// moves is a row you mis-click.
+function sbAttnCompare(a, b) {
+  const ta = sbTierOf(a), tb = sbTierOf(b);
+  if (ta !== tb) return ta - tb;
+
+  if (ta === 0 || ta === 2) {
+    // Blocked and working: longest-held first — a two-hour wait outranks a ten-second
+    // one, and a long-running job is likelier wedged. `state_secs` is absent for a
+    // conversation hive hasn't watched change, which sorts last rather than as zero.
+    const sa = a.src && a.src.state_secs, sb2 = b.src && b.src.state_secs;
+    const va = typeof sa === 'number' ? sa : -1, vb = typeof sb2 === 'number' ? sb2 : -1;
+    if (va !== vb) return vb - va;
+  } else {
+    // Ready and idle: freshest first — today's output belongs at the top.
+    const la = (a.src && a.src.last_activity) || '', lb = (b.src && b.src.last_activity) || '';
+    if (la !== lb) return la < lb ? 1 : -1;
+  }
+  if (a.session !== b.session) return a.session < b.session ? -1 : 1;
+  return String(a.windowIndex) < String(b.windowIndex) ? -1 : 1;
+}
+
+function sbAttentionHtml() {
+  const rows = sessions
+    .filter(s => !s.skipped)
+    .flatMap(s => sbConvRows(s, false))
+    .sort(sbAttnCompare);
+  if (!rows.length) return '<div class="sb-empty">No live conversations</div>';
+
+  return SB_TIERS.map(t => {
+    const mine = rows.filter(r => sbTierOf(r) === t.n);
+    if (!mine.length) return '';
+    const body = mine.map(r => sbRowHtml(r, true)).join('');
+    // Idle is the long tail and the one tier you never need to act on, so it folds —
+    // which is what makes this view shorter than the grouped one rather than longer.
+    if (t.n === 3) return sbSection(t.key, t.label, mine.length, body);
+    return `<div class="sb-group">
+      <div class="sb-tier-head t${t.n}">${esc(t.label)} (${mine.length})</div>
+      ${body}
+    </div>`;
+  }).join('');
+}
+
+// Don't move a click target out from under the pointer. The list is rebuilt wholesale
+// every 1.5s; in the grouped views order is near-static, but here a row can change
+// tier and jump the height of the panel between deciding to click and clicking.
+let sbHover = false;
+function sbSwapList(el, html) {
+  if (!el.dataset.hoverBound) {
+    el.dataset.hoverBound = '1';
+    el.addEventListener('mouseenter', () => { sbHover = true; });
+    el.addEventListener('mouseleave', () => { sbHover = false; });
+  }
+  if (el.innerHTML === html) return;
+  if (sbHover && sbView === 'attention') return;
+  const top = el.scrollTop;
+  el.innerHTML = html;
+  el.scrollTop = top;
+}
+
 function renderSidebarList() {
   const el = document.getElementById('sessionList');
   // Source order, deliberately: the sidebar must list conversations in the same
@@ -3547,24 +3676,27 @@ function renderSidebarList() {
   sbRenderStats();
 
   if (sbView === 'projects') {
-    el.innerHTML = sbProjectList.length
+    sbSwapList(el, sbProjectList.length
       ? sbProjectsHtml()
-      : '<div class="sb-empty">No projects registered</div>';
+      : '<div class="sb-empty">No projects registered</div>');
     return;
   }
 
-  let html = active.length
-    ? active.map(s => sbGroupHtml(s, false)).join('')
-    : '<div class="sb-empty">No live conversations</div>';
+  // Skipped and Frozen sit below in every view — they are set aside, not ranked.
+  let html = sbView === 'attention'
+    ? sbAttentionHtml()
+    : (active.length
+        ? active.map(s => sbGroupHtml(s, false)).join('')
+        : '<div class="sb-empty">No live conversations</div>');
   if (skipped.length) {
     html += sbSection('skipped', 'Skipped', skipped.length, sbNestedHtml(
-      skipped.map(s => ({ sessionName: s.name, html: sbConvRows(s, true).map(sbRowHtml).join('') }))));
+      skipped.map(s => ({ sessionName: s.name, html: sbConvRows(s, true).map(r => sbRowHtml(r)).join('') }))));
   }
   if (frozenList.length) {
     html += sbSection('frozen', 'Frozen', frozenList.length, sbNestedHtml(
       frozenList.map(f => ({ sessionName: f.session_name, html: sbFrozenHtml(f) }))));
   }
-  el.innerHTML = html;
+  sbSwapList(el, html);
 }
 
 function renderList() {

@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 357 tests (333 unit + 24 CLI smoke)
+cargo test                # 371 tests (347 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 612 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 333 unit + 24 smoke.
+> `cargo test` prints 629 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 347 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -1019,7 +1019,15 @@ registers and exits. Requires a one-time "Enable Python API" in iTerm's settings
 > script, but iTerm has **no API to unregister a tool identifier**, so `hive` stays
 > in the Toolbelt's tool list to be unticked by hand.
 
-**Two views**, switched by a header button whose position is fixed (see below):
+**Three views**, switched by header buttons whose positions are fixed (see below):
+
+- **Attention** — the same live conversations, ordered by how much they want a
+  human instead of by which tmux session hosts them. Four tiers: **blocked**
+  (a decision is pending) → **ready for review** (idle, with work in its tree
+  nobody has looked at) → **working** → **idle**. Idle is collapsed by default,
+  which is what makes this view *shorter* than the grouped one. Tier 2 is the
+  only new information; the rest hive already knew and never ranked.
+
 
 - **Live** — conversations grouped by session, then folded `Skipped` / `Frozen`
   sections. One row per CONVERSATION, not per session: a session hosting three of
@@ -1047,6 +1055,58 @@ label, no background change, or a tinted pill per project would stripe the panel
 `margin-left: auto`. The view button is the way back, and hanging the auto margin
 off whichever button came first meant revealing the archived filter shoved it
 sideways — a way back that moves is the one control you can't afford to hunt for.
+
+### The attention view — ranking, and what keeps it usable
+
+**The tier is computed in Rust** (`serve/server.rs::tier_for`, shipped as
+`WindowView.attention`), never in `web.html`. The frontend has no test harness,
+and a second definition of "blocked" would drift from
+`SessionStatus::blocks_human` — itself now the single canonical predicate, after
+being written out independently in `common/conversations.rs`, `serve/server.rs`
+and `serve/metrics.rs`.
+
+**The git probe runs only for idle windows** (`annotate_attention`). It costs
+~0.045s per working tree and there are 13 live trees here, so probing busy and
+blocked windows too would spend 0.59s of the 1s gather on answers that cannot
+change a tier. There is a unit test asserting the call count, because this is a
+performance contract rather than a preference. Skipped sessions are never probed
+or ranked — the same rule `cycle-free` follows.
+
+> **Gotcha — nothing in hive records a status transition.** `last_activity` is
+> "last hook event fired", stamped unconditionally at `daemon/hooks.rs`, so it
+> cannot answer "how long has this been blocked". Measured: six live
+> conversations sharing one identical value, and a `Working` conversation
+> reporting 29 minutes of inactivity. `StateAges` therefore watches for changes
+> in the data thread, keyed on a **payload-free** discriminant — a
+> `NeedsPermission` whose tool name changes is one unbroken wait, and resetting
+> its timer would keep it looking perpetually fresh. First sighting yields
+> `None`, never zero, so a conversation blocked before the server started cannot
+> claim to be new. It is a sort key and is deliberately **not displayed**.
+
+> **Gotcha — unpushed commits on the mainline are not unreviewed work.** This
+> repo's own `main` sits 14 ahead and always will. Counting that as
+> ready-for-review pins the project in a tier that never empties, and a tier that
+> never empties stops being read. `has_unreviewed_work` only counts `ahead` on a
+> branch that is *not* the base branch; on a feature branch it is exactly the
+> finished work that wants merging.
+
+**Rows don't move under the pointer.** The list is rebuilt wholesale every 1.5s.
+In the grouped views order is near-static, but here a row can change tier and jump
+the height of the panel between deciding to click and clicking — so `sbSwapList`
+skips the DOM swap while the pointer is over the list, and preserves `scrollTop`
+across it. Ordering is also a **total** order (tier, then age, then session and
+window index): a merely "mostly sorted" comparator reshuffles ties on every poll.
+Measured 20 samples over 20s with zero reorders.
+
+An ungrouped row has no session header to say where it lives, so the status dot is
+replaced by the **project emoji** and the full place goes in a native tooltip. The
+dot's job is already done twice over by the coloured state word and the `.need`
+styling, whereas a text prefix would eat the title's elide budget.
+
+> **Gotcha — `.map(sbRowHtml)` passes the array index.** `sbRowHtml` gained an
+> optional second parameter (`flat`), which silently turned every row after the
+> first into an attention-view row at three existing call sites. They now pass
+> `r => sbRowHtml(r)`.
 
 ### The stats pane — spend for the conversation you're on
 
@@ -1233,18 +1293,28 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-357 distinct tests. Run with `cargo test`.
+371 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 612 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 255 · bin 333 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 629 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 258 · bin 347 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
-**Unit tests (309)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (323)** — in-module `#[cfg(test)]` blocks:
 - `common/usage.rs`: `accumulate_line` (per-model accumulation, sidechain kept apart,
   thinking not double-counted, zero-usage `<synthetic>` entries dropped, unlabelled
   model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a
   transcript caught mid-write counts that line exactly once on the next pass)
-- `common/worktree_health.rs`: `parse_status_counts` (tracked vs `??`),
+- `serve/server.rs`: `tier_for` (blocked outranks a dirty tree; busy is never
+  ready; idle splits on unreviewed work), `AttentionTier` ordering, `StateAges`
+  (first sighting is `None` not zero, reset only on a kind change, payload churn
+  ignored, gc drops ended conversations), and `annotate_attention` — including
+  **the probe-call-count contract** (idle windows only, skipped sessions never,
+  no shelling out on an empty cwd)
+- `ipc/messages.rs`: `blocks_human` is exactly the four decision states, and
+  `RunningWorkflow` is not one of them
+- `common/worktree_health.rs`: `ttl_for` (deterministic, bounded, and spread so
+  13 trees can't expire on one tick), unpushed-commits-on-the-mainline,
+  `parse_status_counts` (tracked vs `??`),
   `parse_ahead_behind` (left is BEHIND — inverting it silently flips the display),
   `base_from_symbolic_ref` (a non-`main` default must not be read as main), and
   `has_unreviewed_work` (dirty/untracked/ahead count; being *behind* is not work
