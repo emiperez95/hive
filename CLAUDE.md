@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 351 tests (327 unit + 24 CLI smoke)
+cargo test                # 356 tests (332 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 600 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 327 unit + 24 smoke.
+> `cargo test` prints 610 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 332 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -167,6 +167,8 @@ src/
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml)
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
+│   ├── worktree_health.rs  git state of ONE working tree (dirty/ahead/behind/merged), mtime-cached
+│   ├── usage.rs            per-conversation token usage, accumulated incrementally from the transcript
 │   └── debug.rs            debug logging to cache dir
 ├── daemon/
 │   ├── hooks.rs            handle_hook_event(): maps HookEvent → SessionState updates
@@ -1078,6 +1080,36 @@ treats half the spend as free is worse than no cost at all.
 > at parse time; otherwise it appears in the breakdown as a model that cost nothing
 > *and* gets listed as unpriced, implying a missing rate where there is no spend.
 
+**Under the spend, what the work produced** (`common/worktree_health.rs`): the
+branch actually checked out, then chips for dirty / untracked / ahead / behind,
+then the base and last-commit age. Only non-zero counts render, so a clean landed
+tree collapses to a branch and a `merged` chip rather than a row of zeros — the
+same suppress-the-boring-state rule the rest of the panel follows.
+
+The cwd is resolved **server-side** from the transcript's first cwd (the LAUNCH
+dir, per `registry::home_cwd`), never taken from the client: it becomes the
+directory `git` runs in, which is not a value a query parameter should choose.
+
+> **Gotcha — the base branch is not `main`.** It comes from
+> `git symbolic-ref refs/remotes/origin/HEAD`, falling back through
+> `origin/main` → `origin/master` → `main` → `master`. avateen's default is
+> **`origin/production`**, so a hardcoded `origin/main` reports every worktree
+> there as zero-ahead, zero-behind and unmerged — wrong in the direction that
+> looks like "nothing to do here".
+
+> **Gotcha — a worktree's registered branch is not its checked-out branch.**
+> `avateen/test-harness` is registered under that key while `test/integration` is
+> what is actually checked out. The health probe reports what git says.
+
+The probe is ~0.05–0.10s per tree, cached in memory (process lifetime) on the git
+dir's `index` + `HEAD` mtimes with a 60s ceiling — the mtimes catch local edits and
+commits, but ahead/behind also moves when a *fetch* rewrites remote refs, which
+touches neither. Same shape as `machine.rs`'s `pmset` memoization. The cache holds
+the resolved git dir so the hit path costs two stats and no subprocess; a linked
+worktree's `.git` is a file, and `--absolute-git-dir` is what points at the real
+per-worktree `index`. That cache is what would make a fleet-wide consumer — an
+attention-ordered cycle key over every live conversation — affordable.
+
 ### Clicking a row switches the tmux client
 
 `POST /api/switch` resolves a concrete client and runs
@@ -1193,17 +1225,22 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-351 distinct tests. Run with `cargo test`.
+356 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 600 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 249 · bin 327 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 610 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 254 · bin 332 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
-**Unit tests (303)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (308)** — in-module `#[cfg(test)]` blocks:
 - `common/usage.rs`: `accumulate_line` (per-model accumulation, sidechain kept apart,
   thinking not double-counted, zero-usage `<synthetic>` entries dropped, unlabelled
   model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a
   transcript caught mid-write counts that line exactly once on the next pass)
+- `common/worktree_health.rs`: `parse_status_counts` (tracked vs `??`),
+  `parse_ahead_behind` (left is BEHIND — inverting it silently flips the display),
+  `base_from_symbolic_ref` (a non-`main` default must not be read as main), and
+  `has_unreviewed_work` (dirty/untracked/ahead count; being *behind* is not work
+  this conversation produced)
 - `common/config.rs`: `[pricing]` parse + empty default, `price_for` (exact then
   longest-substring), `cost_breakdown` (each class at its own rate, subagent spend
   priced on its own row, unpriced models named rather than counted as zero)

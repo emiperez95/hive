@@ -534,6 +534,45 @@
   body.sidebar .sb-st-row.total .sb-st-model,
   body.sidebar .sb-st-row.total .sb-st-cost { color: var(--on-surface); }
 
+  /* --- Worktree block --------------------------------------------------
+     What the conversation produced, under what it cost. Chips rather than a
+     sentence: the counts are scanned, not read, and only non-zero ones render
+     so a clean tree collapses to almost nothing. */
+  body.sidebar .sb-st-wt {
+    margin-top: 5px; padding-top: 5px;
+    border-top: 1px solid var(--outline-variant);
+  }
+  body.sidebar .sb-st-branch {
+    display: flex; align-items: center; gap: 4px;
+    color: var(--on-surface); font-weight: 600;
+    overflow: hidden; white-space: nowrap;
+  }
+  body.sidebar .sb-st-branch .material-symbols-outlined {
+    font-size: 13px; color: var(--on-surface-variant);
+  }
+  body.sidebar .sb-st-branch b {
+    overflow: hidden; text-overflow: ellipsis; font-weight: 600;
+  }
+  body.sidebar .sb-st-chips {
+    display: flex; flex-wrap: wrap; gap: 3px; margin-top: 3px;
+  }
+  body.sidebar .sb-st-chip {
+    font-size: 10px; line-height: 1.5;
+    padding: 0 5px; border-radius: 4px;
+    background: var(--surface-container);
+    color: var(--on-surface-variant);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Only the states that mean "there is work here nobody has looked at" get
+     colour; behind/merged are context, not a call to action. */
+  body.sidebar .sb-st-chip.work { color: var(--primary); font-weight: 700; }
+  body.sidebar .sb-st-chip.landed { color: var(--secondary); }
+  body.sidebar .sb-st-base {
+    font-size: 10px; color: var(--on-surface-variant);
+    margin-top: 3px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
   body.sidebar .sb-st-note {
     font-size: 10px; color: var(--on-surface-variant);
     padding: 5px 2px 0; line-height: 1.35;
@@ -3387,6 +3426,36 @@ function sbStatsRowsHtml(map, costs, sub) {
   }).join('');
 }
 
+// The git side of the pane. Only non-zero counts render, so a clean landed tree
+// shows a branch and little else rather than a row of zeros.
+function sbWorktreeHtml(w) {
+  if (!w) return '';
+  const chips = [];
+  if (w.dirty) chips.push(`<span class="sb-st-chip work">${w.dirty} dirty</span>`);
+  if (w.untracked) chips.push(`<span class="sb-st-chip work">${w.untracked} new</span>`);
+  if (w.ahead) chips.push(`<span class="sb-st-chip work">${w.ahead} ahead</span>`);
+  if (w.behind) chips.push(`<span class="sb-st-chip">${w.behind} behind</span>`);
+  if (!w.dirty && !w.untracked && !w.ahead) {
+    chips.push(w.merged
+      ? '<span class="sb-st-chip landed">merged</span>'
+      : '<span class="sb-st-chip">clean</span>');
+  }
+
+  const age = w.last_commit_unix
+    ? sbAge(new Date(w.last_commit_unix * 1000).toISOString()) : '';
+  const base = [w.base ? 'base ' + w.base : '', age ? 'last commit ' + age : '']
+    .filter(Boolean).join(' · ');
+
+  return `<div class="sb-st-wt">
+    <div class="sb-st-branch">
+      <span class="material-symbols-outlined">fork_right</span>
+      <b>${esc(w.detached ? 'detached HEAD' : w.branch)}</b>
+    </div>
+    <div class="sb-st-chips">${chips.join('')}</div>
+    ${base ? `<div class="sb-st-base">${esc(base)}</div>` : ''}
+  </div>`;
+}
+
 function sbRenderStats() {
   const el = document.getElementById('sbStats');
   if (!el) return;
@@ -3452,7 +3521,8 @@ function sbRenderStats() {
   el.innerHTML = head +
     (where ? `<div class="sb-st-where">${esc(where)}</div>` : '') +
     (rows || '<div class="sb-st-note">No usage recorded yet.</div>') +
-    (rows ? total : '') + unpriced;
+    (rows ? total : '') + unpriced +
+    sbWorktreeHtml(d.worktree);
 }
 
 function renderSidebarList() {

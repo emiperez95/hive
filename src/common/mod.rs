@@ -26,3 +26,6 @@ pub mod types;
 #[allow(dead_code)]
 pub mod usage;
 pub mod worktree;
+// Git state of one working tree — what a conversation actually produced.
+#[allow(dead_code)]
+pub mod worktree_health;

@@ -635,6 +635,23 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                 let (main_cost, side_cost, unpriced) = cfg.cost_breakdown(&usage);
                                 let total: f64 = main_cost.values().chain(side_cost.values()).sum();
                                 let priced = !main_cost.is_empty() || !side_cost.is_empty();
+
+                                // Git state of the tree this conversation works in.
+                                // Resolved server-side from the transcript's own cwd
+                                // rather than taken from the client: this ends up as
+                                // the directory `git` is run in, and that is not a
+                                // value a query parameter should get to choose.
+                                //
+                                // The transcript's first cwd is the LAUNCH dir, which
+                                // is the right one — the same rule `registry::home_cwd`
+                                // follows, and it survives a conversation cd-ing around.
+                                let health =
+                                    crate::common::jsonl::read_conversation_meta(&transcript)
+                                        .0
+                                        .and_then(|cwd| {
+                                            crate::common::worktree_health::health_for_cwd(&cwd)
+                                        });
+
                                 serde_json::json!({
                                     "id": id,
                                     "usage": usage,
@@ -643,6 +660,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                     "cost_sidechain": side_cost,
                                     "cost_usd": priced.then_some(total),
                                     "unpriced_models": unpriced,
+                                    "worktree": health,
                                 })
                                 .to_string()
                             }
