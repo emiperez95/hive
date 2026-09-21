@@ -478,11 +478,20 @@
   }
   body.sidebar .sb-tier-head.t0 { color: var(--error); }
   body.sidebar .sb-tier-head.t1 { color: var(--primary); }
-  /* Same escape the frozen marker uses: the 7x7 dot box would clip a glyph. */
-  body.sidebar .sb-dot.sb-emoji {
-    width: auto; height: auto; border-radius: 0;
-    font-size: 11px; line-height: 1; background: none !important;
+  /* Two-line rows: the dot aligns to the FIRST line rather than the row's centre,
+     so a column of rows still reads as a column of status marks. */
+  body.sidebar .sb-row.sb-row2 { align-items: flex-start; }
+  body.sidebar .sb-row.sb-row2 > .sb-dot { margin-top: 5px; }
+  body.sidebar .sb-row2-body { flex: 1; min-width: 0; }
+  body.sidebar .sb-row2-top {
+    display: flex; align-items: baseline; gap: 7px;
   }
+  body.sidebar .sb-place {
+    font-size: 10px; color: var(--on-surface-variant);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-top: 1px;
+  }
+  body.sidebar .sb-row.current .sb-place { color: var(--on-primary-fixed); opacity: 0.75; }
 
   /* --- Stats pane (sidebar only) ---------------------------------------
      A second horizontal band under the list, showing spend for whichever
@@ -2835,6 +2844,10 @@ function statusInfo(s) {
     if (st.NeedsPermission) return { label: 'Permission', cls: 'attention', color: 'var(--tertiary-container)', dotColor: 'var(--tertiary-container)', needsAction: true };
     if (st.EditApproval) return { label: 'Edit Approval', cls: 'attention', color: 'var(--tertiary)', dotColor: 'var(--tertiary)', needsAction: true };
     if (st.RunningWorkflow) return { label: 'Workflow', cls: 'busy', color: 'var(--primary)', dotColor: 'var(--primary)', needsAction: false };
+    // Claude says a human is needed but not what for (`claude_sessions.rs`). Same
+    // attention styling as the specific prompts — the whole point is that it must
+    // not read as idle.
+    if (st.NeedsInput) return { label: 'Needs You', cls: 'attention', color: 'var(--tertiary-container)', dotColor: 'var(--tertiary-container)', needsAction: true };
   }
   return { label: 'Busy', cls: 'busy', color: 'var(--error)', dotColor: 'var(--error)', needsAction: false };
 }
@@ -2850,6 +2863,7 @@ function statusDetail(s) {
     }
     if (st.EditApproval) return 'File: ' + st.EditApproval.filename;
     if (st.RunningWorkflow) return st.RunningWorkflow.summary || '';
+    if (st.NeedsInput) return st.NeedsInput.reason || '';
   }
   return '';
 }
@@ -2963,6 +2977,7 @@ function sbStateWord(s) {
     if (st.NeedsPermission) return 'perm';
     if (st.EditApproval) return 'edit';
     if (st.RunningWorkflow) return 'flow';
+    if (st.NeedsInput) return 'needs';
   }
   return 'work';
 }
@@ -3020,30 +3035,46 @@ function sbConvRows(s, isSkipped) {
 }
 
 // `flat` marks a row in the ungrouped attention view, where no session header says
-// where the row lives. It swaps the status dot for the project's emoji — the dot's
-// job (status) is already done twice over by the coloured state word and the `.need`
-// styling, while "which project" would otherwise have to eat into the title's elide
-// budget. The full place goes in a native tooltip.
+// where the row lives. Those rows go to TWO lines and spend the second one on the
+// project and worktree: once the ordering stops being by project, "where is this"
+// is the first thing you need, and at 280px it cannot share a line with a title
+// without one of them being cut to nothing.
+//
+// The grouped views keep their single-line rows — there the session header above
+// already answers it, and density is the whole point.
 function sbRowHtml(r, flat) {
   const si = statusInfo(r.src);
   const current = sbIsCurrent(r.session, r.windowIndex);
   const cls = (si.needsAction ? ' need' : '') + (r.isSkipped ? ' skip' : '') + (current ? ' current' : '');
   const age = sbAge(r.src && r.src.last_activity);
-  const place = flat ? sbPlaceOf(r.session) : null;
-  const marker = place
-    ? `<span class="sb-dot sb-emoji">${esc(place.emoji || '•')}</span>`
-    : `<span class="sb-dot" style="background:${si.dotColor}"></span>`;
-  const tip = place
-    ? ` title="${escAttr([place.label, place.branch].filter(Boolean).join(' · ') + ' — ' + si.label)}"`
-    : '';
   // Session names carry spaces, emoji and `[project]` tags — they go in data
   // attributes (quote-escaped), never interpolated into an onclick expression.
-  return `<div class="sb-row${cls}" onclick="sbRowClick(this)"${tip}
-      data-session="${escAttr(r.session)}" data-window="${escAttr(r.windowIndex == null ? '' : r.windowIndex)}">
-    ${marker}
-    <div class="sb-title">${esc(r.title)}</div>
-    <span class="sb-age">${esc(age)}</span>
-    <span class="sb-state" style="color:${si.color}">${sbStateWord(r.src)}</span>
+  const attrs = `onclick="sbRowClick(this)"
+      data-session="${escAttr(r.session)}" data-window="${escAttr(r.windowIndex == null ? '' : r.windowIndex)}"`;
+  const dot = `<span class="sb-dot" style="background:${si.dotColor}"></span>`;
+  const meta = `<span class="sb-age">${esc(age)}</span>
+    <span class="sb-state" style="color:${si.color}">${sbStateWord(r.src)}</span>`;
+
+  if (!flat) {
+    return `<div class="sb-row${cls}" ${attrs}>
+      ${dot}
+      <div class="sb-title">${esc(r.title)}</div>
+      ${meta}
+    </div>`;
+  }
+
+  const place = sbPlaceOf(r.session);
+  const where = [place.emoji, place.label].filter(Boolean).join(' ')
+    + (place.branch ? ' · ' + place.branch : '');
+  return `<div class="sb-row sb-row2${cls}" ${attrs}>
+    ${dot}
+    <div class="sb-row2-body">
+      <div class="sb-row2-top">
+        <div class="sb-title">${esc(r.title)}</div>
+        ${meta}
+      </div>
+      <div class="sb-place">${esc(where)}</div>
+    </div>
   </div>`;
 }
 

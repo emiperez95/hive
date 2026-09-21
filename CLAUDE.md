@@ -1165,10 +1165,18 @@ across it. Ordering is also a **total** order (tier, then age, then session and
 window index): a merely "mostly sorted" comparator reshuffles ties on every poll.
 Measured 20 samples over 20s with zero reorders.
 
-An ungrouped row has no session header to say where it lives, so the status dot is
-replaced by the **project emoji** and the full place goes in a native tooltip. The
-dot's job is already done twice over by the coloured state word and the `.need`
-styling, whereas a text prefix would eat the title's elide budget.
+**An ungrouped row is TWO lines**, and the second one is the project and worktree
+(`sb-place`). Once the ordering stops being by project, "where is this" is the first
+thing you need, and at 280px it cannot share a line with a title without one of them
+being cut to nothing. The grouped views keep their single-line rows — there the
+session header above already answers it, and density is the point.
+
+> An earlier pass tried to keep one line by swapping the status dot for the project
+> emoji and putting the full place in a tooltip. It fits, but an emoji alone doesn't
+> distinguish the four `avateen` worktrees from each other or from the project, which
+> is exactly the distinction an unsorted list needs — and a tooltip is not a glance.
+> The dot is back to being the status dot, aligned to the first line (`align-items:
+> flex-start` plus a 5px nudge) so a column of rows still reads as a column of marks.
 
 > **Gotcha — `.map(sbRowHtml)` passes the array index.** `sbRowHtml` gained an
 > optional second parameter (`flat`), which silently turned every row after the
