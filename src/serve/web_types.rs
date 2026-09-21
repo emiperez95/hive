@@ -82,6 +82,23 @@ pub struct WindowView {
     pub last_activity: Option<String>,
     /// (session, window, pane) for routing send-keys to this window.
     pub pane: Option<(String, String, String)>,
+    /// Attention tier: 0 blocked · 1 ready for review · 2 working · 3 idle.
+    ///
+    /// Computed in Rust rather than in the frontend so there is exactly one
+    /// definition of "needs you" — the JS has no test harness, and a second
+    /// implementation would drift from `SessionStatus::blocks_human`.
+    #[serde(default)]
+    pub attention: u8,
+    /// This window's worktree holds work nobody has looked at. Only ever computed
+    /// for idle windows (see `annotate_attention`).
+    #[serde(default)]
+    pub unreviewed_work: bool,
+    /// Seconds this window has held its current status, or `None` when it was
+    /// already in that status the first time hive saw it (i.e. since the web server
+    /// last started). A sort key only — never displayed, because after a restart a
+    /// conversation blocked for an hour would otherwise read as brand new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_secs: Option<u32>,
 }
 
 /// One conversation as exposed to the web dashboard's new conversation-first API

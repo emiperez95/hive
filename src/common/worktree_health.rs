@@ -51,13 +51,35 @@ pub struct WorktreeHealth {
 }
 
 impl WorktreeHealth {
+    /// The base branch's own name — `origin/production` → `production`, and a bare
+    /// local fallback like `main` → `main`.
+    fn base_branch_name(&self) -> Option<&str> {
+        self.base
+            .as_deref()
+            .map(|b| b.split_once('/').map(|(_, rest)| rest).unwrap_or(b))
+    }
+
+    /// Whether the checked-out branch *is* the mainline it would be compared against.
+    fn on_base_branch(&self) -> bool {
+        self.base_branch_name() == Some(self.branch.as_str())
+    }
+
     /// Whether this tree holds work that exists nowhere else yet.
     ///
     /// The whole point of the distinction the sidebar is being taught to draw:
     /// an idle conversation over unreviewed output is *waiting on you*, while an
     /// idle one over a clean, landed tree is simply done.
+    ///
+    /// Commits ahead only count on a branch that is **not** the mainline. Sitting on
+    /// `main` with unpushed commits is a permanent condition for anyone who doesn't
+    /// push often — this repo's own `main` is 14 ahead right now — and a tier that
+    /// never empties is a tier nobody reads. On a feature branch, being ahead is
+    /// exactly the finished-and-committed work that wants reviewing.
     pub fn has_unreviewed_work(&self) -> bool {
-        self.dirty > 0 || self.untracked > 0 || self.ahead > 0
+        if self.dirty > 0 || self.untracked > 0 {
+            return true;
+        }
+        self.ahead > 0 && !self.on_base_branch()
     }
 }
 
@@ -407,6 +429,52 @@ mod tests {
             }
             .has_unreviewed_work(),
             "being behind is not work this conversation produced"
+        );
+    }
+
+    #[test]
+    fn unpushed_commits_on_the_mainline_are_not_unreviewed_work() {
+        let on_main = WorktreeHealth {
+            root: "/x".into(),
+            branch: "main".into(),
+            detached: false,
+            base: Some("origin/main".into()),
+            dirty: 0,
+            untracked: 0,
+            ahead: 14,
+            behind: 0,
+            merged: false,
+            last_commit_unix: None,
+        };
+        assert!(
+            !on_main.has_unreviewed_work(),
+            "unpushed commits on main are permanent for anyone who doesn't push — \
+             they must not pin a project in the review tier forever"
+        );
+        assert!(
+            WorktreeHealth {
+                dirty: 1,
+                ..on_main.clone()
+            }
+            .has_unreviewed_work(),
+            "uncommitted changes on main still count"
+        );
+        assert!(
+            WorktreeHealth {
+                branch: "feat/x".into(),
+                ..on_main.clone()
+            }
+            .has_unreviewed_work(),
+            "the same commits on a feature branch ARE reviewable work"
+        );
+        assert!(
+            !WorktreeHealth {
+                branch: "production".into(),
+                base: Some("origin/production".into()),
+                ..on_main.clone()
+            }
+            .has_unreviewed_work(),
+            "a non-main default branch resolves the same way"
         );
     }
 }

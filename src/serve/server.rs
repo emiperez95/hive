@@ -17,7 +17,8 @@ use crate::serve::web_types::{
     ConversationView, PlacementView, ProcessView, SessionView, WindowView,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use sysinfo::System;
 
 /// Auto-approved sessions should surface as Working, never as a permission/edit prompt.
@@ -259,7 +260,146 @@ fn conv_to_window_view(c: &Conversation, is_auto_approve: bool) -> WindowView {
         cwd: (!c.cwd.is_empty()).then(|| c.cwd.clone()),
         last_activity: c.last_activity.clone(),
         pane: Some((session, window_index, pane_id)),
+        // Filled by `annotate_attention`, which owns the I/O and the clock. Keeping
+        // this function pure is what lets the view-building tests run without a git
+        // repo or a wall clock.
+        attention: AttentionTier::Idle as u8,
+        unreviewed_work: false,
+        state_secs: None,
     }
+}
+
+// ── Attention ordering ──────────────────────────────────────────────────────
+//
+// The sidebar can rank conversations by how much they want a human. The ranking
+// is computed here, on the wire, rather than in `web.html`: the frontend has no
+// test harness, and a second copy of "is this blocked" would drift from
+// `SessionStatus::blocks_human`.
+
+/// How badly a conversation wants a human, worst first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AttentionTier {
+    /// A decision is pending; nothing moves until someone answers.
+    Blocked = 0,
+    /// Idle, with work in its tree that nobody has looked at.
+    ReadyForReview = 1,
+    /// Busy. Nothing to do but let it run.
+    Working = 2,
+    /// Idle with nothing pending and nothing produced.
+    Idle = 3,
+}
+
+/// Pure tier assignment.
+///
+/// `unreviewed` is only consulted for an idle window — a conversation that is still
+/// working has not handed anything over, however dirty its tree looks.
+pub(crate) fn tier_for(status: Option<&SessionStatus>, unreviewed: bool) -> AttentionTier {
+    match status {
+        Some(s) if s.blocks_human() => AttentionTier::Blocked,
+        Some(SessionStatus::Working)
+        | Some(SessionStatus::RunningWorkflow { .. })
+        | Some(SessionStatus::Unknown) => AttentionTier::Working,
+        // `Waiting`, or no status at all (no Claude resolved for the window yet).
+        _ if unreviewed => AttentionTier::ReadyForReview,
+        _ => AttentionTier::Idle,
+    }
+}
+
+/// A stable discriminant for "the same kind of wait".
+///
+/// Payloads are excluded on purpose: a `NeedsPermission` whose tool name changes is
+/// still one unbroken wait, and resetting its timer would keep it looking fresh
+/// forever.
+fn status_kind(s: Option<&SessionStatus>) -> u8 {
+    match s {
+        None => 0,
+        Some(SessionStatus::Waiting) => 1,
+        Some(SessionStatus::Working) => 2,
+        Some(SessionStatus::Unknown) => 3,
+        Some(SessionStatus::RunningWorkflow { .. }) => 4,
+        Some(SessionStatus::NeedsPermission { .. }) => 5,
+        Some(SessionStatus::EditApproval { .. }) => 6,
+        Some(SessionStatus::PlanReview) => 7,
+        Some(SessionStatus::QuestionAsked) => 8,
+    }
+}
+
+/// How long each conversation has held its current status.
+///
+/// Nothing in hive records status transitions — `last_activity` is "last hook event
+/// fired", stamped unconditionally, and was measured reporting a `Working`
+/// conversation as 29 minutes inactive. So the web data thread watches for changes
+/// itself. In memory only: this is a sort key, not a fact worth persisting.
+#[derive(Default)]
+pub(crate) struct StateAges {
+    seen: HashMap<String, (u8, Instant)>,
+}
+
+impl StateAges {
+    /// Record `id` as being in `kind` at `now`; return how long it has held it.
+    ///
+    /// `None` on the first sighting — it may have been in that status for hours
+    /// before hive started watching, and claiming 0 would be a lie. A transition
+    /// observed while running returns `Some(0)` and climbs from there, which is the
+    /// real thing.
+    pub(crate) fn observe(&mut self, id: &str, kind: u8, now: Instant) -> Option<u32> {
+        match self.seen.get_mut(id) {
+            Some((prev, since)) if *prev == kind => {
+                Some(now.saturating_duration_since(*since).as_secs() as u32)
+            }
+            Some(entry) => {
+                *entry = (kind, now);
+                Some(0)
+            }
+            None => {
+                self.seen.insert(id.to_string(), (kind, now));
+                None
+            }
+        }
+    }
+
+    /// Drop conversations that are no longer live, so the map can't grow forever.
+    pub(crate) fn gc(&mut self, live: &HashSet<String>) {
+        self.seen.retain(|id, _| live.contains(id));
+    }
+}
+
+/// Fill in `attention` / `unreviewed_work` / `state_secs` across a gathered view.
+///
+/// `unreviewed` is injected so this is testable without a git repo, and so the
+/// call-count contract below can be asserted rather than merely commented.
+///
+/// **It is only called for idle windows.** That is what keeps the cost sane: the
+/// git probe is ~0.045s per working tree, and probing all 13 live trees every tick
+/// would be 0.59s of the 1s budget. A busy or blocked window's tree is irrelevant
+/// to its tier, so it is never asked about.
+pub(crate) fn annotate_attention(
+    views: &mut [SessionView],
+    ages: &mut StateAges,
+    unreviewed: &mut dyn FnMut(&str) -> bool,
+    now: Instant,
+) {
+    let mut live: HashSet<String> = HashSet::new();
+    for view in views.iter_mut() {
+        // Skipped sessions are deliberately set aside; they are not switch targets
+        // for the attention view any more than they are for `cycle-free`.
+        if view.skipped {
+            continue;
+        }
+        for w in view.windows.iter_mut() {
+            let idle = matches!(w.status, None | Some(SessionStatus::Waiting));
+            w.unreviewed_work = idle
+                && w.cwd
+                    .as_deref()
+                    .is_some_and(|cwd| !cwd.is_empty() && unreviewed(cwd));
+            w.attention = tier_for(w.status.as_ref(), w.unreviewed_work) as u8;
+            if let Some(id) = &w.session_id {
+                w.state_secs = ages.observe(id, status_kind(w.status.as_ref()), now);
+                live.insert(id.clone());
+            }
+        }
+    }
+    ages.gc(&live);
 }
 
 fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> ConversationView {
@@ -332,5 +472,270 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
         cpu: c.cpu,
         mem_kb: c.mem_kb,
         ports: c.ports.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn win(id: &str, status: Option<SessionStatus>, cwd: &str) -> WindowView {
+        WindowView {
+            pane_id: "%1".into(),
+            window_index: "1".into(),
+            window_name: "w".into(),
+            session_id: Some(id.into()),
+            status,
+            cpu: 0.0,
+            mem_kb: 0,
+            ports: vec![],
+            cwd: (!cwd.is_empty()).then(|| cwd.to_string()),
+            last_activity: None,
+            pane: None,
+            attention: AttentionTier::Idle as u8,
+            unreviewed_work: false,
+            state_secs: None,
+        }
+    }
+
+    fn session(name: &str, skipped: bool, windows: Vec<WindowView>) -> SessionView {
+        SessionView {
+            name: name.into(),
+            status: None,
+            cpu: 0.0,
+            mem_kb: 0,
+            ports: vec![],
+            processes: vec![],
+            cwd: None,
+            last_activity: None,
+            attached: false,
+            pane: None,
+            claude_continue_failed: false,
+            skipped,
+            todo_count: 0,
+            messages: vec![],
+            windows,
+        }
+    }
+
+    #[test]
+    fn blocked_beats_a_dirty_tree() {
+        // A pending decision outranks anything the tree looks like — you cannot
+        // review work from a conversation that is still asking you a question.
+        for s in [
+            SessionStatus::PlanReview,
+            SessionStatus::QuestionAsked,
+            SessionStatus::NeedsPermission {
+                tool_name: "Bash".into(),
+                description: None,
+            },
+            SessionStatus::EditApproval {
+                filename: "a.rs".into(),
+            },
+        ] {
+            assert_eq!(tier_for(Some(&s), true), AttentionTier::Blocked);
+            assert_eq!(tier_for(Some(&s), false), AttentionTier::Blocked);
+        }
+    }
+
+    #[test]
+    fn busy_is_working_never_ready() {
+        for s in [
+            SessionStatus::Working,
+            SessionStatus::Unknown,
+            SessionStatus::RunningWorkflow {
+                summary: "3 agents".into(),
+            },
+        ] {
+            assert_eq!(
+                tier_for(Some(&s), true),
+                AttentionTier::Working,
+                "{s:?} has not handed anything over yet, however dirty its tree"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_splits_on_unreviewed_work() {
+        assert_eq!(
+            tier_for(Some(&SessionStatus::Waiting), true),
+            AttentionTier::ReadyForReview
+        );
+        assert_eq!(
+            tier_for(Some(&SessionStatus::Waiting), false),
+            AttentionTier::Idle
+        );
+        // No resolved status behaves like idle.
+        assert_eq!(tier_for(None, true), AttentionTier::ReadyForReview);
+        assert_eq!(tier_for(None, false), AttentionTier::Idle);
+    }
+
+    #[test]
+    fn tiers_sort_worst_first() {
+        let mut v = [
+            AttentionTier::Idle,
+            AttentionTier::Blocked,
+            AttentionTier::Working,
+            AttentionTier::ReadyForReview,
+        ];
+        v.sort();
+        assert_eq!(
+            v,
+            [
+                AttentionTier::Blocked,
+                AttentionTier::ReadyForReview,
+                AttentionTier::Working,
+                AttentionTier::Idle
+            ]
+        );
+    }
+
+    #[test]
+    fn state_ages_first_sighting_is_unknown_not_zero() {
+        let mut ages = StateAges::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            ages.observe("a", 5, t0),
+            None,
+            "it may have been blocked for an hour before hive started watching"
+        );
+        assert_eq!(ages.observe("a", 5, t0 + Duration::from_secs(30)), Some(30));
+    }
+
+    #[test]
+    fn state_ages_reset_only_when_the_kind_changes() {
+        let mut ages = StateAges::default();
+        let t0 = Instant::now();
+        ages.observe("a", 5, t0);
+        assert_eq!(ages.observe("a", 5, t0 + Duration::from_secs(10)), Some(10));
+        // Kind changed: observed live, so zero is the truth here.
+        assert_eq!(ages.observe("a", 2, t0 + Duration::from_secs(11)), Some(0));
+        assert_eq!(ages.observe("a", 2, t0 + Duration::from_secs(20)), Some(9));
+    }
+
+    #[test]
+    fn state_ages_ignore_payload_churn() {
+        // Two NeedsPermission for different tools share a kind, so one unbroken wait
+        // keeps accumulating instead of looking perpetually fresh.
+        let a = SessionStatus::NeedsPermission {
+            tool_name: "Bash".into(),
+            description: None,
+        };
+        let b = SessionStatus::NeedsPermission {
+            tool_name: "Write".into(),
+            description: Some("x".into()),
+        };
+        assert_eq!(status_kind(Some(&a)), status_kind(Some(&b)));
+
+        let mut ages = StateAges::default();
+        let t0 = Instant::now();
+        ages.observe("a", status_kind(Some(&a)), t0);
+        assert_eq!(
+            ages.observe("a", status_kind(Some(&b)), t0 + Duration::from_secs(60)),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn state_ages_gc_drops_conversations_that_ended() {
+        let mut ages = StateAges::default();
+        let t0 = Instant::now();
+        ages.observe("gone", 1, t0);
+        ages.observe("here", 1, t0);
+        ages.gc(&HashSet::from(["here".to_string()]));
+        assert_eq!(
+            ages.observe("here", 1, t0 + Duration::from_secs(5)),
+            Some(5)
+        );
+        assert_eq!(
+            ages.observe("gone", 1, t0 + Duration::from_secs(5)),
+            None,
+            "a pruned id is a first sighting again"
+        );
+    }
+
+    #[test]
+    fn annotate_probes_git_only_for_idle_windows() {
+        // The performance contract, asserted rather than commented: the git probe is
+        // ~0.045s per tree and there are 13 live trees, so probing busy or blocked
+        // windows too would spend most of the 1s gather budget on answers that can
+        // never change a tier.
+        let mut views = vec![session(
+            "s",
+            false,
+            vec![
+                win("idle", Some(SessionStatus::Waiting), "/w/idle"),
+                win("busy", Some(SessionStatus::Working), "/w/busy"),
+                win("blocked", Some(SessionStatus::PlanReview), "/w/blocked"),
+                win("nostatus", None, "/w/nostatus"),
+            ],
+        )];
+        let mut asked: Vec<String> = Vec::new();
+        let mut ages = StateAges::default();
+        annotate_attention(
+            &mut views,
+            &mut ages,
+            &mut |cwd| {
+                asked.push(cwd.to_string());
+                true
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(asked, vec!["/w/idle", "/w/nostatus"]);
+        let w = &views[0].windows;
+        assert_eq!(w[0].attention, AttentionTier::ReadyForReview as u8);
+        assert_eq!(w[1].attention, AttentionTier::Working as u8);
+        assert_eq!(w[2].attention, AttentionTier::Blocked as u8);
+        assert_eq!(w[3].attention, AttentionTier::ReadyForReview as u8);
+        assert!(!w[1].unreviewed_work, "a busy window is never marked ready");
+    }
+
+    #[test]
+    fn annotate_skips_skipped_sessions_entirely() {
+        let mut views = vec![session(
+            "skipped",
+            true,
+            vec![win("s1", Some(SessionStatus::Waiting), "/w/s1")],
+        )];
+        let mut asked = 0;
+        let mut ages = StateAges::default();
+        annotate_attention(
+            &mut views,
+            &mut ages,
+            &mut |_| {
+                asked += 1;
+                true
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            asked, 0,
+            "skipped is set aside — never probed, never ranked"
+        );
+        assert!(views[0].windows[0].state_secs.is_none());
+    }
+
+    #[test]
+    fn annotate_handles_a_missing_cwd_without_shelling_out() {
+        let mut views = vec![session(
+            "s",
+            false,
+            vec![win("a", Some(SessionStatus::Waiting), "")],
+        )];
+        let mut asked = 0;
+        let mut ages = StateAges::default();
+        annotate_attention(
+            &mut views,
+            &mut ages,
+            &mut |_| {
+                asked += 1;
+                true
+            },
+            Instant::now(),
+        );
+        assert_eq!(asked, 0, "`git -C ''` is never worth spawning");
+        assert_eq!(views[0].windows[0].attention, AttentionTier::Idle as u8);
     }
 }

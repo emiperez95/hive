@@ -168,12 +168,28 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     std::thread::spawn(move || {
         let mut sys = System::new_all();
         sys.refresh_all();
+        // How long each conversation has held its current status. Lives here, in the
+        // one long-running observer, because nothing on disk records a status
+        // transition — see `StateAges`.
+        let mut ages = crate::serve::server::StateAges::default();
 
         loop {
             // Gather the conversation registry ONCE, then project it into the Active view
             // (session-grouped), the Resume view (closed/frozen), and the metrics snapshot.
             let reg = crate::common::conversations::gather_conversations_stats(&mut sys);
-            let active = gather_active_views(&reg, &sys);
+            let mut active = gather_active_views(&reg, &sys);
+            // Rank for the sidebar's attention view. The git probe runs only for idle
+            // windows and is memoized per working tree, so the common tick costs
+            // nothing; a tree that just changed costs one ~0.045s probe.
+            crate::serve::server::annotate_attention(
+                &mut active,
+                &mut ages,
+                &mut |cwd| {
+                    crate::common::worktree_health::health_for_cwd(cwd)
+                        .is_some_and(|h| h.has_unreviewed_work())
+                },
+                std::time::Instant::now(),
+            );
             let conversations = build_conversation_views(&reg);
             // Taken from the FULL registry, not `conversations` — that view drops archived
             // entries, which the backlog counts must still see.
