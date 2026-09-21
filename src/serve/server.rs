@@ -321,6 +321,7 @@ fn status_kind(s: Option<&SessionStatus>) -> u8 {
         Some(SessionStatus::EditApproval { .. }) => 6,
         Some(SessionStatus::PlanReview) => 7,
         Some(SessionStatus::QuestionAsked) => 8,
+        Some(SessionStatus::NeedsInput { .. }) => 9,
     }
 }
 

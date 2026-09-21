@@ -85,6 +85,18 @@ pub enum SessionStatus {
     PlanReview,
     /// Question asked via AskUserQuestion
     QuestionAsked,
+    /// A human decision is pending, but which kind is unknown.
+    ///
+    /// Not emitted by hooks — this is Claude's own `waiting` status, read from its
+    /// session registry (`common/claude_sessions.rs`), for a conversation whose
+    /// hook entry has been pruned and whose transcript tail didn't name the prompt.
+    /// Before this existed, such a conversation read as plain `Waiting` — i.e.
+    /// **idle** — which is the single worst way to be wrong about attention: the
+    /// one window that cannot move without you is the one the panel hides.
+    ///
+    /// The more specific variants always win when they are available; this is the
+    /// floor, not a replacement. `reason` carries Claude's `waitingFor`, when set.
+    NeedsInput { reason: Option<String> },
     /// A background task (workflow / background agent) is running while the main
     /// thread is idle. Carries a short summary for display. Not emitted by hooks —
     /// derived from the transcript when an otherwise-idle session has work in flight.
@@ -113,6 +125,7 @@ impl SessionStatus {
                 | SessionStatus::EditApproval { .. }
                 | SessionStatus::PlanReview
                 | SessionStatus::QuestionAsked
+                | SessionStatus::NeedsInput { .. }
         )
     }
 }

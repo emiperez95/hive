@@ -2,6 +2,8 @@
 
 pub mod activity;
 pub mod chrome;
+// Claude's own per-process session registry — the first-party status source.
+pub mod claude_sessions;
 pub mod config;
 // Shared gather: builds the ConversationRegistry for both the TUI and the web.
 pub mod conversations;

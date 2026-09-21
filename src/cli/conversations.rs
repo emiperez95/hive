@@ -5638,6 +5638,7 @@ fn status_label(session: &Conversation) -> &'static str {
         Some(SessionStatus::EditApproval { .. }) => "edit-approval",
         Some(SessionStatus::PlanReview) => "plan-review",
         Some(SessionStatus::QuestionAsked) => "question",
+        Some(SessionStatus::NeedsInput { .. }) => "needs-input",
         Some(SessionStatus::RunningWorkflow { .. }) => "workflow",
         Some(SessionStatus::Unknown) => "unknown",
     }
@@ -5653,6 +5654,10 @@ fn status_span(c: &Conversation) -> (&'static str, Color) {
         Some(SessionStatus::QuestionAsked) => ("ask?", Color::Magenta),
         Some(SessionStatus::NeedsPermission { .. }) => ("needs-perm", Color::Yellow),
         Some(SessionStatus::EditApproval { .. }) => ("edit", Color::Yellow),
+        // Claude says a human is needed but not what for. Magenta with the other
+        // "answer me" states rather than yellow — yellow is the approve/reject pair,
+        // and this one can't promise which of them it is.
+        Some(SessionStatus::NeedsInput { .. }) => ("needs?", Color::Magenta),
         Some(SessionStatus::RunningWorkflow { .. }) => ("flow", Color::Blue),
         Some(SessionStatus::Working) => ("work", Color::DarkGray),
         Some(SessionStatus::Unknown) => ("…", Color::DarkGray),

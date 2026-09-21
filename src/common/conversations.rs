@@ -14,6 +14,7 @@ use anyhow::{anyhow, Result};
 use sysinfo::System;
 
 use crate::common::activity::{self, WindowSeen};
+use crate::common::claude_sessions;
 use crate::common::frozen::FrozenState;
 use crate::common::instances;
 use crate::common::jsonl;
@@ -142,6 +143,11 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
         }
     }
 
+    // Claude's own account of what each live conversation is doing. Confirmed
+    // against `id_pids` so a record left behind by a dead process — the files have
+    // no heartbeat — can't be mistaken for a live one. See `claude_sessions`.
+    let first_party = claude_sessions::index_confirmed(claude_sessions::load_all(), &id_pids);
+
     // Recover live status for conversations whose hook entry was pruned (state.json
     // drops entries after ~10 min idle), and overlay a RunningWorkflow badge when
     // the main thread is idle but a background task is in flight. Without this a
@@ -165,6 +171,23 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
                 }
             }
         }
+
+        // Claude's word beats ours wherever it has one: the hook and the transcript
+        // are both outside views, and both are stale in exactly the situations that
+        // matter (a pruned entry, a conversation idle long enough to have scrolled
+        // its last decision out of the tail).
+        if let Some(fp) = first_party.get(&sid) {
+            let inferred = c.status.take().map(|s| s.status);
+            let status = reconcile_with_claude(fp, inferred, || {
+                jsonl::background_running_summary(&c.cwd, Some(&sid))
+            });
+            c.status = Some(ConversationStatus {
+                needs_attention: status.blocks_human(),
+                status,
+            });
+            continue;
+        }
+
         if matches!(
             c.status.as_ref().map(|s| &s.status),
             Some(SessionStatus::Waiting)
@@ -274,6 +297,51 @@ pub(crate) fn convert_claude_to_session_status(status: &ClaudeStatus) -> Session
 /// Delegates to the canonical [`SessionStatus::blocks_human`].
 fn status_needs_attention(s: &SessionStatus) -> bool {
     s.blocks_human()
+}
+
+/// Settle a conversation's status against Claude's own, given whatever hive had
+/// inferred from the hook or the transcript.
+///
+/// Claude decides *which* of the four states it is in — it is the only party that
+/// can see its own task table and its own open prompt. Hive's inference is kept
+/// only where it adds detail Claude's vocabulary doesn't carry:
+///
+/// - `waiting` says a human is needed but not what for, so a specific blocking
+///   status we already inferred (which permission, which file, a plan, a question)
+///   is preserved. Anything non-blocking is discarded — it contradicts Claude.
+/// - `shell` says background work is in flight but not what it is, so the summary
+///   still comes from the transcript. `summary` is a closure because reading that
+///   tail is the expensive part and only this branch needs it — two of eleven live
+///   conversations here, rather than all eleven every tick.
+///
+/// `busy` and `idle` replace whatever we had outright. That is the point: an
+/// orphaned background launch in the transcript, or a permission prompt the hook
+/// recorded and never retracted, both survive indefinitely in hive's own reading
+/// and are exactly what this corrects.
+pub(crate) fn reconcile_with_claude(
+    claude: &claude_sessions::ClaudeSession,
+    inferred: Option<SessionStatus>,
+    summary: impl FnOnce() -> Option<String>,
+) -> SessionStatus {
+    use claude_sessions::ClaudeSessionStatus as Cs;
+    match claude.status {
+        Some(Cs::Busy) => SessionStatus::Working,
+        Some(Cs::Idle) => SessionStatus::Waiting,
+        Some(Cs::Waiting) => match inferred {
+            Some(s) if s.blocks_human() => s,
+            _ => SessionStatus::NeedsInput {
+                reason: claude.waiting_for.clone(),
+            },
+        },
+        Some(Cs::Shell) => SessionStatus::RunningWorkflow {
+            summary: summary()
+                .or_else(|| claude.waiting_for.clone())
+                .unwrap_or_else(|| "background shell".to_string()),
+        },
+        // `index_confirmed` never yields a record without a status; falling back to
+        // what we inferred keeps this total without inventing an answer.
+        None => inferred.unwrap_or(SessionStatus::Unknown),
+    }
 }
 
 // ── Recovery frame ──────────────────────────────────────────────────────────
@@ -441,4 +509,157 @@ pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -
     }
 
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::claude_sessions::{ClaudeSession, ClaudeSessionStatus};
+
+    fn claude(status: ClaudeSessionStatus) -> ClaudeSession {
+        ClaudeSession {
+            pid: 1,
+            session_id: Some("a".into()),
+            status: Some(status),
+            status_updated_at: Some(1),
+            waiting_for: None,
+        }
+    }
+
+    fn no_summary() -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn busy_overrides_whatever_we_inferred() {
+        let s = reconcile_with_claude(
+            &claude(ClaudeSessionStatus::Busy),
+            Some(SessionStatus::PlanReview),
+            no_summary,
+        );
+        assert_eq!(s, SessionStatus::Working);
+    }
+
+    #[test]
+    fn idle_clears_a_permission_prompt_the_hook_never_retracted() {
+        // state.json keeps the last status a hook reported. If Claude was answered
+        // outside hive's view the entry can sit on NeedsPermission indefinitely,
+        // pinning the conversation in the Blocked tier — a tier that never empties
+        // is a tier that stops being read.
+        let s = reconcile_with_claude(
+            &claude(ClaudeSessionStatus::Idle),
+            Some(SessionStatus::NeedsPermission {
+                tool_name: "Bash".into(),
+                description: None,
+            }),
+            no_summary,
+        );
+        assert_eq!(s, SessionStatus::Waiting);
+        assert!(!s.blocks_human());
+    }
+
+    #[test]
+    fn idle_clears_an_orphaned_background_launch() {
+        // The bug this whole change exists for: a backgrounded dev server never
+        // exits, so it never emits the `<task-notification>` the transcript pairing
+        // waits for, and the conversation reads as busy forever. Claude's own task
+        // table says otherwise.
+        let s = reconcile_with_claude(
+            &claude(ClaudeSessionStatus::Idle),
+            Some(SessionStatus::RunningWorkflow {
+                summary: "bg: dev server".into(),
+            }),
+            || Some("bg: dev server".into()),
+        );
+        assert_eq!(s, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn waiting_keeps_the_specific_prompt_we_already_knew_about() {
+        // Claude says "a human is needed"; only hive knows it's a plan.
+        let s = reconcile_with_claude(
+            &claude(ClaudeSessionStatus::Waiting),
+            Some(SessionStatus::PlanReview),
+            no_summary,
+        );
+        assert_eq!(s, SessionStatus::PlanReview);
+    }
+
+    #[test]
+    fn waiting_with_nothing_inferred_still_blocks() {
+        // The case that used to read as plain idle: hook entry pruned, prompt long
+        // since scrolled out of the transcript tail. Losing this is losing the one
+        // window that cannot move without you.
+        let s = reconcile_with_claude(&claude(ClaudeSessionStatus::Waiting), None, no_summary);
+        assert_eq!(s, SessionStatus::NeedsInput { reason: None });
+        assert!(s.blocks_human());
+    }
+
+    #[test]
+    fn waiting_discards_a_non_blocking_inference() {
+        let s = reconcile_with_claude(
+            &claude(ClaudeSessionStatus::Waiting),
+            Some(SessionStatus::Working),
+            no_summary,
+        );
+        assert!(s.blocks_human());
+    }
+
+    #[test]
+    fn waiting_carries_claudes_reason_when_it_gives_one() {
+        let mut c = claude(ClaudeSessionStatus::Waiting);
+        c.waiting_for = Some("approve the migration".into());
+        let s = reconcile_with_claude(&c, None, no_summary);
+        assert_eq!(
+            s,
+            SessionStatus::NeedsInput {
+                reason: Some("approve the migration".into())
+            }
+        );
+    }
+
+    #[test]
+    fn shell_takes_its_summary_from_the_transcript() {
+        let s = reconcile_with_claude(&claude(ClaudeSessionStatus::Shell), None, || {
+            Some("bg: Start the API dev server on port 4000".into())
+        });
+        assert_eq!(
+            s,
+            SessionStatus::RunningWorkflow {
+                summary: "bg: Start the API dev server on port 4000".into()
+            }
+        );
+    }
+
+    #[test]
+    fn shell_still_reports_when_the_transcript_has_no_summary() {
+        // The launch can have scrolled out of the 256KB tail. Claude says a shell is
+        // running; not knowing which one is no reason to report the session as idle.
+        let s = reconcile_with_claude(&claude(ClaudeSessionStatus::Shell), None, no_summary);
+        assert_eq!(
+            s,
+            SessionStatus::RunningWorkflow {
+                summary: "background shell".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_transcript_tail_is_only_read_for_shell() {
+        // Reading it is the expensive part of the status pass, and only one of the
+        // four states can use the result. Measured on this machine: 2 of 11 live
+        // conversations, rather than all 11 on every tick.
+        for status in [
+            ClaudeSessionStatus::Busy,
+            ClaudeSessionStatus::Idle,
+            ClaudeSessionStatus::Waiting,
+        ] {
+            let mut read = false;
+            reconcile_with_claude(&claude(status), None, || {
+                read = true;
+                None
+            });
+            assert!(!read, "{status:?} must not read the transcript");
+        }
+    }
 }

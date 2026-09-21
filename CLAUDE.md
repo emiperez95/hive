@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 371 tests (347 unit + 24 CLI smoke)
+cargo test                # 391 tests (367 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 629 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 347 unit + 24 smoke.
+> `cargo test` prints 669 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 367 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -214,7 +214,7 @@ and `docs/permission-approve-reject.md`.)
 
 - `HookState` (ipc/messages.rs) — `HashMap<session_id, SessionState>`, serialized to state.json
 - `SessionState` — session_id, cwd, status, needs_attention, last_activity
-- `SessionStatus` — Working, Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked, RunningWorkflow (derived; see Background Tasks)
+- `SessionStatus` — Working, Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked, RunningWorkflow (derived; see Background Tasks), NeedsInput (derived; Claude's own `waiting` with no specific prompt known — see Claude's own session registry)
 - `ClaudeStatus` (common/types.rs) — JSONL-parsed status enum; `serve/` maps it to wire `SessionStatus`
 - `ProjectRegistry` (common/projects.rs) — `HashMap<name, ProjectConfig>`, loaded from projects.toml
 - `ProjectConfig` (common/projects.rs) — project definition (emoji, path, startup, ports, files, hooks_dir, auth_profile, etc.)
@@ -781,9 +781,76 @@ fires only on an idle base status (so it never masks a permission/plan/question 
 applied at every status site: TUI single-window + multi-window (`tui/app.rs`) and the web
 per-window builder (`serve/server.rs`). Display: TUI shows `flow` (blue) in the list / `⚙ <summary>`
 in detail; the web shows a blue **Workflow** badge (falls back to a generic Busy if the JS is
-older). Known limitation: a task that dies without a completion notification (e.g. Claude killed
-mid-workflow) leaves an unmatched launch; it only mis-reports while the session is idle, and a
-new turn clears it.
+older).
+
+> **The pairing decides *whether*; Claude decides *whether* now.** An unmatched launch
+> is in-flight work as far as the transcript can tell, and for a backgrounded
+> **service** that is permanently wrong: a dev server exits only when killed, so it
+> never emits a notification, so the conversation reads as busy forever. Measured
+> across 191 transcripts: 12 orphaned Bash launches (every sampled one a server) and
+> 30 orphaned Workflows. Nor does it self-heal — detection reads a 256KB byte-tail, so
+> the launch clears only once that much *new* transcript pushes it out, which an idle
+> conversation never produces. Since `common/claude_sessions.rs`, the decision is
+> Claude's `shell` status and the transcript supplies only the summary; the pairing is
+> still what names the task, and still the fallback where no session record exists.
+
+## Claude's own session registry — the first-party status source
+
+Every running Claude writes `~/.claude*/sessions/<pid>.json` and rewrites it on each
+status change. `common/claude_sessions.rs` reads it, and `gather_conversations_inner`
+lets it settle every live conversation's status (`reconcile_with_claude`).
+
+It matters because **everything else hive has is an outside view**. The hook fires
+from inside Claude, so it reports presence rather than state, and its entry is pruned
+after 10 min idle. The transcript is read from outside and only ever shows what was
+written down. Both are stale in precisely the cases that decide attention: a long-idle
+conversation with a prompt open, and a background launch that never got a completion.
+
+| Field | What it settles |
+|---|---|
+| `sessionId` | the conversation UUID — hive's own key, no resolution needed |
+| `status` | `busy \| shell \| idle \| waiting`, off Claude's live task table |
+| `statusUpdatedAt` | a real status-**transition** timestamp (see `StateAges`) |
+| `tmux` | `session:@window.%pane` — the link `instances.rs` reconstructs. Not consumed yet |
+
+The mapping is in `reconcile_with_claude`, and it is not a straight replacement —
+Claude decides *which* state, hive keeps the detail Claude's vocabulary lacks:
+
+- **`busy` → `Working`** and **`idle` → `Waiting`**, overriding whatever we inferred.
+  That is the point: an orphaned background launch, or a permission prompt the hook
+  recorded and never retracted, both persist indefinitely in hive's own reading.
+- **`waiting`** means a human is needed but not what for, so a *specific* blocking
+  status we already know (which permission, which file, a plan, a question) is kept.
+  With nothing specific it becomes `SessionStatus::NeedsInput` — a new variant, because
+  the alternative was reporting it as plain `Waiting`, i.e. **idle**. Hiding the one
+  window that cannot move without you is the worst way for an attention panel to be wrong.
+- **`shell`** means the main thread is idle *with background shells running* — the state
+  hive inferred by transcript pairing. The summary still comes from the transcript, via a
+  **closure**, so that tail is read only in this branch: 2 of 11 live conversations here
+  rather than all 11 every tick.
+
+Three things shape how the files must be read:
+
+- **Profile-scoped**, like everything Claude writes — glob all of `~/.claude*/sessions/`,
+  the same rule `jsonl::claude_slug_dirs` follows. Measured: 5 of 11 live sessions under
+  `~/.claude`, the rest under `~/.claude-work` and `~/.claude-local`.
+- **No heartbeat.** `updatedAt == statusUpdatedAt` on every live session — the file is
+  written *only* on a status change, so a four-day-old timestamp is indistinguishable by
+  age from one a dead process left behind. `index_confirmed` therefore accepts a record
+  only when its pid is in the process tree the gather already resolved for that
+  conversation — which rules out both a stale file and a recycled pid, for no syscalls.
+- **The vocabulary is Claude's**, so an unrecognised status parses as `None`
+  (`lenient_status`) and `index_confirmed` drops the record rather than keeping a
+  half-answer: callers read "entry present" as "Claude told us", which suppresses the
+  transcript fallback.
+
+> **Gotcha — `claude agents --json` is the worse door onto the same data.** It reports
+> only the *current* auth profile (5 of 11 sessions here), omits `tmux` and
+> `statusUpdatedAt`, and costs 0.17s to spawn against 0.005s to read the files.
+
+Anthropic's own Agent View buckets sessions as `review / blocked / working / done`
+("Needs input" for blocked) — the same four tiers as hive's attention view, arrived at
+independently. It has no equivalent of tier 2's git-derived "unreviewed work".
 
 ## `hive start`
 
@@ -1235,7 +1302,7 @@ sessions exist, where they live, or whether they're stuck waiting on a human.
 | `hive_conversations{lifecycle}` | gauge | live vs closed-but-resumable |
 | `hive_conversations_blocked` | gauge | **the attention bottleneck** — live convs awaiting a human decision |
 | `hive_conversations_needs_attention` | gauge | registry's own attention flag |
-| `hive_conversations_by_status{status}` | gauge | working / waiting / needs_permission / plan_review / question_asked / running_workflow / edit_approval / unknown |
+| `hive_conversations_by_status{status}` | gauge | working / waiting / needs_permission / plan_review / question_asked / running_workflow / edit_approval / needs_input / unknown |
 | `hive_conversations_by_project{project,lifecycle}` | gauge | grouped by PROJECT (a worktree conv rolls up to its project) |
 | `hive_conversations_by_auth_profile{profile}` | gauge | `work` vs `default` — which identity is running |
 | `hive_conversations_{archived,pinned}` | gauge | overlay counts |
@@ -1293,13 +1360,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-371 distinct tests. Run with `cargo test`.
+391 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 629 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 258 · bin 347 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 669 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 278 · bin 367 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
-**Unit tests (323)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (367)** — in-module `#[cfg(test)]` blocks:
 - `common/usage.rs`: `accumulate_line` (per-model accumulation, sidechain kept apart,
   thinking not double-counted, zero-usage `<synthetic>` entries dropped, unlabelled
   model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a
@@ -1310,8 +1377,19 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   ignored, gc drops ended conversations), and `annotate_attention` — including
   **the probe-call-count contract** (idle windows only, skipped sessions never,
   no shelling out on an empty cwd)
-- `ipc/messages.rs`: `blocks_human` is exactly the four decision states, and
-  `RunningWorkflow` is not one of them
+- `ipc/messages.rs`: `blocks_human` is exactly the five decision states (the four
+  prompt kinds plus `NeedsInput`), and `RunningWorkflow` is not one of them
+- `common/claude_sessions.rs`: the record parses from a verbatim live
+  `sessions/<pid>.json` (unknown keys ignored), every status in Claude's vocabulary
+  round-trips, an unrecognised one degrades to `None` rather than failing the record,
+  and `index_confirmed` drops a file a dead process left behind, one whose pid was
+  recycled, and one whose status we can't read — the three ways a registry with no
+  heartbeat lies
+- `common/conversations.rs`: `reconcile_with_claude` — `busy`/`idle` override a stale
+  hook prompt and an orphaned background launch; `waiting` keeps a specific prompt but
+  never reads as idle without one; `shell` falls back to a generic summary; and the
+  transcript tail is read for `shell` **only** (a call-count contract, like
+  `annotate_attention`'s probe)
 - `common/worktree_health.rs`: `ttl_for` (deterministic, bounded, and spread so
   13 trees can't expire on one tick), unpushed-commits-on-the-mainline,
   `parse_status_counts` (tracked vs `??`),

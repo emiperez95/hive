@@ -30,6 +30,7 @@ fn status_label(status: &SessionStatus) -> &'static str {
         SessionStatus::EditApproval { .. } => "edit_approval",
         SessionStatus::PlanReview => "plan_review",
         SessionStatus::QuestionAsked => "question_asked",
+        SessionStatus::NeedsInput { .. } => "needs_input",
         SessionStatus::RunningWorkflow { .. } => "running_workflow",
         SessionStatus::Working => "working",
         SessionStatus::Unknown => "unknown",
