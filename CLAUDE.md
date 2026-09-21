@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 338 tests (314 unit + 24 CLI smoke)
+cargo test                # 351 tests (327 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 574 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 314 unit + 24 smoke.
+> `cargo test` prints 600 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 327 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -240,6 +240,7 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 │   ├── frozen.json            # frozen (hibernated) Claude windows — resume metadata + notes
 │   ├── conversations.json     # per-conversation overlay: note / pinned / archived (+ reason, when) / mute override / cached parent
 │   ├── conversation-scan.json # mtime-keyed transcript scan cache (warm gather ~6x faster)
+│   ├── conversation-usage.json # byte-offset-keyed token-usage cache (sidebar stats pane)
 │   ├── activity.jsonl         # append-only lifecycle/focus event log (feeds `hive stats`)
 │   ├── open-windows.json      # the RECOVERY FRAME: live windows, reconciled by the gather
 │   ├── favorites.txt          # favorite session names
@@ -838,6 +839,25 @@ port = 8375                          # optional (default 8375)
 tts_host = "http://10.18.1.2:9800"   # optional — passed as --tts-host
 ```
 
+Cost display in the sidebar's stats pane needs rates, which hive deliberately does
+not ship (see **The stats pane**). Per-million-token, per class. **The numbers
+below are placeholders showing the shape — fill in the rates actually being
+billed**; hive never invents one, and a model left out shows tokens without cost.
+
+```toml
+[pricing.opus]        # matched by longest substring, so this covers every opus
+input = 15.0
+output = 75.0
+cache_write = 18.75
+cache_read = 1.5
+
+[pricing."claude-sonnet-5"]   # or pin an exact model id
+input = 3.0
+output = 15.0
+cache_write = 3.75
+cache_read = 0.3
+```
+
 `run_conversations_tui` then calls `serve::web::ensure_web_autostart()` **once** at startup (never
 in the refresh loop, so there's no ongoing polling cost). It's idempotent and best-effort:
 
@@ -896,6 +916,7 @@ into explicitly.
 | POST | `/api/thaw` | Thaw a frozen window by key: `{"key": "..."}` |
 | POST | `/api/discard-frozen` | Discard a frozen window (no restore): `{"key": "..."}` |
 | GET | `/api/ambient` | Sidebar ambient state: the attached client's session/window, `global_mute`, `muted_projects` |
+| GET | `/api/conv-stats?id=X` | Token spend for ONE conversation (per model, main vs subagent) + cost when priced |
 | POST | `/api/switch` | Move the attached tmux client: `{"session","window_index"}` |
 | POST | `/api/toggle-mute` | Toggle global mute (`muted-global`) |
 | POST | `/api/toggle-project-mute` | Toggle a project's mute: `{"key": "..."}` |
@@ -1017,6 +1038,46 @@ label, no background change, or a tinted pill per project would stripe the panel
 off whichever button came first meant revealing the archived filter shoved it
 sideways — a way back that moves is the one control you can't afford to hunt for.
 
+### The stats pane — spend for the conversation you're on
+
+A second horizontal band under the list (`#sbStats`), showing token usage and cost
+for whichever conversation the tmux client is currently on. The list keeps
+`flex: 1` and scrolls; the pane is capped at 45% so a long breakdown can never
+squeeze out the list the panel exists for. Collapsible, remembered in
+`localStorage` (wrapped in try/catch — a webview can refuse storage).
+
+**Four token classes, never one number.** Measured on a live conversation here,
+cache reads outran output tokens by ~340x (160M vs 464k). A summed "tokens" figure
+is therefore dominated by the cheapest class and says nothing about spend, so
+input / output / cache-write / cache-read stay apart all the way to the display.
+`thinking` is reported too but is **a subset of output**, never added to a total.
+
+**Main and subagent spend are priced separately** and the subagent rows render
+with a `↳`. That split is the point: it's the only number that answers whether
+fanning out to subagents paid for itself.
+
+**Pricing is config-only** (`[pricing.<model>]` in `~/.hive/config.toml`, keyed by
+exact model id else longest substring, so `[pricing.opus]` covers every opus).
+Transcripts carry no cost field, and a built-in rate table would be wrong the
+moment a model ships while still looking authoritative — so an unpriced model
+shows its tokens, omits cost, and is **named** in a footnote. A cost that quietly
+treats half the spend as free is worse than no cost at all.
+
+> **Why this is not in the gather.** Usage needs *every* assistant line of a
+> transcript; the corpus here is 446MB across 185 files (largest 67MB), and the
+> conversation you're using is exactly the one whose file would be re-read every
+> 1s tick. So it is computed **on demand, for one conversation**, and accumulated
+> **incrementally** — `common/usage.rs` records how many bytes it has folded in
+> (`conversation-usage.json`) and parses only what was appended since. Cold on the
+> 67MB worst case: 0.54s; warm: ~0. The byte offset always lands on a newline, so
+> a transcript caught mid-write re-reads that line whole next time instead of
+> losing it, and a shrunk file or a changed head fingerprint forces a full re-read.
+
+> **Gotcha — `<synthetic>` is a real model id** in transcripts, used for injected
+> placeholder messages, and its usage is all zeros. Zero-usage entries are dropped
+> at parse time; otherwise it appears in the breakdown as a model that cost nothing
+> *and* gets listed as unpriced, implying a missing rate where there is no spend.
+
 ### Clicking a row switches the tmux client
 
 `POST /api/switch` resolves a concrete client and runs
@@ -1132,13 +1193,20 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-338 distinct tests. Run with `cargo test`.
+351 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 574 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 236 · bin 314 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 600 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 249 · bin 327 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
-**Unit tests (293)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (303)** — in-module `#[cfg(test)]` blocks:
+- `common/usage.rs`: `accumulate_line` (per-model accumulation, sidechain kept apart,
+  thinking not double-counted, zero-usage `<synthetic>` entries dropped, unlabelled
+  model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a
+  transcript caught mid-write counts that line exactly once on the next pass)
+- `common/config.rs`: `[pricing]` parse + empty default, `price_for` (exact then
+  longest-substring), `cost_breakdown` (each class at its own rate, subagent spend
+  priced on its own row, unpriced models named rather than counted as zero)
 - `common/tmux.rs`: `parse_clients`/`pick_client` (tab-separated fields, control clients
   never a switch target, most-recent-activity wins) and
   `exact`/`exact_window`/`exact_pane`/`exact_active_pane` target building —

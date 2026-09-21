@@ -614,6 +614,49 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            // Token spend for ONE conversation — the one the sidebar's stats pane
+            // is showing.
+            //
+            // Deliberately per-conversation and on demand rather than part of the
+            // 1s gather: usage needs every assistant line of a transcript, and the
+            // corpus here is ~446MB (largest single file 67MB). The conversation
+            // you're actively using is exactly the one whose transcript would be
+            // re-read every tick. `usage_for_transcript` folds in only the bytes
+            // appended since it last looked, so the warm path is a stat plus an 8KB
+            // fingerprint read.
+            (Method::Get, url) if path == "/api/conv-stats" => {
+                let json = match query_param(url, "id") {
+                    Some(id) => {
+                        match crate::common::jsonl::find_jsonl_by_session_id_anywhere(&id) {
+                            Some(transcript) => {
+                                let usage =
+                                    crate::common::usage::usage_for_transcript(&id, &transcript);
+                                let cfg = crate::common::config::HiveConfig::load();
+                                let (main_cost, side_cost, unpriced) = cfg.cost_breakdown(&usage);
+                                let total: f64 = main_cost.values().chain(side_cost.values()).sum();
+                                let priced = !main_cost.is_empty() || !side_cost.is_empty();
+                                serde_json::json!({
+                                    "id": id,
+                                    "usage": usage,
+                                    "totals": usage.totals(),
+                                    "cost_main": main_cost,
+                                    "cost_sidechain": side_cost,
+                                    "cost_usd": priced.then_some(total),
+                                    "unpriced_models": unpriced,
+                                })
+                                .to_string()
+                            }
+                            None => {
+                                r#"{"error":"no transcript for that conversation"}"#.to_string()
+                            }
+                        }
+                    }
+                    None => r#"{"error":"missing id"}"#.to_string(),
+                };
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
             // Move the attached tmux client to a conversation's window.
             //
             // Resolves a concrete client rather than using a bare `switch-client`: this

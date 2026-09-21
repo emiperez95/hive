@@ -465,6 +465,84 @@
     padding: 16px 4px; text-align: center;
   }
 
+  /* --- Stats pane (sidebar only) ---------------------------------------
+     A second horizontal band under the list, showing spend for whichever
+     conversation the tmux client is on. The list keeps `flex: 1` and scrolls;
+     this sits below it and is capped so a long breakdown can never squeeze the
+     list — the list is the reason the panel exists. */
+  body.sidebar .sb-stats {
+    flex: 0 0 auto;
+    max-height: 45%;
+    overflow-y: auto;
+    border-top: 1px solid var(--outline-variant);
+    background: var(--surface-container-low);
+    padding: 6px 8px 10px;
+    font-size: 11px;
+  }
+  body.sidebar .sb-stats.collapsed { max-height: none; }
+  body.sidebar .sb-stats.collapsed .sb-st-body { display: none; }
+
+  body.sidebar .sb-st-head {
+    display: flex; align-items: center; gap: 4px;
+    cursor: pointer; user-select: none;
+    padding: 2px 2px 4px;
+    color: var(--on-surface-variant);
+    font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    font-size: 10px;
+  }
+  body.sidebar .sb-st-head:hover { color: var(--on-surface); }
+  body.sidebar .sb-st-caret {
+    font-size: 14px; transition: transform 0.12s ease;
+  }
+  body.sidebar .sb-stats:not(.collapsed) .sb-st-caret { transform: rotate(90deg); }
+  body.sidebar .sb-st-name {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    text-transform: none; letter-spacing: 0; font-weight: 700;
+    color: var(--on-surface);
+  }
+
+  body.sidebar .sb-st-where {
+    font-size: 10px; color: var(--on-surface-variant);
+    padding: 0 2px 6px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* Model rows: name elides, numbers hold fixed right-aligned columns so the
+     eye can scan a column of figures rather than re-finding each one. */
+  body.sidebar .sb-st-row {
+    display: flex; align-items: baseline; gap: 6px;
+    padding: 1px 2px;
+  }
+  body.sidebar .sb-st-model {
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--on-surface-variant);
+  }
+  body.sidebar .sb-st-tok {
+    font-variant-numeric: tabular-nums;
+    color: var(--on-surface); min-width: 46px; text-align: right;
+  }
+  body.sidebar .sb-st-cost {
+    font-variant-numeric: tabular-nums;
+    color: var(--on-surface-variant); min-width: 52px; text-align: right;
+  }
+  body.sidebar .sb-st-row.sub .sb-st-model { font-style: italic; }
+  body.sidebar .sb-st-row.total {
+    border-top: 1px solid var(--outline-variant);
+    margin-top: 3px; padding-top: 3px; font-weight: 700;
+  }
+  body.sidebar .sb-st-row.total .sb-st-model,
+  body.sidebar .sb-st-row.total .sb-st-cost { color: var(--on-surface); }
+
+  body.sidebar .sb-st-note {
+    font-size: 10px; color: var(--on-surface-variant);
+    padding: 5px 2px 0; line-height: 1.35;
+  }
+  body.sidebar .sb-st-note code {
+    font-size: 9.5px; background: var(--surface-container);
+    padding: 0 3px; border-radius: 3px;
+  }
+
   /* ============================================
      DETAIL VIEW
      ============================================ */
@@ -2044,6 +2122,9 @@
     <div class="session-list" id="sessionList">
       <div class="loading"><span class="dot-pulse">Loading sessions...</span></div>
     </div>
+    <!-- Sidebar only: stats for the conversation the tmux client is currently on.
+         Hidden outside sidebar mode (the phone dashboard has a detail view). -->
+    <div class="sb-stats" id="sbStats" hidden></div>
     <button class="fab" onclick="openPicker()">
       <span class="material-symbols-outlined">add</span>
     </button>
@@ -3205,6 +3286,175 @@ function sbProjectsHtml() {
   return note + withWork + without;
 }
 
+// --- Stats pane -------------------------------------------------------------
+//
+// Spend for the ONE conversation the tmux client is currently on. Scoped to the
+// focused conversation on purpose: usage means reading every assistant line of a
+// transcript, and doing that for all of them would be minutes of I/O. One
+// conversation is milliseconds, and it's the only one whose numbers you're
+// looking at.
+
+let sbStatsCollapsed = false;
+let sbStats = null;        // last /api/conv-stats payload
+let sbStatsId = null;      // conversation it describes
+let sbStatsFetchedAt = 0;
+let sbStatsInflight = false;
+
+try { sbStatsCollapsed = localStorage.getItem('hiveSbStats') === '0'; } catch (e) { /* private mode */ }
+
+// The conversation the attached client is looking at, or null when it's on a
+// window that hosts none (a plain shell, a server pane).
+function sbFocusedConv() {
+  for (const s of sessions) {
+    for (const w of (s.windows || [])) {
+      if (sbIsCurrent(s.name, w.window_index) && w.session_id) {
+        return { id: w.session_id, session: s.name, src: w,
+                 title: (w.window_name && !/^[0-9.]+$/.test(w.window_name))
+                   ? w.window_name : ('Window ' + w.window_index) };
+      }
+    }
+  }
+  return null;
+}
+
+function sbFmtTokens(n) {
+  if (!n) return '0';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return Math.round(n / 1e3) + 'k';
+  return String(n);
+}
+
+function sbFmtCost(v) {
+  if (v == null) return '';
+  return '$' + (v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(2));
+}
+
+// Strip the vendor prefix so the column stays narrow: claude-opus-5 -> opus-5.
+function sbShortModel(m) {
+  return String(m || '').replace(/^claude-/, '');
+}
+
+function sbToggleStats() {
+  sbStatsCollapsed = !sbStatsCollapsed;
+  try { localStorage.setItem('hiveSbStats', sbStatsCollapsed ? '0' : '1'); } catch (e) { /* ignore */ }
+  sbRenderStats();
+}
+
+// Refresh on focus change, and otherwise on a slow cadence — this is a much
+// heavier read than the 1.5s session poll and the numbers move slowly.
+const SB_STATS_TTL_MS = 10000;
+
+async function sbMaybeFetchStats() {
+  if (!SIDEBAR) return;
+  const conv = sbFocusedConv();
+  if (!conv) { sbStats = null; sbStatsId = null; sbRenderStats(); return; }
+
+  const changed = conv.id !== sbStatsId;
+  if (!changed && Date.now() - sbStatsFetchedAt < SB_STATS_TTL_MS) return;
+  if (sbStatsInflight) return;
+
+  sbStatsInflight = true;
+  // Clear stale numbers immediately on a focus change so the pane never shows
+  // one conversation's title over another's spend.
+  if (changed) { sbStats = null; sbStatsId = conv.id; sbRenderStats(); }
+  try {
+    const r = await fetch('/api/conv-stats?id=' + encodeURIComponent(conv.id));
+    const data = await r.json();
+    if (data && data.id === conv.id) {
+      sbStats = data;
+      sbStatsId = conv.id;
+      sbStatsFetchedAt = Date.now();
+    }
+  } catch (e) { /* keep whatever we had */ }
+  finally { sbStatsInflight = false; }
+  sbRenderStats();
+}
+
+// Every row carries a cost cell, empty when that model has no rate — otherwise
+// the priced rows' token column would sit in a different place from the unpriced
+// ones', and a column you can't scan straight down is worse than a blank cell.
+function sbStatsRowsHtml(map, costs, sub) {
+  return Object.keys(map || {}).sort().map(model => {
+    const u = map[model];
+    const tok = u.input + u.output + u.cache_write + u.cache_read;
+    const cost = costs && costs[model] != null ? sbFmtCost(costs[model]) : '';
+    return `<div class="sb-st-row${sub ? ' sub' : ''}">
+      <span class="sb-st-model">${esc(sub ? '↳ ' + sbShortModel(model) : sbShortModel(model))}</span>
+      <span class="sb-st-tok">${esc(sbFmtTokens(tok))}</span>
+      <span class="sb-st-cost">${esc(cost)}</span>
+    </div>`;
+  }).join('');
+}
+
+function sbRenderStats() {
+  const el = document.getElementById('sbStats');
+  if (!el) return;
+  if (!SIDEBAR) { el.hidden = true; return; }
+
+  const conv = sbFocusedConv();
+  if (!conv) {
+    // No conversation under the client — say so rather than showing the last
+    // one's numbers, which would read as current.
+    el.hidden = false;
+    el.className = 'sb-stats collapsed';
+    el.innerHTML = `<div class="sb-st-head" onclick="sbToggleStats()">
+        <span class="material-symbols-outlined sb-st-caret">chevron_right</span>
+        <span class="sb-st-name">No conversation here</span>
+      </div>`;
+    return;
+  }
+
+  el.hidden = false;
+  el.className = 'sb-stats' + (sbStatsCollapsed ? ' collapsed' : '');
+
+  const place = sbPlaceOf(conv.session);
+  const where = [
+    [place.emoji, place.label].filter(Boolean).join(' '),
+    place.branch,
+  ].filter(Boolean).join(' · ');
+  const head = `<div class="sb-st-head" onclick="sbToggleStats()">
+      <span class="material-symbols-outlined sb-st-caret">chevron_right</span>
+      <span class="sb-st-name">${esc(conv.title)}</span>
+    </div>`;
+
+  if (sbStatsCollapsed) { el.innerHTML = head; return; }
+
+  const d = sbStats;
+  if (!d || d.id !== conv.id) {
+    el.innerHTML = head + `<div class="sb-st-note">Reading transcript…</div>`;
+    return;
+  }
+  if (d.error) {
+    el.innerHTML = head + `<div class="sb-st-note">${esc(d.error)}</div>`;
+    return;
+  }
+
+  const u = d.usage || { main: {}, sidechain: {} };
+  const rows = sbStatsRowsHtml(u.main, d.cost_main, false)
+             + sbStatsRowsHtml(u.sidechain, d.cost_sidechain, true);
+  const t = d.totals || {};
+  const totalTok = (t.input || 0) + (t.output || 0) + (t.cache_write || 0) + (t.cache_read || 0);
+
+  const total = `<div class="sb-st-row total">
+      <span class="sb-st-model">total</span>
+      <span class="sb-st-tok">${esc(sbFmtTokens(totalTok))}</span>
+      <span class="sb-st-cost">${esc(sbFmtCost(d.cost_usd))}</span>
+    </div>`;
+
+  // An unpriced model is named, never silently treated as free — a cost that
+  // quietly omits half the spend is worse than no cost at all.
+  const unpriced = (d.unpriced_models || []).length
+    ? `<div class="sb-st-note">No rate for ${esc((d.unpriced_models || []).map(sbShortModel).join(', '))}
+         — add <code>[pricing]</code> to <code>~/.hive/config.toml</code> for cost.</div>`
+    : '';
+
+  el.innerHTML = head +
+    (where ? `<div class="sb-st-where">${esc(where)}</div>` : '') +
+    (rows || '<div class="sb-st-note">No usage recorded yet.</div>') +
+    (rows ? total : '') + unpriced;
+}
+
 function renderSidebarList() {
   const el = document.getElementById('sessionList');
   // Source order, deliberately: the sidebar must list conversations in the same
@@ -3222,6 +3472,9 @@ function renderSidebarList() {
       : `${liveRows} LIVE${need ? ' · ' + need + ' NEED YOU' : ''}`;
   }
   sbRenderControls();
+  // Independent of which view is showing — the pane describes where the tmux
+  // client is, not what the list happens to be listing.
+  sbRenderStats();
 
   if (sbView === 'projects') {
     el.innerHTML = sbProjectList.length
@@ -3727,6 +3980,11 @@ async function fetchSessions() {
     // The resumable set changes slowly and is only visible on the Resume tab, so
     // poll it only while that tab is showing.
     if (listTab === 'resume') fetchConversations();
+
+    // Stats for the focused conversation, on its own slower cadence (see
+    // SB_STATS_TTL_MS) — not awaited, so a large transcript can never stall the
+    // session poll.
+    if (SIDEBAR) sbMaybeFetchStats();
 
     // In detail view, only update badges (not chat — that has its own poll)
     if (selectedSession) {

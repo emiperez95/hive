@@ -22,4 +22,7 @@ pub mod projects;
 pub mod registry;
 pub mod tmux;
 pub mod types;
+// Per-conversation token usage, read incrementally from the transcript.
+#[allow(dead_code)]
+pub mod usage;
 pub mod worktree;
