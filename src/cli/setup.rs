@@ -496,8 +496,20 @@ pub fn run_setup(yes: bool) -> Result<()> {
         && tmux_cf_bound;
     let agent_needs_install = agent_status != "ok";
     let cmd_needs_install = cmd_status != "ok";
+    // `n/a` (no iTerm) is not work; "missing" and "update" both are. Leaving the
+    // sidebar out of this check made a version-only change unreachable: the status
+    // block printed `[update]`, the early return fired anyway, and setup announced
+    // "Everything is already set up!" without ever offering the install. Since the
+    // version in the URL is the ONLY thing that forces iTerm's webview to reload,
+    // that silently pinned the panel to whatever page it first loaded.
+    let sidebar_needs_install = sidebar_status == "missing" || sidebar_status == "update";
 
-    if !needs_hook_changes && all_tmux_bound && !agent_needs_install && !cmd_needs_install {
+    if !needs_hook_changes
+        && all_tmux_bound
+        && !agent_needs_install
+        && !cmd_needs_install
+        && !sidebar_needs_install
+    {
         println!();
         println!("Everything is already set up!");
         return Ok(());
