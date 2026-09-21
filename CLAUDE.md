@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 356 tests (332 unit + 24 CLI smoke)
+cargo test                # 357 tests (333 unit + 24 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 610 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 332 unit + 24 smoke.
+> `cargo test` prints 612 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 333 unit + 24 smoke.
 
 ## The TUI (conversation-first)
 
@@ -579,6 +579,14 @@ the parse yields something different from an unchanged transcript.
 > cwd sat on line 45 behind 35 snapshot entries, so it scanned as cwd-less. An empty cwd means
 > no `resolve_parent`, which means the conversation shows under `(unassigned)` **and** cannot
 > be recovered — there is nothing to `-c` into.
+>
+> **And the budget is spent AFTER reading a line, never before.** Decrementing first
+> meant one line bigger than the remaining budget was skipped whole instead of ending
+> the scan after it — and the first substantive entry is exactly where the cwd lives.
+> Measured: a transcript whose line 4 is **576KB** against the 256KB budget, carrying
+> the cwd, scanned as cwd-less. Rare (1 of 191 transcripts here) and invisible until
+> something asks that conversation where it lives. The budget bounds how far the scan
+> *continues*, never which lines it *looks at*.
 
 ## Recovery — reopening the windows a restart wiped (`R`)
 
@@ -1225,13 +1233,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-356 distinct tests. Run with `cargo test`.
+357 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 610 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 254 · bin 332 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 612 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 255 · bin 333 (the superset — adds cli/daemon/serve)
 > · smoke 24.
 
-**Unit tests (308)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (309)** — in-module `#[cfg(test)]` blocks:
 - `common/usage.rs`: `accumulate_line` (per-model accumulation, sidechain kept apart,
   thinking not double-counted, zero-usage `<synthetic>` entries dropped, unlabelled
   model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a

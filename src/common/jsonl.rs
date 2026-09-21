@@ -206,10 +206,14 @@ pub fn read_conversation_meta(path: &Path) -> (Option<String>, Option<String>) {
             .map_while(Result::ok)
             .enumerate()
         {
-            budget = budget.saturating_sub(line.len() + 1);
-            if budget == 0 {
-                break;
-            }
+            // Read the line BEFORE spending its bytes. Decrementing first meant a
+            // single line bigger than the remaining budget was skipped whole rather
+            // than ending the scan after it — and the first substantive entry is
+            // exactly where the cwd lives. Measured: one transcript opens with a
+            // 576KB line 4 carrying the cwd, against a 256KB budget, so it scanned
+            // as cwd-less. That is not cosmetic: no cwd means no `resolve_parent`,
+            // which puts the conversation under "(unassigned)" AND makes it
+            // unrecoverable, since there is nothing to `-c` into.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if cwd.is_none() {
                     if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
@@ -222,6 +226,10 @@ pub fn read_conversation_meta(path: &Path) -> (Option<String>, Option<String>) {
                 if let Some(t) = title_field(&v, "ai-title", "aiTitle") {
                     ai = Some(t);
                 }
+            }
+            budget = budget.saturating_sub(line.len() + 1);
+            if budget == 0 {
+                break;
             }
             if cwd.is_some() && i >= TITLE_LINES {
                 break;
@@ -317,7 +325,9 @@ pub fn scan_all_disk_conversations() -> Vec<DiskConversation> {
 /// "did our reading of it change?". Without this, a parser fix is invisible on exactly the
 /// conversations it repairs: the file is untouched, so the stale result is served forever.
 /// (v2: the head scan is byte-bounded, so a cwd behind a long metadata preamble is found.)
-const SCAN_PARSER_VERSION: u32 = 2;
+/// (v3: the byte budget is spent AFTER reading a line, so a single line larger than the
+/// budget is no longer skipped whole — one transcript's cwd sits on a 576KB line 4.)
+const SCAN_PARSER_VERSION: u32 = 3;
 
 /// The on-disk scan cache: id → last scan result. Keyed reuse hinges on `mtime`
 /// (== `last_activity`), so an unchanged transcript is never re-parsed.
@@ -1726,6 +1736,40 @@ mod tests {
             "cwd must be found behind the preamble"
         );
         assert_eq!(title.as_deref(), Some("Claude code artifact review"));
+    }
+
+    #[test]
+    fn test_read_conversation_meta_reads_a_line_larger_than_the_head_budget() {
+        // A single entry can dwarf the whole head budget — a pasted file, a big tool
+        // result. Observed: a transcript whose line 4 is 576KB against a 256KB budget,
+        // and that line is the first one carrying a cwd. Spending the budget *before*
+        // reading skipped it whole, so the conversation scanned as cwd-less: unplaceable
+        // under "(unassigned)" and unrecoverable. The budget must bound how far the scan
+        // CONTINUES, never which lines it looks at.
+        let dir = std::env::temp_dir().join(format!("hive-bigline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bigline.jsonl");
+
+        let filler = "x".repeat(600 * 1024); // comfortably over the 256KB head budget
+        let mut body = String::new();
+        body.push_str("{\"type\":\"mode\",\"mode\":\"normal\"}\n");
+        body.push_str(&format!(
+            "{{\"type\":\"user\",\"cwd\":\"/home/u/projects/media\",\"pasted\":\"{filler}\"}}\n"
+        ));
+        body.push_str("{\"type\":\"ai-title\",\"aiTitle\":\"Message routing\"}\n");
+        std::fs::write(&path, body).unwrap();
+
+        let (cwd, title) = read_conversation_meta(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            cwd.as_deref(),
+            Some("/home/u/projects/media"),
+            "an oversized line must still be parsed, not skipped"
+        );
+        // The tail scan picks the title up even though the head budget ran out on the
+        // big line, which is exactly the division of labour the two passes are for.
+        assert_eq!(title.as_deref(), Some("Message routing"));
     }
 
     #[test]
