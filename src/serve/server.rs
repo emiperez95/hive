@@ -42,18 +42,9 @@ fn aggregate_status(windows: &[WindowView]) -> Option<SessionStatus> {
     if windows.is_empty() {
         return None;
     }
-    let needs_attention = |s: &SessionStatus| {
-        matches!(
-            s,
-            SessionStatus::NeedsPermission { .. }
-                | SessionStatus::EditApproval { .. }
-                | SessionStatus::PlanReview
-                | SessionStatus::QuestionAsked
-        )
-    };
     if let Some(w) = windows
         .iter()
-        .find(|w| w.status.as_ref().is_some_and(needs_attention))
+        .find(|w| w.status.as_ref().is_some_and(SessionStatus::blocks_human))
     {
         return w.status.clone();
     }

@@ -39,14 +39,10 @@ fn status_label(status: &SessionStatus) -> &'static str {
 /// True for statuses that mean "this agent is stopped until a human answers". This is the
 /// attention bottleneck the adoption model describes at Step 1/2 — the thing that caps how
 /// many agents one person can actually keep moving.
+/// Delegates to the canonical [`SessionStatus::blocks_human`] so `hive_conversations_blocked`
+/// can never drift from what the TUI and the sidebar call blocked.
 fn is_blocked(status: &SessionStatus) -> bool {
-    matches!(
-        status,
-        SessionStatus::NeedsPermission { .. }
-            | SessionStatus::EditApproval { .. }
-            | SessionStatus::PlanReview
-            | SessionStatus::QuestionAsked
-    )
+    status.blocks_human()
 }
 
 /// Aggregates of the conversation registry, computed **once per data-thread tick** rather than

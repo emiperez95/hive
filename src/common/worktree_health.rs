@@ -13,6 +13,7 @@
 //! later.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -100,23 +101,35 @@ pub fn base_from_symbolic_ref(out: &str) -> Option<String> {
 
 // --- the probe --------------------------------------------------------------
 
-fn git(dir: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+/// A `git` invocation that never takes a lock or writes.
+///
+/// `GIT_OPTIONAL_LOCKS=0` is load-bearing, not hygiene. `git status` refreshes stale
+/// stat info by **rewriting the index**, and this cache keys on the index's mtime —
+/// so the probe would invalidate its own entry on the next tick, in exactly the
+/// worktrees where an agent is actively editing. Measured: after touching three files,
+/// a plain `git status --porcelain` moved the index mtime (…096 → …099); with the flag
+/// set it did not move at all.
+///
+/// It also keeps hive out of a fight over `index.lock` with the Claude running in that
+/// same tree.
+fn git_cmd(dir: &str, args: &[&str]) -> Command {
+    let mut c = Command::new("git");
+    c.env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+        .args(args);
+    c
+}
+
+fn git(dir: &str, args: &[&str]) -> Option<String> {
+    let out = git_cmd(dir, args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn git_ok(dir: &str, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    git_cmd(dir, args)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -199,6 +212,22 @@ fn probe(cwd: &str) -> Option<WorktreeHealth> {
 /// simply expires.
 const MAX_AGE: Duration = Duration::from_secs(60);
 
+/// How far past [`MAX_AGE`] an entry's expiry can be pushed.
+const TTL_SPREAD_SECS: u64 = 30;
+
+/// Per-tree expiry, deterministically spread over `[MAX_AGE, MAX_AGE + TTL_SPREAD)`.
+///
+/// Every tree is probed for the first time on the same gather, so a flat ceiling
+/// expires them all on the same later tick and replays the full cold cost (measured
+/// 0.59s across 13 trees) as a recurring stall. Spreading by a hash of the path keeps
+/// it deterministic — no RNG, no state — while making a synchronised expiry
+/// impossible.
+fn ttl_for(cwd: &str) -> Duration {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cwd.hash(&mut h);
+    MAX_AGE + Duration::from_secs(h.finish() % TTL_SPREAD_SECS)
+}
+
 struct Entry {
     /// Resolved once per working tree so the cache check itself costs no
     /// subprocess — only two stats.
@@ -239,7 +268,7 @@ pub fn health_for_cwd(cwd: &str) -> Option<WorktreeHealth> {
     let key = cwd.to_string();
     if let Ok(map) = cache().lock() {
         if let Some(e) = map.get(&key) {
-            if e.at.elapsed() < MAX_AGE {
+            if e.at.elapsed() < ttl_for(cwd) {
                 if let Some(gd) = &e.git_dir {
                     let (i, h) = git_dir_mtimes(gd);
                     if i == e.index_mtime && h == e.head_mtime {
@@ -280,6 +309,28 @@ pub fn health_for_cwd(cwd: &str) -> Option<WorktreeHealth> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttl_is_deterministic_and_spread() {
+        let a = ttl_for("/a/one");
+        assert_eq!(a, ttl_for("/a/one"), "same path must give the same expiry");
+        assert!(a >= MAX_AGE && a < MAX_AGE + Duration::from_secs(TTL_SPREAD_SECS));
+
+        // Not a guarantee for any specific pair, but across a realistic set the
+        // expiries must not all land together — that is the whole point.
+        let paths = [
+            "/Users/x/Projects/hive",
+            "/Users/x/Projects/worktrees/avateen/sos-avatar",
+            "/Users/x/Projects/worktrees/avateen/live-avatar",
+            "/Users/x/Projects/00-main",
+            "/Users/x/Projects/02-promobile/media",
+        ];
+        let distinct: std::collections::HashSet<_> = paths.iter().map(|p| ttl_for(p)).collect();
+        assert!(
+            distinct.len() > 1,
+            "a flat TTL would replay the full cold probe cost on one tick"
+        );
+    }
 
     #[test]
     fn status_counts_split_tracked_from_untracked() {

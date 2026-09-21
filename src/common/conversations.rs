@@ -271,14 +271,9 @@ pub(crate) fn convert_claude_to_session_status(status: &ClaudeStatus) -> Session
 
 /// Whether a status is one that requires the user to act (the "needs attention"
 /// axis), used when we recover status from a transcript rather than the hook.
+/// Delegates to the canonical [`SessionStatus::blocks_human`].
 fn status_needs_attention(s: &SessionStatus) -> bool {
-    matches!(
-        s,
-        SessionStatus::NeedsPermission { .. }
-            | SessionStatus::EditApproval { .. }
-            | SessionStatus::PlanReview
-            | SessionStatus::QuestionAsked
-    )
+    s.blocks_human()
 }
 
 // ── Recovery frame ──────────────────────────────────────────────────────────

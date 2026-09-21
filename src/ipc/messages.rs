@@ -95,6 +95,28 @@ pub enum SessionStatus {
     Unknown,
 }
 
+impl SessionStatus {
+    /// Whether a human decision is pending — the conversation cannot progress until
+    /// someone answers.
+    ///
+    /// The canonical definition. It used to be spelled out independently in
+    /// `common/conversations.rs`, `serve/server.rs` and `serve/metrics.rs`; three
+    /// copies of a predicate this central is three chances for "needs you" to mean
+    /// something different depending on which surface you are looking at.
+    ///
+    /// `RunningWorkflow` is deliberately **not** blocking: work is in flight, nobody
+    /// is being waited on.
+    pub fn blocks_human(&self) -> bool {
+        matches!(
+            self,
+            SessionStatus::NeedsPermission { .. }
+                | SessionStatus::EditApproval { .. }
+                | SessionStatus::PlanReview
+                | SessionStatus::QuestionAsked
+        )
+    }
+}
+
 /// State of a single Claude session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
@@ -436,6 +458,34 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: HookState = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.sessions["s1"].tmux_pane.as_deref(), Some("%3"));
+    }
+
+    #[test]
+    fn blocks_human_is_exactly_the_four_decision_states() {
+        for s in [
+            SessionStatus::NeedsPermission {
+                tool_name: "Bash".into(),
+                description: None,
+            },
+            SessionStatus::EditApproval {
+                filename: "a.rs".into(),
+            },
+            SessionStatus::PlanReview,
+            SessionStatus::QuestionAsked,
+        ] {
+            assert!(s.blocks_human(), "{s:?} stops until a human answers");
+        }
+        for s in [
+            SessionStatus::Waiting,
+            SessionStatus::Working,
+            SessionStatus::Unknown,
+            // Busy, not blocked — work is in flight and nobody is being waited on.
+            SessionStatus::RunningWorkflow {
+                summary: "3 agents".into(),
+            },
+        ] {
+            assert!(!s.blocks_human(), "{s:?} is not waiting on a human");
+        }
     }
 
     #[test]
