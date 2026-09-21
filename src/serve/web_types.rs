@@ -82,7 +82,7 @@ pub struct WindowView {
     pub last_activity: Option<String>,
     /// (session, window, pane) for routing send-keys to this window.
     pub pane: Option<(String, String, String)>,
-    /// Attention tier: 0 blocked · 1 ready for review · 2 working · 3 idle.
+    /// Attention tier: 0 blocked · 1 ready for review · 2 idle · 3 working.
     ///
     /// Computed in Rust rather than in the frontend so there is exactly one
     /// definition of "needs you" — the JS has no test harness, and a second
@@ -99,6 +99,15 @@ pub struct WindowView {
     /// conversation blocked for an hour would otherwise read as brand new.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_secs: Option<u32>,
+    /// This window's position in the attention order, 0 = most wanting a human.
+    /// `None` for a window in a skipped session, which is not a routing target.
+    ///
+    /// The ORDER lives in Rust for the same reason the tier does. It has two
+    /// consumers that must agree — the sidebar's attention view and `cycle-free`
+    /// on `Ctrl+g` — and a keybinding that visits conversations in a different
+    /// order than the panel showing them is worse than either order alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_rank: Option<u32>,
 }
 
 /// One conversation as exposed to the web dashboard's new conversation-first API

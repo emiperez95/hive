@@ -66,7 +66,7 @@ hive update             # update to latest version from GitHub + re-run setup
 hive --version          # print current version
 hive cycle-next         # switch to next tmux session (skipping skipped)
 hive cycle-prev         # switch to previous tmux session
-hive cycle-free         # jump to next non-busy Claude window (current session first)
+hive cycle-free         # jump to the next non-busy Claude window, in attention order
 hive window-next        # switch to next tmux window in the current session
 hive window-prev        # switch to previous tmux window in the current session
 hive connect <key>      # create/attach tmux session for a registered project
@@ -1091,9 +1091,16 @@ registers and exits. Requires a one-time "Enable Python API" in iTerm's settings
 - **Attention** — the same live conversations, ordered by how much they want a
   human instead of by which tmux session hosts them. Four tiers: **blocked**
   (a decision is pending) → **ready for review** (idle, with work in its tree
-  nobody has looked at) → **working** → **idle**. Idle is collapsed by default,
-  which is what makes this view *shorter* than the grouped one. Tier 2 is the
-  only new information; the rest hive already knew and never ranked.
+  nobody has looked at) → **idle** → **working**. Tier 2 is the only new
+  information; the rest hive already knew and never ranked.
+
+  **Working sorts LAST, below idle**, and every tier renders open. The order is by
+  what you could *do* about a row, not by how busy the machine is: an agent
+  mid-turn keeps going whether or not you look at it, while an idle conversation
+  is a window you can pick up right now. Idle folded at first, on the theory that
+  it's the tail you never act on — but it is exactly the list of free windows,
+  which is half of what this view is for, and a fold is one click between you and
+  it every time the panel rebuilds.
 
 
 - **Live** — conversations grouped by session, then folded `Skipped` / `Frozen`
@@ -1125,12 +1132,33 @@ sideways — a way back that moves is the one control you can't afford to hunt f
 
 ### The attention view — ranking, and what keeps it usable
 
-**The tier is computed in Rust** (`serve/server.rs::tier_for`, shipped as
-`WindowView.attention`), never in `web.html`. The frontend has no test harness,
-and a second definition of "blocked" would drift from
-`SessionStatus::blocks_human` — itself now the single canonical predicate, after
-being written out independently in `common/conversations.rs`, `serve/server.rs`
-and `serve/metrics.rs`.
+**The tier AND the order are computed in Rust** (`serve/server.rs::tier_for` and
+`attention_key`, shipped as `WindowView.attention` / `attention_rank`), never in
+`web.html` — which now just sorts by the rank it is handed.
+
+> **The order has two consumers and they must agree.** `Ctrl+g` (`cycle-free`)
+> walks the same ranked list the panel draws; a keybinding that visits
+> conversations in a different order than the panel in front of you is worse than
+> either order alone. That is why the rank is assigned once, globally, in
+> `rank_attention` — `SessionView` only ever sees one session's windows, and a
+> per-session rank would be useless to an ungrouped view.
+>
+> `cycle-free` must call `annotate_attention` **itself**: `gather_active_views`
+> leaves the rank unset (the pass does I/O and needs a clock), and only the web
+> data thread was calling it. Miss that and every rank is `None` and the sort
+> degrades silently to session-name order. A one-shot has no `StateAges`, so
+> `state_secs` is `None` there and the longest-held tie-break within the blocked
+> and working tiers falls back to session/window; the tiers themselves — the part
+> that decides where you land — match exactly.
+>
+> The old behaviour, where a forward scan exhausted the current session before
+> leaving it, is gone. That was a consequence of tmux ordering, never the goal:
+> priority doesn't stop at a session boundary.
+
+The frontend has no test harness, and a second definition of "blocked" would
+drift from `SessionStatus::blocks_human` — itself now the single canonical
+predicate, after being written out independently in `common/conversations.rs`,
+`serve/server.rs` and `serve/metrics.rs`.
 
 **The git probe runs only for idle windows** (`annotate_attention`). It costs
 ~0.045s per working tree and there are 13 live trees here, so probing busy and
@@ -1161,9 +1189,14 @@ or ranked — the same rule `cycle-free` follows.
 In the grouped views order is near-static, but here a row can change tier and jump
 the height of the panel between deciding to click and clicking — so `sbSwapList`
 skips the DOM swap while the pointer is over the list, and preserves `scrollTop`
-across it. Ordering is also a **total** order (tier, then age, then session and
-window index): a merely "mostly sorted" comparator reshuffles ties on every poll.
-Measured 20 samples over 20s with zero reorders.
+across it. `attention_key` is also a **total** order (tier, then age, then session
+and window index): a merely "mostly sorted" comparator reshuffles ties on every
+poll. Measured 20 samples over 20s with zero reorders.
+
+Within a tier the age rule differs by tier and is deliberate: **blocked and working
+sort longest-held first** (a two-hour wait outranks a ten-second one, and a
+long-running job is likelier wedged), **ready-for-review and idle sort freshest
+first** (there the question is "what did I just finish", not "what is stuck").
 
 **An ungrouped row is TWO lines**, and the second one is the project and worktree
 (`sb-place`). Once the ordering stops being by project, "where is this" is the first
@@ -1362,7 +1395,7 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 - `prefix + a` — conversations popup, **project** detail for the current window
   (`hive --project-detail`) — see `current_window_project()`
 - `Ctrl+n` / `Ctrl+p` — cycle next/prev session
-- `Ctrl+g` — jump to the next non-busy Claude window (current session first, then others)
+- `Ctrl+g` — jump to the next non-busy Claude window, in the sidebar's attention order
 - `Ctrl+\` — cycle to next window in the current session (`window-prev` is CLI-only)
 - Configured in `~/.tmux.conf`, also set by `hive setup`
 
@@ -1380,7 +1413,11 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a
   transcript caught mid-write counts that line exactly once on the next pass)
 - `serve/server.rs`: `tier_for` (blocked outranks a dirty tree; busy is never
-  ready; idle splits on unreviewed work), `AttentionTier` ordering, `StateAges`
+  ready; idle splits on unreviewed work), `AttentionTier` ordering (working sorts
+  BELOW idle — it is the tier that needs nothing from you), `rank_attention`
+  (blocked → ready → idle → working; ranks are global across sessions and dense,
+  since the view is ungrouped; a skipped session's windows get no rank and so are
+  never a routing target), `StateAges`
   (first sighting is `None` not zero, reset only on a kind change, payload churn
   ignored, gc drops ended conversations), and `annotate_attention` — including
   **the probe-call-count contract** (idle windows only, skipped sessions never,

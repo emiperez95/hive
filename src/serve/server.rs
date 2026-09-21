@@ -266,6 +266,7 @@ fn conv_to_window_view(c: &Conversation, is_auto_approve: bool) -> WindowView {
         attention: AttentionTier::Idle as u8,
         unreviewed_work: false,
         state_secs: None,
+        attention_rank: None,
     }
 }
 
@@ -277,16 +278,26 @@ fn conv_to_window_view(c: &Conversation, is_auto_approve: bool) -> WindowView {
 // `SessionStatus::blocks_human`.
 
 /// How badly a conversation wants a human, worst first.
+///
+/// The ordering is by **what you could do about it**, not by how busy the machine
+/// is. `Working` is last because it is the one tier that needs nothing from you:
+/// an agent mid-turn will keep going whether or not you look at it, whereas an idle
+/// conversation is a window you can pick up right now. Ranking busy above idle
+/// sorted the panel by the machine's activity, which is the opposite of the
+/// question it exists to answer.
+///
+/// The discriminants go on the wire as `WindowView.attention`, so `SB_TIERS` in
+/// `web.html` must be reordered with this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum AttentionTier {
     /// A decision is pending; nothing moves until someone answers.
     Blocked = 0,
     /// Idle, with work in its tree that nobody has looked at.
     ReadyForReview = 1,
+    /// Idle with nothing pending and nothing produced — free to pick up.
+    Idle = 2,
     /// Busy. Nothing to do but let it run.
-    Working = 2,
-    /// Idle with nothing pending and nothing produced.
-    Idle = 3,
+    Working = 3,
 }
 
 /// Pure tier assignment.
@@ -401,6 +412,66 @@ pub(crate) fn annotate_attention(
         }
     }
     ages.gc(&live);
+    rank_attention(views);
+}
+
+/// Assign each rankable window its position in the attention order.
+///
+/// Done here, over every session at once, because the order is **global** — that is
+/// the whole point of the attention view, and `SessionView` only ever sees one
+/// session's windows.
+fn rank_attention(views: &mut [SessionView]) {
+    let mut keys: Vec<(AttentionKey, usize, usize)> = Vec::new();
+    for (vi, view) in views.iter().enumerate() {
+        if view.skipped {
+            continue;
+        }
+        for (wi, w) in view.windows.iter().enumerate() {
+            keys.push((attention_key(&view.name, w), vi, wi));
+        }
+    }
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rank, (_, vi, wi)) in keys.into_iter().enumerate() {
+        views[vi].windows[wi].attention_rank = Some(rank as u32);
+    }
+}
+
+/// The total order behind both the sidebar's attention view and `cycle-free`.
+///
+/// Every component is load-bearing:
+///
+/// - **tier** first — see [`AttentionTier`].
+/// - **within a tier**, blocked and working sort *longest-held first*: a two-hour
+///   wait outranks a ten-second one, and a long-running job is likelier wedged.
+///   Ready-for-review and idle sort *freshest first*, because there the question is
+///   "what did I just finish", not "what is stuck". `state_secs` is absent for a
+///   conversation hive hasn't watched change, and sorts last rather than as zero.
+/// - **session then window** last, so the order is TOTAL. A merely "mostly sorted"
+///   comparator reshuffles ties between 1.5s polls, and a row that moves under the
+///   pointer is a row you mis-click.
+type AttentionKey = (u8, std::cmp::Reverse<i64>, String, String);
+
+fn attention_key(session: &str, w: &crate::serve::web_types::WindowView) -> AttentionKey {
+    let busyish =
+        w.attention == AttentionTier::Blocked as u8 || w.attention == AttentionTier::Working as u8;
+    // One numeric axis for both rules, so the key type stays uniform: held-time for
+    // blocked/working, recency for ready/idle. Both are "bigger sorts first", hence
+    // the single `Reverse`. A missing value becomes the smallest, i.e. last.
+    let axis: i64 = if busyish {
+        w.state_secs.map(i64::from).unwrap_or(-1)
+    } else {
+        w.last_activity
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.timestamp())
+            .unwrap_or(i64::MIN)
+    };
+    (
+        w.attention,
+        std::cmp::Reverse(axis),
+        session.to_string(),
+        w.window_index.clone(),
+    )
 }
 
 fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> ConversationView {
@@ -497,6 +568,7 @@ mod tests {
             attention: AttentionTier::Idle as u8,
             unreviewed_work: false,
             state_secs: None,
+            attention_rank: None,
         }
     }
 
@@ -573,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn tiers_sort_worst_first() {
+    fn tiers_sort_by_what_you_can_do_about_them() {
         let mut v = [
             AttentionTier::Idle,
             AttentionTier::Blocked,
@@ -586,10 +658,14 @@ mod tests {
             [
                 AttentionTier::Blocked,
                 AttentionTier::ReadyForReview,
-                AttentionTier::Working,
-                AttentionTier::Idle
+                AttentionTier::Idle,
+                AttentionTier::Working
             ]
         );
+        // Working is LAST, below idle. It is the one tier that needs nothing from
+        // you — sorting it above idle ranks the panel by the machine's activity
+        // rather than by what you could pick up, which is the opposite question.
+        assert!(AttentionTier::Idle < AttentionTier::Working);
     }
 
     #[test]
@@ -691,6 +767,83 @@ mod tests {
         assert_eq!(w[2].attention, AttentionTier::Blocked as u8);
         assert_eq!(w[3].attention, AttentionTier::ReadyForReview as u8);
         assert!(!w[1].unreviewed_work, "a busy window is never marked ready");
+    }
+
+    #[test]
+    fn rank_orders_blocked_then_ready_then_idle_then_working() {
+        // The order Ctrl+g walks and the order the sidebar draws are the same list.
+        // Working last is the load-bearing part: it is the tier that needs nothing
+        // from you, so it must not sit between you and a window you could pick up.
+        let mut views = vec![session(
+            "s",
+            false,
+            vec![
+                win("busy", Some(SessionStatus::Working), ""),
+                win("idle", Some(SessionStatus::Waiting), ""),
+                win("blocked", Some(SessionStatus::PlanReview), ""),
+                win("ready", Some(SessionStatus::Waiting), "/w/ready"),
+            ],
+        )];
+        let mut ages = StateAges::default();
+        annotate_attention(
+            &mut views,
+            &mut ages,
+            &mut |cwd| cwd == "/w/ready",
+            Instant::now(),
+        );
+
+        let mut order: Vec<(u32, &str)> = views[0]
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    w.attention_rank.unwrap(),
+                    w.session_id.as_deref().unwrap_or(""),
+                )
+            })
+            .collect();
+        order.sort();
+        let names: Vec<&str> = order.into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, vec!["blocked", "ready", "idle", "busy"]);
+    }
+
+    #[test]
+    fn rank_is_a_total_order_across_sessions() {
+        // Ranks are assigned over ALL sessions at once — the attention view is
+        // ungrouped, so a rank that only ordered within a session would be useless
+        // to it and would send Ctrl+g somewhere else entirely.
+        let mut views = vec![
+            session("b-session", false, vec![win("b1", None, "")]),
+            session("a-session", false, vec![win("a1", None, "")]),
+        ];
+        let mut ages = StateAges::default();
+        annotate_attention(&mut views, &mut ages, &mut |_| false, Instant::now());
+
+        let mut ranks: Vec<u32> = views
+            .iter()
+            .flat_map(|v| v.windows.iter())
+            .filter_map(|w| w.attention_rank)
+            .collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1], "ranks must be globally unique and dense");
+        // Same tier and no timestamps, so the session name breaks the tie — which is
+        // what stops ties reshuffling between polls.
+        assert_eq!(views[1].windows[0].attention_rank, Some(0)); // a-session
+        assert_eq!(views[0].windows[0].attention_rank, Some(1)); // b-session
+    }
+
+    #[test]
+    fn a_skipped_sessions_windows_get_no_rank() {
+        // Unranked means "not a routing target". `cycle-free` sorts them last and
+        // never selects them; the attention view doesn't render them at all.
+        let mut views = vec![
+            session("live", false, vec![win("l", None, "")]),
+            session("skipped", true, vec![win("s", None, "")]),
+        ];
+        let mut ages = StateAges::default();
+        annotate_attention(&mut views, &mut ages, &mut |_| false, Instant::now());
+        assert_eq!(views[0].windows[0].attention_rank, Some(0));
+        assert_eq!(views[1].windows[0].attention_rank, None);
     }
 
     #[test]

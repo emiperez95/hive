@@ -60,12 +60,37 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     let mut sys = System::new_all();
     sys.refresh_all();
     let reg = crate::common::conversations::gather_conversations_stats(&mut sys);
-    let session_data = crate::serve::server::gather_active_views(&reg, &sys);
+    let mut session_data = crate::serve::server::gather_active_views(&reg, &sys);
+    // `gather_active_views` leaves `attention_rank` unset — the ranking is a separate
+    // pass because it does I/O (the git probe) and needs a clock. The web data thread
+    // runs it every tick; a one-shot keypress has to run it itself, or every rank is
+    // `None` and the sort below silently degrades to session-name order.
+    //
+    // `StateAges` is process-lifetime state, so a one-shot has none and `state_secs`
+    // comes back `None` for every window. That only affects the tie-break *within*
+    // the blocked and working tiers (longest-held first), which falls back to
+    // session/window; the tiers themselves — the part that decides where you land —
+    // match the panel exactly.
+    let mut ages = crate::serve::server::StateAges::default();
+    crate::serve::server::annotate_attention(
+        &mut session_data,
+        &mut ages,
+        &mut |cwd| {
+            crate::common::worktree_health::health_for_cwd(cwd)
+                .is_some_and(|h| h.has_unreviewed_work())
+        },
+        std::time::Instant::now(),
+    );
 
-    // Flatten to one entry per Claude window in tmux order. A session's windows
-    // are contiguous (sorted by window index), so a forward scan from the current
-    // window naturally exhausts the current session before moving outside it.
-    let mut windows: Vec<(String, String, bool)> = Vec::new(); // (session, window_index, free)
+    // Flatten to one entry per Claude window, in the SIDEBAR'S order — by attention
+    // rank, not tmux order. `Ctrl+g` and the attention panel are two views of one
+    // question ("where do you want me next"), and a key that answers it differently
+    // from the panel in front of you is worse than either answer alone.
+    //
+    // The cost is the old property that a forward scan exhausted the current session
+    // before leaving it. That was a consequence of tmux ordering, never the goal:
+    // priority doesn't stop at a session boundary.
+    let mut windows: Vec<(String, String, bool, u32)> = Vec::new(); // (session, window, free, rank)
     for sv in &session_data {
         let session_blocked = skipped.contains(&sv.name) || other_clients.contains(&sv.name);
         for w in &sv.windows {
@@ -76,11 +101,14 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
                 w.status,
                 Some(SessionStatus::Working) | Some(SessionStatus::RunningWorkflow { .. })
             );
-            windows.push((s, win, !busy && !session_blocked));
+            // Unranked (skipped session) sorts last; it is never `free` anyway.
+            let rank = w.attention_rank.unwrap_or(u32::MAX);
+            windows.push((s, win, !busy && !session_blocked, rank));
         }
     }
+    windows.sort_by_key(|(s, w, _, rank)| (*rank, s.clone(), w.clone()));
 
-    if !windows.iter().any(|(_, _, free)| *free) {
+    if !windows.iter().any(|(_, _, free, _)| *free) {
         return Ok(());
     }
 
@@ -90,7 +118,7 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     let cur_session = current_session(pane);
     let cur_window = current_window(pane);
     let cur_idx = match (&cur_session, &cur_window) {
-        (Some(s), Some(w)) => windows.iter().position(|(ws, ww, _)| ws == s && ww == w),
+        (Some(s), Some(w)) => windows.iter().position(|(ws, ww, _, _)| ws == s && ww == w),
         _ => None,
     };
 
@@ -98,9 +126,9 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     let start = cur_idx.map(|i| i + 1).unwrap_or(0);
     let target = (0..n)
         .map(|step| &windows[(start + step) % n])
-        .find(|(_, _, free)| *free);
+        .find(|(_, _, free, _)| *free);
 
-    if let Some((s, w, _)) = target {
+    if let Some((s, w, _, _)) = target {
         // Avoid a no-op switch when the only free window is the current one.
         if Some(s) != cur_session.as_ref() || Some(w) != cur_window.as_ref() {
             switch_to_session(s);

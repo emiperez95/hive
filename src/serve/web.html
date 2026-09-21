@@ -3612,55 +3612,48 @@ function sbRenderStats() {
 // on the wire as `attention` — there is deliberately no second definition of "blocked"
 // here, where nothing could test it.
 
+// Ordered by what you could do about it. `Working` sits LAST because it is the one
+// tier that needs nothing from you — an agent mid-turn keeps going whether or not you
+// look — while an idle conversation is a window you can pick up right now. Mirrors
+// `AttentionTier` in serve/server.rs, which is what actually assigns `attention`.
 const SB_TIERS = [
   { n: 0, key: 'tier0', label: 'Needs you' },
   { n: 1, key: 'tier1', label: 'Ready for review' },
-  { n: 2, key: 'tier2', label: 'Working' },
-  { n: 3, key: 'tier3', label: 'Idle' },
+  { n: 2, key: 'tier2', label: 'Idle' },
+  { n: 3, key: 'tier3', label: 'Working' },
 ];
 
 function sbTierOf(r) {
   const a = r.src && r.src.attention;
-  return typeof a === 'number' ? a : 3;
+  // Fall back to Idle, not Working: a row we can't place is one you can look at.
+  return typeof a === 'number' ? a : 2;
 }
 
-// Total and stable. The trailing session/window keys matter as much as the tier: an
-// order that is merely "mostly sorted" reshuffles between 1.5s polls, and a row that
-// moves is a row you mis-click.
-function sbAttnCompare(a, b) {
-  const ta = sbTierOf(a), tb = sbTierOf(b);
-  if (ta !== tb) return ta - tb;
-
-  if (ta === 0 || ta === 2) {
-    // Blocked and working: longest-held first — a two-hour wait outranks a ten-second
-    // one, and a long-running job is likelier wedged. `state_secs` is absent for a
-    // conversation hive hasn't watched change, which sorts last rather than as zero.
-    const sa = a.src && a.src.state_secs, sb2 = b.src && b.src.state_secs;
-    const va = typeof sa === 'number' ? sa : -1, vb = typeof sb2 === 'number' ? sb2 : -1;
-    if (va !== vb) return vb - va;
-  } else {
-    // Ready and idle: freshest first — today's output belongs at the top.
-    const la = (a.src && a.src.last_activity) || '', lb = (b.src && b.src.last_activity) || '';
-    if (la !== lb) return la < lb ? 1 : -1;
-  }
-  if (a.session !== b.session) return a.session < b.session ? -1 : 1;
-  return String(a.windowIndex) < String(b.windowIndex) ? -1 : 1;
+// The order is NOT computed here. `attention_rank` arrives on the wire already
+// totally ordered (serve/server.rs::attention_key), because it has a second consumer
+// — `cycle-free` on Ctrl+g — and a keybinding that visits conversations in a
+// different order than the panel showing them is worse than either order alone.
+// A window with no rank is in a skipped session and isn't rendered here anyway.
+function sbAttnRank(r) {
+  const n = r.src && r.src.attention_rank;
+  return typeof n === 'number' ? n : Number.MAX_SAFE_INTEGER;
 }
 
 function sbAttentionHtml() {
   const rows = sessions
     .filter(s => !s.skipped)
     .flatMap(s => sbConvRows(s, false))
-    .sort(sbAttnCompare);
+    .sort((a, b) => sbAttnRank(a) - sbAttnRank(b));
   if (!rows.length) return '<div class="sb-empty">No live conversations</div>';
 
   return SB_TIERS.map(t => {
     const mine = rows.filter(r => sbTierOf(r) === t.n);
     if (!mine.length) return '';
     const body = mine.map(r => sbRowHtml(r, true)).join('');
-    // Idle is the long tail and the one tier you never need to act on, so it folds —
-    // which is what makes this view shorter than the grouped one rather than longer.
-    if (t.n === 3) return sbSection(t.key, t.label, mine.length, body);
+    // Every tier renders open. Idle used to fold, on the theory that it's the tail you
+    // never act on — but it is precisely the list of windows that are free to take,
+    // which is half of what this view is for, and a fold is one click between you and
+    // it every time the panel rebuilds.
     return `<div class="sb-group">
       <div class="sb-tier-head t${t.n}">${esc(t.label)} (${mine.length})</div>
       ${body}
