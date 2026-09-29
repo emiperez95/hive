@@ -153,6 +153,11 @@ pub struct Conversation {
     /// closed. Not persisted. Lets the web build the per-process breakdown.
     #[serde(skip)]
     pub pids: Vec<u32>,
+    /// Runtime-only: when Claude last changed this conversation's status (epoch ms),
+    /// from its own `sessions/<pid>.json` `statusUpdatedAt`. `None` when Claude has no
+    /// record for it. The only first-party answer to "working since when".
+    #[serde(skip)]
+    pub status_since_ms: Option<i64>,
 }
 
 impl Conversation {
@@ -220,9 +225,27 @@ pub struct ConversationOverlay {
     pub parent: Option<String>,
     #[serde(default)]
     pub frozen_at: Option<String>,
+    /// Free-form, multi-line scratchpad — the sidebar's Notes pane. Kept apart from
+    /// `note`, which is a one-line label rendered inline on list rows and frozen
+    /// cards, where a newline would break the row.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
 }
 
 impl ConversationSidecar {
+    /// Load, apply `f` to one conversation's overlay, and save — dropping the entry
+    /// when it ends up all-default so the file doesn't collect empty records.
+    /// Load-modify-save on every call, so a write from another surface (TUI, web,
+    /// the gather's cached parents) in between is merged rather than undone.
+    pub fn edit(id: &str, f: impl FnOnce(&mut ConversationOverlay)) -> Result<()> {
+        let mut sc = Self::load();
+        f(sc.conversations.entry(id.to_string()).or_default());
+        if sc.conversations.get(id) == Some(&ConversationOverlay::default()) {
+            sc.conversations.remove(id);
+        }
+        sc.save()
+    }
+
     /// New derived file `~/.hive/cache/conversations.json`. Never repurposes existing
     /// state (state.json / frozen.json / worktrees.json stay authoritative).
     fn file_path() -> Option<PathBuf> {
@@ -354,6 +377,7 @@ impl ConversationRegistry {
                     mem_kb: 0,
                     ports: Vec::new(),
                     pids: Vec::new(),
+                    status_since_ms: None,
                 },
             );
         }
@@ -411,6 +435,7 @@ impl ConversationRegistry {
                             mem_kb: 0,
                             ports: Vec::new(),
                             pids: Vec::new(),
+                            status_since_ms: None,
                         },
                     );
                 }
@@ -674,6 +699,7 @@ mod tests {
             mem_kb: 0,
             ports: Vec::new(),
             pids: Vec::new(),
+            status_since_ms: None,
         }
     }
 
@@ -800,11 +826,13 @@ mod tests {
                 archived_at: None,
                 parent: Some("hive/CSD-1".to_string()),
                 frozen_at: Some("2026-07-01T00:00:00Z".to_string()),
+                notes: "line one\nline two".to_string(),
             },
         );
         let json = serde_json::to_string(&sc).unwrap();
         let back: ConversationSidecar = serde_json::from_str(&json).unwrap();
         assert_eq!(back.conversations.len(), 1);
+        assert_eq!(back.conversations["abc-123"].notes, "line one\nline two");
         assert_eq!(
             back.conversations["abc-123"].parent.as_deref(),
             Some("hive/CSD-1")
@@ -957,6 +985,7 @@ mod tests {
             archived_at: None,
             parent: parent.map(|s| s.to_string()),
             frozen_at: None,
+            notes: String::new(),
         }
     }
 
@@ -1101,6 +1130,7 @@ mod tests {
             mem_kb: 0,
             ports: Vec::new(),
             pids: Vec::new(),
+            status_since_ms: None,
         }
     }
 

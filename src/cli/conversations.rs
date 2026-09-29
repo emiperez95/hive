@@ -436,12 +436,7 @@ fn toggle_archived_project(key: &str) {
 /// Mutate one conversation's overlay entry in `conversations.json`, dropping the
 /// entry again if it's been reset to empty (keeps the sidecar tidy).
 fn edit_overlay(id: &str, f: impl FnOnce(&mut ConversationOverlay)) {
-    let mut sc = ConversationSidecar::load();
-    f(sc.conversations.entry(id.to_string()).or_default());
-    if sc.conversations.get(id) == Some(&ConversationOverlay::default()) {
-        sc.conversations.remove(id);
-    }
-    let _ = sc.save();
+    let _ = ConversationSidecar::edit(id, f);
 }
 
 /// Set (or clear) a conversation's pinned flag (persisted overlay).
@@ -5505,93 +5500,13 @@ fn connect_worktree(project: &str, branch: &str) -> Result<String> {
     ))
 }
 
-/// POSIX single-quote a string so it survives being typed onto a shell command line
-/// (todos can contain apostrophes, colons, `$`, …): wrap in `'…'` and rewrite each
-/// embedded `'` as `'\''`.
-fn sh_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-/// Resolve a tmux session name back to a `(cwd, env)` for creating a window in it —
-/// via the project registry (project session) or the worktree registry (worktree
-/// session, inheriting the parent project's env). None if it matches neither.
-fn resolve_session_target(session: &str) -> Option<(String, Vec<(String, String)>)> {
-    let projects = ProjectRegistry::load();
-    for (key, config) in &projects.projects {
-        if ProjectRegistry::session_name(key, config) == session {
-            let cwd = expand_tilde(&config.project_root)
-                .to_string_lossy()
-                .into_owned();
-            return Some((cwd, config.tmux_env()));
-        }
-    }
-    let wts = WorktreeState::load();
-    if let Some(e) = wts.worktrees.values().find(|e| e.session_name == session) {
-        let env = projects
-            .projects
-            .get(&e.project_key)
-            .map(|c| c.tmux_env())
-            .unwrap_or_default();
-        return Some((e.path.clone(), env));
-    }
-    None
-}
-
-/// Start a fresh conversation in `session` with an initial `prompt` (`claude "…"`).
-/// Opens a new window if the session is alive, else recreates it from the project /
-/// worktree registry. Then switches to it.
+/// Start a fresh conversation in `session` with an initial `prompt`, then switch to
+/// it. The window-opening half lives in `common::conversations` so the web sidebar
+/// can dispatch a todo the same way (and switch a specific client instead).
 fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
-    let startup = format!("claude {}", sh_quote(prompt));
-    let target = resolve_session_target(session);
-    let tmux_target = exact(session);
-    let alive = Command::new("tmux")
-        .args(["has-session", "-t", &tmux_target])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if alive {
-        let mut cmd = Command::new("tmux");
-        cmd.args(["new-window", "-t", &tmux_target]);
-        if let Some((cwd, env)) = &target {
-            cmd.args(["-c", cwd]);
-            for (k, v) in env {
-                cmd.arg("-e").arg(format!("{k}={v}"));
-            }
-        }
-        if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
-            return Err(anyhow!("failed to open a new window in '{session}'"));
-        }
-        let _ = Command::new("tmux")
-            .args([
-                "send-keys",
-                "-t",
-                &exact_active_pane(session),
-                &startup,
-                "Enter",
-            ])
-            .output();
-    } else {
-        let (cwd, env) = target.ok_or_else(|| {
-            anyhow!("session '{session}' isn't alive and matches no known project/worktree")
-        })?;
-        if !ensure_tmux_session(session, &cwd, Some(&startup), &env) {
-            return Err(anyhow!("failed to create session '{session}'"));
-        }
-    }
-
+    let msg = crate::common::conversations::start_task_in_session(session, prompt)?;
     attach_or_switch(session);
-    Ok(format!("Started task in {session} — {startup}"))
+    Ok(msg)
 }
 
 /// Close a live conversation: kill its tmux window (freeing the Claude process).
@@ -5847,14 +5762,6 @@ mod tests {
         let set: std::collections::HashSet<&String> = labels.iter().collect();
         assert_eq!(set.len(), labels.len(), "labels must be unique");
         assert_eq!(&labels[0..3], &["aa", "as", "ad"]); // stable order
-    }
-
-    #[test]
-    fn test_sh_quote() {
-        assert_eq!(sh_quote("task: fix scrolling"), "'task: fix scrolling'");
-        // An apostrophe is broken out and backslash-escaped so the shell rejoins it.
-        assert_eq!(sh_quote("it's a $test"), "'it'\\''s a $test'");
-        assert_eq!(sh_quote(""), "''");
     }
 
     #[test]
@@ -6467,6 +6374,7 @@ mod tests {
             mem_kb: 0,
             ports: Vec::new(),
             pids: Vec::new(),
+            status_since_ms: None,
         }
     }
 

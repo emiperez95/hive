@@ -95,8 +95,9 @@ pub struct WindowView {
     pub unreviewed_work: bool,
     /// Seconds this window has held its current status, or `None` when it was
     /// already in that status the first time hive saw it (i.e. since the web server
-    /// last started). A sort key only — never displayed, because after a restart a
-    /// conversation blocked for an hour would otherwise read as brand new.
+    /// last started) and Claude has no transition timestamp to seed it from.
+    /// Displayed as the age of a working or blocked row — `last_activity` there is
+    /// always "now", since every tool call stamps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_secs: Option<u32>,
     /// This window's position in the attention order, 0 = most wanting a human.
@@ -108,6 +109,16 @@ pub struct WindowView {
     /// order than the panel showing them is worse than either order alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_rank: Option<u32>,
+    /// This window pinged — its turn ended, or it started waiting on a decision —
+    /// and nobody has looked at it since. Sticky until a tmux client lands on the
+    /// window (clicking the row does that). See `UnseenPings`.
+    #[serde(default)]
+    pub unseen: bool,
+    /// When Claude says this window entered its current status (epoch ms). Seeds
+    /// `StateAges` on first sighting; not sent to the browser, which gets the
+    /// resulting `state_secs`.
+    #[serde(skip)]
+    pub status_since_ms: Option<i64>,
 }
 
 /// One conversation as exposed to the web dashboard's new conversation-first API

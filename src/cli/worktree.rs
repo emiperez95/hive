@@ -187,7 +187,10 @@ pub fn run_wt_new(
         } else if let Some(ref cmd) = config.startup_command {
             let base_cmd = cmd.replace("claude -c", "claude");
             let full_cmd = match prompt {
-                Some(p) => format!("{} {:?}", base_cmd, p),
+                // Single-quoted, not `{:?}`: Rust's debug quoting is DOUBLE quotes,
+                // inside which the shell still expands `$(…)` and backticks — so a
+                // prompt from a todo could run a command on the way in.
+                Some(p) => format!("{} {}", base_cmd, crate::common::tmux::sh_quote(p)),
                 None => base_cmd,
             };
             let _ = std::process::Command::new("tmux")

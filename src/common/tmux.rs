@@ -320,6 +320,24 @@ pub(crate) fn parse_clients(output: &str) -> Vec<ClientInfo> {
         .collect()
 }
 
+/// POSIX single-quote a string so it survives being typed onto a shell command line
+/// (via `send-keys`, or as a session's startup command): wrap in `'…'` and rewrite
+/// each embedded `'` as `'\''`. Todos and prompts are free text — `$(…)`, backticks
+/// and quotes included — so anything interpolated into a command goes through this.
+pub fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Every attached tmux client, with the window each one is currently on.
 ///
 /// **This is the only honest source for a client's position.** `display-message
@@ -638,7 +656,7 @@ pub fn clean_claude_title(title: &str) -> String {
 mod tests {
     use super::{
         clean_claude_title, exact, exact_active_pane, exact_pane, exact_window, parse_clients,
-        pick_client,
+        pick_client, sh_quote,
     };
 
     #[test]
@@ -682,6 +700,21 @@ mod tests {
     fn pick_client_prefers_most_recently_active() {
         let c = parse_clients("/dev/ttys1\ta\t1\t100\t0\n/dev/ttys2\tb\t1\t900\t0\n");
         assert_eq!(pick_client(&c).unwrap().tty, "/dev/ttys2");
+    }
+
+    #[test]
+    fn sh_quote_survives_the_shell() {
+        assert_eq!(sh_quote("task: fix scrolling"), "'task: fix scrolling'");
+        // An apostrophe is broken out and backslash-escaped so the shell rejoins it.
+        assert_eq!(sh_quote("it's a $test"), "'it'\\''s a $test'");
+        assert_eq!(sh_quote(""), "''");
+        // What a shell actually makes of it: `$(…)` and backticks stay literal.
+        let nasty = "it's `id` and $(whoami) \"quoted\"";
+        let out = std::process::Command::new("sh")
+            .args(["-c", &format!("printf %s {}", sh_quote(nasty))])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), nasty);
     }
 
     #[test]

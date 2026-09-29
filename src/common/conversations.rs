@@ -185,6 +185,7 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
                 needs_attention: status.blocks_human(),
                 status,
             });
+            c.status_since_ms = fp.status_updated_at;
             continue;
         }
 
@@ -342,6 +343,97 @@ pub(crate) fn reconcile_with_claude(
         // what we inferred keeps this total without inventing an answer.
         None => inferred.unwrap_or(SessionStatus::Unknown),
     }
+}
+
+// ── Start a task (a todo) as a new conversation ─────────────────────────────
+
+/// What a tmux session name resolves back to: where a new window in it should start,
+/// with which auth env, and which PROJECT owns it (a worktree session names its
+/// parent project).
+pub struct SessionTarget {
+    pub cwd: String,
+    pub env: Vec<(String, String)>,
+    pub project: String,
+}
+
+/// Resolve a tmux session name via the project registry (project session) or the
+/// worktree registry (worktree session, inheriting the parent project's env).
+/// `None` for a session neither registry knows — a plain `00-main` shell, say.
+pub fn resolve_session_target(session: &str) -> Option<SessionTarget> {
+    let projects = ProjectRegistry::load();
+    for (key, config) in &projects.projects {
+        if ProjectRegistry::session_name(key, config) == session {
+            let cwd = crate::common::projects::expand_tilde(&config.project_root)
+                .to_string_lossy()
+                .into_owned();
+            return Some(SessionTarget {
+                cwd,
+                env: config.tmux_env(),
+                project: key.clone(),
+            });
+        }
+    }
+    let wts = WorktreeState::load();
+    let e = wts.worktrees.values().find(|e| e.session_name == session)?;
+    let env = projects
+        .projects
+        .get(&e.project_key)
+        .map(|c| c.tmux_env())
+        .unwrap_or_default();
+    Some(SessionTarget {
+        cwd: e.path.clone(),
+        env,
+        project: e.project_key.clone(),
+    })
+}
+
+/// Start a fresh conversation in `session` with an initial `prompt` (`claude '…'`):
+/// a new window if the session is alive, else the session recreated from the
+/// project / worktree registry. Does NOT switch — the TUI and the web each move a
+/// different client, so that's the caller's half.
+pub fn start_task_in_session(session: &str, prompt: &str) -> Result<String> {
+    let startup = format!("claude {}", crate::common::tmux::sh_quote(prompt));
+    let target = resolve_session_target(session);
+    if let Some(t) = &target {
+        activate_project(&t.project);
+    }
+    let tmux_target = crate::common::tmux::exact(session);
+    let alive = Command::new("tmux")
+        .args(["has-session", "-t", &tmux_target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if alive {
+        let mut cmd = Command::new("tmux");
+        cmd.args(["new-window", "-t", &tmux_target]);
+        if let Some(t) = &target {
+            cmd.args(["-c", &t.cwd]);
+            for (k, v) in &t.env {
+                cmd.arg("-e").arg(format!("{k}={v}"));
+            }
+        }
+        if !cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+            return Err(anyhow!("failed to open a new window in '{session}'"));
+        }
+        let _ = Command::new("tmux")
+            .args([
+                "send-keys",
+                "-t",
+                &crate::common::tmux::exact_active_pane(session),
+                &startup,
+                "Enter",
+            ])
+            .output();
+    } else {
+        let t = target.ok_or_else(|| {
+            anyhow!("session '{session}' isn't alive and matches no known project/worktree")
+        })?;
+        if !ensure_tmux_session(session, &t.cwd, Some(&startup), &t.env) {
+            return Err(anyhow!("failed to create session '{session}'"));
+        }
+    }
+    Ok(format!("Started task in {session} — {startup}"))
 }
 
 // ── Recovery frame ──────────────────────────────────────────────────────────

@@ -144,3 +144,26 @@ end tell
 pub fn collapse_panes() -> bool {
     false
 }
+
+/// Hand keyboard focus back to the terminal of iTerm's front window.
+///
+/// Clicking a row in the Toolbelt sidebar leaves the webview as first responder,
+/// so the tmux client moves but every keystroke — prefix bindings included — still
+/// goes to the panel. `select` on the current session makes that session active
+/// again, which moves first responder off the Toolbelt.
+#[cfg(target_os = "macos")]
+pub fn focus_current_session() -> bool {
+    std::process::Command::new("osascript")
+        .args([
+            "-e",
+            r#"tell application "iTerm2" to tell current session of current window to select"#,
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn focus_current_session() -> bool {
+    false
+}

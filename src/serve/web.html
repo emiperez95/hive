@@ -395,6 +395,21 @@
     background: var(--tertiary-fixed);
   }
   body.sidebar .sb-row.skip { background: var(--surface-container-high); opacity: 0.7; }
+  /* It pinged and nobody has looked yet. Sticky until a tmux client lands on the
+     window — the notification popup is gone in seconds, this is what stays. */
+  body.sidebar .sb-row.unseen { border-left-color: var(--primary); }
+  body.sidebar .sb-ping {
+    flex: none; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--primary);
+    box-shadow: 0 0 0 0 var(--primary);
+    animation: sb-ping 1.6s ease-out infinite;
+  }
+  @keyframes sb-ping {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+  @media (prefers-reduced-motion: reduce) { body.sidebar .sb-ping { animation: none; } }
   body.sidebar .sb-row.frozen { background: var(--surface-container-low); }
 
   body.sidebar .sb-dot {
@@ -529,6 +544,195 @@
     color: var(--on-surface);
   }
 
+  /* --- Notes pane (sidebar only) ---------------------------------------
+     A third band: free-form notes for the conversation you're on. Capped like
+     the stats pane so neither can push the list off screen. */
+  body.sidebar .sb-notes {
+    flex: 0 0 auto;
+    max-height: 35%;
+    display: flex; flex-direction: column;
+    border-top: 1px solid var(--outline-variant);
+    background: var(--surface-container-low);
+    padding: 6px 8px 8px;
+    font-size: 11px;
+  }
+  body.sidebar .sb-notes.collapsed .sb-nt-text { display: none; }
+  body.sidebar .sb-notes:not(.collapsed) .sb-st-caret { transform: rotate(90deg); }
+  body.sidebar .sb-nt-state {
+    margin-left: auto; flex: none;
+    font-weight: 600; text-transform: none; letter-spacing: 0;
+    color: var(--on-surface-variant); opacity: 0.8;
+  }
+  body.sidebar .sb-nt-text {
+    flex: 1 1 auto; min-height: 64px;
+    width: 100%; box-sizing: border-box; resize: none;
+    font: inherit; font-size: 12px; line-height: 1.4;
+    color: var(--on-surface);
+    background: var(--surface-container-lowest);
+    border: 1px solid var(--outline-variant); border-radius: 6px;
+    padding: 6px 7px;
+  }
+  body.sidebar .sb-nt-text:focus { outline: none; border-color: var(--primary); }
+
+  /* --- Todos pane (sidebar only) --- */
+  body.sidebar .sb-todos {
+    flex: 0 0 auto;
+    max-height: 35%;
+    display: flex; flex-direction: column;
+    border-top: 1px solid var(--outline-variant);
+    background: var(--surface-container-low);
+    padding: 6px 8px 8px;
+    font-size: 11px;
+  }
+  body.sidebar .sb-todos.collapsed .sb-td-body { display: none; }
+  body.sidebar .sb-todos:not(.collapsed) > .sb-st-head .sb-st-caret { transform: rotate(90deg); }
+  body.sidebar .sb-td-body { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+  body.sidebar .sb-td-add {
+    flex: none; width: 100%; box-sizing: border-box;
+    font: inherit; font-size: 12px; color: var(--on-surface);
+    background: var(--surface-container-lowest);
+    border: 1px solid var(--outline-variant); border-radius: 6px;
+    padding: 4px 7px; margin-bottom: 4px;
+  }
+  body.sidebar .sb-td-add:focus { outline: none; border-color: var(--primary); }
+  body.sidebar .sb-td-list { overflow-y: auto; min-height: 0; flex: 1 1 auto; }
+  body.sidebar .sb-td-item {
+    display: flex; align-items: flex-start; gap: 6px;
+    padding: 3px 2px; border-radius: 4px;
+    font-size: 12px; line-height: 1.35; color: var(--on-surface);
+  }
+  body.sidebar .sb-td-item:hover { background: var(--surface-container); }
+  body.sidebar .sb-td-check {
+    flex: none; cursor: pointer; font-size: 15px; color: var(--outline);
+    border: 0; background: transparent; padding: 0; line-height: 1;
+  }
+  body.sidebar .sb-td-check:hover { color: var(--primary); }
+  body.sidebar .sb-td-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  body.sidebar .sb-td-del {
+    flex: none; cursor: pointer; font-size: 13px; color: var(--outline);
+    border: 0; background: transparent; padding: 0; opacity: 0; line-height: 1;
+  }
+  body.sidebar .sb-td-item:hover .sb-td-del { opacity: 1; }
+  body.sidebar .sb-td-del:hover { color: var(--error); }
+  body.sidebar .sb-td-item.done .sb-td-text { text-decoration: line-through; color: var(--on-surface-variant); }
+  body.sidebar .sb-td-item.done .sb-td-check { color: var(--primary); }
+  body.sidebar .sb-td-donehead {
+    display: flex; align-items: center; gap: 3px; cursor: pointer; user-select: none;
+    margin-top: 4px; padding: 2px; font-size: 10px; font-weight: 700;
+    color: var(--on-surface-variant); text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  body.sidebar .sb-td-donehead .sb-st-caret { font-size: 13px; }
+  body.sidebar .sb-td-donehead.open .sb-st-caret { transform: rotate(90deg); }
+  body.sidebar .sb-td-empty { color: var(--on-surface-variant); padding: 2px; font-size: 11px; }
+  body.sidebar .sb-st-count {
+    margin-left: auto; flex: none; font-weight: 700; letter-spacing: 0;
+    color: var(--on-surface-variant);
+  }
+
+  body.sidebar .sb-td-go {
+    flex: none; cursor: pointer; font-size: 15px; color: var(--primary);
+    border: 0; background: transparent; padding: 0; opacity: 0.35; line-height: 1;
+  }
+  body.sidebar .sb-td-item:hover .sb-td-go { opacity: 1; }
+
+  /* --- Todo dispatch dialog ---
+     An overlay over the whole panel: at sidebar width there's no room for a
+     popover, and the choice deserves the full column while you make it. */
+  body.sidebar .sb-modal {
+    position: fixed; inset: 0; z-index: 50;
+    background: color-mix(in srgb, var(--on-surface) 28%, transparent);
+    display: flex; align-items: flex-start; justify-content: center;
+    padding: 48px 8px 8px;
+  }
+  body.sidebar .sb-modal[hidden] { display: none; }
+  body.sidebar .sb-dlg {
+    width: 100%; max-width: 360px;
+    background: var(--surface-container-lowest);
+    border-radius: 10px; padding: 10px;
+    box-shadow: 0 8px 28px color-mix(in srgb, var(--on-surface) 25%, transparent);
+    font-size: 12px; color: var(--on-surface);
+  }
+  body.sidebar .sb-dlg-head {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 10px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--on-surface-variant); margin-bottom: 6px;
+  }
+  body.sidebar .sb-dlg-x {
+    margin-left: auto; border: 0; background: transparent; cursor: pointer;
+    color: var(--outline); font-size: 16px; padding: 0;
+  }
+  body.sidebar .sb-dlg-todo {
+    font-size: 13px; line-height: 1.35; font-weight: 600;
+    padding: 6px 8px; margin-bottom: 8px; border-radius: 6px;
+    background: var(--surface-container-low);
+    display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+  body.sidebar .sb-dlg-opt {
+    display: flex; align-items: flex-start; gap: 8px; width: 100%; text-align: left;
+    border: 1px solid var(--outline-variant); border-radius: 8px;
+    background: var(--surface-container-lowest); color: inherit; font: inherit;
+    padding: 7px 8px; margin-bottom: 5px; cursor: pointer;
+  }
+  body.sidebar .sb-dlg-opt:hover:not(:disabled) { border-color: var(--primary); background: var(--surface-container-low); }
+  body.sidebar .sb-dlg-opt.on { border-color: var(--primary); }
+  body.sidebar .sb-dlg-opt:disabled { opacity: 0.5; cursor: default; }
+  body.sidebar .sb-dlg-opt .material-symbols-outlined { font-size: 17px; color: var(--primary); flex: none; }
+  body.sidebar .sb-dlg-opt-body { min-width: 0; flex: 1; }
+  body.sidebar .sb-dlg-opt-t { font-weight: 700; }
+  body.sidebar .sb-dlg-opt-s {
+    font-size: 11px; color: var(--on-surface-variant);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  body.sidebar .sb-dlg-wt { margin: -1px 0 6px; padding: 0 2px; }
+  body.sidebar .sb-dlg-wt[hidden] { display: none; }
+  body.sidebar .sb-dlg-row { display: flex; gap: 5px; align-items: center; }
+  body.sidebar .sb-dlg-branch {
+    flex: 1; min-width: 0; font: inherit; font-size: 12px; font-family: ui-monospace, monospace;
+    color: var(--on-surface); background: var(--surface-container-lowest);
+    border: 1px solid var(--outline-variant); border-radius: 6px; padding: 4px 6px;
+  }
+  body.sidebar .sb-dlg-branch:focus { outline: none; border-color: var(--primary); }
+  body.sidebar .sb-dlg-src { font-size: 10px; color: var(--on-surface-variant); padding: 2px 1px 0; }
+  body.sidebar .sb-dlg-btn {
+    flex: none; border: 0; border-radius: 6px; cursor: pointer; font: inherit;
+    font-size: 11px; font-weight: 700; padding: 5px 10px;
+    background: var(--primary); color: white;
+  }
+  body.sidebar .sb-dlg-btn:disabled { opacity: 0.5; cursor: default; }
+  body.sidebar .sb-dlg-msg { margin-top: 6px; font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+  body.sidebar .sb-dlg-msg.err { color: var(--error); }
+  body.sidebar .sb-dlg-msg:empty { display: none; }
+
+  /* --- Resize grips between the panes ---
+     A drag handle ABOVE each pane: dragging it up grows that pane, and the list
+     (flex: 1) gives up the space. Double-click resets. Hidden when the pane is
+     hidden or collapsed — there's nothing to size. */
+  body.sidebar .sb-grip {
+    flex: none; height: 6px; margin: -3px 0; position: relative; z-index: 2;
+    cursor: row-resize;
+  }
+  body.sidebar .sb-grip::after {
+    content: ''; position: absolute; left: 50%; top: 2px; width: 28px; height: 2px;
+    margin-left: -14px; border-radius: 1px; background: var(--outline-variant);
+    opacity: 0; transition: opacity 0.12s;
+  }
+  body.sidebar .sb-grip:hover::after,
+  body.sidebar .sb-grip.dragging::after { opacity: 1; background: var(--primary); }
+  body.sidebar .sb-grip:has(+ [hidden]),
+  body.sidebar .sb-grip:has(+ .collapsed) { display: none; }
+  body:not(.sidebar) .sb-grip { display: none; }
+  /* A sized pane keeps its height; a collapsed one is always just its header. */
+  body.sidebar .sb-stats.collapsed,
+  body.sidebar .sb-notes.collapsed,
+  body.sidebar .sb-todos.collapsed { height: auto !important; }
+  body.sidebar.sb-resizing { cursor: row-resize; user-select: none; }
+
+  body.sidebar .sb-st-title {
+    font-size: 12px; font-weight: 700; color: var(--on-surface);
+    padding: 0 2px 1px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   body.sidebar .sb-st-where {
     font-size: 10px; color: var(--on-surface-variant);
     padding: 0 2px 6px;
@@ -2192,6 +2396,12 @@
     <!-- Sidebar only: stats for the conversation the tmux client is currently on.
          Hidden outside sidebar mode (the phone dashboard has a detail view). -->
     <div class="sb-stats" id="sbStats" hidden></div>
+    <!-- Sidebar only: a scratchpad for the conversation the client is on. -->
+    <div class="sb-notes" id="sbNotes" hidden></div>
+    <!-- Sidebar only: the SESSION's todos (same lists as `hive todo`). -->
+    <div class="sb-todos" id="sbTodos" hidden></div>
+    <!-- Sidebar only: the todo "start" dialog (see sbOpenDispatch). -->
+    <div class="sb-modal" id="sbDispatch" hidden></div>
     <button class="fab" onclick="openPicker()">
       <span class="material-symbols-outlined">add</span>
     </button>
@@ -2986,7 +3196,10 @@ function sbAge(iso) {
   if (!iso) return '';
   const t = Date.parse(iso);
   if (isNaN(t)) return '';
-  const s = Math.max(0, (Date.now() - t) / 1000);
+  return sbDur(Math.max(0, (Date.now() - t) / 1000));
+}
+
+function sbDur(s) {
   if (s < 60) return 'now';
   if (s < 3600) return Math.floor(s / 60) + 'm';
   if (s < 86400) return Math.floor(s / 3600) + 'h';
@@ -2996,16 +3209,19 @@ function sbAge(iso) {
 // Switch the attached tmux client to a conversation's window. This — not
 // opening the transcript in a 300px column — is what clicking a sidebar row is
 // for: the panel is a way INTO the work, not a place to read it.
-async function sbSwitch(session, windowIndex) {
+async function sbSwitch(session, windowIndex, id) {
   // Optimistic: move the marker now, so the panel feels instant instead of
   // waiting out the next poll.
   currentFocus = { session, window_index: String(windowIndex == null ? '' : windowIndex) };
+  if (id) sbSeen.add(id);
   renderList();
   try {
     await fetch('/api/switch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session, window_index: String(windowIndex == null ? '' : windowIndex) }),
+      // refocus: hand the keyboard back to the terminal — otherwise the webview keeps
+      // it and every tmux binding goes to the panel instead.
+      body: JSON.stringify({ session, window_index: String(windowIndex == null ? '' : windowIndex), refocus: true }),
     });
   } catch (e) { /* the next poll re-syncs the marker */ }
 }
@@ -3042,17 +3258,40 @@ function sbConvRows(s, isSkipped) {
 //
 // The grouped views keep their single-line rows — there the session header above
 // already answers it, and density is the whole point.
+// A working or blocked row shows how long it has HELD that state: its
+// `last_activity` is stamped by every tool call, so for a working row it always
+// reads "now". Idle rows keep last-activity age, which there is when it went idle.
+function sbRowAge(src) {
+  if (!src) return '';
+  const tier = src.attention;
+  if ((tier === 0 || tier === 3) && src.status !== 'Waiting') {
+    return src.state_secs == null ? '' : sbDur(src.state_secs);
+  }
+  return sbAge(src.last_activity);
+}
+
+// Ids clicked since the last poll — clears the ping mark instantly instead of
+// after the server next sees the client land on the window.
+const sbSeen = new Set();
+
 function sbRowHtml(r, flat) {
   const si = statusInfo(r.src);
   const current = sbIsCurrent(r.session, r.windowIndex);
-  const cls = (si.needsAction ? ' need' : '') + (r.isSkipped ? ' skip' : '') + (current ? ' current' : '');
-  const age = sbAge(r.src && r.src.last_activity);
+  const unseen = !!(r.src && r.src.unseen && !current && !sbSeen.has(r.src.session_id));
+  const cls = (si.needsAction ? ' need' : '') + (r.isSkipped ? ' skip' : '') + (current ? ' current' : '')
+    + (unseen ? ' unseen' : '');
+  const age = sbRowAge(r.src);
   // Session names carry spaces, emoji and `[project]` tags — they go in data
   // attributes (quote-escaped), never interpolated into an onclick expression.
-  const attrs = `onclick="sbRowClick(this)"
-      data-session="${escAttr(r.session)}" data-window="${escAttr(r.windowIndex == null ? '' : r.windowIndex)}"`;
+  //
+  // mousedown, not click: the list is rebuilt on every poll, and a click whose
+  // mouseup lands after a rebuild has no element to complete on — it is silently
+  // dropped. That was the "sometimes clicking does nothing".
+  const attrs = `onmousedown="if (event.button === 0) sbRowClick(this)"
+      data-session="${escAttr(r.session)}" data-window="${escAttr(r.windowIndex == null ? '' : r.windowIndex)}"
+      data-id="${escAttr((r.src && r.src.session_id) || '')}"`;
   const dot = `<span class="sb-dot" style="background:${si.dotColor}"></span>`;
-  const meta = `<span class="sb-age">${esc(age)}</span>
+  const meta = `${unseen ? '<span class="sb-ping" title="Pinged — not looked at yet"></span>' : ''}<span class="sb-age">${esc(age)}</span>
     <span class="sb-state" style="color:${si.color}">${sbStateWord(r.src)}</span>`;
 
   if (!flat) {
@@ -3079,7 +3318,7 @@ function sbRowHtml(r, flat) {
 }
 
 function sbRowClick(el) {
-  sbSwitch(el.dataset.session, el.dataset.window === '' ? null : el.dataset.window);
+  sbSwitch(el.dataset.session, el.dataset.window === '' ? null : el.dataset.window, el.dataset.id);
 }
 
 // --- Project / worktree nesting (skipped + frozen) ---
@@ -3490,6 +3729,460 @@ async function sbMaybeFetchStats() {
   sbRenderStats();
 }
 
+// --- Notes pane -------------------------------------------------------------
+//
+// A scratchpad per conversation, following the client like the stats pane does.
+// The textarea is built ONCE and only its value is swapped on a focus change —
+// re-rendering it on the 1.5s poll would drop the caret and whatever you'd typed.
+// Saves are debounced while typing and flushed on blur and before switching away,
+// so moving to another conversation mid-sentence never loses the sentence.
+
+let sbNotesCollapsed = false;
+let sbNotesId = null;        // conversation the textarea currently holds
+let sbNotesDirty = false;
+let sbNotesTimer = null;
+try { sbNotesCollapsed = localStorage.getItem('hiveSbNotes') === '0'; } catch (e) { /* private mode */ }
+
+function sbNotesEls() {
+  const el = document.getElementById('sbNotes');
+  if (!el) return null;
+  if (!el.dataset.built) {
+    el.dataset.built = '1';
+    el.innerHTML = `<div class="sb-st-head" onclick="sbToggleNotes()">
+        <span class="material-symbols-outlined sb-st-caret">chevron_right</span>
+        <span class="sb-st-name">Notes</span>
+        <span class="sb-nt-state" id="sbNotesState"></span>
+      </div>
+      <textarea class="sb-nt-text" id="sbNotesText" spellcheck="false"
+        placeholder="Notes for this conversation…"></textarea>`;
+    const ta = el.querySelector('textarea');
+    ta.addEventListener('input', () => {
+      sbNotesDirty = true;
+      sbNotesSetState('…');
+      clearTimeout(sbNotesTimer);
+      sbNotesTimer = setTimeout(sbNotesSave, 700);
+    });
+    ta.addEventListener('blur', () => sbNotesSave());
+  }
+  return { el, ta: el.querySelector('textarea'), state: el.querySelector('#sbNotesState') };
+}
+
+function sbNotesSetState(t) {
+  const e = sbNotesEls();
+  if (e) e.state.textContent = t;
+}
+
+function sbToggleNotes() {
+  sbNotesCollapsed = !sbNotesCollapsed;
+  try { localStorage.setItem('hiveSbNotes', sbNotesCollapsed ? '0' : '1'); } catch (e) { /* ignore */ }
+  sbRenderNotes();
+}
+
+async function sbNotesSave() {
+  clearTimeout(sbNotesTimer);
+  const e = sbNotesEls();
+  if (!e || !sbNotesDirty || !sbNotesId) return;
+  const id = sbNotesId, notes = e.ta.value;
+  sbNotesDirty = false;
+  try {
+    const r = await (await fetch('/api/conv-notes', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, notes }),
+    })).json();
+    if (id === sbNotesId) sbNotesSetState(r.ok ? 'saved' : 'not saved');
+  } catch (err) {
+    // Keep it dirty so the next edit or blur retries.
+    if (id === sbNotesId) { sbNotesDirty = true; sbNotesSetState('offline'); }
+  }
+}
+
+// Called on every poll; does work only when the focused conversation changes.
+async function sbRenderNotes() {
+  const e = sbNotesEls();
+  if (!e) return;
+  if (!SIDEBAR) { e.el.hidden = true; return; }
+  const conv = sbFocusedConv();
+  e.el.hidden = !conv;
+  e.el.className = 'sb-notes' + (sbNotesCollapsed ? ' collapsed' : '');
+  if (!conv || conv.id === sbNotesId) return;
+
+  // Flush the previous conversation's edits. Not awaited: the save captures its id
+  // and text before its first await, and claiming the new id synchronously is what
+  // stops two quick polls both starting a load.
+  sbNotesSave();
+  sbNotesId = conv.id;
+  e.ta.value = '';
+  e.ta.disabled = true;
+  sbNotesSetState('');
+  try {
+    const d = await (await fetch('/api/conv-notes?id=' + encodeURIComponent(conv.id))).json();
+    if (sbNotesId === conv.id) e.ta.value = d.notes || '';
+  } catch (err) { /* empty is the honest fallback */ }
+  if (sbNotesId === conv.id) e.ta.disabled = false;
+}
+
+// --- Todos pane -------------------------------------------------------------
+//
+// The SESSION's todos — the same `todos.txt` / `todos-done.txt` the `hive todo`
+// CLI, the TUI's project detail and the phone dashboard use, so there is one list,
+// not a sidebar-private one. Follows the client's session, not its conversation:
+// todos are a session-level thing everywhere else in hive.
+//
+// Like the notes pane, the skeleton (and the add input) is built once and only the
+// list is re-rendered, so a refresh never eats what you're typing.
+
+let sbTodosCollapsed = false;
+let sbTodosDoneOpen = false;
+let sbTodosSession = null;
+let sbTodosData = null;         // { todos: [...], done: [...] }
+let sbTodosFetchedAt = 0;
+const SB_TODOS_TTL_MS = 5000;   // picks up `hive todo add` from a terminal
+try {
+  sbTodosCollapsed = localStorage.getItem('hiveSbTodos') === '0';
+  sbTodosDoneOpen = localStorage.getItem('hiveSbTodosDone') === '1';
+} catch (e) { /* private mode */ }
+
+function sbTodosEls() {
+  const el = document.getElementById('sbTodos');
+  if (!el) return null;
+  if (!el.dataset.built) {
+    el.dataset.built = '1';
+    el.innerHTML = `<div class="sb-st-head" onclick="sbToggleTodos()">
+        <span class="material-symbols-outlined sb-st-caret">chevron_right</span>
+        <span class="sb-st-name" id="sbTodosTitle">Todos</span>
+        <span class="sb-st-count" id="sbTodosCount"></span>
+      </div>
+      <div class="sb-td-body">
+        <input class="sb-td-add" id="sbTodosAdd" type="text" placeholder="Add a todo…" spellcheck="false">
+        <div class="sb-td-list" id="sbTodosList"></div>
+      </div>`;
+    el.querySelector('#sbTodosAdd').addEventListener('keydown', ev => {
+      if (ev.key !== 'Enter') return;
+      ev.preventDefault();
+      const text = ev.target.value.trim();
+      if (!text) return;
+      ev.target.value = '';
+      sbTodoAction('add', { text });
+    });
+  }
+  return {
+    el,
+    title: el.querySelector('#sbTodosTitle'),
+    count: el.querySelector('#sbTodosCount'),
+    list: el.querySelector('#sbTodosList'),
+  };
+}
+
+function sbToggleTodos() {
+  sbTodosCollapsed = !sbTodosCollapsed;
+  try { localStorage.setItem('hiveSbTodos', sbTodosCollapsed ? '0' : '1'); } catch (e) { /* ignore */ }
+  sbRenderTodos();
+}
+
+function sbToggleTodosDone() {
+  sbTodosDoneOpen = !sbTodosDoneOpen;
+  try { localStorage.setItem('hiveSbTodosDone', sbTodosDoneOpen ? '1' : '0'); } catch (e) { /* ignore */ }
+  sbRenderTodosList();
+}
+
+async function sbTodoAction(action, extra) {
+  const session = sbTodosSession;
+  if (!session) return;
+  try {
+    const d = await (await fetch('/api/todos', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ session, action }, extra || {})),
+    })).json();
+    if (d.ok && session === sbTodosSession) {
+      sbTodosData = { todos: d.todos || [], done: d.done || [] };
+      sbTodosFetchedAt = Date.now();
+      sbRenderTodosList();
+    }
+  } catch (e) { /* next refresh re-syncs */ }
+}
+
+function sbRenderTodosList() {
+  const e = sbTodosEls();
+  if (!e) return;
+  const d = sbTodosData;
+  e.count.textContent = d && d.todos.length ? String(d.todos.length) : '';
+  if (!d) { e.list.innerHTML = ''; return; }
+  // Indexes go to the server as positions in ITS arrays, so they're taken before
+  // the done list is reversed for display (most recently finished first).
+  let html = d.todos.length
+    ? d.todos.map((t, i) => `<div class="sb-td-item">
+        <button class="sb-td-check material-symbols-outlined" title="Mark done"
+          onclick="sbTodoAction('done', { index: ${i} })">radio_button_unchecked</button>
+        <span class="sb-td-text">${esc(t)}</span>
+        <button class="sb-td-del material-symbols-outlined" title="Delete"
+          onclick="sbTodoAction('delete', { index: ${i} })">close</button>
+        <button class="sb-td-go material-symbols-outlined" title="Start this…"
+          onclick="sbOpenDispatch(${i})">play_circle</button>
+      </div>`).join('')
+    : '<div class="sb-td-empty">Nothing to do</div>';
+  if (d.done.length) {
+    html += `<div class="sb-td-donehead${sbTodosDoneOpen ? ' open' : ''}" onclick="sbToggleTodosDone()">
+        <span class="material-symbols-outlined sb-st-caret">chevron_right</span>Done (${d.done.length})
+      </div>`;
+    if (sbTodosDoneOpen) {
+      html += d.done.map((t, i) => ({ t, i })).reverse().map(({ t, i }) => `<div class="sb-td-item done">
+          <button class="sb-td-check material-symbols-outlined" title="Reopen"
+            onclick="sbTodoAction('reopen', { index: ${i} })">check_circle</button>
+          <span class="sb-td-text">${esc(t)}</span>
+        </div>`).join('');
+    }
+  }
+  if (e.list._html !== html) { e.list._html = html; e.list.innerHTML = html; }
+}
+
+// Called on every poll; fetches on a session change or when the TTL lapses.
+async function sbRenderTodos() {
+  const e = sbTodosEls();
+  if (!e) return;
+  if (!SIDEBAR) { e.el.hidden = true; return; }
+  const session = currentFocus && currentFocus.session;
+  e.el.hidden = !session;
+  e.el.className = 'sb-todos' + (sbTodosCollapsed ? ' collapsed' : '');
+  if (!session) return;
+
+  const changed = session !== sbTodosSession;
+  if (changed) {
+    sbTodosSession = session;
+    sbTodosData = null;
+    const place = sbPlaceOf(session);
+    e.title.textContent = 'Todos · ' + ([place.label, place.branch].filter(Boolean).join(' · ') || session);
+    sbRenderTodosList();
+  }
+  if (!changed && Date.now() - sbTodosFetchedAt < SB_TODOS_TTL_MS) return;
+  sbTodosFetchedAt = Date.now();
+  try {
+    const d = await (await fetch('/api/todos?session=' + encodeURIComponent(session))).json();
+    if (session === sbTodosSession && !d.error) {
+      sbTodosData = { todos: d.todos || [], done: d.done || [] };
+      sbRenderTodosList();
+    }
+  } catch (err) { /* keep what we had */ }
+}
+
+// --- Todo dispatch dialog -----------------------------------------------------
+//
+// Turns a todo into work, three ways (see `serve/dispatch.rs`). The rules that
+// matter live on the server — notably that "send" refuses a conversation waiting on
+// a decision, since the Enter would answer the prompt — the dialog only mirrors
+// them so a disabled option can say why.
+
+let sbDsp = null;   // { session, text, conv, project, job, timer }
+
+function sbOpenDispatch(index) {
+  const text = sbTodosData && sbTodosData.todos[index];
+  const session = sbTodosSession;
+  if (!text || !session) return;
+  const conv = sbFocusedConv();
+  sbDsp = { session, text, conv: conv && conv.session === session ? conv : null, project: undefined };
+  sbRenderDispatch();
+  document.getElementById('sbDispatch').hidden = false;
+  fetch('/api/todo-target?session=' + encodeURIComponent(session))
+    .then(r => r.json())
+    .then(d => { if (sbDsp && sbDsp.session === session) { sbDsp.project = d.project || null; sbRenderDispatch(); } })
+    .catch(() => { if (sbDsp) { sbDsp.project = null; sbRenderDispatch(); } });
+}
+
+function sbCloseDispatch() {
+  if (sbDsp && sbDsp.timer) clearInterval(sbDsp.timer);
+  sbDsp = null;
+  const el = document.getElementById('sbDispatch');
+  el.hidden = true;
+  el.innerHTML = '';
+}
+
+function sbDspMsg(text, err) {
+  const m = document.getElementById('sbDspMsg');
+  if (m) { m.textContent = text || ''; m.className = 'sb-dlg-msg' + (err ? ' err' : ''); }
+}
+
+function sbRenderDispatch() {
+  const el = document.getElementById('sbDispatch');
+  const d = sbDsp;
+  if (!d) return;
+  const place = sbPlaceOf(d.session);
+  const where = [place.label, place.branch].filter(Boolean).join(' · ') || d.session;
+  const blocked = d.conv && statusInfo(d.conv.src).needsAction;
+  const sendWhy = !d.conv ? 'No conversation in this window'
+    : blocked ? 'Waiting on a decision — answer it first' : d.conv.title;
+  const wtWhy = d.project === undefined ? 'Checking…'
+    : d.project === null ? 'This session isn’t a registered project' : 'Project ' + d.project;
+  const running = d.job != null;
+  const opt = (mode, icon, title, sub, disabled) => `<button class="sb-dlg-opt${d.open === mode ? ' on' : ''}"
+      ${disabled || running ? 'disabled' : ''} onclick="sbDspPick('${mode}')">
+      <span class="material-symbols-outlined">${icon}</span>
+      <span class="sb-dlg-opt-body"><div class="sb-dlg-opt-t">${title}</div>
+        <div class="sb-dlg-opt-s">${esc(sub)}</div></span>
+    </button>`;
+  el.innerHTML = `<div class="sb-dlg" onclick="event.stopPropagation()">
+      <div class="sb-dlg-head">Start todo
+        <button class="sb-dlg-x material-symbols-outlined" onclick="sbCloseDispatch()" title="Close">close</button></div>
+      <div class="sb-dlg-todo">${esc(d.text)}</div>
+      ${opt('send', 'send', 'Send to this conversation', sendWhy, !d.conv || blocked)}
+      ${opt('new', 'add_comment', 'New conversation here', where, false)}
+      ${opt('worktree', 'account_tree', 'New worktree', wtWhy, !d.project)}
+      <div class="sb-dlg-wt" id="sbDspWt" ${d.open === 'worktree' ? '' : 'hidden'}>
+        <div class="sb-dlg-row">
+          <input class="sb-dlg-branch" id="sbDspBranch" spellcheck="false" placeholder="branch name"
+            value="${escAttr(d.branch || '')}" ${running ? 'disabled' : ''}>
+          <button class="sb-dlg-btn" id="sbDspCreate" onclick="sbDspCreate()" ${running || d.suggesting ? 'disabled' : ''}>Create</button>
+        </div>
+        <div class="sb-dlg-src">${esc(d.suggesting ? 'Suggesting a name…' : d.source ? sbDspSourceWord(d.source) : '')}</div>
+      </div>
+      <div class="sb-dlg-msg" id="sbDspMsg"></div>
+    </div>`;
+  el.onclick = () => { if (!running) sbCloseDispatch(); };
+  if (d.msg) sbDspMsg(d.msg.text, d.msg.err);
+}
+
+function sbDspSourceWord(src) {
+  return src === 'ticket' ? 'From the ticket key in the todo'
+    : src === 'model' ? 'Suggested by Haiku from your existing branches — edit freely'
+    : 'From the todo’s words (the model didn’t answer)';
+}
+
+async function sbDspPost(body) {
+  return (await fetch('/api/todo-dispatch', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ session: sbDsp.session, text: sbDsp.text }, body)),
+  })).json();
+}
+
+async function sbDspPick(mode) {
+  const d = sbDsp;
+  if (!d) return;
+  if (mode === 'worktree') {
+    d.open = 'worktree';
+    sbRenderDispatch();
+    if (d.branch == null && !d.suggesting) {
+      d.suggesting = true;
+      sbRenderDispatch();
+      try {
+        const r = await (await fetch('/api/todo-branch?session=' + encodeURIComponent(d.session)
+          + '&text=' + encodeURIComponent(d.text))).json();
+        if (sbDsp !== d) return;
+        if (r.error) d.msg = { text: r.error, err: true };
+        else {
+          // Don't clobber a name typed while the model was thinking.
+          const typed = document.getElementById('sbDspBranch');
+          d.branch = typed && typed.value.trim() ? typed.value : r.branch;
+          d.source = typed && typed.value.trim() ? null : r.source;
+        }
+      } catch (e) { if (sbDsp === d) d.msg = { text: 'Couldn’t reach hive', err: true }; }
+      if (sbDsp !== d) return;
+      d.suggesting = false;
+      sbRenderDispatch();
+      const inp = document.getElementById('sbDspBranch');
+      if (inp) { inp.focus(); inp.select(); inp.onkeydown = ev => { if (ev.key === 'Enter') sbDspCreate(); }; }
+    }
+    return;
+  }
+  try {
+    const body = { mode };
+    if (mode === 'send') body.window = d.conv && d.conv.src.pane_id;
+    const r = await sbDspPost(body);
+    if (sbDsp !== d) return;
+    if (r.error) { d.msg = { text: r.error, err: true }; sbRenderDispatch(); return; }
+    sbCloseDispatch();
+  } catch (e) { d.msg = { text: 'Couldn’t reach hive', err: true }; sbRenderDispatch(); }
+}
+
+async function sbDspCreate() {
+  const d = sbDsp;
+  const inp = document.getElementById('sbDspBranch');
+  if (!d || !inp) return;
+  d.branch = inp.value.trim();
+  if (!d.branch) { sbDspMsg('Name the branch first', true); return; }
+  try {
+    const r = await sbDspPost({ mode: 'worktree', branch: d.branch });
+    if (sbDsp !== d) return;
+    if (r.error) { d.msg = { text: r.error, err: true }; sbRenderDispatch(); return; }
+    d.job = r.job;
+    d.msg = { text: 'Creating worktree… project hooks can take a while. You can close this.' };
+    sbRenderDispatch();
+    d.timer = setInterval(async () => {
+      try {
+        const j = await (await fetch('/api/job?id=' + d.job)).json();
+        if (sbDsp !== d || j.state === 'running') return;
+        clearInterval(d.timer);
+        d.timer = null;
+        if (j.state === 'ok') {
+          const el = document.getElementById('sbDspMsg');
+          el.className = 'sb-dlg-msg';
+          el.innerHTML = `${esc(j.message)} <button class="sb-dlg-btn" style="margin-left:6px"
+              onclick="sbSwitch(${escAttr(JSON.stringify(j.session))}, null); sbCloseDispatch()">Go</button>`;
+          d.job = null;
+          d.msg = null;
+        } else {
+          d.job = null;
+          d.msg = { text: j.message, err: true };
+          sbRenderDispatch();
+        }
+      } catch (e) { /* keep polling */ }
+    }, 1000);
+  } catch (e) { d.msg = { text: 'Couldn’t reach hive', err: true }; sbRenderDispatch(); }
+}
+
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && sbDsp && sbDsp.job == null) sbCloseDispatch();
+});
+
+// --- Resizable panes ----------------------------------------------------------
+//
+// A grip sits above each pane; dragging it sets that pane's height in px and the
+// list (flex: 1) absorbs the difference. Heights are remembered per pane. The
+// clamp keeps the list at least SB_LIST_MIN tall — the list is the reason the
+// panel exists, and a pane dragged over it would hide the thing you switch with.
+const SB_LIST_MIN = 80;
+
+function sbInitGrips() {
+  if (!SIDEBAR) return;
+  const list = document.getElementById('sessionList');
+  for (const id of ['sbStats', 'sbNotes', 'sbTodos']) {
+    const pane = document.getElementById(id);
+    if (!pane || pane.previousElementSibling?.classList.contains('sb-grip')) continue;
+    try {
+      const h = parseInt(localStorage.getItem('hiveSbH:' + id), 10);
+      if (h > 0) { pane.style.height = h + 'px'; pane.style.maxHeight = 'none'; }
+    } catch (e) { /* ignore */ }
+    const grip = document.createElement('div');
+    grip.className = 'sb-grip';
+    grip.title = 'Drag to resize · double-click to reset';
+    pane.before(grip);
+    grip.addEventListener('dblclick', () => {
+      pane.style.height = ''; pane.style.maxHeight = '';
+      try { localStorage.removeItem('hiveSbH:' + id); } catch (e) { /* ignore */ }
+    });
+    grip.addEventListener('mousedown', ev => {
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      const startY = ev.clientY;
+      const startH = pane.getBoundingClientRect().height;
+      const maxH = startH + list.getBoundingClientRect().height - SB_LIST_MIN;
+      grip.classList.add('dragging');
+      document.body.classList.add('sb-resizing');
+      const move = e2 => {
+        const h = Math.round(Math.max(28, Math.min(maxH, startH + (startY - e2.clientY))));
+        pane.style.height = h + 'px';
+        pane.style.maxHeight = 'none';
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        grip.classList.remove('dragging');
+        document.body.classList.remove('sb-resizing');
+        try { localStorage.setItem('hiveSbH:' + id, String(parseInt(pane.style.height, 10))); } catch (e) { /* ignore */ }
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  }
+}
+
 // Every row carries a cost cell, empty when that model has no rate — otherwise
 // the priced rows' token column would sit in a different place from the unpriced
 // ones', and a column you can't scan straight down is worse than a blank cell.
@@ -3549,7 +4242,8 @@ function sbRenderStats() {
     el.className = 'sb-stats collapsed';
     el.innerHTML = `<div class="sb-st-head" onclick="sbToggleStats()">
         <span class="material-symbols-outlined sb-st-caret">chevron_right</span>
-        <span class="sb-st-name">No conversation here</span>
+        <span class="sb-st-name">Details</span>
+        <span class="sb-st-count">no conversation here</span>
       </div>`;
     return;
   }
@@ -3562,20 +4256,23 @@ function sbRenderStats() {
     [place.emoji, place.label].filter(Boolean).join(' '),
     place.branch,
   ].filter(Boolean).join(' · ');
+  // The header names the SECTION, like Notes and Todos below it; which
+  // conversation it describes is the first line of the body.
   const head = `<div class="sb-st-head" onclick="sbToggleStats()">
       <span class="material-symbols-outlined sb-st-caret">chevron_right</span>
-      <span class="sb-st-name">${esc(conv.title)}</span>
+      <span class="sb-st-name">Details</span>
     </div>`;
 
   if (sbStatsCollapsed) { el.innerHTML = head; return; }
+  const title = `<div class="sb-st-title">${esc(conv.title)}</div>`;
 
   const d = sbStats;
   if (!d || d.id !== conv.id) {
-    el.innerHTML = head + `<div class="sb-st-note">Reading transcript…</div>`;
+    el.innerHTML = head + title + `<div class="sb-st-note">Reading transcript…</div>`;
     return;
   }
   if (d.error) {
-    el.innerHTML = head + `<div class="sb-st-note">${esc(d.error)}</div>`;
+    el.innerHTML = head + title + `<div class="sb-st-note">${esc(d.error)}</div>`;
     return;
   }
 
@@ -3598,7 +4295,7 @@ function sbRenderStats() {
          — add <code>[pricing]</code> to <code>~/.hive/config.toml</code> for cost.</div>`
     : '';
 
-  el.innerHTML = head +
+  el.innerHTML = head + title +
     (where ? `<div class="sb-st-where">${esc(where)}</div>` : '') +
     (rows || '<div class="sb-st-note">No usage recorded yet.</div>') +
     (rows ? total : '') + unpriced +
@@ -3671,9 +4368,13 @@ function sbSwapList(el, html) {
     el.addEventListener('mouseenter', () => { sbHover = true; });
     el.addEventListener('mouseleave', () => { sbHover = false; });
   }
-  if (el.innerHTML === html) return;
+  // Compare against what we last WROTE, not `el.innerHTML`: the browser re-serializes
+  // markup (entities, attribute quoting), so that comparison never matched and the
+  // list was torn down on every poll whether or not anything changed.
+  if (el._sbHtml === html) return;
   if (sbHover && sbView === 'attention') return;
   const top = el.scrollTop;
+  el._sbHtml = html;
   el.innerHTML = html;
   el.scrollTop = top;
 }
@@ -4190,6 +4891,12 @@ async function fetchSessions() {
 
     sessions = JSON.parse(json);
     frozenList = JSON.parse(frJson);
+    // Forget a local "seen" once the server agrees, so the same window can ping again.
+    if (sbSeen.size) {
+      const stillMarked = new Set(sessions.flatMap(s => (s.windows || [])
+        .filter(w => w.unseen).map(w => w.session_id)));
+      for (const id of [...sbSeen]) if (!stillMarked.has(id)) sbSeen.delete(id);
+    }
     // Only after a parse that actually yielded data — a reachable server returning
     // garbage is not "connected", and marking it so would suppress the banner forever.
     markOnline();
@@ -4210,7 +4917,7 @@ async function fetchSessions() {
     // Stats for the focused conversation, on its own slower cadence (see
     // SB_STATS_TTL_MS) — not awaited, so a large transcript can never stall the
     // session poll.
-    if (SIDEBAR) sbMaybeFetchStats();
+    if (SIDEBAR) { sbInitGrips(); sbMaybeFetchStats(); sbRenderNotes(); sbRenderTodos(); }
 
     // In detail view, only update badges (not chat — that has its own poll)
     if (selectedSession) {

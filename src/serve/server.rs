@@ -267,6 +267,8 @@ fn conv_to_window_view(c: &Conversation, is_auto_approve: bool) -> WindowView {
         unreviewed_work: false,
         state_secs: None,
         attention_rank: None,
+        unseen: false,
+        status_since_ms: c.status_since_ms,
     }
 }
 
@@ -354,7 +356,18 @@ impl StateAges {
     /// before hive started watching, and claiming 0 would be a lie. A transition
     /// observed while running returns `Some(0)` and climbs from there, which is the
     /// real thing.
-    pub(crate) fn observe(&mut self, id: &str, kind: u8, now: Instant) -> Option<u32> {
+    ///
+    /// `seed` is how long *Claude* says it has held its status (from its own
+    /// `statusUpdatedAt`). It only matters on a first sighting, where it replaces
+    /// the `None`: that is what makes a conversation already working when the
+    /// server started read as "working 40m" instead of nothing.
+    pub(crate) fn observe(
+        &mut self,
+        id: &str,
+        kind: u8,
+        now: Instant,
+        seed: Option<u32>,
+    ) -> Option<u32> {
         match self.seen.get_mut(id) {
             Some((prev, since)) if *prev == kind => {
                 Some(now.saturating_duration_since(*since).as_secs() as u32)
@@ -364,8 +377,11 @@ impl StateAges {
                 Some(0)
             }
             None => {
-                self.seen.insert(id.to_string(), (kind, now));
-                None
+                let since =
+                    seed.and_then(|s| now.checked_sub(std::time::Duration::from_secs(s.into())));
+                self.seen
+                    .insert(id.to_string(), (kind, since.unwrap_or(now)));
+                since.map(|_| seed.unwrap_or(0))
             }
         }
     }
@@ -391,6 +407,9 @@ pub(crate) fn annotate_attention(
     unreviewed: &mut dyn FnMut(&str) -> bool,
     now: Instant,
 ) {
+    // Wall clock, only to turn Claude's epoch `statusUpdatedAt` into a held-for
+    // seed. A window without one (every test fixture) never reads it.
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut live: HashSet<String> = HashSet::new();
     for view in views.iter_mut() {
         // Skipped sessions are deliberately set aside; they are not switch targets
@@ -406,13 +425,91 @@ pub(crate) fn annotate_attention(
                     .is_some_and(|cwd| !cwd.is_empty() && unreviewed(cwd));
             w.attention = tier_for(w.status.as_ref(), w.unreviewed_work) as u8;
             if let Some(id) = &w.session_id {
-                w.state_secs = ages.observe(id, status_kind(w.status.as_ref()), now);
+                let seed = w
+                    .status_since_ms
+                    .and_then(|ms| u32::try_from((now_ms - ms) / 1000).ok());
+                w.state_secs = ages.observe(id, status_kind(w.status.as_ref()), now, seed);
                 live.insert(id.clone());
             }
         }
     }
     ages.gc(&live);
     rank_attention(views);
+}
+
+/// Which windows pinged and haven't been looked at since.
+///
+/// A "ping" is the moment the hook notifier fires for: a turn ending (working →
+/// idle) or a conversation starting to wait on a decision. The notification itself
+/// vanishes in seconds, so without this nothing says which window it was about —
+/// the sidebar keeps the mark until a tmux client actually lands on the window.
+///
+/// In memory, like `StateAges`: after a server restart nothing is marked, which is
+/// the right failure — a mark that can't be cleared is worse than a missing one.
+#[derive(Default)]
+pub(crate) struct UnseenPings {
+    last: HashMap<String, Phase>,
+    unseen: HashSet<String>,
+}
+
+/// The coarse state a ping is a transition between. Payload-free for the same
+/// reason as `status_kind`: a permission prompt whose tool changes is not a new ping.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    Busy,
+    Blocked,
+    Idle,
+    Other,
+}
+
+fn phase_of(s: Option<&SessionStatus>) -> Phase {
+    match s {
+        Some(s) if s.blocks_human() => Phase::Blocked,
+        Some(SessionStatus::Working | SessionStatus::RunningWorkflow { .. }) => Phase::Busy,
+        None | Some(SessionStatus::Waiting) => Phase::Idle,
+        _ => Phase::Other,
+    }
+}
+
+/// Mark / clear `unseen` on every live window. `focused` holds the
+/// `(session, window_index)` each attached client is on right now.
+///
+/// A transition is only a ping when nobody is looking: finishing a turn in the
+/// window you're typing in is not news. Going back to busy clears the mark too —
+/// someone answered it, from here or from the phone.
+pub(crate) fn mark_pings(
+    views: &mut [SessionView],
+    pings: &mut UnseenPings,
+    focused: &HashSet<(String, String)>,
+) {
+    let mut live: HashSet<String> = HashSet::new();
+    for view in views.iter_mut() {
+        for w in view.windows.iter_mut() {
+            let Some(id) = w.session_id.clone() else {
+                continue;
+            };
+            let now = phase_of(w.status.as_ref());
+            let was = pings.last.insert(id.clone(), now);
+            let pinged = matches!(
+                (was, now),
+                (Some(Phase::Busy), Phase::Idle)
+                    | (
+                        Some(Phase::Busy | Phase::Idle | Phase::Other),
+                        Phase::Blocked
+                    )
+            );
+            if now == Phase::Busy || focused.contains(&(view.name.clone(), w.window_index.clone()))
+            {
+                pings.unseen.remove(&id);
+            } else if pinged {
+                pings.unseen.insert(id.clone());
+            }
+            w.unseen = pings.unseen.contains(&id);
+            live.insert(id);
+        }
+    }
+    pings.last.retain(|id, _| live.contains(id));
+    pings.unseen.retain(|id| live.contains(id));
 }
 
 /// Assign each rankable window its position in the attention order.
@@ -441,11 +538,12 @@ fn rank_attention(views: &mut [SessionView]) {
 /// Every component is load-bearing:
 ///
 /// - **tier** first — see [`AttentionTier`].
-/// - **within a tier**, blocked and working sort *longest-held first*: a two-hour
-///   wait outranks a ten-second one, and a long-running job is likelier wedged.
-///   Ready-for-review and idle sort *freshest first*, because there the question is
-///   "what did I just finish", not "what is stuck". `state_secs` is absent for a
-///   conversation hive hasn't watched change, and sorts last rather than as zero.
+/// - **within a tier**, *oldest first*, in every tier: a two-hour wait outranks a
+///   ten-second one, a long-running job is likelier wedged, and the conversation
+///   that finished an hour ago has waited on you longest. Blocked and working
+///   measure it by `state_secs` (absent for a conversation hive hasn't watched
+///   change — it sorts last rather than as zero); ready and idle by
+///   `last_activity`, which for an idle window IS when it went idle.
 /// - **session then window** last, so the order is TOTAL. A merely "mostly sorted"
 ///   comparator reshuffles ties between 1.5s polls, and a row that moves under the
 ///   pointer is a row you mis-click.
@@ -454,16 +552,17 @@ type AttentionKey = (u8, std::cmp::Reverse<i64>, String, String);
 fn attention_key(session: &str, w: &crate::serve::web_types::WindowView) -> AttentionKey {
     let busyish =
         w.attention == AttentionTier::Blocked as u8 || w.attention == AttentionTier::Working as u8;
-    // One numeric axis for both rules, so the key type stays uniform: held-time for
-    // blocked/working, recency for ready/idle. Both are "bigger sorts first", hence
-    // the single `Reverse`. A missing value becomes the smallest, i.e. last.
+    // One numeric axis for both measures, so the key type stays uniform: held-time
+    // for blocked/working, age of the last activity for ready/idle (negated, so an
+    // older timestamp is bigger). Both are "bigger sorts first", hence the single
+    // `Reverse`. A missing value becomes the smallest, i.e. last.
     let axis: i64 = if busyish {
         w.state_secs.map(i64::from).unwrap_or(-1)
     } else {
         w.last_activity
             .as_deref()
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .map(|t| t.timestamp())
+            .map(|t| -t.timestamp())
             .unwrap_or(i64::MIN)
     };
     (
@@ -569,6 +668,8 @@ mod tests {
             unreviewed_work: false,
             state_secs: None,
             attention_rank: None,
+            unseen: false,
+            status_since_ms: None,
         }
     }
 
@@ -673,22 +774,34 @@ mod tests {
         let mut ages = StateAges::default();
         let t0 = Instant::now();
         assert_eq!(
-            ages.observe("a", 5, t0),
+            ages.observe("a", 5, t0, None),
             None,
             "it may have been blocked for an hour before hive started watching"
         );
-        assert_eq!(ages.observe("a", 5, t0 + Duration::from_secs(30)), Some(30));
+        assert_eq!(
+            ages.observe("a", 5, t0 + Duration::from_secs(30), None),
+            Some(30)
+        );
     }
 
     #[test]
     fn state_ages_reset_only_when_the_kind_changes() {
         let mut ages = StateAges::default();
         let t0 = Instant::now();
-        ages.observe("a", 5, t0);
-        assert_eq!(ages.observe("a", 5, t0 + Duration::from_secs(10)), Some(10));
+        ages.observe("a", 5, t0, None);
+        assert_eq!(
+            ages.observe("a", 5, t0 + Duration::from_secs(10), None),
+            Some(10)
+        );
         // Kind changed: observed live, so zero is the truth here.
-        assert_eq!(ages.observe("a", 2, t0 + Duration::from_secs(11)), Some(0));
-        assert_eq!(ages.observe("a", 2, t0 + Duration::from_secs(20)), Some(9));
+        assert_eq!(
+            ages.observe("a", 2, t0 + Duration::from_secs(11), None),
+            Some(0)
+        );
+        assert_eq!(
+            ages.observe("a", 2, t0 + Duration::from_secs(20), None),
+            Some(9)
+        );
     }
 
     #[test]
@@ -707,9 +820,14 @@ mod tests {
 
         let mut ages = StateAges::default();
         let t0 = Instant::now();
-        ages.observe("a", status_kind(Some(&a)), t0);
+        ages.observe("a", status_kind(Some(&a)), t0, None);
         assert_eq!(
-            ages.observe("a", status_kind(Some(&b)), t0 + Duration::from_secs(60)),
+            ages.observe(
+                "a",
+                status_kind(Some(&b)),
+                t0 + Duration::from_secs(60),
+                None
+            ),
             Some(60)
         );
     }
@@ -718,15 +836,15 @@ mod tests {
     fn state_ages_gc_drops_conversations_that_ended() {
         let mut ages = StateAges::default();
         let t0 = Instant::now();
-        ages.observe("gone", 1, t0);
-        ages.observe("here", 1, t0);
+        ages.observe("gone", 1, t0, None);
+        ages.observe("here", 1, t0, None);
         ages.gc(&HashSet::from(["here".to_string()]));
         assert_eq!(
-            ages.observe("here", 1, t0 + Duration::from_secs(5)),
+            ages.observe("here", 1, t0 + Duration::from_secs(5), None),
             Some(5)
         );
         assert_eq!(
-            ages.observe("gone", 1, t0 + Duration::from_secs(5)),
+            ages.observe("gone", 1, t0 + Duration::from_secs(5), None),
             None,
             "a pruned id is a first sighting again"
         );
@@ -891,5 +1009,94 @@ mod tests {
         );
         assert_eq!(asked, 0, "`git -C ''` is never worth spawning");
         assert_eq!(views[0].windows[0].attention, AttentionTier::Idle as u8);
+    }
+
+    #[test]
+    fn idle_sorts_oldest_first_within_its_tier() {
+        let mut old = win("old", Some(SessionStatus::Waiting), "");
+        old.last_activity = Some("2026-09-28T09:00:00+00:00".into());
+        let mut new = win("new", Some(SessionStatus::Waiting), "");
+        new.last_activity = Some("2026-09-28T10:00:00+00:00".into());
+        let mut views = vec![
+            session("a", false, vec![new]),
+            session("b", false, vec![old]),
+        ];
+        let mut ages = StateAges::default();
+        annotate_attention(&mut views, &mut ages, &mut |_| false, Instant::now());
+        assert_eq!(
+            views[1].windows[0].attention_rank,
+            Some(0),
+            "the older idle ranks first"
+        );
+        assert_eq!(views[0].windows[0].attention_rank, Some(1));
+    }
+
+    #[test]
+    fn claude_timestamp_seeds_a_first_sighting() {
+        let mut ages = StateAges::default();
+        let t0 = Instant::now() + Duration::from_secs(10_000);
+        // Claude says it has been busy 40 minutes: that, not `None`, is the answer.
+        assert_eq!(ages.observe("a", 2, t0, Some(2400)), Some(2400));
+        assert_eq!(
+            ages.observe("a", 2, t0 + Duration::from_secs(5), None),
+            Some(2405)
+        );
+        // Only the first sighting takes a seed; a transition we watched restarts at 0.
+        assert_eq!(
+            ages.observe("a", 1, t0 + Duration::from_secs(6), Some(9999)),
+            Some(0)
+        );
+    }
+
+    fn ping_step(
+        views_status: Option<SessionStatus>,
+        pings: &mut UnseenPings,
+        focused: bool,
+    ) -> bool {
+        let mut views = vec![session("s", false, vec![win("c", views_status, "")])];
+        let f: HashSet<(String, String)> = if focused {
+            [("s".to_string(), "1".to_string())].into()
+        } else {
+            HashSet::new()
+        };
+        mark_pings(&mut views, pings, &f);
+        views[0].windows[0].unseen
+    }
+
+    #[test]
+    fn a_finished_turn_pings_and_stays_until_looked_at() {
+        let mut p = UnseenPings::default();
+        assert!(!ping_step(Some(SessionStatus::Working), &mut p, false));
+        assert!(ping_step(Some(SessionStatus::Waiting), &mut p, false));
+        assert!(
+            ping_step(Some(SessionStatus::Waiting), &mut p, false),
+            "sticky"
+        );
+        assert!(
+            !ping_step(Some(SessionStatus::Waiting), &mut p, true),
+            "landing clears it"
+        );
+        assert!(
+            !ping_step(Some(SessionStatus::Waiting), &mut p, false),
+            "and it stays cleared"
+        );
+    }
+
+    #[test]
+    fn blocking_pings_but_first_sighting_and_focused_windows_do_not() {
+        let mut p = UnseenPings::default();
+        // Already idle when first seen: nothing happened while we watched.
+        assert!(!ping_step(Some(SessionStatus::Waiting), &mut p, false));
+        let ask = || {
+            Some(SessionStatus::NeedsPermission {
+                tool_name: "Bash".into(),
+                description: None,
+            })
+        };
+        assert!(ping_step(ask(), &mut p, false));
+        // Back to work (answered from elsewhere) clears it.
+        assert!(!ping_step(Some(SessionStatus::Working), &mut p, false));
+        // A turn ending in the window you're on is not news.
+        assert!(!ping_step(Some(SessionStatus::Waiting), &mut p, true));
     }
 }

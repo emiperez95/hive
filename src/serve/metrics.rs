@@ -557,6 +557,7 @@ mod tests {
             mem_kb: 0,
             ports: Vec::new(),
             pids: Vec::new(),
+            status_since_ms: None,
         }
     }
 

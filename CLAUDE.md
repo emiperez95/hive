@@ -178,6 +178,7 @@ src/
 ├── serve/                  web dashboard — projects the ConversationRegistry (conversation model)
 │   ├── mod.rs              module registration (metrics, server, web, web_types)
 │   ├── server.rs           gather_active_views()/build_conversation_views() — project the registry
+│   ├── dispatch.rs         todo → work: branch naming (ticket / Haiku / slug), worktree jobs
 │   ├── metrics.rs          Prometheus text exposition for GET /metrics (scraped by OTel)
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
@@ -985,7 +986,8 @@ into explicitly.
 | POST | `/api/tts-hls` | Create HLS TTS session, waits for first segment: `{"text": "...", ...}` |
 | POST | `/api/tts-cancel` | Cancel TTS generation: `{"session_id": "..."}` |
 | POST | `/api/toggle-flag` | Toggle favorite/auto_approve/skip: `{"session": "...", "flag": "..."}` |
-| POST | `/api/todos` | Manage todos: `{"session": "...", "action": "add|done|delete", ...}` |
+| GET | `/api/todos?session=X` | Active + done todos for one session (`{todos, done}`) |
+| POST | `/api/todos` | Manage todos: `{"session": "...", "action": "add|done|delete|reopen", ...}` — `reopen` indexes the DONE list; replies with both lists |
 | POST | `/api/connect` | Create/attach session: `{"session_name": "..."}` |
 | POST | `/api/kill-session` | Kill tmux session (with frontend confirmation): `{"session": "..."}` |
 | GET | `/api/frozen` | List frozen Claude windows (key, session_name, window_label, note, relative) |
@@ -993,6 +995,12 @@ into explicitly.
 | POST | `/api/thaw` | Thaw a frozen window by key: `{"key": "..."}` |
 | POST | `/api/discard-frozen` | Discard a frozen window (no restore): `{"key": "..."}` |
 | GET | `/api/ambient` | Sidebar ambient state: the attached client's session/window, `global_mute`, `muted_projects` |
+| GET | `/api/conv-notes?id=X` | The sidebar Notes pane's scratchpad for one conversation |
+| POST | `/api/conv-notes` | Save it: `{"id","notes"}` — refused for an id with no transcript |
+| GET | `/api/todo-target?session=X` | The project a session belongs to (`null` ⇒ no worktree option) |
+| GET | `/api/todo-branch?session=X&text=Y` | Suggested branch for a todo + its `source` (ticket / model / slug). Answers from its own thread |
+| POST | `/api/todo-dispatch` | `{session, text, mode: send\|new\|worktree, window?, branch?}` |
+| GET | `/api/job?id=N` | A worktree dispatch's progress: `running` / `ok` (+ session) / `error` |
 | GET | `/api/conv-stats?id=X` | Token spend for ONE conversation (per model, main vs subagent) + cost when priced |
 | POST | `/api/switch` | Move the attached tmux client: `{"session","window_index"}` |
 | POST | `/api/toggle-mute` | Toggle global mute (`muted-global`) |
@@ -1176,7 +1184,9 @@ or ranked — the same rule `cycle-free` follows.
 > `NeedsPermission` whose tool name changes is one unbroken wait, and resetting
 > its timer would keep it looking perpetually fresh. First sighting yields
 > `None`, never zero, so a conversation blocked before the server started cannot
-> claim to be new. It is a sort key and is deliberately **not displayed**.
+> claim to be new — unless Claude's own `statusUpdatedAt` says how long it has held
+> it, which seeds the first sighting. It is the **age shown on working and blocked
+> rows**: their `last_activity` is stamped by every tool call and so always read "now".
 
 > **Gotcha — unpushed commits on the mainline are not unreviewed work.** This
 > repo's own `main` sits 14 ahead and always will. Counting that as
@@ -1193,10 +1203,23 @@ across it. `attention_key` is also a **total** order (tier, then age, then sessi
 and window index): a merely "mostly sorted" comparator reshuffles ties on every
 poll. Measured 20 samples over 20s with zero reorders.
 
-Within a tier the age rule differs by tier and is deliberate: **blocked and working
-sort longest-held first** (a two-hour wait outranks a ten-second one, and a
-long-running job is likelier wedged), **ready-for-review and idle sort freshest
-first** (there the question is "what did I just finish", not "what is stuck").
+Within a tier, **oldest first, in every tier**: blocked and working by how long
+they've held that state (a two-hour wait outranks a ten-second one, a long job is
+likelier wedged), ready and idle by last activity (the one that finished an hour ago
+has waited on you longest).
+
+**Pings stay visible until looked at** (`server::mark_pings`). A turn ending
+(busy → idle) or a conversation starting to wait on a decision marks the row with a
+pulsing dot, sticky until a tmux client *lands* on that window — clicking the row,
+`Ctrl+g`, or getting there any other way. Going back to busy clears it (answered
+from the phone). A transition in the window you're already on never marks, and a
+first sighting never does either. In memory in the data thread, like `StateAges`.
+
+**Clicking a row fires on `mousedown`**, not `click`: the list is rebuilt on each
+poll, and a click whose mouseup lands after a rebuild is silently dropped. The
+switch also sends `refocus: true`, which runs `iterm::focus_current_session` so the
+keyboard goes back to the terminal — otherwise the Toolbelt webview keeps it and
+every tmux binding goes to the panel.
 
 **An ungrouped row is TWO lines**, and the second one is the project and worktree
 (`sb-place`). Once the ordering stops being by project, "where is this" is the first
@@ -1285,6 +1308,70 @@ the resolved git dir so the hit path costs two stats and no subprocess; a linked
 worktree's `.git` is a file, and `--absolute-git-dir` is what points at the real
 per-worktree `index`. That cache is what would make a fleet-wide consumer — an
 attention-ordered cycle key over every live conversation — affordable.
+
+### The notes pane — a scratchpad per conversation
+
+A third band under the stats pane (`#sbNotes`): a textarea holding free-form notes
+for whichever conversation the client is on. Stored as `notes` in that
+conversation's overlay in `conversations.json` — **not** the existing `note`, which
+is a one-line label rendered inline on TUI rows, frozen cards and search, where a
+newline would break the row. Writes go through `ConversationSidecar::edit`
+(load-modify-save, the same helper the TUI's `edit_overlay` now uses), so they merge
+with a pin or cached parent written in between.
+
+The textarea is built **once** and only its value swaps on a focus change —
+re-rendering on the 1.5s poll would drop the caret mid-sentence. Saves debounce at
+700ms while typing and flush on blur and before switching conversations.
+
+### The todos pane, and resizing the panes
+
+A fourth band (`#sbTodos`): the **session's** todos — the same `todos.txt` /
+`todos-done.txt` as `hive todo`, the TUI project detail and the phone dashboard, so
+there is one list, not a sidebar-private one. It follows the client's *session*
+(todos are session-level everywhere in hive), not its conversation. Add with Enter,
+the circle marks done, `×` deletes, and a folded `Done (n)` tail lists finished items
+newest-first — clicking one reopens it. Refetched on a session change and every 5s,
+so a `hive todo add` from a terminal shows up. Same build-once rule as notes: only
+the list re-renders, never the add input.
+
+**Starting a todo** (the ▶ on each row) opens a dialog with three ways to turn it
+into work (`serve/dispatch.rs`):
+
+- **Send to this conversation** — typed + submitted into the focused conversation.
+  Refused *server-side* while that conversation `blocks_human()`: the Enter would
+  answer the open permission / plan / question prompt with its default.
+- **New conversation here** — `common::conversations::start_task_in_session` (the
+  TUI's todo → task, moved to `common` minus its switch), then the picked client is
+  switched to the new window.
+- **New worktree** — a branch name is *suggested*, never imposed: a ticket key in the
+  text wins; else Haiku names it after the project's 8 newest worktree branches; else
+  a slug. The field stays editable. Creation runs `run_wt_new` in a background job
+  (hooks can take minutes) that the dialog polls. The prompt rides on the project's
+  startup command only when that command runs `claude`; otherwise the session starts
+  as usual and the conversation gets its own window.
+
+**Starting a todo never completes it** — starting the work isn't finishing it, so
+the todo stays active until it's ticked off by hand.
+
+> **Gotcha — the naming call must not look like a conversation.** It runs
+> `claude -p --model haiku --setting-sources project --no-session-persistence --tools ''`
+> from the empty `~/.hive/cache/branch-namer/`. `--setting-sources project` in an
+> empty dir loads **no user settings**, so none of the user's hooks fire — hive's own
+> included, which would otherwise record it and ping when it stops. `--bare` would be
+> the obvious flag but requires an API key (it skips keychain/OAuth). The prompt goes
+> on **stdin**: `--tools` is variadic and swallows a trailing positional prompt.
+> ~6–8s; it answers from a spawned thread because the request loop is serial.
+
+> **Gotcha — `{:?}` is not shell quoting.** `run_wt_new` used to append the prompt as
+> `format!("{} {:?}", cmd, prompt)`: Rust debug quoting is *double* quotes, inside
+> which the shell still expands `$(…)` and backticks. Everything interpolated into a
+> command now goes through `tmux::sh_quote` (single quotes), whose test runs the
+> output through a real `sh`.
+
+Each pane has a **drag grip above it** (`sbInitGrips`): drag up to grow the pane,
+the list (`flex: 1`) gives up the space, clamped so the list keeps ≥80px.
+Heights persist per pane in `localStorage` (`hiveSbH:<id>`); double-click resets.
+Grips hide via `:has(+ [hidden])` / `:has(+ .collapsed)` — nothing to size there.
 
 ### Clicking a row switches the tmux client
 

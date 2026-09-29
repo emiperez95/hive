@@ -10,6 +10,7 @@ use crate::common::persistence::{
     save_favorite_sessions, save_session_todos, save_skipped_sessions,
 };
 use crate::common::projects::{connect_project, ProjectRegistry};
+use crate::common::tmux::sh_quote;
 use crate::common::tmux::{get_current_tmux_session_names, kill_tmux_session, send_text_to_pane};
 use crate::serve::server::{build_conversation_views, gather_active_views};
 use crate::serve::web_types::{ConversationMessage, ConversationView, SessionView};
@@ -31,22 +32,6 @@ use tiny_http::{Header, Method, Response, Server};
 fn web_server_listening(port: u16) -> bool {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
-}
-
-/// Wrap a string in single quotes for safe interpolation into the shell command
-/// tmux runs for a new session.
-fn sh_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// Ensure a web server is running, if `[web].autostart` is set — called ONCE at
@@ -172,6 +157,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         // one long-running observer, because nothing on disk records a status
         // transition — see `StateAges`.
         let mut ages = crate::serve::server::StateAges::default();
+        // Which windows pinged and nobody has looked at yet. Same observer, same
+        // reason: it needs to see transitions, and this is the thread that does.
+        let mut pings = crate::serve::server::UnseenPings::default();
 
         loop {
             // Gather the conversation registry ONCE, then project it into the Active view
@@ -190,6 +178,15 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 },
                 std::time::Instant::now(),
             );
+            // Where every person-driven client is right now: landing on a window is
+            // what "looked at it" means, however you got there.
+            let focused: std::collections::HashSet<(String, String)> =
+                crate::common::tmux::list_clients()
+                    .into_iter()
+                    .filter(|c| !c.control)
+                    .map(|c| (c.session, c.window_index))
+                    .collect();
+            crate::serve::server::mark_pings(&mut active, &mut pings, &focused);
             let conversations = build_conversation_views(&reg);
             // Taken from the FULL registry, not `conversations` — that view drops archived
             // entries, which the backlog counts must still see.
@@ -214,6 +211,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             std::thread::sleep(Duration::from_secs(1));
         }
     });
+
+    // Worktree dispatches from the sidebar's todo dialog — see `serve::dispatch`.
+    let jobs: Arc<crate::serve::dispatch::Jobs> = Arc::default();
 
     // Handle HTTP requests (blocking)
     for mut request in server.incoming_requests() {
@@ -640,6 +640,46 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             // re-read every tick. `usage_for_transcript` folds in only the bytes
             // appended since it last looked, so the warm path is a stat plus an 8KB
             // fingerprint read.
+            // The Notes pane: a free-form scratchpad per conversation, kept in the
+            // same overlay (`conversations.json`) as pin / note / archive.
+            (Method::Get, url) if path == "/api/conv-notes" => {
+                let json = match query_param(url, "id") {
+                    Some(id) => {
+                        let notes = crate::common::registry::ConversationSidecar::load()
+                            .conversations
+                            .get(&id)
+                            .map(|o| o.notes.clone())
+                            .unwrap_or_default();
+                        serde_json::json!({ "id": id, "notes": notes }).to_string()
+                    }
+                    None => r#"{"error":"missing id"}"#.to_string(),
+                };
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Post, "/api/conv-notes") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let id = req.get("id")?.as_str()?;
+                    let notes = req.get("notes")?.as_str()?;
+                    // Only for a conversation that exists: the id is a key into a file
+                    // every surface loads, and a LAN-reachable endpoint shouldn't be
+                    // able to fill it with arbitrary records.
+                    crate::common::jsonl::find_jsonl_by_session_id_anywhere(id)?;
+                    let text = notes.trim_end().to_string();
+                    let ok =
+                        crate::common::registry::ConversationSidecar::edit(id, |o| o.notes = text)
+                            .is_ok();
+                    Some(format!(r#"{{"ok":{ok}}}"#))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
             (Method::Get, url) if path == "/api/conv-stats" => {
                 let json = match query_param(url, "id") {
                     Some(id) => {
@@ -717,6 +757,17 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     let tty = client.tty.clone();
                     let ok =
                         crate::common::tmux::switch_client_to(&tty, session, window.as_deref());
+                    // The click left keyboard focus in the sidebar's webview; give it
+                    // back to the terminal so tmux bindings keep working. Off-thread:
+                    // osascript costs ~100ms and the response shouldn't wait on it.
+                    if ok
+                        && req
+                            .get("refocus")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    {
+                        std::thread::spawn(crate::common::iterm::focus_current_session);
+                    }
                     Some(format!(
                         r#"{{"ok":{},"client":{}}}"#,
                         ok,
@@ -849,6 +900,153 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            // ── Todo dispatch (the sidebar's "start" dialog) — see `serve::dispatch`.
+            //
+            // What the dialog needs to decide which options to offer: the project
+            // the session belongs to (none ⇒ no worktree option).
+            (Method::Get, url) if path == "/api/todo-target" => {
+                let json = match query_param(url, "session") {
+                    Some(session) => {
+                        let t = crate::common::conversations::resolve_session_target(&session);
+                        serde_json::json!({ "project": t.map(|t| t.project) }).to_string()
+                    }
+                    None => r#"{"error":"missing session"}"#.to_string(),
+                };
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // A branch name for a todo. May call a model (~6s), so it answers from
+            // its own thread — this loop serves every other request one at a time,
+            // and the sidebar polls on a 1.5s cadence.
+            (Method::Get, url) if path == "/api/todo-branch" => {
+                let session = query_param(url, "session");
+                let text = query_param(url, "text");
+                std::thread::spawn(move || {
+                    let json = match (session, text) {
+                        (Some(session), Some(text)) => {
+                            match crate::common::conversations::resolve_session_target(&session) {
+                                Some(t) => {
+                                    let (branch, source) =
+                                        crate::serve::dispatch::suggest_branch(&t.project, &text);
+                                    serde_json::json!({
+                                        "project": t.project, "branch": branch, "source": source
+                                    })
+                                    .to_string()
+                                }
+                                None => r#"{"error":"not a registered project"}"#.to_string(),
+                            }
+                        }
+                        _ => r#"{"error":"missing session or text"}"#.to_string(),
+                    };
+                    let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                    let _ = request.respond(Response::from_string(json).with_header(header));
+                });
+            }
+
+            (Method::Get, url) if path == "/api/job" => {
+                let job = query_param(url, "id")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .and_then(|id| jobs.get(id));
+                let json = match job {
+                    Some(j) => serde_json::to_string(&j).unwrap_or_default(),
+                    None => r#"{"state":"error","message":"unknown job"}"#.to_string(),
+                };
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // Turn a todo into work:
+            //   send     — type it into the current conversation (`window` = pane id)
+            //   new      — a new conversation in the same session, and go there
+            //   worktree — a new worktree on `branch`, started on the todo (a job)
+            // The todo stays active: starting work isn't finishing it.
+            (Method::Post, "/api/todo-dispatch") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Result<String, String> {
+                    let req: serde_json::Value =
+                        serde_json::from_str(&body).map_err(|_| "invalid request")?;
+                    let field = |k: &str| req.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                    let session = field("session").ok_or("missing session")?;
+                    let text = field("text").ok_or("missing text")?;
+                    let mode = field("mode").ok_or("missing mode")?;
+                    match mode.as_str() {
+                        "send" => {
+                            let pane_id = field("window").ok_or("missing window")?;
+                            let (pane, status) = shared_active
+                                .lock()
+                                .ok()
+                                .and_then(|data| {
+                                    let s = data.iter().find(|s| s.name == session)?;
+                                    let w = s.windows.iter().find(|w| w.pane_id == pane_id)?;
+                                    Some((w.pane.clone()?, w.status.clone()))
+                                })
+                                .ok_or("that conversation isn't running")?;
+                            // Checked HERE, not trusted from the client: typing into
+                            // a permission / plan / question prompt answers it — the
+                            // Enter picks the default option.
+                            if status.as_ref().is_some_and(|s| s.blocks_human()) {
+                                return Err("it's waiting on a decision — answer that first".into());
+                            }
+                            send_text_to_pane(&pane.0, &pane.1, &pane.2, &text);
+                            std::thread::spawn(crate::common::iterm::focus_current_session);
+                            Ok(r#"{"ok":true}"#.into())
+                        }
+                        "new" => {
+                            crate::common::conversations::start_task_in_session(&session, &text)
+                                .map_err(|e| format!("{e:#}"))?;
+                            // The new window is the session's current one, so a
+                            // session-level switch lands on it.
+                            let clients = crate::common::tmux::list_clients();
+                            if let Some(c) = crate::common::tmux::pick_client(&clients) {
+                                crate::common::tmux::switch_client_to(&c.tty, &session, None);
+                                std::thread::spawn(crate::common::iterm::focus_current_session);
+                            }
+                            Ok(r#"{"ok":true}"#.into())
+                        }
+                        "worktree" => {
+                            let branch = field("branch").unwrap_or_default();
+                            let branch = branch.trim().to_string();
+                            if !crate::serve::dispatch::valid_branch(&branch) {
+                                return Err(format!("'{branch}' isn't a valid branch name"));
+                            }
+                            let project =
+                                crate::common::conversations::resolve_session_target(&session)
+                                    .ok_or("this session isn't a registered project")?
+                                    .project;
+                            let id = crate::serve::dispatch::start_worktree_job(
+                                &jobs,
+                                project,
+                                branch,
+                                text.clone(),
+                            );
+                            Ok(format!(r#"{{"ok":true,"job":{id}}}"#))
+                        }
+                        _ => Err("unknown mode".into()),
+                    }
+                })()
+                .unwrap_or_else(|e| serde_json::json!({ "error": e }).to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // Both lists for one session — the sidebar's Todos pane shows the done
+            // tail too, which `/api/session-info` doesn't carry.
+            (Method::Get, url) if path == "/api/todos" => {
+                let json = match query_param(url, "session") {
+                    Some(session) => {
+                        let todos = load_session_todos().remove(&session).unwrap_or_default();
+                        let done = load_completed_todos().remove(&session).unwrap_or_default();
+                        serde_json::json!({ "session": session, "todos": todos, "done": done })
+                            .to_string()
+                    }
+                    None => r#"{"error":"missing session"}"#.to_string(),
+                };
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
             (Method::Post, "/api/todos") => {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
@@ -883,6 +1081,17 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                 save_session_todos(&todos);
                             }
                         }
+                        // Move a DONE item back to the active list (index into done).
+                        "reopen" => {
+                            let index = req.get("index")?.as_u64()? as usize;
+                            let list = todos_done.get_mut(&session)?;
+                            if index < list.len() {
+                                let item = list.remove(index);
+                                todos.entry(session.clone()).or_default().push(item);
+                                save_session_todos(&todos);
+                                save_completed_todos(&todos_done);
+                            }
+                        }
                         _ => return Some(r#"{"error":"unknown action"}"#.to_string()),
                     }
 
@@ -890,7 +1099,13 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         .get(&session)
                         .map(|v| v.iter().map(|s| s.as_str()).collect())
                         .unwrap_or_default();
-                    Some(serde_json::json!({"ok": true, "todos": current}).to_string())
+                    let done: Vec<&str> = todos_done
+                        .get(&session)
+                        .map(|v| v.iter().map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    Some(
+                        serde_json::json!({"ok": true, "todos": current, "done": done}).to_string(),
+                    )
                 })()
                 .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
