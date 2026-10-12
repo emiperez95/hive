@@ -17,13 +17,100 @@ use crate::serve::web_types::{ConversationMessage, ConversationView, SessionView
 
 use anyhow::Result;
 use serde::Deserialize;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use sysinfo::System;
 use tiny_http::{Header, Method, Response, Server};
+
+/// How long `/api/ambient-wait` holds a request open before answering anyway. Well
+/// under the usual idle-connection timeouts, so nothing between the page and the
+/// server drops the request first.
+const FOCUS_WAIT: Duration = Duration::from_secs(25);
+
+/// "The tmux client moved" — a counter the focus hooks bump (via
+/// `/api/focus-nudge`) and `/api/ambient-wait` blocks on.
+///
+/// Without it the sidebar learns about a switch only on its next 1.5s poll, so
+/// the marker trails a keyboard switch by ~0.75s on average and 1.5s at worst —
+/// while the page itself redraws in ~3ms. tmux already reports every switch to
+/// `hive event focus`; this is the wire from there to the page.
+///
+/// A generation counter rather than a flag: a waiter says which generation it has
+/// seen, so a nudge that lands between two waits is never lost.
+#[derive(Default)]
+struct FocusSignal {
+    gen: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl FocusSignal {
+    fn current(&self) -> u64 {
+        *self.gen.lock().unwrap()
+    }
+
+    fn bump(&self) {
+        *self.gen.lock().unwrap() += 1;
+        self.cv.notify_all();
+    }
+
+    /// Block until the generation moves past `seen`, or `timeout` passes. Returns
+    /// the generation at wake-up either way.
+    fn wait_past(&self, seen: u64, timeout: Duration) -> u64 {
+        let guard = self.gen.lock().unwrap();
+        let (guard, _) = self
+            .cv
+            .wait_timeout_while(guard, timeout, |g| *g <= seen)
+            .unwrap();
+        *guard
+    }
+}
+
+/// The ambient payload (`/api/ambient`, `/api/ambient-wait`): where the attached
+/// client is, the mute flags, and the focus generation it reflects. `gen` lets the
+/// page drop a slow poll answer that a pushed one has already overtaken.
+fn ambient_json(gen: u64) -> String {
+    let clients = crate::common::tmux::list_clients();
+    let muted = crate::common::persistence::is_globally_muted();
+    let mut muted_projects: Vec<String> = crate::common::persistence::load_muted_projects()
+        .into_iter()
+        .collect();
+    muted_projects.sort();
+    let client = crate::common::tmux::pick_client(&clients);
+    serde_json::json!({
+        "session": client.map(|c| c.session.clone()),
+        "window_index": client.map(|c| c.window_index.clone()),
+        "tty": client.map(|c| c.tty.clone()),
+        "global_mute": muted,
+        "muted_projects": muted_projects,
+        "gen": gen,
+    })
+    .to_string()
+}
+
+/// Tell a running dashboard that the tmux client moved — called from the focus
+/// hooks (`hive event focus`). Best-effort and bounded: nothing listening is an
+/// immediate `ECONNREFUSED`, and the hook runs under `run-shell -b`, so even the
+/// worst case never delays tmux.
+pub fn nudge_focus() {
+    let port = HiveConfig::load().web.port;
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let req = "POST /api/focus-nudge HTTP/1.1\r\nHost: localhost\r\n\
+               Content-Length: 0\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_ok() {
+        // Wait for the answer rather than hanging up mid-request, so the server
+        // never sees a reset before it has read the request.
+        let _ = stream.read(&mut [0u8; 64]);
+    }
+}
 
 /// True if a TCP server is already accepting on `127.0.0.1:port`. A localhost
 /// probe with a tight timeout — when nothing listens the OS returns
@@ -214,6 +301,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
 
     // Worktree dispatches from the sidebar's todo dialog — see `serve::dispatch`.
     let jobs: Arc<crate::serve::dispatch::Jobs> = Arc::default();
+    let focus: Arc<FocusSignal> = Arc::default();
 
     // Handle HTTP requests (blocking)
     for mut request in server.incoming_requests() {
@@ -610,24 +698,34 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             // globally muted. One ~4ms `list-clients` plus a file-existence check; no
             // registry gather.
             (Method::Get, "/api/ambient") => {
-                let clients = crate::common::tmux::list_clients();
-                let muted = crate::common::persistence::is_globally_muted();
-                let mut muted_projects: Vec<String> =
-                    crate::common::persistence::load_muted_projects()
-                        .into_iter()
-                        .collect();
-                muted_projects.sort();
-                let client = crate::common::tmux::pick_client(&clients);
-                let json = serde_json::json!({
-                    "session": client.map(|c| c.session.clone()),
-                    "window_index": client.map(|c| c.window_index.clone()),
-                    "tty": client.map(|c| c.tty.clone()),
-                    "global_mute": muted,
-                    "muted_projects": muted_projects,
-                })
-                .to_string();
+                let json = ambient_json(focus.current());
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // The same payload, pushed: held open until the client moves past the
+            // generation the page has seen (or `FOCUS_WAIT`). No `gen` answers at once,
+            // which is how the page learns the current one. Its own thread, because
+            // this loop serves every other request one at a time.
+            (Method::Get, url) if path == "/api/ambient-wait" => {
+                let seen = query_param(url, "gen").and_then(|g| g.parse::<u64>().ok());
+                let focus = Arc::clone(&focus);
+                std::thread::spawn(move || {
+                    let gen = match seen {
+                        Some(seen) => focus.wait_past(seen, FOCUS_WAIT),
+                        None => focus.current(),
+                    };
+                    let json = ambient_json(gen);
+                    let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                    let _ = request.respond(Response::from_string(json).with_header(header));
+                });
+            }
+
+            // From the tmux focus hooks (`hive event focus`): the client moved, wake
+            // every `/api/ambient-wait`.
+            (Method::Post, "/api/focus-nudge") => {
+                focus.bump();
+                let _ = request.respond(Response::from_string("{}"));
             }
 
             // Token spend for ONE conversation — the one the sidebar's stats pane
@@ -1423,4 +1521,39 @@ fn get_all_ips(_port: u16) -> Vec<(String, String)> {
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn focus_wait_returns_at_once_when_already_past() {
+        let f = FocusSignal::default();
+        f.bump();
+        let t = Instant::now();
+        assert_eq!(f.wait_past(0, Duration::from_secs(5)), 1);
+        assert!(t.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn focus_wait_times_out_without_a_bump() {
+        let f = FocusSignal::default();
+        assert_eq!(f.wait_past(0, Duration::from_millis(30)), 0);
+    }
+
+    #[test]
+    fn focus_wait_wakes_on_bump() {
+        let f = Arc::new(FocusSignal::default());
+        let waiter = {
+            let f = Arc::clone(&f);
+            std::thread::spawn(move || f.wait_past(0, Duration::from_secs(5)))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let t = Instant::now();
+        f.bump();
+        assert_eq!(waiter.join().unwrap(), 1);
+        assert!(t.elapsed() < Duration::from_millis(500));
+    }
 }

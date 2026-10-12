@@ -238,6 +238,8 @@ pub fn run_event(kind: &str, session: Option<&str>, window: Option<&str>) -> Res
         "focus" => {
             if let Some(s) = session.filter(|s| !s.is_empty()) {
                 activity::log_focus(s, window.filter(|w| !w.is_empty()));
+                // Wake the sidebar now rather than at its next poll.
+                crate::serve::web::nudge_focus();
             }
         }
         "blur" => activity::log_blur(),

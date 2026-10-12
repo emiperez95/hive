@@ -3214,6 +3214,7 @@ async function sbSwitch(session, windowIndex, id) {
   // waiting out the next poll.
   currentFocus = { session, window_index: String(windowIndex == null ? '' : windowIndex) };
   if (id) sbSeen.add(id);
+  sbForceSwap = true;
   renderList();
   try {
     await fetch('/api/switch', {
@@ -4362,6 +4363,7 @@ function sbAttentionHtml() {
 // every 1.5s; in the grouped views order is near-static, but here a row can change
 // tier and jump the height of the panel between deciding to click and clicking.
 let sbHover = false;
+let sbForceSwap = false;
 function sbSwapList(el, html) {
   if (!el.dataset.hoverBound) {
     el.dataset.hoverBound = '1';
@@ -4372,7 +4374,11 @@ function sbSwapList(el, html) {
   // markup (entities, attribute quoting), so that comparison never matched and the
   // list was torn down on every poll whether or not anything changed.
   if (el._sbHtml === html) return;
-  if (sbHover && sbView === 'attention') return;
+  // A render the user caused (a click) always lands — the freeze exists to stop
+  // rows moving under a pointer that is about to click, not to swallow the click.
+  const forced = sbForceSwap;
+  sbForceSwap = false;
+  if (sbHover && sbView === 'attention' && !forced) return;
   const top = el.scrollTop;
   el._sbHtml = html;
   el.innerHTML = html;
@@ -4884,8 +4890,11 @@ async function fetchSessions() {
     let focusJson = lastFocusJson;
     if (SIDEBAR) {
       try {
-        focusJson = await (await fetch('/api/ambient')).text();
-        currentFocus = JSON.parse(focusJson);
+        const txt = await (await fetch('/api/ambient')).text();
+        const d = JSON.parse(txt);
+        // A pushed answer (sbFocusLoop) may have overtaken this one while it was in
+        // flight; an older generation would put the marker back where it was.
+        if (!(d.gen < sbFocusGen)) { focusJson = txt; currentFocus = d; }
       } catch (e) { /* keep last */ }
     }
 
@@ -5776,8 +5785,36 @@ updateAppHeight();
 // changes rarely, so it's fetched once rather than polled.
 if (SIDEBAR) sbLoadProjects();
 
+// Push for focus changes: tmux's focus hooks nudge the server, which answers a
+// held-open /api/ambient-wait, so the marker follows a keyboard switch in tens of
+// ms instead of trailing it by up to a poll (1.5s). The poll still carries
+// everything else, and still covers focus if this loop is down.
+let sbFocusGen = -1;
+async function sbFocusLoop() {
+  for (;;) {
+    try {
+      const q = sbFocusGen < 0 ? '' : '?gen=' + sbFocusGen;
+      const txt = await (await fetch('/api/ambient-wait' + q)).text();
+      const d = JSON.parse(txt);
+      // A restarted server counts from 0 again — take its number, don't wait for ours.
+      sbFocusGen = d.gen;
+      if (txt !== lastFocusJson) {
+        currentFocus = d;
+        lastFocusJson = txt;
+        if (listTab === 'active') { sbForceSwap = true; renderList(); }
+        sbMaybeFetchStats(); sbRenderNotes(); sbRenderTodos();
+      }
+    } catch (e) {
+      // Server down or restarting — back off; the 1.5s poll keeps the panel honest.
+      sbFocusGen = -1;
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+}
+
 // Start polling
 fetchSessions();
+if (SIDEBAR) sbFocusLoop();
 pollTimer = setInterval(fetchSessions, 1500);
 // Warm the resumable set once at startup so the Resume tab paints on first tap
 // instead of opening on a spinner. It's only refetched while that tab is showing.
