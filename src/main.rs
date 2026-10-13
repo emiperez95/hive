@@ -126,6 +126,19 @@ fn main() -> Result<()> {
                 } => cli::worktree::run_wt_delete(&project, &branch, keep_branch, force),
                 WtCommand::List { project } => cli::worktree::run_wt_list(project.as_deref()),
                 WtCommand::Import { project } => cli::worktree::run_wt_import(&project),
+                WtCommand::Prune {
+                    project,
+                    branches,
+                    idle_hours,
+                    dry_run,
+                    yes,
+                } => cli::worktree::run_wt_prune(
+                    project.as_deref(),
+                    &branches,
+                    idle_hours,
+                    dry_run,
+                    yes,
+                ),
             }
         }
         // Default view is now the conversation-first TUI. The classic session-first

@@ -298,6 +298,25 @@ pub enum WtCommand {
         /// Project key to import worktrees for
         project: String,
     },
+    /// Remove what Claude's Workflows leave behind: agent worktrees under
+    /// .claude/worktrees/ and their worktree-wf_* / wf/* branches. Only removes what is
+    /// clean and fully on a remote; shows the plan and asks first.
+    Prune {
+        /// Only this project (default: every registered project)
+        project: Option<String>,
+        /// Also prune local branches matching this glob, e.g. 'review-*' (repeatable)
+        #[arg(long = "branches", value_name = "GLOB")]
+        branches: Vec<String>,
+        /// Leave agent worktrees git has touched within this many hours
+        #[arg(long, default_value_t = 24)]
+        idle_hours: u64,
+        /// Show the plan without removing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

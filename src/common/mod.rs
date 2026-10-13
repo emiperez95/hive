@@ -19,6 +19,8 @@ pub mod persistence;
 pub mod ports;
 pub mod process;
 pub mod projects;
+// Leftover Workflow agent worktrees/branches and the rules for removing them.
+pub mod prune;
 // Read-only shadow model (Increment 0); wired into views in a later increment.
 #[allow(dead_code)]
 pub mod registry;

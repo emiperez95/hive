@@ -437,3 +437,218 @@ pub fn run_wt_import(project: &str) -> Result<()> {
 
     Ok(())
 }
+
+/// One repo's share of a prune: what was found and what will happen to each.
+struct PrunePlan {
+    label: String,
+    repo: String,
+    worktrees: Vec<(
+        crate::common::prune::GitWorktree,
+        crate::common::prune::Verdict,
+    )>,
+    branches: Vec<(String, crate::common::prune::Verdict)>,
+    /// Worktree records whose folder is already gone (`git worktree prune` drops them).
+    stale: usize,
+}
+
+/// Remove what Claude's background Workflows leave behind — agent worktrees under
+/// `.claude/worktrees/` and their `worktree-wf_*` branches — across every registered
+/// project (or one). See `common::prune` for the rules; nothing that exists only
+/// locally is ever removed.
+pub fn run_wt_prune(
+    project: Option<&str>,
+    extra_patterns: &[String],
+    idle_hours: u64,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use crate::common::prune::*;
+    use std::collections::HashSet;
+    use std::time::{Duration, SystemTime};
+
+    let registry = ProjectRegistry::load();
+    let mut keys: Vec<&String> = match project {
+        Some(p) => vec![
+            registry
+                .projects
+                .get_key_value(p)
+                .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", p))?
+                .0,
+        ],
+        None => registry.projects.keys().collect(),
+    };
+    keys.sort();
+
+    let patterns: Vec<String> = DEFAULT_BRANCH_PATTERNS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(extra_patterns.iter().cloned())
+        .collect();
+    let now = SystemTime::now();
+    let min_idle = Duration::from_secs(idle_hours * 3600);
+
+    // Several projects can share one repo (a project registered at a subdirectory),
+    // so plans are per git common dir, not per project.
+    let mut seen = HashSet::new();
+    let mut plans = Vec::new();
+    for key in keys {
+        let config = &registry.projects[key];
+        let repo = expand_tilde(&config.project_root)
+            .to_string_lossy()
+            .to_string();
+        let Some(common) = common_dir(&repo) else {
+            continue;
+        };
+        if !seen.insert(common) {
+            continue;
+        }
+
+        let all = list_worktrees(&repo);
+        let stale = all.iter().filter(|w| w.prunable).count();
+        let worktrees: Vec<_> = all
+            .iter()
+            .filter(|w| !w.prunable && is_agent_worktree(&w.path))
+            .map(|w| {
+                (
+                    w.clone(),
+                    worktree_verdict(&worktree_facts(w, now), min_idle),
+                )
+            })
+            .collect();
+        // Branches still checked out once the planned removals are done.
+        let checked_out: HashSet<&str> = all
+            .iter()
+            .filter(|w| !w.prunable)
+            .filter(|w| {
+                !worktrees
+                    .iter()
+                    .any(|(r, v)| r.path == w.path && *v == Verdict::Remove)
+            })
+            .filter_map(|w| w.branch.as_deref())
+            .collect();
+        let branches: Vec<_> = matching_branches(&repo, &patterns)
+            .into_iter()
+            .map(|b| {
+                let v =
+                    branch_verdict(checked_out.contains(b.as_str()), branch_unpushed(&repo, &b));
+                (b, v)
+            })
+            .collect();
+
+        if worktrees.is_empty() && branches.is_empty() && stale == 0 {
+            continue;
+        }
+        plans.push(PrunePlan {
+            label: format!("{} {}", config.emoji, key),
+            repo,
+            worktrees,
+            branches,
+            stale,
+        });
+    }
+
+    let removable = |v: &Verdict| *v == Verdict::Remove;
+    let (mut n_wt, mut n_br, mut n_stale) = (0, 0, 0);
+    for p in &plans {
+        println!("{}  ({})", p.label, p.repo);
+        for (w, v) in &p.worktrees {
+            let rel = w
+                .path
+                .strip_prefix(&format!("{}/", p.repo))
+                .unwrap_or(&w.path);
+            match v {
+                Verdict::Remove => println!("  remove  {}", rel),
+                Verdict::Keep(why) => println!("  keep    {}  — {}", rel, why),
+            }
+        }
+        let doomed: Vec<_> = p.branches.iter().filter(|(_, v)| removable(v)).collect();
+        if !p.branches.is_empty() {
+            println!(
+                "  {} branch(es) matching {} — {} to delete",
+                p.branches.len(),
+                patterns.join(", "),
+                doomed.len()
+            );
+        }
+        // Listing 170 deletions helps no one; the kept ones and their reasons do.
+        if doomed.len() <= 10 {
+            for (b, _) in &doomed {
+                println!("  delete  {}", b);
+            }
+        }
+        for (b, v) in &p.branches {
+            if let Verdict::Keep(why) = v {
+                println!("  keep    {}  — {}", b, why);
+            }
+        }
+        if p.stale > 0 {
+            println!(
+                "  {} stale worktree record(s) (folder already gone)",
+                p.stale
+            );
+        }
+        println!();
+        n_wt += p.worktrees.iter().filter(|(_, v)| removable(v)).count();
+        n_br += doomed.len();
+        n_stale += p.stale;
+    }
+
+    if n_wt + n_br + n_stale == 0 {
+        println!("Nothing to prune.");
+        return Ok(());
+    }
+    println!(
+        "Will remove {} agent worktree(s), delete {} branch(es) and drop {} stale record(s).",
+        n_wt, n_br, n_stale
+    );
+    if dry_run {
+        println!("(dry run — nothing changed)");
+        return Ok(());
+    }
+    if !yes {
+        print!("Proceed? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let mut failures = 0;
+    for p in &plans {
+        let mut fail = |what: &str, e: anyhow::Error| {
+            eprintln!("  {}: {} — {}", p.label, what, e);
+            failures += 1;
+        };
+        if p.stale > 0 {
+            if let Err(e) = git_run(&p.repo, &["worktree", "prune"]) {
+                fail("worktree prune", e);
+            }
+        }
+        for (w, v) in &p.worktrees {
+            // No --force: if the tree changed since the plan, git refuses, and we keep it.
+            if removable(v) {
+                if let Err(e) = git_run(&p.repo, &["worktree", "remove", &w.path]) {
+                    fail(&w.path, e);
+                }
+            }
+        }
+        for (b, v) in &p.branches {
+            // -D, not -d: -d judges "merged" against the current HEAD, while the
+            // check that matters — every commit is on a remote — was made above.
+            if removable(v) {
+                if let Err(e) = git_run(&p.repo, &["branch", "-D", b]) {
+                    fail(b, e);
+                }
+            }
+        }
+    }
+    if failures == 0 {
+        println!("Done.");
+    } else {
+        println!("Done, with {} failure(s) left in place.", failures);
+    }
+    Ok(())
+}

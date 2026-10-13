@@ -104,9 +104,25 @@ fn wt_help_exits_zero() {
     let output = hive_cmd().args(["wt", "--help"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for sub in ["new", "delete", "list", "import"] {
+    for sub in ["new", "delete", "list", "import", "prune"] {
         assert!(stdout.contains(sub), "Missing wt subcommand '{}'", sub);
     }
+}
+
+/// `wt prune` over an empty registry: nothing to scan, nothing touched, exit 0.
+/// Isolated HOME so the real registry's repos are never even read.
+#[test]
+fn wt_prune_with_no_projects_is_a_no_op() {
+    let home = std::env::temp_dir().join(format!("hive-smoke-prune-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let output = hive_cmd()
+        .args(["wt", "prune", "--dry-run"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&home).ok();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Nothing to prune."));
 }
 
 /// `wt new` switches you into the new session; `--no-switch` is the opt-out that

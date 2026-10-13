@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 391 tests (367 unit + 24 CLI smoke)
+cargo test                # 413 tests (388 unit + 25 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 669 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 367 unit + 24 smoke.
+> `cargo test` prints 699 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 388 unit + 25 smoke.
 
 ## The TUI (conversation-first)
 
@@ -79,6 +79,8 @@ hive wt new <project> <branch>  # create worktree + tmux session (hooks), switch
 hive wt new <project> <branch> --no-switch  # …and stay where you are
 hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
+hive wt prune [project] # remove leftover Workflow agent worktrees + worktree-wf_* / wf/* branches (plan, then y/N)
+hive wt prune --branches 'review-*' --dry-run  # extra branch globs; show the plan only
 hive todo list [--session <name>] [--done]  # list active (or completed) todos
 hive todo next [--session <name>]           # print first active todo (exit 1 if none)
 hive todo add <text> [--session <name>]     # add a todo
@@ -105,6 +107,31 @@ unauthenticated identity rather than erroring). The `N` wizard doesn't cover it.
 JSONL conversation lookup (`jsonl.rs`) searches across all `~/.claude*/projects/` dirs, so the TUI and web dashboard display conversations regardless of which profile created them.
 
 See `docs/claude-auth-profiles.md` for full setup guide.
+
+## `hive wt prune` — what Workflows leave behind
+
+A background Workflow gives each agent its own worktree at `<checkout>/.claude/worktrees/wf_*`
+on a `worktree-wf_*` branch. Claude's harness removes the folder when an agent ends cleanly but
+**never the branch**, and agents that run `git checkout -b` inside their tree leave theirs too.
+None of it is hive's (`wt delete` cleans its own worktree + branch), but hive knows every project
+root, so it is the one place that can sweep them all. Measured on avateen after two months: 177
+`worktree-wf_*` branches and 3 agent worktrees holding 2.7 GB.
+
+The rule is **nothing that exists only here is removed** (`common/prune.rs`):
+
+- An agent worktree goes only when it is clean, every commit on its HEAD is on some remote, it
+  isn't locked, and git hasn't touched its admin dir for `--idle-hours` (24). Idleness is the
+  load-bearing check: a *running* reviewer's tree is clean and pushed too.
+- A branch (default globs `worktree-wf_*` and `wf/*` — the namespace workflow agents are told to
+  use for a branch of their own — more via `--branches`) goes only when no worktree has
+  it checked out and `rev-list <b> --not --remotes` is empty — hence `branch -D`: `-d` judges
+  "merged" against the current HEAD, which is the wrong question.
+- `git worktree remove` without `--force`, so a tree that changed after the plan was printed is
+  refused by git and stays. Hive's own worktrees are never touched; they need their hooks.
+
+> **Gotcha — the idle clock is the worktree's admin dir** (`.git/worktrees/<name>/HEAD`, `index`,
+> `logs/HEAD`), and inspection runs with `GIT_OPTIONAL_LOCKS=0`. A plain `git status` refreshes
+> the index and would reset the clock it is reading.
 
 ## Worktree creation switches you into it
 
@@ -166,6 +193,7 @@ src/
 │   ├── jsonl.rs            JSONL parsing + transcript scan (all auth profiles), mtime-keyed scan cache
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml)
+│   ├── prune.rs            leftover Workflow agent worktrees/branches + the keep/remove rules (`hive wt prune`)
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
 │   ├── worktree_health.rs  git state of ONE working tree (dirty/ahead/behind/merged), mtime-cached
 │   ├── usage.rs            per-conversation token usage, accumulated incrementally from the transcript
@@ -1519,13 +1547,17 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-391 distinct tests. Run with `cargo test`.
+413 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 669 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 278 · bin 367 (the superset — adds cli/daemon/serve)
-> · smoke 24.
+> `cargo test` prints 699 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 286 · bin 388 (the superset — adds cli/daemon/serve)
+> · smoke 25.
 
-**Unit tests (367)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (388)** — in-module `#[cfg(test)]` blocks:
+- `common/prune.rs`: `git worktree list --porcelain` parsing (detached, valued `locked`,
+  `prunable`, slashed branches), only `.claude/worktrees/` counts as an agent worktree, and the
+  keep rules — dirty, unpushed, locked, recently used or unreadable all keep; a branch goes only
+  when nothing has it checked out and every commit is on a remote
 - `common/usage.rs`: `accumulate_line` (per-model accumulation, sidechain kept apart,
   thinking not double-counted, zero-usage `<synthetic>` entries dropped, unlabelled
   model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a
@@ -1611,7 +1643,7 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   blocked-vs-working split, closed convs contributing no status/resources, auth-profile
   defaulting, payload-free status labels)
 
-**Integration tests (24)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (25)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
@@ -1619,6 +1651,7 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 - Project archive roundtrip (add → archive → list hides → `--all` shows → unarchive), isolated via a temp `$HOME`
 - `--auth-profile` persists to `projects.toml`, and is absent from the TOML when the flag is omitted
 - `wt new --help` still lists `--no-switch` (the opt-out `/hive:fork-to-worktree` relies on)
+- `wt prune --dry-run` over an empty registry is a no-op (isolated `$HOME`)
 
 No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test
 infrastructure) — hence the pure `build_active`/`build_browse` functions take their tmux/flag
