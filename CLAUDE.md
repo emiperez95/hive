@@ -994,7 +994,9 @@ into explicitly.
 | POST | `/api/freeze` | Freeze one window: `{"session","window_index","window_name","cwd","session_id","note"}` |
 | POST | `/api/thaw` | Thaw a frozen window by key: `{"key": "..."}` |
 | POST | `/api/discard-frozen` | Discard a frozen window (no restore): `{"key": "..."}` |
-| GET | `/api/ambient` | Sidebar ambient state: the attached client's session/window, `global_mute`, `muted_projects` |
+| GET | `/api/ambient` | Sidebar ambient state: the attached client's session/window, `global_mute`, `muted_projects`, and the focus `gen` it reflects |
+| GET | `/api/ambient-wait?gen=N` | The same payload, held open until the focus generation passes N (≤25s). No `gen` answers at once |
+| POST | `/api/focus-nudge` | Sent by `hive event focus` (the tmux focus hooks): wakes every held `ambient-wait` |
 | GET | `/api/conv-notes?id=X` | The sidebar Notes pane's scratchpad for one conversation |
 | POST | `/api/conv-notes` | Save it: `{"id","notes"}` — refused for an id with no transcript |
 | GET | `/api/todo-target?session=X` | The project a session belongs to (`null` ⇒ no worktree option) |
@@ -1394,6 +1396,35 @@ call — it would double-count.
 `tmux::pick_client` is the whole multi-client rule: skip control-mode clients (a
 `tmux -C` connection is a tool, not a person — switching it moves nobody's screen),
 then take the most recently active, which is also right after `hive spread`.
+
+### Focus is pushed, not polled
+
+The "you are here" marker used to move on the next 1.5s poll — 0.75s behind a
+keyboard switch on average, 1.5s at worst — while the page redraws in ~3ms. All
+of that lag was waiting. tmux already reports every switch (`after-select-window`,
+`client-session-changed`, `client-focus-in` → `hive event focus`), so the hook now
+also POSTs `/api/focus-nudge`, which bumps a generation counter (`FocusSignal`, a
+`Mutex<u64>` + `Condvar`). The page keeps one `GET /api/ambient-wait?gen=N` open;
+it answers the moment the counter passes N. Measured: 5ms nudge → answer, 20ms
+nudge → marker moved.
+
+- **Generation, not a flag**: a waiter names what it has seen, so a nudge landing
+  between two waits is never lost.
+- **Each wait runs on its own thread** — the request loop is serial, and a held
+  request on it would stall every other endpoint.
+- **The poll still runs** and still carries focus, so a missed nudge (server down,
+  `hive web --port` differing from `[web].port`, which is where the hook sends)
+  degrades to the old 1.5s behaviour, never to a stuck marker. Its answer is
+  dropped when its `gen` is older than the pushed one, or a slow poll would put
+  the marker back.
+- The nudge is bounded (100ms connect, `ECONNREFUSED` when nothing listens) and
+  runs under `run-shell -b`, so it can never delay tmux.
+
+> **Gotcha — the attention view's hover freeze swallowed clicks.** `sbSwapList`
+> skips the DOM swap while the pointer is over the list, and the pointer is always
+> over the list when you click — so the click's own optimistic redraw was dropped
+> and the marker waited for the mouse to leave. A render the user caused sets
+> `sbForceSwap` and always lands; so does a pushed focus change.
 
 ## Metrics (`GET /metrics`)
 
