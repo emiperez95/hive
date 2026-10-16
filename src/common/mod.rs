@@ -11,7 +11,6 @@ pub mod debug;
 pub mod frozen;
 // Shared multi-Claude-per-session detection (consumed by the web server; TUI next).
 pub mod instances;
-pub mod iterm;
 #[allow(dead_code)]
 pub mod jsonl;
 pub mod machine;
@@ -24,6 +23,8 @@ pub mod prune;
 // Read-only shadow model (Increment 0); wired into views in a later increment.
 #[allow(dead_code)]
 pub mod registry;
+// The terminal emulator around tmux (iTerm2 or Ghostty): panes, focus.
+pub mod terminal;
 // Every session's todos regrouped by the project that owns the session.
 pub mod tmux;
 pub mod todos;

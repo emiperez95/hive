@@ -94,7 +94,7 @@ enum Action {
     /// Start a fresh conversation in a tmux session (name) with an initial prompt —
     /// used to turn a todo into a `claude "task: …"` window.
     NewTask(String, String),
-    /// Spread N sessions into iTerm2 panes / collapse back (classic `L`).
+    /// Spread N sessions into terminal panes / collapse back (classic `L`).
     Spread(usize),
     Collapse,
     /// Create a worktree (project key, branch) and switch to it.
@@ -1988,7 +1988,7 @@ fn conversations_loop(
     // Transient footer message (e.g. `R` with nothing to recover). Expires on its own so it
     // never becomes permanent chrome.
     let mut notice: Option<(String, Instant)> = None;
-    // Spread prompt (`L` with ≤1 iTerm pane): typing a digit spreads N sessions.
+    // Spread prompt (`L` with ≤1 terminal pane): typing a digit spreads N sessions.
     let mut spreading = false;
     // New-project wizard (`N`): Some while stepping through key → emoji → path.
     let mut wizard: Option<NewProject> = None;
@@ -2987,7 +2987,7 @@ fn conversations_loop(
             continue;
         }
 
-        // Spread prompt: a digit spreads that many sessions into iTerm2 panes.
+        // Spread prompt: a digit spreads that many sessions into terminal panes.
         if spreading {
             match key.code {
                 KeyCode::Char(d @ '1'..='9') => {
@@ -3237,9 +3237,9 @@ fn conversations_loop(
         match key.code {
             KeyCode::Char('?') => showing_help = true,
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
-            // `L` spreads sessions into iTerm2 panes, or collapses if already spread.
+            // `L` spreads sessions into terminal panes, or collapses if already spread.
             KeyCode::Char('L') => {
-                if crate::common::iterm::get_iterm_pane_count() > 1 {
+                if crate::common::terminal::pane_count() > 1 {
                     return Ok(Action::Collapse);
                 }
                 spreading = true;
@@ -5089,7 +5089,7 @@ fn help_lines() -> Vec<Line<'static>> {
             "t",
             "Todos of every project — Enter start · x done · a add · → project · ^R archived",
         ),
-        key("L", "Spread sessions into iTerm2 panes / collapse back"),
+        key("L", "Spread sessions into terminal panes / collapse back"),
         key("N", "New-project wizard (key → emoji → path)"),
         key("w / x", "In a project detail: create / delete a worktree"),
         key(

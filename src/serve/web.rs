@@ -864,7 +864,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false)
                     {
-                        std::thread::spawn(crate::common::iterm::focus_current_session);
+                        std::thread::spawn(crate::common::terminal::focus_current_session);
                     }
                     Some(format!(
                         r#"{{"ok":{},"client":{}}}"#,
@@ -1088,7 +1088,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                 return Err("it's waiting on a decision — answer that first".into());
                             }
                             send_text_to_pane(&pane.0, &pane.1, &pane.2, &text);
-                            std::thread::spawn(crate::common::iterm::focus_current_session);
+                            std::thread::spawn(crate::common::terminal::focus_current_session);
                             Ok(r#"{"ok":true}"#.into())
                         }
                         "new" => {
@@ -1099,7 +1099,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             let clients = crate::common::tmux::list_clients();
                             if let Some(c) = crate::common::tmux::pick_client(&clients) {
                                 crate::common::tmux::switch_client_to(&c.tty, &session, None);
-                                std::thread::spawn(crate::common::iterm::focus_current_session);
+                                std::thread::spawn(crate::common::terminal::focus_current_session);
                             }
                             Ok(r#"{"ok":true}"#.into())
                         }

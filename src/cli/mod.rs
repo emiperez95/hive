@@ -120,12 +120,12 @@ pub enum Command {
         #[command(subcommand)]
         command: TodoCommand,
     },
-    /// Spread tmux sessions into N vertical iTerm2 panes
+    /// Spread tmux sessions into N side-by-side terminal panes (iTerm2 or Ghostty)
     Spread {
         /// Number of panes (1-9)
         count: usize,
     },
-    /// Collapse iTerm2 panes back to a single pane
+    /// Collapse terminal panes back to a single pane
     Collapse,
     /// Auto-attach to the first available tmux session
     Start,

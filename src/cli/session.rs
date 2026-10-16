@@ -248,20 +248,20 @@ pub fn run_event(kind: &str, session: Option<&str>, window: Option<&str>) -> Res
     Ok(())
 }
 
-/// Spread tmux sessions into N vertical iTerm2 panes
+/// Spread tmux sessions into N side-by-side terminal panes (iTerm2 or Ghostty)
 pub fn run_spread(count: usize) -> Result<()> {
     if count <= 1 {
         return Ok(());
     }
     crate::common::tmux::set_all_sessions_layout("spread");
-    crate::common::iterm::spread_panes(count - 1);
+    crate::common::terminal::spread_panes(count - 1);
     crate::common::activity::log_spread(count);
     Ok(())
 }
 
-/// Collapse iTerm2 panes back to a single pane
+/// Collapse terminal panes back to a single pane
 pub fn run_collapse() -> Result<()> {
-    crate::common::iterm::collapse_panes();
+    crate::common::terminal::collapse_panes();
     crate::common::tmux::set_all_sessions_layout("collapse");
     crate::common::activity::log_collapse();
     Ok(())
