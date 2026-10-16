@@ -99,12 +99,38 @@ pub fn run_project_add(cmd: ProjectCommand) -> Result<()> {
 /// Remove a project from the registry
 pub fn run_project_remove(key: &str) -> Result<()> {
     let mut registry = ProjectRegistry::load();
+    // The session names must be read BEFORE the project leaves the registry.
+    let mut sessions: Vec<String> = registry
+        .projects
+        .get(key)
+        .map(|c| ProjectRegistry::session_name(key, c))
+        .into_iter()
+        .collect();
+    sessions.extend(
+        crate::common::worktree::WorktreeState::load()
+            .worktrees
+            .values()
+            .filter(|e| e.project_key == key)
+            .map(|e| e.session_name.clone()),
+    );
     if !registry.remove_project(key) {
         anyhow::bail!("Project '{}' not found in registry", key);
     }
     registry.save()?;
     println!("Removed project '{}'", key);
+    print_dropped_todos(&crate::common::todos::drop_session_todos(&sessions));
     Ok(())
+}
+
+/// Echo todos a removal dropped, so they survive in the scrollback at least.
+pub fn print_dropped_todos(dropped: &[(String, String)]) {
+    if dropped.is_empty() {
+        return;
+    }
+    println!("  Dropped {} todo(s):", dropped.len());
+    for (session, text) in dropped {
+        println!("    [{session}] {text}");
+    }
 }
 
 /// Archive or unarchive a project in the registry

@@ -24,7 +24,9 @@ pub mod prune;
 // Read-only shadow model (Increment 0); wired into views in a later increment.
 #[allow(dead_code)]
 pub mod registry;
+// Every session's todos regrouped by the project that owns the session.
 pub mod tmux;
+pub mod todos;
 pub mod types;
 // Per-conversation token usage, read incrementally from the transcript.
 #[allow(dead_code)]

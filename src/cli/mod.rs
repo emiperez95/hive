@@ -328,6 +328,9 @@ pub enum TodoCommand {
         /// Show completed todos instead of active
         #[arg(long)]
         done: bool,
+        /// Every session's todos, grouped by project
+        #[arg(long, conflicts_with_all = ["session", "done"])]
+        all: bool,
     },
     /// Print the first active todo (exit 1 if none)
     Next {

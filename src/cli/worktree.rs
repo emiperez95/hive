@@ -304,6 +304,10 @@ pub fn run_wt_delete(project: &str, branch: &str, keep_branch: bool, force: bool
         let mut state = WorktreeState::load();
         state.remove(project, branch);
         state.save()?;
+        // Its session is gone for good; its todos would otherwise linger unclaimed.
+        crate::cli::project::print_dropped_todos(&crate::common::todos::drop_session_todos(
+            std::slice::from_ref(&entry.session_name),
+        ));
     } else {
         eprintln!("  Keeping registry entry (git worktree still exists on disk)");
     }

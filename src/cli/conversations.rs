@@ -50,6 +50,7 @@ use crate::common::tmux::{
     exact, exact_active_pane, exact_window, get_all_windows, get_current_tmux_session,
     get_current_tmux_session_names, get_current_tmux_window, select_window, switch_to_session,
 };
+use crate::common::todos::{load_grouped_todos, project_display_name, TodoGroup, TodoRow};
 use crate::common::types::ProcessInfo;
 use crate::common::worktree::WorktreeState;
 use crate::ipc::messages::SessionStatus;
@@ -525,6 +526,110 @@ fn delete_session_todo(session: &str, idx: usize) {
         todos.remove(session);
     }
     save_session_todos(&todos);
+}
+
+/// The todos screen (`t`): every session's todos, grouped by the project that owns
+/// the session. Todos are stored per session, so before this the only way to see a
+/// project's was to drill into it — and there was no way to see all of them at once.
+struct TodosState {
+    groups: Vec<TodoGroup>,
+    /// Index into the flattened rows (headers aren't selectable).
+    sel: usize,
+    /// Some while typing a new todo; it goes to the selected row's session.
+    input: Option<String>,
+    /// `Del` arms a delete of the selected todo; `y` confirms, anything else cancels.
+    /// A delete is NOT recoverable (done moves to the done list), hence the confirm.
+    confirm_delete: bool,
+    loaded_at: Instant,
+    /// Archived projects' todos are hidden until revealed (`Ctrl+R`, as in Browse):
+    /// archiving a project says "not now", and its todos are the same kind of noise.
+    show_archived: bool,
+    /// How many todos the archived filter is hiding — the title says so, otherwise
+    /// a hidden todo reads as a lost one.
+    hidden_archived: usize,
+}
+
+/// Drop archived projects' groups unless `show_archived`; returns what's left plus how
+/// many todos were hidden. Unclaimed sessions have no project, so never count as archived.
+fn filter_archived_todos(
+    groups: Vec<TodoGroup>,
+    projects: &ProjectRegistry,
+    show_archived: bool,
+) -> (Vec<TodoGroup>, usize) {
+    if show_archived {
+        return (groups, 0);
+    }
+    let archived = |g: &TodoGroup| {
+        g.project
+            .as_ref()
+            .and_then(|k| projects.projects.get(k))
+            .is_some_and(|c| c.archived)
+    };
+    let hidden = groups
+        .iter()
+        .filter(|g| archived(g))
+        .map(|g| g.rows.len())
+        .sum();
+    (
+        groups.into_iter().filter(|g| !archived(g)).collect(),
+        hidden,
+    )
+}
+
+impl TodosState {
+    fn load(projects: &ProjectRegistry) -> Self {
+        let mut t = TodosState {
+            groups: Vec::new(),
+            sel: 0,
+            input: None,
+            confirm_delete: false,
+            loaded_at: Instant::now(),
+            show_archived: false,
+            hidden_archived: 0,
+        };
+        t.reload(projects);
+        t
+    }
+
+    /// Re-read from disk, keeping the cursor on the same todo when it still exists
+    /// (and in range when it doesn't).
+    fn reload(&mut self, projects: &ProjectRegistry) {
+        let keep = self.selected().map(|r| (r.session.clone(), r.text.clone()));
+        (self.groups, self.hidden_archived) =
+            filter_archived_todos(load_grouped_todos(projects), projects, self.show_archived);
+        self.loaded_at = Instant::now();
+        if let Some(i) =
+            keep.and_then(|(s, t)| self.rows().position(|r| r.session == s && r.text == t))
+        {
+            self.sel = i;
+        }
+        self.sel = self.sel.min(self.len().saturating_sub(1));
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &TodoRow> {
+        self.groups.iter().flat_map(|g| g.rows.iter())
+    }
+
+    fn len(&self) -> usize {
+        self.groups.iter().map(|g| g.rows.len()).sum()
+    }
+
+    fn selected(&self) -> Option<&TodoRow> {
+        self.rows().nth(self.sel)
+    }
+
+    /// The group holding the selected row.
+    fn selected_group(&self) -> Option<&TodoGroup> {
+        let mut n = self.sel;
+        self.groups.iter().find(|g| {
+            if n < g.rows.len() {
+                true
+            } else {
+                n -= g.rows.len();
+                false
+            }
+        })
+    }
 }
 
 /// Which session-level flag a key toggles.
@@ -1898,6 +2003,9 @@ fn conversations_loop(
     let mut detail_stack: Vec<ProjectDetailState> = Vec::new();
     // Project detail sub-screen: Some(state) while drilled into a project.
     let mut detail: Option<ProjectDetailState> = None;
+    // Todos screen (`t`): Some while open. Sits UNDER the project detail, so `→` from a
+    // todo opens its project and Esc comes back here.
+    let mut todos_view: Option<TodosState> = None;
     // Conversation detail: sits ON TOP of the project detail (so backing out of a
     // conversation returns to the project it was opened from, if any).
     let mut conv_detail: Option<ConvDetailState> = None;
@@ -2624,6 +2732,142 @@ fn conversations_loop(
             continue;
         }
 
+        // ── Todos screen ────────────────────────────────────────────────────
+        // Every session's todos grouped by project. Owns the frame + input while open;
+        // the project detail (opened with `→`) draws over it, Esc returns here.
+        if todos_view.is_some() {
+            {
+                let t = todos_view.as_mut().unwrap();
+                // Re-read on the same ~2s rhythm as the list, so a `hive todo add` from
+                // another window — or an edit in the project detail — shows up.
+                if t.input.is_none() && t.loaded_at.elapsed() >= Duration::from_secs(2) {
+                    t.reload(&projects);
+                }
+                terminal.draw(|frame| draw_todos(frame, t, &projects))?;
+            }
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let t = todos_view.as_mut().unwrap();
+            if t.confirm_delete {
+                t.confirm_delete = false;
+                if key.code == KeyCode::Char('y') {
+                    if let Some(r) = t.selected().cloned() {
+                        delete_session_todo(&r.session, r.index);
+                        t.reload(&projects);
+                        flags = Flags::load();
+                    }
+                }
+                continue;
+            }
+            if let Some(input) = t.input.as_mut() {
+                match key.code {
+                    KeyCode::Esc => t.input = None,
+                    KeyCode::Enter => {
+                        let text = t.input.take().unwrap_or_default().trim().to_string();
+                        if let (false, Some(r)) = (text.is_empty(), t.selected().cloned()) {
+                            add_session_todo(&r.session, &text);
+                            t.reload(&projects);
+                            flags = Flags::load();
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Char(c) => input.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => todos_view = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if t.sel + 1 < t.len() {
+                        t.sel += 1;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => t.sel = t.sel.saturating_sub(1),
+                // Jump to the next / previous project.
+                KeyCode::Char('J') | KeyCode::PageDown => {
+                    let mut start = 0;
+                    for g in &t.groups {
+                        if start > t.sel {
+                            t.sel = start;
+                            break;
+                        }
+                        start += g.rows.len();
+                    }
+                }
+                KeyCode::Char('K') | KeyCode::PageUp => {
+                    let mut starts = Vec::new();
+                    let mut start = 0;
+                    for g in &t.groups {
+                        starts.push(start);
+                        start += g.rows.len();
+                    }
+                    if let Some(&s) = starts.iter().rev().find(|&&s| s < t.sel) {
+                        t.sel = s;
+                    }
+                }
+                // Enter starts the work: a `task: <todo>` conversation in its session,
+                // same as Enter on a todo in the project detail.
+                KeyCode::Enter => {
+                    if let Some(r) = t.selected() {
+                        return Ok(Action::NewTask(
+                            r.session.clone(),
+                            format!("task: {}", r.text),
+                        ));
+                    }
+                }
+                // `x` marks it done (moved to the done list, as everywhere else).
+                KeyCode::Char('x') => {
+                    if let Some(r) = t.selected().cloned() {
+                        done_session_todo(&r.session, r.index);
+                        t.reload(&projects);
+                        flags = Flags::load();
+                    }
+                }
+                KeyCode::Delete | KeyCode::Backspace => {
+                    t.confirm_delete = t.selected().is_some();
+                }
+                KeyCode::Char('a') => {
+                    if t.selected().is_some() {
+                        t.input = Some(String::new());
+                    }
+                }
+                // Ctrl+R reveals / hides archived projects' todos (same chord as Browse).
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    t.show_archived = !t.show_archived;
+                    t.reload(&projects);
+                }
+                // → opens where the todo lives: its worktree's detail when that is
+                // registered, else its project's. Unclaimed sessions have neither.
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let target = t.selected().zip(t.selected_group()).and_then(|(r, g)| {
+                        let project = g.project.clone()?;
+                        let wt = r.branch.as_ref().and_then(|b| {
+                            WorktreeState::load()
+                                .get(&project, b)
+                                .map(|_| WorktreeState::make_key(&project, b))
+                        });
+                        Some(wt.unwrap_or(project))
+                    });
+                    if let Some(key) = target {
+                        detail_stack.clear();
+                        detail = Some(build_group_detail(&key, &reg));
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         // Only Browse pages its sections; Active lists every live window (see
         // `visible_rows`).
         let page = matches!(view, View::Browse).then_some(BROWSE_PAGE);
@@ -3179,6 +3423,8 @@ fn conversations_loop(
             // per-session `m` above. Persisted as the shared `muted-global` flag the
             // hook notifier checks, so it affects the web too.
             KeyCode::Char('G') => set_global_mute(!is_globally_muted()),
+            // `t` opens every project's todos in one list.
+            KeyCode::Char('t') => todos_view = Some(TodosState::load(&projects)),
             // `R` reopens the last frame — the windows that were open when hive last saw
             // the machine. Nothing to show is not an error; it means nothing is missing.
             KeyCode::Char('R') => {
@@ -3294,7 +3540,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · f jump · z freeze · R recover · P pin · Del close · v★ m ! s · M ring · G mute-all · / search · ? · q",
+            " → detail · Enter switch · f jump · z freeze · R recover · t todos · P pin · Del close · v★ m ! s · M ring · G mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -3557,6 +3803,152 @@ fn draw(
 /// Multi-select rather than all-or-nothing because restoring is not free — every row is a
 /// Claude process and its context — and the set you want after a crash mid-week is rarely
 /// the set you want after a clean reboot.
+/// The todos screen: one header per project (emoji, name, count), its todos under
+/// it — a worktree's tagged with its branch — and unclaimed sessions last.
+fn draw_todos(frame: &mut ratatui::Frame, state: &TodosState, projects: &ProjectRegistry) {
+    let area = frame.area();
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    let total = state.len();
+    let title = vec![
+        Span::styled(
+            " ☑ Todos",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            {
+                let claimed = state.groups.iter().filter(|g| g.project.is_some()).count();
+                let other = state.groups.len() - claimed;
+                let mut s = format!("{total} todos · {claimed} projects");
+                if other > 0 {
+                    s.push_str(&format!(" · {other} other sessions"));
+                }
+                if state.hidden_archived > 0 {
+                    s.push_str(&format!(
+                        " · {} in archived projects hidden",
+                        state.hidden_archived
+                    ));
+                }
+                s
+            },
+            dim,
+        ),
+        Span::styled("   ( Esc back )", dim),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(title)), chunks[0]);
+
+    let width = chunks[1].width as usize;
+    let mut display: Vec<Line> = Vec::new();
+    let mut item_pos: Vec<usize> = Vec::new();
+    if total == 0 {
+        display.push(Line::raw(""));
+        display.push(Line::from(Span::styled(
+            if state.hidden_archived > 0 {
+                "  no todos outside archived projects — Ctrl+R to show them"
+            } else {
+                "  no todos — add one from a project detail or `hive todo add`"
+            },
+            dim,
+        )));
+    }
+    let mut i = 0;
+    for g in &state.groups {
+        display.push(Line::raw(""));
+        let mut header = match &g.project {
+            Some(key) => {
+                let cfg = projects.projects.get(key);
+                let emoji = cfg.map(|c| c.emoji.as_str()).unwrap_or("📁");
+                let mut spans = vec![Span::styled(
+                    format!(" {emoji} {}", project_display_name(projects, key)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                if cfg.is_some_and(|c| c.archived) {
+                    spans.push(Span::styled("  [archived]", dim));
+                }
+                spans
+            }
+            None => vec![
+                Span::styled(
+                    format!(" {}", g.session().unwrap_or_default()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  (no project)", dim),
+            ],
+        };
+        header.push(Span::styled(format!("  ({})", g.rows.len()), dim));
+        display.push(Line::from(header));
+
+        for r in &g.rows {
+            let selected = i == state.sel;
+            item_pos.push(display.len());
+            let base = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![Span::styled("   • ", base.add_modifier(Modifier::DIM))];
+            let mut used = 5;
+            if let Some(b) = &r.branch {
+                let tag = format!("[{b}] ");
+                used += tag.chars().count();
+                spans.push(Span::styled(tag, base.fg(Color::Green)));
+            }
+            // Newlines are stored escaped and come back real; a row is one line.
+            let text = r.text.replace('\n', " ⏎ ");
+            spans.push(Span::styled(
+                ellipsize(&text, width.saturating_sub(used + 1).max(8)),
+                base,
+            ));
+            display.push(Line::from(spans));
+            i += 1;
+        }
+    }
+
+    let h = chunks[1].height as usize;
+    let sel_display = item_pos.get(state.sel).copied().unwrap_or(0);
+    let offset = if sel_display >= h {
+        sel_display + 1 - h
+    } else {
+        0
+    };
+    let lines: Vec<Line> = display.into_iter().skip(offset).take(h).collect();
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    let footer = if let Some(input) = &state.input {
+        let session = state.selected().map(|r| r.session.as_str()).unwrap_or("");
+        Line::from(vec![
+            Span::styled(
+                format!(" add to {session}: "),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(format!("{input}▏")),
+        ])
+    } else if state.confirm_delete {
+        Line::from(Span::styled(
+            " delete this todo for good? y / any key to cancel  (x marks it done instead)",
+            Style::default().fg(Color::Red),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                " Enter start · x done · a add · Del delete · → project · J/K next/prev project · ^R {} archived · Esc back",
+                if state.show_archived { "hide" } else { "show" }
+            ),
+            dim,
+        ))
+    };
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
 fn draw_recover(frame: &mut ratatui::Frame, state: &RecoverState, projects: &ProjectRegistry) {
     let area = frame.area();
     let chunks = Layout::vertical([
@@ -4693,6 +5085,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "! / s",
             "Toggle auto-approve / skip the conversation's session",
         ),
+        key(
+            "t",
+            "Todos of every project — Enter start · x done · a add · → project · ^R archived",
+        ),
         key("L", "Spread sessions into iTerm2 panes / collapse back"),
         key("N", "New-project wizard (key → emoji → path)"),
         key("w / x", "In a project detail: create / delete a worktree"),
@@ -5695,6 +6091,43 @@ pub fn render_conversations(reg: &ConversationRegistry) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn archived_projects_todos_hide_until_revealed() {
+        let mut projects = ProjectRegistry::default();
+        projects.projects.insert(
+            "old".into(),
+            crate::common::projects::ProjectConfig {
+                archived: true,
+                ..Default::default()
+            },
+        );
+        projects.projects.insert("live".into(), Default::default());
+        let group = |p: Option<&str>, n: usize| TodoGroup {
+            project: p.map(Into::into),
+            rows: (0..n)
+                .map(|i| TodoRow {
+                    session: p.unwrap_or("stray").into(),
+                    branch: None,
+                    index: i,
+                    text: format!("t{i}"),
+                })
+                .collect(),
+        };
+        let groups = vec![
+            group(Some("live"), 1),
+            group(Some("old"), 2),
+            group(None, 1),
+        ];
+        let (shown, hidden) = filter_archived_todos(groups.clone(), &projects, false);
+        assert_eq!(hidden, 2);
+        // An unclaimed session has no project to be archived — it stays.
+        let keys: Vec<_> = shown.iter().map(|g| g.project.as_deref()).collect();
+        assert_eq!(keys, [Some("live"), None]);
+        let (shown, hidden) = filter_archived_todos(groups, &projects, true);
+        assert_eq!((shown.len(), hidden), (3, 0));
+    }
+
     use super::*;
     use crate::common::registry::{ConversationId, Lifecycle};
 

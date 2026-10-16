@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 413 tests (388 unit + 25 CLI smoke)
+cargo test                # 420 tests (395 unit + 25 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -82,6 +82,7 @@ hive wt list [project]  # list registered worktrees with tmux status
 hive wt prune [project] # remove leftover Workflow agent worktrees + worktree-wf_* / wf/* branches (plan, then y/N)
 hive wt prune --branches 'review-*' --dry-run  # extra branch globs; show the plan only
 hive todo list [--session <name>] [--done]  # list active (or completed) todos
+hive todo list --all                        # every session's todos, grouped by project
 hive todo next [--session <name>]           # print first active todo (exit 1 if none)
 hive todo add <text> [--session <name>]     # add a todo
 hive todo done [index] [--session <name>]   # mark todo as done (default: 1)
@@ -193,6 +194,7 @@ src/
 │   ├── jsonl.rs            JSONL parsing + transcript scan (all auth profiles), mtime-keyed scan cache
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml)
+│   ├── todos.rs            every session's todos regrouped by owning project (TUI `t`, `todo list --all`)
 │   ├── prune.rs            leftover Workflow agent worktrees/branches + the keep/remove rules (`hive wt prune`)
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
 │   ├── worktree_health.rs  git state of ONE working tree (dirty/ahead/behind/merged), mtime-cached
@@ -463,6 +465,7 @@ the cwd's shared-prefix remainder just restates the project).
 | `v` `m` `s` `!` | favorite · mute · skip · auto-approve (session-level) |
 | `M` | mute override 🔔 (per conversation) · `G` global mute · `P` pin conversation · `e` edit note |
 | `z`/`Z` | freeze a Claude window (prompts for a note) |
+| `t` | todos screen — every project's todos in one list (see below) |
 | `R` | recovery screen — reopen the windows that were open when hive last saw the machine |
 | `Del` | close live conv (kill window) · discard frozen · archive project (Browse header) · delete worktree (confirm) |
 | `a` | project detail: archive / unarchive the project |
@@ -499,6 +502,34 @@ would clobber that project's auth profile / ports / worktrees dir with defaults)
 A failed `reg.save()` puts the wizard back **with everything you typed** rather than dropping
 it. Emoji stays optional and defaults to 📁. It writes only key/emoji/path — for the full set
 (auth profile, worktrees, ports, hooks) use `hive project add`.
+
+### Todos screen (`t`)
+
+Todos are stored **per tmux session** (`todos.txt`), which is the right key for adding one
+from inside a window and the wrong one for reading them back: a project's work is spread over
+its own session plus one per worktree. `common/todos.rs` regroups them by the PROJECT that owns
+each session, resolved by **name** — the project's derived session name, or a worktree's
+registered `session_name` — so it needs no tmux and no registry gather. Two fallbacks keep a
+todo from vanishing:
+
+- A session named `{emoji} [{project}] {branch}` whose worktree is no longer registered is
+  still claimed by its `[project]` tag, as long as that project is registered.
+- A session nothing claims shows as its own `(no project)` group, after the projects.
+
+Archived projects' todos are **hidden until `Ctrl+R`** (the same reveal chord as Browse); the
+title counts what the filter hides, so a hidden todo never reads as a lost one. Unclaimed
+sessions have no project to be archived and always show. `Enter` starts a `task: <todo>`
+conversation in the todo's session (same as in the project detail), `x` marks done, `a` adds
+to the selected row's session, `Del` deletes (y-confirmed — unlike done, it's unrecoverable),
+`→` opens the worktree's detail (else the project's) on top, `J`/`K` jump between projects.
+The list re-reads every ~2s so a `hive todo add` from elsewhere shows up.
+
+**Removal clears them.** `hive project remove` drops the todos (active and done) of the
+project's session and every registered worktree session of it; `hive wt delete` (and the
+TUI's) drops the worktree session's, once the worktree is actually gone. Both print what
+they dropped. Before this nothing ever cleared them — a removed project's todos sat in the
+`t` screen as `(no project)` forever. Removal from a hand-edited `projects.toml` still
+can't be seen; those orphans are `Del`-able from the `t` screen.
 
 ### Archived conversations (`A`)
 
