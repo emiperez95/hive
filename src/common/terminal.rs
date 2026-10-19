@@ -266,24 +266,28 @@ pub fn collapse_panes() -> bool {
     false
 }
 
-/// Hand keyboard focus back to the terminal.
+/// Hand keyboard focus from iTerm's Toolbelt sidebar back to the terminal.
 ///
-/// Clicking a row in the sidebar leaves the sidebar as first responder, so the
-/// tmux client moves but every keystroke — prefix bindings included — still
-/// goes to the panel. In iTerm the sidebar is a Toolbelt webview inside the
-/// same window, so `select` on the current session moves first responder off
-/// it; anywhere else the sidebar is its own window and the terminal app just
-/// needs activating.
+/// Clicking a row in the web sidebar leaves the Toolbelt webview as first
+/// responder, so the tmux client moves but every keystroke — prefix bindings
+/// included — still goes to the panel. `select` on the current session moves
+/// first responder off it.
+///
+/// Deliberately iTerm-only, never [`detect`]: the web sidebar's only terminal
+/// host is the iTerm Toolbelt (the Ghostty sidebar is terminal-native and hands
+/// focus back itself, via [`focus_work_split`]). Routing by the most recent tmux
+/// client sent this to Ghostty whenever a Ghostty client had been used last —
+/// and iTerm's sidebar kept the keyboard, so its key bindings stopped working.
+/// Checked for `is running` first, so it never launches iTerm.
 #[cfg(target_os = "macos")]
 pub fn focus_current_session() -> bool {
-    let script = match detect() {
-        Some(Terminal::ITerm) => {
-            r#"tell application "iTerm2" to tell current session of current window to select"#
-        }
-        Some(Terminal::Ghostty) => r#"tell application "Ghostty" to activate"#,
-        None => return false,
-    };
-    osascript(script).is_some()
+    osascript(
+        r#"
+if application "iTerm2" is not running then return
+tell application "iTerm2" to tell current session of current window to select
+"#,
+    )
+    .is_some()
 }
 
 #[cfg(not(target_os = "macos"))]
