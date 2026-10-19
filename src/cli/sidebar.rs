@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::style::{Color, Modifier, Style};
@@ -73,8 +73,13 @@ pub fn open_split() -> bool {
         .unwrap_or_else(|_| "hive".to_string());
     // A new split starts with Ghostty's launchd PATH, which has no tmux.
     let path = std::env::var("PATH").unwrap_or_default();
+    let debug = if crate::common::debug::is_debug_enabled() {
+        " --debug"
+    } else {
+        ""
+    };
     let command = format!(
-        "env PATH={} {} sidebar --fit",
+        "env PATH={} {}{debug} sidebar --fit",
         tmux::sh_quote(&path),
         tmux::sh_quote(&exe)
     );
@@ -105,13 +110,18 @@ pub fn run_sidebar(split: bool, fit: bool) -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::SetTitle(SIDEBAR_TITLE),
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableFocusChange
     )?;
     if fit {
         fit_width();
     }
     let result = sidebar_loop(&mut term, &shared);
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableFocusChange,
+        crossterm::event::DisableMouseCapture
+    );
     ratatui::restore();
     result
 }
@@ -231,6 +241,9 @@ fn sidebar_loop(term: &mut ratatui::DefaultTerminal, shared: &Arc<Mutex<Shared>>
     let mut focus = Focus::default();
     let mut error: Option<String> = None;
     let mut force = true;
+    // The row under the pointer and when the pointer was last there — see
+    // `Event::FocusGained` below.
+    let mut hover: Option<(usize, Instant)> = None;
 
     loop {
         {
@@ -270,8 +283,10 @@ fn sidebar_loop(term: &mut ratatui::DefaultTerminal, shared: &Arc<Mutex<Shared>>
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
-        force = true;
-        match event::read()? {
+        let ev = event::read()?;
+        // Motion arrives on every pixel; only a change of row is worth a redraw.
+        force = !matches!(ev, Event::Mouse(m) if m.kind == MouseEventKind::Moved);
+        match ev {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -294,10 +309,38 @@ fn sidebar_loop(term: &mut ratatui::DefaultTerminal, shared: &Arc<Mutex<Shared>>
                         }
                     }
                 }
+                MouseEventKind::Moved => {
+                    let row = hit.get(m.row as usize).copied().flatten();
+                    if let Some(i) = row {
+                        if sel != i {
+                            sel = i;
+                            force = true;
+                        }
+                    }
+                    hover = row.map(|i| (i, Instant::now()));
+                }
                 MouseEventKind::ScrollDown => scroll += 2,
                 MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(2),
                 _ => {}
             },
+            // Ghostty never passes the click that focuses an unfocused split on to
+            // the program (ghostty#6998, modelled on iTerm2), so clicking the
+            // sidebar from the work split took two clicks. Motion IS reported
+            // while unfocused, so the row under the pointer is known: focus
+            // arriving right after the pointer was over a row is that click.
+            // The recency bound keeps a keyboard `goto_split` into the sidebar,
+            // with the pointer parked over it, from switching anywhere.
+            Event::FocusGained => {
+                crate::common::debug::debug_log(&format!("sidebar: focus gained, hover {hover:?}"));
+                if let Some((i, at)) = hover {
+                    if at.elapsed() < Duration::from_millis(1500) {
+                        sel = i;
+                        if let Some(r) = rows.get(i) {
+                            switch_to(r, shared);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
