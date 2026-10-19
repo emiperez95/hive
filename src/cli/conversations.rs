@@ -4609,7 +4609,7 @@ fn mem_color(kb: u64) -> Color {
 /// space-padded when narrower. Uses DISPLAY width, unlike the `{:<n}` padding used
 /// for plain-ASCII columns — an emoji is two cells but one char, so char padding
 /// pushes everything after it one column right on exactly the rows that have one.
-fn fit_cells(s: &str, cells: usize) -> String {
+pub(crate) fn fit_cells(s: &str, cells: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if cells == 0 {
         return String::new();

@@ -291,6 +291,108 @@ pub fn focus_current_session() -> bool {
     false
 }
 
+/// The terminal title `hive sidebar` sets on itself. Ghostty's AppleScript has
+/// no other handle on "which split is the sidebar", so the title is the marker:
+/// it is how a tab is checked for an existing sidebar, how the sidebar finds its
+/// own split to resize, and how it finds the work split to hand focus back to.
+pub const SIDEBAR_TITLE: &str = "hive sidebar";
+
+/// Escape a string for an AppleScript double-quoted literal.
+#[cfg(target_os = "macos")]
+fn as_quote(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// What [`open_sidebar_split`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SidebarSplit {
+    Opened,
+    AlreadyOpen,
+    /// Not in Ghostty, or the AppleScript failed.
+    Unavailable,
+}
+
+/// Open `command` as a split on the right of the current Ghostty tab, unless
+/// the tab already has a sidebar. Focus stays on the split it was opened from —
+/// the caller is usually `hive start`, about to become the tmux client there.
+#[cfg(target_os = "macos")]
+pub fn open_sidebar_split(command: &str) -> SidebarSplit {
+    if detect() != Some(Terminal::Ghostty) {
+        return SidebarSplit::Unavailable;
+    }
+    let script = format!(
+        r#"
+tell application "Ghostty"
+    set tb to selected tab of front window
+    if (count of (terminals of tb whose name is "{title}")) > 0 then return "open"
+    set t to focused terminal of tb
+    split t direction right with configuration {{command:"{command}"}}
+    focus t
+    return "opened"
+end tell
+"#,
+        title = SIDEBAR_TITLE,
+        command = as_quote(command),
+    );
+    match osascript(&script).as_deref() {
+        Some("opened") => SidebarSplit::Opened,
+        Some("open") => SidebarSplit::AlreadyOpen,
+        _ => SidebarSplit::Unavailable,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_sidebar_split(_command: &str) -> SidebarSplit {
+    SidebarSplit::Unavailable
+}
+
+/// Move the sidebar split's divider by `points`: positive shrinks the sidebar
+/// (divider right), negative grows it (divider left). Ghostty measures in
+/// screen points, not the pixels the pty reports — see `sidebar::fit_width`.
+#[cfg(target_os = "macos")]
+pub fn resize_sidebar_split(points: i32) -> bool {
+    let (dir, amount) = if points >= 0 {
+        ("right", points)
+    } else {
+        ("left", -points)
+    };
+    let script = format!(
+        r#"
+tell application "Ghostty"
+    set tb to selected tab of front window
+    set s to first terminal of tb whose name is "{SIDEBAR_TITLE}"
+    perform action "resize_split:{dir},{amount}" on s
+end tell
+"#
+    );
+    osascript(&script).is_some()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn resize_sidebar_split(_points: i32) -> bool {
+    false
+}
+
+/// Move keyboard focus from the sidebar to the work split beside it, so a click
+/// in the sidebar doesn't leave every keystroke going to the sidebar.
+#[cfg(target_os = "macos")]
+pub fn focus_work_split() -> bool {
+    let script = format!(
+        r#"
+tell application "Ghostty"
+    set tb to selected tab of front window
+    focus (first terminal of tb whose name is not "{SIDEBAR_TITLE}")
+end tell
+"#
+    );
+    osascript(&script).is_some()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn focus_work_split() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

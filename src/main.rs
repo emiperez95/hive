@@ -68,7 +68,12 @@ fn main() -> Result<()> {
             dev,
             tts_host,
         }) => crate::serve::web::run_web_server(port, dev, tts_host),
-        Some(Command::Start) => {
+        Some(Command::Sidebar { split, fit }) => cli::sidebar::run_sidebar(split, fit),
+        Some(Command::Start { sidebar }) => {
+            if sidebar {
+                // Best-effort: outside Ghostty there is nothing to split.
+                cli::sidebar::open_split();
+            }
             if let Some(target) = cli::session::run_start()? {
                 use std::os::unix::process::CommandExt;
                 let tmux = resolve_tmux_path();

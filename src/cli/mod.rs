@@ -8,6 +8,7 @@ pub mod hook;
 pub mod project;
 pub mod session;
 pub mod setup;
+pub mod sidebar;
 pub mod stats;
 pub mod todo;
 pub mod update;
@@ -128,7 +129,20 @@ pub enum Command {
     /// Collapse terminal panes back to a single pane
     Collapse,
     /// Auto-attach to the first available tmux session
-    Start,
+    Start {
+        /// In Ghostty, first open the hive sidebar as a split of this tab (if it has none)
+        #[arg(long)]
+        sidebar: bool,
+    },
+    /// Attention list as a terminal UI — meant for a Ghostty split beside tmux
+    Sidebar {
+        /// Open it as a split on the right of the current Ghostty tab instead
+        #[arg(long)]
+        split: bool,
+        /// Shrink this split to the sidebar's width on startup (used by --split)
+        #[arg(long, hide = true)]
+        fit: bool,
+    },
     /// Show usage stats from the activity log
     Stats {
         /// How many days back to summarize (default: 7)
