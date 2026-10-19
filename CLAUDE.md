@@ -1537,6 +1537,18 @@ Things that shaped it:
   `$TERM` is a generic `xterm-256color`, so the XTVERSION reply is the reliable signal — and
   the only one available to the detached `__hive_web` server.
 
+- **Launch**: Ghostty's `initial-command = …/hive start --sidebar` gives the first window
+  tmux + sidebar; later windows, tabs and splits stay plain shells (`command` would apply to
+  every split too). `open_split_on_start` retries briefly, since the first window isn't yet
+  AppleScript's "front window" when the command starts.
+
+> **Gotcha — a terminal-launched hive gets a bare environment.** Ghostty runs commands with
+> launchd's PATH (no Homebrew) and possibly no locale. Most tmux call sites spawn a bare
+> `tmux`, and without a UTF-8 locale tmux prints every emoji as `_` (`⛅ AWS Hub` →
+> `__ AWS Hub`), so no session name matches. Measured: `hive start` saw 0 live sessions and
+> fell to the picker. `tmux::ensure_tmux_env()`, first thing in `main`, puts tmux's dir on
+> PATH and sets `LC_CTYPE=UTF-8` when no locale names UTF-8 — inherited by every child.
+
 > **Known gap**: a split closed via AppleScript `close` sometimes left its process running
 > (pty kept open by Ghostty); not yet seen when closing by hand.
 

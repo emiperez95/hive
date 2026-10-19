@@ -416,8 +416,53 @@ pub fn get_other_client_sessions() -> HashSet<String> {
     other_sessions
 }
 
+/// Make this process's environment (inherited by every child) one tmux works
+/// in: tmux's directory on PATH, and a UTF-8 locale.
+///
+/// A terminal launching hive directly — Ghostty's `initial-command`, a new
+/// split's command — hands it the bare launchd PATH (`/usr/bin:/bin:…`, no
+/// Homebrew). Only the final `attach` resolved tmux by absolute path; the other
+/// call sites spawn a bare `tmux`, which then fails silently: measured, `hive
+/// start` saw 0 live sessions and fell through to the picker, and the sidebar's
+/// clicks switched nothing. Fixing PATH once at startup covers all of them.
+///
+/// The locale matters just as much: with no UTF-8 in `LC_ALL` / `LC_CTYPE` /
+/// `LANG`, tmux prints every non-ASCII character as `_` — `⛅ AWS Hub` comes
+/// back `__ AWS Hub` — so no session name matches anything hive knows.
+pub fn ensure_tmux_env() {
+    let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"].iter().any(|k| {
+        std::env::var(k).is_ok_and(|v| {
+            let v = v.to_ascii_uppercase();
+            v.contains("UTF-8") || v.contains("UTF8")
+        })
+    });
+    if !utf8 {
+        std::env::set_var("LC_CTYPE", "UTF-8");
+    }
+    let tmux = resolve_tmux_path();
+    let Some(dir) = std::path::Path::new(&tmux)
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+    else {
+        return;
+    };
+    let path = std::env::var("PATH").unwrap_or_default();
+    if path.split(':').any(|p| std::path::Path::new(p) == dir) {
+        return;
+    }
+    let dir = dir.display();
+    std::env::set_var(
+        "PATH",
+        if path.is_empty() {
+            dir.to_string()
+        } else {
+            format!("{dir}:{path}")
+        },
+    );
+}
+
 /// Resolve the absolute path to tmux by searching PATH.
-/// Needed for exec() and iTerm split panes which may have minimal PATH.
+/// Needed for exec() and terminal split panes which may have minimal PATH.
 pub fn resolve_tmux_path() -> String {
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':') {

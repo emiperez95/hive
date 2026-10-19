@@ -310,6 +310,21 @@ pub fn open_split() -> bool {
     }
 }
 
+/// `hive start --sidebar`. As Ghostty's `initial-command` this runs while its
+/// first window is still coming up, before AppleScript can see it as the front
+/// window — so retry briefly, and only when Ghostty is actually the terminal.
+pub fn open_split_on_start() {
+    if terminal::detect() != Some(terminal::Terminal::Ghostty) {
+        return;
+    }
+    for _ in 0..10 {
+        if open_split() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// `hive sidebar [--split] [--fit]`.
 pub fn run_sidebar(split: bool, fit: bool) -> Result<()> {
     if split {

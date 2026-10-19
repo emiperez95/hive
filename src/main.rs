@@ -28,6 +28,7 @@ fn conv_opts(args: &Args, list: bool) -> ConvOptions {
 fn main() -> Result<()> {
     let args = Args::parse();
     init_debug(args.debug);
+    common::tmux::ensure_tmux_env();
 
     match args.command {
         Some(Command::Hook { event }) => cli::hook::run_hook(&event),
@@ -72,7 +73,7 @@ fn main() -> Result<()> {
         Some(Command::Start { sidebar }) => {
             if sidebar {
                 // Best-effort: outside Ghostty there is nothing to split.
-                cli::sidebar::open_split();
+                cli::sidebar::open_split_on_start();
             }
             if let Some(target) = cli::session::run_start()? {
                 use std::os::unix::process::CommandExt;
