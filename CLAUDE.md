@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 420 tests (395 unit + 25 CLI smoke)
+cargo test                # 452 tests (427 unit + 25 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 699 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 388 unit + 25 smoke.
+> `cargo test` prints 747 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 427 unit + 25 smoke.
 
 ## The TUI (conversation-first)
 
@@ -58,6 +58,9 @@ hive --filter <q>       # conversations, start in Browse + search pre-filled wit
 hive conversations      # explicit; --list for a static listing (also used when piped)
 hive stats [--days N]   # usage summary from the activity log (default 7 days)
 hive start              # auto-attach to first available session (or fall through to picker)
+hive start --sidebar    # …in Ghostty, first open the terminal sidebar as a split of this tab
+hive sidebar            # the sidebar as a terminal UI (see Terminal sidebar)
+hive sidebar --split    # open it on the right of the current Ghostty tab (no-op if there is one)
 hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
 hive setup              # register hooks, agent, tmux keybindings, iTerm sidebar panel
@@ -87,8 +90,8 @@ hive todo next [--session <name>]           # print first active todo (exit 1 if
 hive todo add <text> [--session <name>]     # add a todo
 hive todo done [index] [--session <name>]   # mark todo as done (default: 1)
 hive todo clear [--session <name>]          # clear completed todos
-hive spread <N>                             # spread N sessions into vertical iTerm2 panes
-hive collapse                               # collapse iTerm2 panes back to one
+hive spread <N>                             # spread N sessions into side-by-side terminal panes (iTerm2 / Ghostty)
+hive collapse                               # collapse terminal panes back to one
 hive web                                    # start web dashboard on port 8375
 hive web --dev                              # dev mode: serve HTML from disk (live reload)
 hive web --tts-host <url>                   # enable TTS read-aloud via TTSQwen service
@@ -169,7 +172,9 @@ src/
 ├── bin/bench.rs            benchmark tool
 ├── cli/
 │   ├── mod.rs              Args, Command, subcommand enums
-│   ├── conversations.rs    ★ conversation-first TUI (self-contained: gather, views, render, keys) — ~3.9k lines
+│   ├── conversations.rs    ★ conversation-first TUI (self-contained: gather, views, render, keys) — ~7.4k lines
+│   ├── sidebar/            terminal sidebar for a Ghostty split: api (HTTP client) · model (pure rows/views) ·
+│   │                         render (draw + click map) · editor (notes text editor) · mod (state, input)
 │   ├── hook.rs             run_hook(): parse stdin JSON, update state, notify (honors muted projects)
 │   ├── setup.rs            run_setup(), run_uninstall(), is_hive_hook_command()
 │   ├── worktree.rs         run_wt_new/delete/list/import(): full worktree lifecycle
@@ -190,7 +195,7 @@ src/
 │   ├── process.rs          Claude process detection, process tree, build_cmdline_map/parse_resume_id
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
-│   ├── iterm.rs            iTerm2 pane spread/collapse via AppleScript (macOS only, #[cfg] guarded)
+│   ├── terminal.rs         the emulator around tmux — iTerm2 or Ghostty (detect, spread/collapse, focus, sidebar split)
 │   ├── jsonl.rs            JSONL parsing + transcript scan (all auth profiles), mtime-keyed scan cache
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml)
@@ -301,7 +306,7 @@ Files are created on demand — `muted-projects.txt` only exists once you mute a
 macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other platforms:
 - `ports.rs`: `get_listening_ports_for_pids()` — uses `libproc`
 - `chrome.rs`: `get_chrome_tabs()`, `focus_all_matched_tabs()` — uses JXA (sees all Chrome profiles)
-- `iterm.rs`: `get_iterm_pane_count()`, `spread_panes()`, `collapse_panes()` — uses AppleScript
+- `terminal.rs`: `pane_count()`, `spread_panes()`, `collapse_panes()`, `focus_current_session()`, the Ghostty sidebar split helpers — AppleScript against whichever emulator `detect()` finds
 
 ## Conversations TUI (`hive` / `hive conversations`, `prefix + s`, `prefix + d`, `prefix + a`)
 
@@ -470,7 +475,7 @@ the cwd's shared-prefix remainder just restates the project).
 | `Del` | close live conv (kill window) · discard frozen · archive project (Browse header) · delete worktree (confirm) |
 | `a` | project detail: archive / unarchive the project |
 | `A` | project detail: archive the selected conversation (prompts for a reason) / unarchive |
-| `L` `N` | iTerm spread/collapse · new-project wizard (key → emoji → path) |
+| `L` `N` | terminal spread/collapse · new-project wizard (key → emoji → path) |
 | `Ctrl+R` | Browse: reveal/hide archived |
 
 **Mute has three levels**: `m` per-session, `G` global, and `m` on a *project* (project detail)
@@ -927,9 +932,9 @@ TUI's own `Action` enum is the only post-exit dispatch.)
 
 ## `hive spread/collapse`
 
-`hive spread N` opens N-1 new vertical iTerm2 panes via AppleScript (`split vertically`). Each new pane runs `env PATH='...' /path/to/hive start` — PATH is captured from the current process since iTerm split panes have minimal environment. Each `hive start` independently picks a session.
+`hive spread N` opens N-1 new side-by-side panes via AppleScript — iTerm2's `split vertically`, or Ghostty's `split … direction right` followed by `equalize_splits` (each split halves the last). Each new pane runs `env PATH='...' /path/to/hive start` — PATH is captured from the current process since iTerm split panes have minimal environment. Each `hive start` independently picks a session.
 
-`hive collapse` closes all iTerm2 panes except the current one. Tmux sessions stay alive (just detached).
+`hive collapse` closes all terminal panes in the tab except the focused one. Tmux sessions stay alive (just detached).
 
 In the TUI, `L` toggles: if multiple panes exist → collapse, otherwise → show SpreadPrompt for digit input.
 
@@ -1278,7 +1283,7 @@ first sighting never does either. In memory in the data thread, like `StateAges`
 
 **Clicking a row fires on `mousedown`**, not `click`: the list is rebuilt on each
 poll, and a click whose mouseup lands after a rebuild is silently dropped. The
-switch also sends `refocus: true`, which runs `iterm::focus_current_session` so the
+switch also sends `refocus: true`, which runs `terminal::focus_current_session` so the
 keyboard goes back to the terminal — otherwise the Toolbelt webview keeps it and
 every tmux binding goes to the panel.
 
@@ -1485,6 +1490,56 @@ nudge → marker moved.
 > and the marker waited for the mouse to leave. A render the user caused sets
 > `sbForceSwap` and always lands; so does a pushed focus change.
 
+## Terminal sidebar — `hive sidebar` in a Ghostty split
+
+Ghostty has no Toolbelt, and tmux can't host a pane outside its windows (every pane belongs
+to one window; the status line is the only per-client chrome). So the sidebar's terminal
+form lives in a **Ghostty split** beside the one running `tmux attach`: outside tmux, it
+never moves when the client switches sessions — the Toolbelt's permanence, with no extra
+layer. `hive start --sidebar` opens it before attaching; `hive sidebar --split` adds it to
+the current tab. It reaches feature parity with the web sidebar: Live / Attention / Projects,
+folded Skipped and Frozen (click thaws), global and per-project mute, the archived filter,
+Details (spend + git chips), Notes, Todos and the start-todo dialog, resizable panes.
+
+**It decides nothing.** Every row, tier, rank, age, ping, figure and dispatch rule comes
+from the dashboard's JSON API (`cli/sidebar/api.rs`), computed by the web data thread's one
+gather — so its attention order is `Ctrl+g`'s, and one sidebar per tab costs one HTTP poll
+each. Focus is pushed over the same `/api/ambient-wait` long-poll the web page holds. It
+needs `__hive_web`, and calls `ensure_web_autostart` on launch.
+
+Things that shaped it:
+
+- **The split is found by its terminal title** (`terminal::SIDEBAR_TITLE`): Ghostty's
+  AppleScript has no other handle on "which split is the sidebar". The title is how a tab is
+  checked for an existing one, how the sidebar resizes itself, and how it hands focus back.
+- **It sizes itself** (`fit_width`) to 40 columns. Ghostty's `resize_split` takes screen
+  POINTS while the pty reports PIXELS — the ratio is the display's scale factor, so it
+  resizes once on a retina guess, measures, and corrects. The naive pixel count overshot a
+  49-column split to 31.
+- **One click, not two.** Ghostty never forwards the click that focuses an unfocused split
+  (ghostty#6998, modelled on iTerm2). It *does* report motion there, so the sidebar tracks
+  the pointer and treats focus arriving within 1.5s of it being over something as a click on
+  that spot (`on_focus_gained`). Confirmed in the debug log.
+- **Clicks in the header and list hand the keyboard back** to the work split
+  (`focus_work_split`) — they are navigation, and otherwise the next thing typed (a `q`)
+  lands in the sidebar. Clicks in Notes and Todos keep it: you clicked there to type. `Esc`
+  in the list goes back to the terminal; `Tab` cycles list → notes → todos.
+- **Every draw records a click map** (`App::hits`: spans per screen row), so mouse handling
+  never re-derives layout. The dialog clears the rows it covers first, so nothing behind it
+  is clickable.
+- **Rows don't move under the pointer**: in Attention, a refresh that lands while the
+  pointer was over the list in the last 2s is held (`pending`) until it leaves.
+- **Prefs persist** in `~/.hive/cache/sidebar.json` (view, folds, pane heights) — the web
+  page keeps the same in localStorage. Pane headers are the resize grips: drag to resize,
+  click to fold.
+- **Detection** (`terminal::detect`): `$HIVE_TERMINAL` → `$TERM_PROGRAM` → the most recent
+  tmux client's `#{client_termtype}`. Inside tmux `$TERM_PROGRAM` is `tmux`, and iTerm's
+  `$TERM` is a generic `xterm-256color`, so the XTVERSION reply is the reliable signal — and
+  the only one available to the detached `__hive_web` server.
+
+> **Known gap**: a split closed via AppleScript `close` sometimes left its process running
+> (pty kept open by Ghostty); not yet seen when closing by hand.
+
 ## Metrics (`GET /metrics`)
 
 `serve/metrics.rs` renders hive's state as **Prometheus text exposition**, so an OTel collector
@@ -1578,13 +1633,24 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-413 distinct tests. Run with `cargo test`.
+452 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 699 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 286 · bin 388 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 747 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 295 · bin 427 (the superset — adds cli/daemon/serve)
 > · smoke 25.
 
-**Unit tests (388)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (427)** — in-module `#[cfg(test)]` blocks:
+- `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
+  session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
+  busy projects first and never hides an archived one with conversations, held-for vs
+  last-activity ages, item keys stable across rebuilds), `render` (`layout` shrinks the tallest
+  pane first and keeps the list's minimum, never underflows), `editor` (wrap by display width,
+  cursor across soft/hard lines, up/down keep the column, paste), `api` (query encoding, the
+  conv-stats wire shape), and TestBackend draws of the whole app — panes, the click map
+  matching the screen, the dialog owning its clicks, done todos newest-first with the server's
+  index, no panic down to 4×3
+- `common/terminal.rs`: emulator detection — `$TERM_PROGRAM`, a tmux client's
+  `client_termtype`/`termname` (iTerm's `$TERM` is generic), the most recent non-control client
 - `common/prune.rs`: `git worktree list --porcelain` parsing (detached, valued `locked`,
   `prunable`, slashed branches), only `.claude/worktrees/` counts as an agent worktree, and the
   keep rules — dirty, unpushed, locked, recently used or unreadable all keep; a branch goes only
