@@ -718,6 +718,15 @@ guess about a world that no longer exists — the same mistake behind the thaw b
   the COMMON case — during normal use the frame equals the live set — and silence there reads
   as a broken key.
 
+> **Gotcha — the SessionEnd hook must not drop the frame on a signal.** A reboot fires
+> SessionEnd in every running Claude at once, and the hook used to remove its window from
+> the frame unconditionally — nine hooks within 300ms on 2026-10-19 emptied it down to the
+> one entry that survived their load-modify-save race, under the very guard above that
+> stops the gather from doing the same. The hook now drops an entry only when Claude's
+> `reason` is `prompt_input_exit` (`activity::session_end_drops_window`); `other` is what a
+> signal produces, and `clear` / `resume` / `logout` keep the window. The `window_close`
+> log line carries the `reason` so `hive stats` can tell a reboot from an exit.
+
 **Known limitation**: the mirror is only honest while something is gathering. With no web
 autostart and the TUI closed, a window closed in that gap stays in the frame and will be
 offered. Relatedly, two hive instances watching *different* tmux servers will fight over the

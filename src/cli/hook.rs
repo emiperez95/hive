@@ -63,19 +63,23 @@ pub fn run_hook(event_type: &str) -> Result<()> {
     let cwd_for_record = cwd.clone();
     let tmux_pane = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty());
 
-    // SessionEnd is a lifecycle event, not a status change: drop the window from the recovery
-    // snapshot and log a clean close. Handled here since it has no HookEvent variant.
+    // SessionEnd is a lifecycle event, not a status change: log the close and, only when the
+    // user ended the session on purpose, drop the window from the recovery frame. A reboot
+    // fires this in every running Claude at once with `reason: "other"`, and those must leave
+    // the frame alone — it is the list of what to reopen (see
+    // `activity::session_end_drops_window`). Handled here since it has no HookEvent variant.
     if event_type == "SessionEnd" {
-        let mut open = crate::common::activity::OpenWindowsState::load();
-        let session_name = open
+        use crate::common::activity;
+        let reason = json.get("reason").and_then(|v| v.as_str());
+        let session_name = activity::OpenWindowsState::load()
             .windows
             .get(&session_id)
             .map(|w| w.session_name.clone())
             .unwrap_or_default();
-        if open.remove(&session_id) {
-            let _ = open.save();
+        if activity::session_end_drops_window(reason) {
+            activity::remove_window(&session_id);
         }
-        crate::common::activity::log_window_close(&session_id, &session_name);
+        activity::log_window_close(&session_id, &session_name, reason);
         return Ok(());
     }
 

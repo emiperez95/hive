@@ -363,6 +363,9 @@ pub struct ActivityEntry {
     /// Window title at the time (open events).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Why Claude ended (close events): its SessionEnd `reason`, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl ActivityEntry {
@@ -376,6 +379,7 @@ impl ActivityEntry {
             sid: None,
             client: None,
             title: None,
+            reason: None,
         }
     }
 
@@ -444,9 +448,32 @@ fn entry_line(entry: &ActivityEntry) -> Option<String> {
     Some(line)
 }
 
-/// Log a clean window close (SessionEnd).
-pub fn log_window_close(sid: &str, session: &str) {
-    append_event(&ActivityEntry::new(EVENT_WINDOW_CLOSE, Utc::now()).with(sid, session, "", ""));
+/// The SessionEnd `reason` Claude sends when the user ended the session from the prompt
+/// (`/exit`, Ctrl-D, Ctrl-C) — the one deliberate close among its reasons.
+pub const SESSION_END_PROMPT_EXIT: &str = "prompt_input_exit";
+
+/// Whether a SessionEnd with this `reason` should drop the window from the recovery frame.
+///
+/// Only a deliberate exit does. Claude's other reasons are either not a close at all —
+/// `clear` and `resume` swap the conversation but keep the window, `logout` likewise — or the
+/// catch-all `other`, which is what a **signal** produces: a reboot, `tmux kill-server`, a
+/// kill-window. A reboot fires SessionEnd in every running Claude at once, and before this
+/// rule those hooks deleted the frame one window at a time, under the empty-set guard in
+/// [`reconcile_open_windows`] that exists precisely to keep a reboot from doing that. Measured
+/// on 2026-10-19: nine `window_close` lines within 300ms of the reboot, and a frame left
+/// holding the one entry that survived their load-modify-save race.
+///
+/// Keeping an entry is always the safe direction: the gather drops a window it no longer sees,
+/// and an entry nothing reconciles merely gets *offered* on the `R` screen, never reopened.
+pub fn session_end_drops_window(reason: Option<&str>) -> bool {
+    reason == Some(SESSION_END_PROMPT_EXIT)
+}
+
+/// Log a window close (SessionEnd), with Claude's `reason` when it sent one.
+pub fn log_window_close(sid: &str, session: &str, reason: Option<&str>) {
+    let mut entry = ActivityEntry::new(EVENT_WINDOW_CLOSE, Utc::now()).with(sid, session, "", "");
+    entry.reason = reason.and_then(non_empty);
+    append_event(&entry);
 }
 
 /// Log a window freeze.
@@ -830,6 +857,44 @@ mod tests {
     /// so the first gather sees an empty live set. Writing it through would erase the frame
     /// we are about to recover *from*.
     #[test]
+    fn session_end_drops_the_window_only_on_a_deliberate_exit() {
+        assert!(session_end_drops_window(Some("prompt_input_exit")));
+        // A signal — reboot, kill-server, kill-window — arrives as the catch-all.
+        assert!(!session_end_drops_window(Some("other")));
+        // These swap the conversation inside a window that stays open.
+        assert!(!session_end_drops_window(Some("clear")));
+        assert!(!session_end_drops_window(Some("resume")));
+        assert!(!session_end_drops_window(Some("logout")));
+        // An older Claude that sends no reason: keep, same as any unknown.
+        assert!(!session_end_drops_window(None));
+        assert!(!session_end_drops_window(Some("")));
+    }
+
+    #[test]
+    fn close_entry_carries_the_reason_and_omits_it_when_absent() {
+        let mut e = ActivityEntry::new(EVENT_WINDOW_CLOSE, ts("2026-10-19T18:15:27Z")).with(
+            "sid-1",
+            "🐝 hive",
+            "",
+            "",
+        );
+        e.reason = Some("other".into());
+        let line = entry_line(&e).unwrap();
+        assert!(line.contains(r#""reason":"other""#), "{line}");
+        let back: ActivityEntry = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(back, e);
+
+        e.reason = None;
+        assert!(!entry_line(&e).unwrap().contains("reason"));
+        // A line written before the field existed still parses.
+        let old: ActivityEntry = serde_json::from_str(
+            r#"{"ts":"2026-10-19T18:15:27+00:00","event":"window_close","sid":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.reason, None);
+    }
+
+    #[test]
     fn empty_live_set_never_overwrites_the_frame() {
         let mut before = HashMap::new();
         let now = ts("2026-09-05T21:30:00Z");
@@ -979,6 +1044,7 @@ mod tests {
             sid: None,
             client: None,
             title: None,
+            reason: None,
         }
     }
 
