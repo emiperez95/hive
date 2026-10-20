@@ -275,6 +275,10 @@ pub(crate) struct App {
     dialog: Option<Dialog>,
     drag: Option<Drag>,
     theme: theme::Theme,
+    /// The OS appearance the theme was read under; `None` = don't watch it
+    /// (tests, which have no terminal to ask).
+    os_dark: Option<bool>,
+    os_dark_at: Option<Instant>,
 
     frozen_at: Option<Instant>,
     projects_at: Option<Instant>,
@@ -346,6 +350,7 @@ pub fn run_sidebar(split: bool, fit: bool) -> Result<()> {
     api.start_loops();
 
     let mut term = ratatui::try_init().context("hive sidebar: needs a terminal")?;
+    let os_dark = theme::os_dark();
     let palette = theme::detect();
     crossterm::execute!(
         std::io::stdout(),
@@ -359,6 +364,7 @@ pub fn run_sidebar(split: bool, fit: bool) -> Result<()> {
     }
     let mut app = App::new(api);
     app.theme = palette;
+    app.os_dark = Some(os_dark);
     let result = app.run(&mut term, &rx);
     app.flush_notes();
     let _ = crossterm::execute!(
@@ -448,6 +454,8 @@ impl App {
             todos_scroll: 0,
             dialog: None,
             theme: theme::Theme::default(),
+            os_dark: None,
+            os_dark_at: None,
             drag: None,
             frozen_at: None,
             projects_at: None,
@@ -654,6 +662,18 @@ impl App {
         if stale(self.frozen_at, 5) {
             self.frozen_at = Some(Instant::now());
             self.api.fetch_frozen();
+        }
+        // Light/dark switch: Ghostty recolours itself, the palette has to follow.
+        if let Some(was) = self.os_dark {
+            if stale(self.os_dark_at, 3) {
+                self.os_dark_at = Some(Instant::now());
+                let now = theme::os_dark();
+                if now != was {
+                    self.os_dark = Some(now);
+                    self.theme = theme::detect();
+                    changed = true;
+                }
+            }
         }
         if stale(self.projects_at, 30) {
             self.projects_at = Some(Instant::now());

@@ -90,11 +90,22 @@ fn shift((r, g, b): (u8, u8, u8), by: f32) -> Color {
     Color::Rgb(s(r), s(g), s(b))
 }
 
-/// Ask the terminal for its background. Must run in raw mode and before the
-/// event loop starts reading stdin, or the reply is echoed / eaten as keys.
-/// A terminal that doesn't answer within 150ms gets the default.
+/// Ask the terminal for its background. Must run in raw mode, between event
+/// reads (never while crossterm is waiting on stdin), or the reply is echoed /
+/// eaten as keys. A terminal that doesn't answer within 150ms gets the default.
 pub(crate) fn detect() -> Theme {
     query_bg().map(Theme::from_bg).unwrap_or_default()
+}
+
+/// Whether macOS is in dark mode. Ghostty's `theme = light:…,dark:…` follows
+/// it, but a running sidebar only learns its background by asking, so it
+/// watches this and asks again when it flips. `AppleInterfaceStyle` is absent
+/// (non-zero exit) in light mode.
+pub(crate) fn os_dark() -> bool {
+    std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"Dark"))
 }
 
 fn query_bg() -> Option<(u8, u8, u8)> {
