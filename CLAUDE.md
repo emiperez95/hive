@@ -1529,9 +1529,11 @@ Things that shaped it:
   is clickable.
 - **Rows don't move under the pointer**: in Attention, a refresh that lands while the
   pointer was over the list in the last 2s is held (`pending`) until it leaves.
-- **Colours come from the terminal's background** (`sidebar/theme.rs`): it asks once with OSC 11
-  and derives every surface from the answer, so the web's cards/tints work on a light or a dark
-  theme. Ghostty's `theme = light:…,dark:…` follows macOS appearance; the sidebar polls
+- **Colours come from the terminal's theme** (`sidebar/theme.rs`), like Claude Code's: text and
+  accents are the default foreground + ANSI palette (`Reset`, `Red`, `Blue`…), so they keep their
+  place relative to everything else when the theme changes. Only the surfaces the palette can't
+  express are RGB, mixed from what the terminal reports (OSC 10/11 fg/bg, OSC 4 blue/yellow): a
+  card is the background 6% toward the foreground, the current row the background tinted blue. Ghostty's `theme = light:…,dark:…` follows macOS appearance; the sidebar polls
   `AppleInterfaceStyle` every 3s and re-asks when it flips (a query mid-loop is safe only
   between crossterm reads — the main thread is the only stdin reader).
 - **Prefs persist** in `~/.hive/cache/sidebar.json` (view, folds, pane heights) — the web

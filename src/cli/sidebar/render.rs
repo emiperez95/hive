@@ -435,7 +435,7 @@ impl App {
                 let title_fg = if current {
                     t.on_current
                 } else if c.skipped {
-                    t.muted
+                    t.faint
                 } else {
                     t.text
                 };
@@ -468,7 +468,7 @@ impl App {
                 );
                 // The attention view is ungrouped, so each row says where it lives.
                 if *flat {
-                    let place_fg = if current { t.on_current } else { t.muted };
+                    let place_fg = if current { t.on_current } else { t.faint };
                     out.push(
                         Line::from(vec![
                             Span::raw(gutter.clone()),
@@ -621,7 +621,7 @@ impl App {
                         format!("↳ {}", model::short_model(m)),
                         t.sum(),
                         s.cost_sidechain.get(m).copied(),
-                        Style::default().fg(self.theme.muted),
+                        Style::default().fg(self.theme.faint),
                     ));
                 }
                 if s.usage.main.is_empty() && s.usage.sidechain.is_empty() {

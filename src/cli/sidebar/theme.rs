@@ -1,15 +1,19 @@
-//! Colours, modelled on the web sidebar's tokens (`web.html` `:root`).
+//! Colours, laid out like the web sidebar's tokens (`web.html` `:root`) but
+//! taken from the terminal's own theme, the way Claude Code and every other
+//! terminal program follow it.
 //!
-//! The web page owns its background; a terminal split doesn't, and a palette
-//! picked for a dark terminal turns to mud on a light one. So the terminal is
-//! asked for its background (OSC 11) once at startup, and every surface is
-//! derived from it: a card is the background nudged a few steps away, not a
-//! fixed grey that only suits one theme.
+//! Text and accents are the default foreground and the ANSI palette (`Reset`,
+//! `Red`, `Blue`…), so the theme decides them and they keep their place
+//! relative to everything else on screen. The surfaces the palette can't
+//! express — a card a shade off the background, a current row tinted blue —
+//! are mixed from the colours the terminal reports (OSC 10/11 and OSC 4).
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
+
+type Rgb = (u8, u8, u8);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Theme {
@@ -24,8 +28,9 @@ pub(crate) struct Theme {
     /// Pane headers.
     pub band: Color,
     pub text: Color,
-    /// Group headers, ages, secondary lines.
+    /// Group and pane headings.
     pub muted: Color,
+    /// Ages, secondary lines, placeholders.
     pub faint: Color,
     pub primary: Color,
     pub idle: Color,
@@ -33,68 +38,72 @@ pub(crate) struct Theme {
     pub attention: Color,
 }
 
+/// What the terminal said about its theme.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Reported {
+    pub bg: Rgb,
+    pub fg: Rgb,
+    pub blue: Rgb,
+    pub yellow: Rgb,
+}
+
+impl Default for Reported {
+    /// Ghostty's defaults, for a terminal that doesn't answer.
+    fn default() -> Self {
+        Self {
+            bg: (0x28, 0x2c, 0x34),
+            fg: (0xff, 0xff, 0xff),
+            blue: (0x00, 0x1e, 0x80),
+            yellow: (0xd3, 0x87, 0x00),
+        }
+    }
+}
+
 impl Theme {
-    pub(crate) fn from_bg(bg: (u8, u8, u8)) -> Self {
-        let light = luma(bg) > 0.5;
-        // How far a surface steps away from the background, toward the text.
-        let step = |n: f32| shift(bg, if light { -n } else { n });
-        if light {
-            Self {
-                card: step(10.0),
-                card_hover: step(20.0),
-                current: Color::Rgb(0xd8, 0xe2, 0xff),
-                on_current: Color::Rgb(0x00, 0x1a, 0x42),
-                need: Color::Rgb(0xff, 0xdc, 0xc6),
-                band: step(14.0),
-                text: Color::Rgb(0x19, 0x1c, 0x1e),
-                muted: Color::Rgb(0x42, 0x47, 0x54),
-                faint: Color::Rgb(0x72, 0x77, 0x85),
-                primary: Color::Rgb(0x00, 0x58, 0xbe),
-                idle: Color::Rgb(0x00, 0x6c, 0x49),
-                busy: Color::Rgb(0xba, 0x1a, 0x1a),
-                attention: Color::Rgb(0xb7, 0x5b, 0x00),
-            }
-        } else {
-            Self {
-                card: step(12.0),
-                card_hover: step(22.0),
-                current: Color::Rgb(0x1e, 0x33, 0x5c),
-                on_current: Color::Rgb(0xd8, 0xe2, 0xff),
-                need: Color::Rgb(0x4a, 0x2c, 0x12),
-                band: step(16.0),
-                text: Color::Rgb(0xe2, 0xe4, 0xe8),
-                muted: Color::Rgb(0xa8, 0xae, 0xbc),
-                faint: Color::Rgb(0x7a, 0x80, 0x8e),
-                primary: Color::Rgb(0x8a, 0xb4, 0xff),
-                idle: Color::Rgb(0x4c, 0xd6, 0x9a),
-                busy: Color::Rgb(0xff, 0x7a, 0x70),
-                attention: Color::Rgb(0xff, 0xa8, 0x5c),
-            }
+    pub(crate) fn from_reported(r: Reported) -> Self {
+        let dark = luma(r.bg) <= 0.5;
+        // Tints read weaker on a dark background, so they mix in further.
+        let tint = if dark { 0.32 } else { 0.18 };
+        Self {
+            card: mix(r.bg, r.fg, 0.06),
+            card_hover: mix(r.bg, r.fg, 0.12),
+            current: mix(r.bg, r.blue, tint),
+            on_current: Color::Reset,
+            need: mix(r.bg, r.yellow, tint),
+            band: mix(r.bg, r.fg, 0.09),
+            text: Color::Reset,
+            muted: Color::Reset,
+            faint: Color::DarkGray,
+            primary: Color::Blue,
+            idle: Color::Green,
+            busy: Color::Red,
+            attention: Color::Yellow,
         }
     }
 }
 
 impl Default for Theme {
-    /// Ghostty's default background.
     fn default() -> Self {
-        Self::from_bg((0x28, 0x2c, 0x34))
+        Self::from_reported(Reported::default())
     }
 }
 
-fn luma((r, g, b): (u8, u8, u8)) -> f32 {
+fn luma((r, g, b): Rgb) -> f32 {
     (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0
 }
 
-fn shift((r, g, b): (u8, u8, u8), by: f32) -> Color {
-    let s = |c: u8| (f32::from(c) + by).clamp(0.0, 255.0) as u8;
-    Color::Rgb(s(r), s(g), s(b))
+/// `a` moved `t` of the way toward `b`.
+fn mix(a: Rgb, b: Rgb, t: f32) -> Color {
+    let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Color::Rgb(m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
 }
 
-/// Ask the terminal for its background. Must run in raw mode, between event
-/// reads (never while crossterm is waiting on stdin), or the reply is echoed /
-/// eaten as keys. A terminal that doesn't answer within 150ms gets the default.
+/// Ask the terminal for its colours. Must run in raw mode, between event
+/// reads (never while crossterm is waiting on stdin), or the replies are
+/// echoed / eaten as keys. Whatever doesn't answer within 150ms keeps its
+/// default.
 pub(crate) fn detect() -> Theme {
-    query_bg().map(Theme::from_bg).unwrap_or_default()
+    Theme::from_reported(query())
 }
 
 /// Whether macOS is in dark mode. Ghostty's `theme = light:…,dark:…` follows
@@ -108,10 +117,15 @@ pub(crate) fn os_dark() -> bool {
         .is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"Dark"))
 }
 
-fn query_bg() -> Option<(u8, u8, u8)> {
+/// The four queries, in one write: background, foreground, ANSI blue, yellow.
+const QUERIES: &[u8] = b"\x1b]11;?\x1b\\\x1b]10;?\x1b\\\x1b]4;4;?\x1b\\\x1b]4;3;?\x1b\\";
+
+fn query() -> Reported {
+    let mut rep = Reported::default();
     let mut out = std::io::stdout();
-    out.write_all(b"\x1b]11;?\x1b\\").ok()?;
-    out.flush().ok()?;
+    if out.write_all(QUERIES).and_then(|_| out.flush()).is_err() {
+        return rep;
+    }
     let deadline = Instant::now() + Duration::from_millis(150);
     let mut buf = Vec::new();
     let mut stdin = std::io::stdin();
@@ -126,23 +140,34 @@ fn query_bg() -> Option<(u8, u8, u8)> {
         if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as i32) } <= 0 {
             break;
         }
-        let mut chunk = [0u8; 64];
-        let n = stdin.read(&mut chunk).ok()?;
-        if n == 0 {
+        let mut chunk = [0u8; 256];
+        match stdin.read(&mut chunk) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+        // The yellow reply comes last; once it's in, everything is.
+        if reply(&buf, "4;3").is_some() {
             break;
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(rgb) = parse_osc11(&buf) {
-            return Some(rgb);
-        }
     }
-    None
+    let fill = |slot: &mut Rgb, key: &str| {
+        if let Some(c) = reply(&buf, key) {
+            *slot = c;
+        }
+    };
+    fill(&mut rep.bg, "11");
+    fill(&mut rep.fg, "10");
+    fill(&mut rep.blue, "4;4");
+    fill(&mut rep.yellow, "4;3");
+    rep
 }
 
-/// `ESC ] 11 ; rgb:RRRR/GGGG/BBBB` (BEL or ST), 1–4 hex digits per channel.
-fn parse_osc11(buf: &[u8]) -> Option<(u8, u8, u8)> {
-    let s = std::str::from_utf8(buf).ok()?;
-    let body = &s[s.find("rgb:")? + 4..];
+/// The colour in `ESC ] <key> ; rgb:RRRR/GGGG/BBBB` (BEL or ST terminated),
+/// 1–4 hex digits per channel.
+fn reply(buf: &[u8], key: &str) -> Option<Rgb> {
+    let s = String::from_utf8_lossy(buf);
+    let head = format!("\x1b]{key};rgb:");
+    let body = &s[s.find(&head)? + head.len()..];
     let end = body.find(['\x07', '\x1b'])?;
     let mut ch = body[..end].split('/').map(|h| {
         let v = u32::from_str_radix(h, 16).ok()?;
@@ -157,24 +182,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_osc11_in_both_terminators_and_widths() {
-        assert_eq!(
-            parse_osc11(b"\x1b]11;rgb:2828/2c2c/3434\x1b\\"),
-            Some((0x28, 0x2c, 0x34))
-        );
-        assert_eq!(
-            parse_osc11(b"\x1b]11;rgb:ff/ff/ff\x07"),
-            Some((255, 255, 255))
-        );
-        assert_eq!(parse_osc11(b"\x1b]11;rgb:28"), None, "incomplete reply");
+    fn reads_each_reply_by_key_in_both_terminators_and_widths() {
+        let buf = b"\x1b]11;rgb:2828/2c2c/3434\x1b\\\x1b]10;rgb:ff/ff/ff\x07\x1b]4;4;rgb:0000/0000/ffff\x1b\\";
+        assert_eq!(reply(buf, "11"), Some((0x28, 0x2c, 0x34)));
+        assert_eq!(reply(buf, "10"), Some((255, 255, 255)));
+        assert_eq!(reply(buf, "4;4"), Some((0, 0, 255)));
+        assert_eq!(reply(buf, "4;3"), None, "not answered");
+        assert_eq!(reply(b"\x1b]11;rgb:28", "11"), None, "incomplete reply");
     }
 
     #[test]
-    fn surfaces_step_toward_the_text() {
-        let dark = Theme::from_bg((0x28, 0x2c, 0x34));
-        let light = Theme::from_bg((0xff, 0xff, 0xff));
-        assert_eq!(dark.card, Color::Rgb(0x34, 0x38, 0x40));
-        assert_eq!(light.card, Color::Rgb(0xf5, 0xf5, 0xf5));
-        assert_ne!(dark.text, light.text);
+    fn surfaces_mix_from_the_reported_colours_and_text_follows_the_palette() {
+        let light = Theme::from_reported(Reported {
+            bg: (255, 255, 255),
+            fg: (0, 0, 0),
+            blue: (0, 0, 255),
+            yellow: (255, 255, 0),
+        });
+        // A card is the background a few percent toward the foreground.
+        assert_eq!(light.card, Color::Rgb(240, 240, 240));
+        assert_eq!(light.current, Color::Rgb(209, 209, 255));
+        // Text is the terminal's, so a theme change moves it with everything else.
+        assert_eq!(light.text, Color::Reset);
+        assert_eq!(light.idle, Color::Green);
     }
 }
