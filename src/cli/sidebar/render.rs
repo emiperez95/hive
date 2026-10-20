@@ -9,6 +9,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::model::{self, Item, Sect, View};
+use super::theme::Theme;
 use super::{App, Ctl, DlgHit, Hit, KeyFocus, Pane, TodoBtn, TodoLine};
 use crate::cli::conversations::fit_cells;
 use crate::ipc::messages::SessionStatus;
@@ -16,10 +17,6 @@ use crate::ipc::messages::SessionStatus;
 /// The list never shrinks below this many rows: it is the reason the panel
 /// exists, and a pane dragged over it would hide the thing you switch with.
 const LIST_MIN: u16 = 6;
-
-const DIM: Style = Style::new().fg(Color::DarkGray);
-const HEAD_BG: Color = Color::Rgb(38, 38, 50);
-const SEL_BG: Color = Color::Rgb(45, 45, 58);
 
 /// Lines plus, per line, the clickable spans on it.
 #[derive(Default)]
@@ -57,22 +54,31 @@ pub(crate) fn layout(height: u16, panes: &[(bool, u16)]) -> (u16, Vec<u16>) {
     )
 }
 
-fn state_color(st: &Option<SessionStatus>) -> Color {
-    match st {
-        Some(s) if s.blocks_human() => Color::Yellow,
-        Some(SessionStatus::Waiting) => Color::Green,
-        Some(SessionStatus::RunningWorkflow { .. }) => Color::Blue,
-        Some(_) => Color::Red,
-        None => Color::DarkGray,
+impl Theme {
+    /// The web's `statusInfo` colours: blocked orange, idle green, a workflow
+    /// blue, anything else busy red.
+    fn state(&self, st: &Option<SessionStatus>) -> Color {
+        match st {
+            Some(s) if s.blocks_human() => self.attention,
+            Some(SessionStatus::Waiting) => self.idle,
+            Some(SessionStatus::RunningWorkflow { .. }) => self.primary,
+            Some(_) => self.busy,
+            None => self.faint,
+        }
+    }
+
+    fn dim(&self) -> Style {
+        Style::new().fg(self.faint)
+    }
+
+    /// Group, tier, section and project headings: small, bold, uppercase —
+    /// labels, not rows, so they never compete with the cards under them.
+    fn label(&self) -> Style {
+        Style::new().fg(self.muted).add_modifier(Modifier::BOLD)
     }
 }
 
-const TIERS: [(&str, Color); 4] = [
-    ("NEEDS YOU", Color::Yellow),
-    ("READY FOR REVIEW", Color::Cyan),
-    ("IDLE", Color::Green),
-    ("WORKING", Color::Red),
-];
+const TIERS: [&str; 4] = ["NEEDS YOU", "READY FOR REVIEW", "IDLE", "WORKING"];
 
 fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
@@ -146,21 +152,25 @@ impl App {
             .collect();
         let need = live.iter().filter(|c| c.blocks()).count();
         let title = if self.prefs.view == View::Projects {
-            "projects".to_string()
+            "PROJECTS".to_string()
         } else if need > 0 {
-            format!("{} live · {need} need you", live.len())
+            format!("{} LIVE · {need} NEED YOU", live.len())
         } else {
-            format!("{} live", live.len())
+            format!("{} LIVE", live.len())
         };
 
         // Right to left: mute, projects, attention, archived. Archived is the
         // leftmost so it's the only one that moves when it appears — the view
         // toggles are the way back and must stay put (same rule as the web).
+        let t = self.theme;
         let on = |b: bool| {
             if b {
-                Style::default().add_modifier(Modifier::REVERSED)
+                Style::new()
+                    .fg(t.primary)
+                    .bg(t.current)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                DIM
+                t.dim()
             }
         };
         let view = self.prefs.view;
@@ -173,9 +183,9 @@ impl App {
                 }
                 .into(),
                 if self.focus.global_mute {
-                    Style::default().fg(Color::Red)
+                    Style::new().fg(t.busy)
                 } else {
-                    Style::default()
+                    Style::new()
                 },
                 Ctl::Mute,
             ),
@@ -199,7 +209,7 @@ impl App {
         let left = fit_cells(&left, (x as usize).saturating_sub(1));
         let mut spans = vec![Span::styled(
             left,
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().fg(t.text).add_modifier(Modifier::BOLD),
         )];
         let mut cur = x.saturating_sub(1) as usize;
         cur = cur.max(spans[0].width());
@@ -230,7 +240,7 @@ impl App {
             .or_else(|| self.flash.as_ref().map(|f| f.0.clone()))
         {
             out.push(
-                Line::styled(format!(" {e}"), Style::default().fg(Color::Red)),
+                Line::styled(format!(" {e}"), Style::new().fg(self.theme.busy)),
                 vec![],
             );
         }
@@ -274,16 +284,19 @@ impl App {
         hovered: bool,
         w: usize,
     ) {
+        let t = self.theme;
+        // Headings take the selection as a background; cards take it as their
+        // hover tint (below).
         let base = if selected {
-            Style::default().bg(SEL_BG)
+            Style::new().bg(t.card_hover)
         } else {
-            Style::default()
+            Style::new()
         };
         let whole = |w: usize| vec![(0u16, w as u16, Hit::Item(i))];
         let bell = |key: &str| -> (Span<'static>, Option<(u16, u16, Hit)>) {
             let muted = self.focus.muted_projects.iter().any(|k| k == key);
             let span = if muted {
-                Span::styled("🔕", Style::default().fg(Color::Red))
+                Span::styled("🔕", Style::new().fg(t.busy))
             } else if hovered {
                 Span::raw("🔔")
             } else {
@@ -298,34 +311,31 @@ impl App {
                 )),
             )
         };
+        let emoji_or = |e: &str| if e.is_empty() { "💻" } else { e }.to_string();
         match item {
-            Item::Note(s) => out.push(Line::styled(format!(" {s}"), DIM), vec![]),
+            Item::Note(s) => out.push(Line::styled(format!(" {s}"), t.dim()), vec![]),
             Item::Blank => out.push(Line::raw(""), vec![]),
             Item::Tier { tier, n } => {
-                let (label, color) = TIERS
-                    .get(*tier as usize)
-                    .copied()
-                    .unwrap_or(("OTHER", Color::Gray));
+                let label = TIERS.get(*tier as usize).copied().unwrap_or("OTHER");
+                let color = match tier {
+                    0 => t.busy,
+                    1 => t.primary,
+                    _ => t.muted,
+                };
                 out.push(
                     Line::from(vec![
-                        Span::styled(
-                            format!(" {label}"),
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!(" {n}"), DIM),
+                        Span::styled(format!(" {label}"), t.label().fg(color)),
+                        Span::styled(format!(" {n}"), t.dim()),
                     ]),
                     vec![],
                 );
             }
             Item::Group { emoji, label, key } => {
                 let (b, hit) = bell(key);
-                let text = format!(" {} {}", if emoji.is_empty() { "💻" } else { emoji }, label);
+                let text = format!(" {} {}", emoji_or(emoji), label.to_uppercase());
                 out.push(
                     Line::from(vec![
-                        Span::styled(
-                            fit_cells(&text, w.saturating_sub(3)),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(fit_cells(&text, w.saturating_sub(3)), t.label()),
                         Span::raw(" "),
                         b,
                     ]),
@@ -335,22 +345,22 @@ impl App {
             Item::Worktree(b) => {
                 out.push(
                     Line::styled(
-                        fit_cells(&format!("   · {b}"), w),
-                        Style::default().fg(Color::Cyan),
+                        fit_cells(&format!("  ⎇ {b}"), w),
+                        Style::new().fg(t.faint).add_modifier(Modifier::BOLD),
                     ),
                     vec![],
                 );
             }
             Item::Section { sect, n, open } => {
                 let label = match sect {
-                    Sect::Skipped => "Skipped",
-                    Sect::Frozen => "Frozen",
+                    Sect::Skipped => "SKIPPED",
+                    Sect::Frozen => "FROZEN",
                 };
                 let caret = if *open { "▾" } else { "▸" };
                 out.push(
                     Line::styled(
                         fit_cells(&format!(" {caret} {label} ({n})"), w),
-                        base.fg(Color::Gray),
+                        base.patch(t.label()),
                     ),
                     whole(w),
                 );
@@ -366,27 +376,26 @@ impl App {
                 let (b, hit) = bell(key);
                 let caret = if *open { "▾" } else { "▸" };
                 let tail = match (archived, count) {
-                    (true, 0) => " arch".to_string(),
-                    (true, n) => format!(" arch {n}"),
+                    (true, 0) => " ARCH".to_string(),
+                    (true, n) => format!(" ARCH {n}"),
                     (false, 0) => String::new(),
                     (false, n) => format!(" {n}"),
                 };
-                let head = format!(
-                    " {caret} {} {label}",
-                    if emoji.is_empty() { "💻" } else { emoji }
-                );
+                let head = format!(" {caret} {} {}", emoji_or(emoji), label.to_uppercase());
                 let head_w = w.saturating_sub(3 + width(&tail));
-                let style = if *archived {
-                    base.fg(Color::DarkGray)
+                let style = base.patch(t.label()).fg(if *archived {
+                    t.faint
+                } else if *open {
+                    t.text
                 } else {
-                    base
-                };
+                    t.muted
+                });
                 let mut hits = whole(w.saturating_sub(3));
                 hits.extend(hit);
                 out.push(
                     Line::from(vec![
-                        Span::styled(fit_cells(&head, head_w), style.add_modifier(Modifier::BOLD)),
-                        Span::styled(tail, base.fg(Color::DarkGray)),
+                        Span::styled(fit_cells(&head, head_w), style),
+                        Span::styled(tail, base.fg(t.faint)),
                         Span::styled(" ", base),
                         b,
                     ]),
@@ -398,45 +407,78 @@ impl App {
                     return;
                 };
                 let current = self.is_current(c);
-                let marker = if current {
-                    Span::styled("▌", base.fg(Color::Blue))
+                let unseen = c.unseen && !current;
+                // The web's card: a tinted row with a coloured left edge for the
+                // three states worth a glance — here, blocked, pinged.
+                let bg = if current {
+                    t.current
+                } else if c.blocks() {
+                    t.need
+                } else if selected || hovered {
+                    t.card_hover
                 } else {
-                    Span::styled(" ", base)
+                    t.card
                 };
-                let pad = " ".repeat(*indent as usize);
-                let ping = if c.unseen && !current { "● " } else { "" };
-                let word = model::state_word(&c.status);
-                let tail_w = width(ping) + 3 + 1 + 5;
-                let title_w = w.saturating_sub(1 + pad.len() + 2 + 1 + tail_w);
+                let card = Style::new().bg(bg);
+                let edge = if current || unseen {
+                    Some(t.primary)
+                } else if c.blocks() {
+                    Some(t.attention)
+                } else {
+                    None
+                };
+                let bar = match edge {
+                    Some(col) => Span::styled("▌", card.fg(col)),
+                    None => Span::styled(" ", card),
+                };
+                let gutter = " ".repeat((*indent as usize).max(1));
+                let title_fg = if current {
+                    t.on_current
+                } else if c.skipped {
+                    t.muted
+                } else {
+                    t.text
+                };
                 let title_style = if current {
-                    base.add_modifier(Modifier::BOLD)
+                    card.fg(title_fg).add_modifier(Modifier::BOLD)
                 } else {
-                    base
+                    card.fg(title_fg)
                 };
+                let ping = if unseen { "● " } else { "" };
+                let word = model::state_word(&c.status).to_uppercase();
+                // gutter · bar · dot+space · title · space · ping · age · space · word · space · right gutter
+                let tail_w = width(ping) + 3 + 1 + 5 + 1;
+                let title_w = w.saturating_sub(gutter.len() + 1 + 2 + 1 + tail_w + 1);
                 out.push(
                     Line::from(vec![
-                        marker.clone(),
-                        Span::styled(pad.clone(), base),
-                        Span::styled("●", base.fg(state_color(&c.status))),
-                        Span::styled(" ", base),
+                        Span::raw(gutter.clone()),
+                        bar.clone(),
+                        Span::styled("● ", card.fg(t.state(&c.status))),
                         Span::styled(fit_cells(&c.title, title_w), title_style),
-                        Span::styled(" ", base),
-                        Span::styled(ping.to_string(), base.fg(Color::Magenta)),
-                        Span::styled(format!("{:>3} ", c.age), base.fg(Color::DarkGray)),
-                        Span::styled(format!("{word:<5}"), base.fg(state_color(&c.status))),
+                        Span::styled(" ", card),
+                        Span::styled(ping.to_string(), card.fg(t.primary)),
+                        Span::styled(format!("{:>3} ", c.age), card.fg(t.faint)),
+                        Span::styled(
+                            format!("{word:<5}"),
+                            card.fg(t.state(&c.status)).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" ", card),
                     ]),
                     whole(w),
                 );
                 // The attention view is ungrouped, so each row says where it lives.
                 if *flat {
+                    let place_fg = if current { t.on_current } else { t.muted };
                     out.push(
                         Line::from(vec![
-                            marker,
-                            Span::styled("  ", base),
+                            Span::raw(gutter.clone()),
+                            bar,
+                            Span::styled("  ", card),
                             Span::styled(
-                                fit_cells(&c.place.line(), w.saturating_sub(3)),
-                                base.fg(Color::DarkGray),
+                                fit_cells(&c.place.line(), w.saturating_sub(gutter.len() + 5)),
+                                card.fg(place_fg),
                             ),
+                            Span::styled(" ", card),
                         ]),
                         whole(w),
                     );
@@ -453,14 +495,20 @@ impl App {
                     .cloned()
                     .unwrap_or_default();
                 let age = fz.relative.trim_end_matches(" ago").to_string();
-                let pad = " ".repeat(*indent as usize + 1);
-                let title_w = w.saturating_sub(pad.len() + 3 + 1 + width(&age) + 1);
+                let gutter = " ".repeat((*indent as usize).max(1));
+                let card = Style::new().bg(if selected || hovered {
+                    t.card_hover
+                } else {
+                    t.card
+                });
+                let title_w = w.saturating_sub(gutter.len() + 4 + 1 + width(&age) + 3);
                 out.push(
                     Line::from(vec![
-                        Span::styled(pad, base),
-                        Span::styled("💤 ", base),
-                        Span::styled(fit_cells(&title, title_w), base),
-                        Span::styled(format!(" {age} "), base.fg(Color::DarkGray)),
+                        Span::raw(gutter),
+                        Span::styled(" 💤 ", card),
+                        Span::styled(fit_cells(&title, title_w), card.fg(t.text)),
+                        Span::styled(format!(" {age} "), card.fg(t.faint)),
+                        Span::styled(" ", card),
                     ]),
                     whole(w),
                 );
@@ -506,18 +554,19 @@ impl App {
             }
         };
         let caret = if collapsed { "▸" } else { "▾" };
-        let bg = Style::default().bg(HEAD_BG);
+        let t = self.theme;
+        let bg = Style::new().bg(t.band);
         let name_style = if focused {
-            bg.fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            bg.fg(t.primary).add_modifier(Modifier::BOLD)
         } else {
-            bg.add_modifier(Modifier::BOLD)
+            bg.fg(t.muted).add_modifier(Modifier::BOLD)
         };
         let extra_w = width(&extra);
         let name_w = w.saturating_sub(3 + extra_w + 1);
         let line = Line::from(vec![
-            Span::styled(format!(" {caret} "), bg.fg(Color::Gray)),
+            Span::styled(format!(" {caret} "), bg.fg(t.faint)),
             Span::styled(fit_cells(&name, name_w), name_style),
-            Span::styled(format!("{extra} "), bg.fg(Color::DarkGray)),
+            Span::styled(format!("{extra} "), bg.fg(t.faint)),
         ]);
         f.render_widget(Paragraph::new(line).style(bg), r);
         self.place_hits(r.y, vec![vec![(0, r.width, Hit::PaneHead(pane))]]);
@@ -535,13 +584,13 @@ impl App {
         ));
         lines.push(Line::styled(
             fit_cells(&format!(" {}", conv.place.line()), w),
-            DIM,
+            self.theme.dim(),
         ));
         match &self.stats {
-            None => lines.push(Line::styled(" Reading transcript…", DIM)),
+            None => lines.push(Line::styled(" Reading transcript…", self.theme.dim())),
             Some(s) if s.error.is_some() => lines.push(Line::styled(
                 format!(" {}", s.error.clone().unwrap_or_default()),
-                DIM,
+                self.theme.dim(),
             )),
             Some(s) => {
                 // Model | tokens | cost columns. Every row carries a cost cell,
@@ -572,11 +621,11 @@ impl App {
                         format!("↳ {}", model::short_model(m)),
                         t.sum(),
                         s.cost_sidechain.get(m).copied(),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(self.theme.muted),
                     ));
                 }
                 if s.usage.main.is_empty() && s.usage.sidechain.is_empty() {
-                    lines.push(Line::styled(" No usage recorded yet.", DIM));
+                    lines.push(Line::styled(" No usage recorded yet.", self.theme.dim()));
                 } else {
                     lines.push(row(
                         "total".into(),
@@ -597,7 +646,7 @@ impl App {
                         names.join(", ")
                     );
                     for chunk in wrap_words(&text, w.saturating_sub(2)) {
-                        lines.push(Line::styled(format!(" {chunk}"), DIM));
+                        lines.push(Line::styled(format!(" {chunk}"), self.theme.dim()));
                     }
                 }
                 if let Some(g) = &s.worktree {
@@ -608,7 +657,7 @@ impl App {
                         &g.branch
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(" ⑂ ", DIM),
+                        Span::styled(" ⑂ ", self.theme.dim()),
                         Span::styled(
                             branch.to_string(),
                             Style::default().add_modifier(Modifier::BOLD),
@@ -616,7 +665,7 @@ impl App {
                     ]));
                     // Only non-zero counts render, so a clean landed tree is a
                     // branch and a `merged` chip, not a row of zeros.
-                    let work = Style::default().fg(Color::Yellow);
+                    let work = Style::default().fg(self.theme.attention);
                     let mut chips: Vec<Span<'static>> = vec![Span::raw(" ")];
                     let mut chip = |text: String, style: Style| {
                         chips.push(Span::styled(text, style));
@@ -632,13 +681,13 @@ impl App {
                         chip(format!("{} ahead", g.ahead), work);
                     }
                     if g.behind > 0 {
-                        chip(format!("{} behind", g.behind), DIM);
+                        chip(format!("{} behind", g.behind), self.theme.dim());
                     }
                     if g.dirty == 0 && g.untracked == 0 && g.ahead == 0 {
                         if g.merged {
-                            chip("merged".into(), Style::default().fg(Color::Green));
+                            chip("merged".into(), Style::default().fg(self.theme.idle));
                         } else {
-                            chip("clean".into(), DIM);
+                            chip("clean".into(), self.theme.dim());
                         }
                     }
                     lines.push(Line::from(chips));
@@ -655,7 +704,7 @@ impl App {
                     if !base.is_empty() {
                         lines.push(Line::styled(
                             fit_cells(&format!(" {}", base.join(" · ")), w),
-                            DIM,
+                            self.theme.dim(),
                         ));
                     }
                 }
@@ -675,7 +724,10 @@ impl App {
         let rows = r.height as usize;
         let focused = self.key_focus == KeyFocus::Notes && self.dialog.is_none();
         if self.notes_loading {
-            f.render_widget(Paragraph::new(Line::styled(" loading…", DIM)), r);
+            f.render_widget(
+                Paragraph::new(Line::styled(" loading…", self.theme.dim())),
+                r,
+            );
             return;
         }
         let wrapped = self.notes.wrap(tw);
@@ -689,7 +741,7 @@ impl App {
         }
         self.notes_scroll = self.notes_scroll.min(wrapped.len().saturating_sub(rows));
         let lines: Vec<Line<'static>> = if self.notes.is_empty() && !focused {
-            vec![Line::styled(" Click to add notes…", DIM)]
+            vec![Line::styled(" Click to add notes…", self.theme.dim())]
         } else {
             wrapped
                 .iter()
@@ -723,7 +775,7 @@ impl App {
         for i in 0..self.todo_lines() {
             let selected = focused && i == self.todo_sel;
             let base = if selected {
-                Style::default().bg(SEL_BG)
+                Style::default().bg(self.theme.card_hover)
             } else {
                 Style::default()
             };
@@ -732,7 +784,7 @@ impl App {
                 TodoLine::Add => {
                     let text = self.todo_input.text();
                     let (shown, style) = if text.is_empty() && !selected {
-                        ("Add a todo…".to_string(), base.fg(Color::DarkGray))
+                        ("Add a todo…".to_string(), base.fg(self.theme.faint))
                     } else {
                         (text, base)
                     };
@@ -741,13 +793,13 @@ impl App {
                     }
                     out.push(
                         Line::from(vec![
-                            Span::styled(" + ", base.fg(Color::Cyan)),
+                            Span::styled(" + ", base.fg(self.theme.primary)),
                             Span::styled(fit_cells(&shown, w.saturating_sub(3)), style),
                         ]),
                         vec![(0, w as u16, Hit::TodoAdd)],
                     );
                     if todos.todos.is_empty() && self.todos.is_some() {
-                        out.push(Line::styled("   Nothing to do", DIM), vec![]);
+                        out.push(Line::styled("   Nothing to do", self.theme.dim()), vec![]);
                     }
                 }
                 TodoLine::Item(n) => {
@@ -755,10 +807,10 @@ impl App {
                     let tw = w.saturating_sub(3 + 5);
                     out.push(
                         Line::from(vec![
-                            Span::styled(" ○ ", base.fg(Color::Gray)),
+                            Span::styled(" ○ ", base.fg(self.theme.muted)),
                             Span::styled(fit_cells(&text, tw), base),
-                            Span::styled(" × ", base.fg(Color::DarkGray)),
-                            Span::styled("▶ ", base.fg(Color::Cyan)),
+                            Span::styled(" × ", base.fg(self.theme.faint)),
+                            Span::styled("▶ ", base.fg(self.theme.primary)),
                         ]),
                         vec![
                             (0, 3, Hit::Todo(n, TodoBtn::Check)),
@@ -781,7 +833,7 @@ impl App {
                     out.push(
                         Line::styled(
                             format!(" {caret} Done ({})", todos.done.len()),
-                            base.fg(Color::Gray),
+                            base.fg(self.theme.muted),
                         ),
                         vec![(0, w as u16, Hit::DoneToggle)],
                     );
@@ -790,10 +842,11 @@ impl App {
                     let text = todos.done.get(n).cloned().unwrap_or_default();
                     out.push(
                         Line::from(vec![
-                            Span::styled(" ● ", base.fg(Color::Green)),
+                            Span::styled(" ● ", base.fg(self.theme.idle)),
                             Span::styled(
                                 fit_cells(&text, w.saturating_sub(3)),
-                                base.fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT),
+                                base.fg(self.theme.faint)
+                                    .add_modifier(Modifier::CROSSED_OUT),
                             ),
                         ]),
                         vec![(0, w as u16, Hit::Done(n))],
@@ -876,7 +929,7 @@ impl App {
         ];
         for (n, title, sub, disabled, hit) in opts {
             let style = if disabled || running {
-                DIM
+                self.theme.dim()
             } else {
                 Style::default()
             };
@@ -887,7 +940,7 @@ impl App {
             };
             out.push(
                 Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{mark} "), Style::default().fg(self.theme.primary)),
                     Span::styled(
                         fit_cells(title, inner_w.saturating_sub(2)),
                         style.add_modifier(Modifier::BOLD),
@@ -898,7 +951,7 @@ impl App {
             out.push(
                 Line::styled(
                     format!("  {}", fit_cells(&sub, inner_w.saturating_sub(2))),
-                    DIM,
+                    self.theme.dim(),
                 ),
                 vec![(0, inner_w as u16, Hit::Dlg(hit))],
             );
@@ -914,23 +967,23 @@ impl App {
             }
             out.push(
                 Line::from(vec![
-                    Span::styled(label, DIM),
+                    Span::styled(label, self.theme.dim()),
                     Span::styled(
                         fit_cells(&text, inner_w.saturating_sub(label.len())),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(self.theme.attention),
                     ),
                 ]),
                 vec![(0, inner_w as u16, Hit::Dlg(DlgHit::Branch))],
             );
             let create_style = if running || d.suggesting {
-                DIM
+                self.theme.dim()
             } else {
                 Style::default().add_modifier(Modifier::REVERSED)
             };
             out.push(
                 Line::from(vec![
                     Span::styled(" Create ", create_style),
-                    Span::styled("  Enter", DIM),
+                    Span::styled("  Enter", self.theme.dim()),
                 ]),
                 vec![(0, 8, Hit::Dlg(DlgHit::Create))],
             );
@@ -945,13 +998,13 @@ impl App {
                 }
             };
             for chunk in wrap_words(src, inner_w) {
-                out.push(Line::styled(chunk, DIM), vec![]);
+                out.push(Line::styled(chunk, self.theme.dim()), vec![]);
             }
         }
         if let Some((msg, err)) = &d.msg {
             out.push(Line::raw(""), vec![]);
             let style = if *err {
-                Style::default().fg(Color::Red)
+                Style::default().fg(self.theme.busy)
             } else {
                 Style::default()
             };
@@ -963,12 +1016,15 @@ impl App {
             out.push(
                 Line::from(vec![
                     Span::styled(" Go ", Style::default().add_modifier(Modifier::REVERSED)),
-                    Span::styled("  Enter", DIM),
+                    Span::styled("  Enter", self.theme.dim()),
                 ]),
                 vec![(0, 4, Hit::Dlg(DlgHit::Go))],
             );
         }
-        out.push(Line::styled("Esc close · 1 2 3 pick", DIM), vec![]);
+        out.push(
+            Line::styled("Esc close · 1 2 3 pick", self.theme.dim()),
+            vec![],
+        );
 
         let bh = (out.lines.len() as u16 + 2).min(area.height);
         let bw = (inner_w as u16 + 2).min(area.width);
@@ -978,7 +1034,7 @@ impl App {
         f.render_widget(Clear, rect);
         let block = Block::bordered()
             .title(" Start todo ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(self.theme.primary));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         f.render_widget(Paragraph::new(out.lines), inner);
@@ -1016,7 +1072,7 @@ impl App {
         }
         let close = Rect::new(rect.x + rect.width.saturating_sub(4), rect.y, 3, 1);
         f.render_widget(
-            Paragraph::new(Span::styled(" × ", Style::default().fg(Color::Cyan))),
+            Paragraph::new(Span::styled(" × ", Style::default().fg(self.theme.primary))),
             close,
         );
         if let Some((line, col)) = cursor {

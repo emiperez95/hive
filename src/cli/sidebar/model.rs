@@ -394,6 +394,11 @@ pub fn build_items(
             for i in live {
                 let c = &convs[i];
                 if last != Some(c.session.as_str()) {
+                    // A blank line between sessions: rows are tinted cards, and
+                    // two groups' cards touching read as one block.
+                    if last.is_some() {
+                        items.push(Item::Blank);
+                    }
                     let (emoji, rest) = split_emoji(&c.session);
                     items.push(Item::Group {
                         emoji: emoji.to_string(),

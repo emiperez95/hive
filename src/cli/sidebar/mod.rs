@@ -20,6 +20,7 @@ mod api;
 mod editor;
 mod model;
 mod render;
+mod theme;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -273,6 +274,7 @@ pub(crate) struct App {
 
     dialog: Option<Dialog>,
     drag: Option<Drag>,
+    theme: theme::Theme,
 
     frozen_at: Option<Instant>,
     projects_at: Option<Instant>,
@@ -344,6 +346,7 @@ pub fn run_sidebar(split: bool, fit: bool) -> Result<()> {
     api.start_loops();
 
     let mut term = ratatui::try_init().context("hive sidebar: needs a terminal")?;
+    let palette = theme::detect();
     crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::SetTitle(SIDEBAR_TITLE),
@@ -355,6 +358,7 @@ pub fn run_sidebar(split: bool, fit: bool) -> Result<()> {
         fit_width();
     }
     let mut app = App::new(api);
+    app.theme = palette;
     let result = app.run(&mut term, &rx);
     app.flush_notes();
     let _ = crossterm::execute!(
@@ -443,6 +447,7 @@ impl App {
             todo_sel: 0,
             todos_scroll: 0,
             dialog: None,
+            theme: theme::Theme::default(),
             drag: None,
             frozen_at: None,
             projects_at: None,
@@ -1438,7 +1443,7 @@ mod tests {
     fn draws_list_and_all_three_panes() {
         let mut a = app();
         let s = screen(&mut a, 40, 40);
-        assert!(s.contains("1 live"), "{s}");
+        assert!(s.contains("1 LIVE"), "{s}");
         assert!(s.contains("fix the bug"));
         assert!(s.contains("Details"));
         assert!(s.contains("Notes"));
