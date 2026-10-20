@@ -4139,7 +4139,7 @@ fn draw_project_detail(
         title_spans.push(Span::styled(
             "[archived]",
             Style::default()
-                .fg(Color::Gray)
+                .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -4320,7 +4320,7 @@ fn draw_project_detail(
                 display.extend(sub_header(
                     i,
                     format!("    Closed ({n_closed})"),
-                    Color::Gray,
+                    Color::DarkGray,
                 ));
             }
             if arch_from == Some(i) {
@@ -4425,7 +4425,7 @@ fn draw_project_detail(
                 Style::default().fg(if w.live > 0 {
                     Color::Green
                 } else {
-                    Color::Gray
+                    Color::DarkGray
                 })
             };
             let dim = if selected {
@@ -4966,7 +4966,7 @@ fn render_conv_resources(lines: &mut Vec<Line<'static>>, r: &ConvResources) {
             let (glyph, col) = if m.role == "user" {
                 ("›", Color::Cyan)
             } else {
-                ("‹", Color::White)
+                ("‹", Color::Reset)
             };
             let text = m.text.replace('\n', " ");
             lines.push(Line::from(vec![
@@ -5175,10 +5175,11 @@ fn header_line(
         format!("{icon}{}  ({n}, {live} live){mute_mark}{arch_mark}", g.key)
     };
     let mut style = if archived {
-        // Archived (only shown when revealed): plain gray — set apart from an active
-        // header (which is bold cyan/green) without DIM-on-DarkGray, which many
-        // themes render nearly black and so illegible on a dark background.
-        Style::default().fg(Color::Gray)
+        // Archived (only shown when revealed): the theme's dim grey (ANSI 8) — set
+        // apart from an active header (bold cyan/green). Not `Gray` (ANSI 7): that
+        // is the theme's light grey, near-invisible on a light background; and no
+        // DIM on top, which many themes render nearly black on a dark one.
+        Style::default().fg(Color::DarkGray)
     } else if skipped {
         // Toned down from an active header, but still legible: DIM over the base
         // `Blue` came out near-black on a dark background, so dim the LIGHT blue
@@ -5544,7 +5545,7 @@ fn conv_line(
     } else if c.lifecycle.is_actionable_here() {
         Style::default().fg(live_color(c))
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(Color::DarkGray)
     };
     if bold && !selected {
         base = base.add_modifier(Modifier::BOLD);
@@ -5742,7 +5743,7 @@ fn wt_line(w: &BrowseWt, selected: bool) -> Line<'static> {
     } else if w.session_live {
         Style::default().fg(Color::Green)
     } else {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+        Style::default().fg(Color::DarkGray)
     };
     let dim = if selected {
         base
