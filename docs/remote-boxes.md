@@ -246,6 +246,22 @@ overrides the program, which is how the tests stand a second `$HOME` in for a se
 - `reopen_conversation` refuses a conversation whose overlay has a `location`: resuming a
   shipped conversation locally would fork its transcript.
 
+**HTTP transport (added after phase 5).** A remote with an `api` now takes boxes over HTTP —
+no ssh, rsync or `hive`-on-PATH needed, so a host without rsync still works; `--via-ssh`
+forces the old path, and a remote without an `api` still uses it. The server side is
+`serve/boxes_api.rs`: `PUT|GET /api/box/<id>` stream a tarball, `POST …/pack|unpack|mark` run the
+same code the CLI runs, each request on its own thread (the request loop is serial). `hive box
+send` is the transfer half of `push`, for retrying without re-freezing.
+- **No authentication, by design** (trusted LAN, like the rest of the dashboard). What stands in
+  for it: `[web] accept_boxes = true` is required (default off → 403), and `boxes::unpack`
+  refuses, on every transport, a `root` outside the project's checkout / worktrees dir /
+  an already-registered worktree (no relative paths, no `..`), and any box id, profile or slug
+  that isn't a plain name. A received tarball is extracted into a scratch dir and installed
+  only if its manifest's id matches.
+- Not hardened: `tar -x` is trusted to refuse `..` members (bsdtar and GNU tar both do), and
+  anyone on the LAN can fill the disk by PUTting boxes to an opted-in server.
+- Projects need a worktrees dir (`--worktrees-dir`) for linked-worktree boxes to be accepted.
+
 **Phase 3 — federation (read-only).** Deviation: the peer's wire is `GET /api/registry`
 (the registry's own serde `Conversation`s: live + parked, local only), not `/api/active` +
 `/api/conversations` — those are lossy projections (no parent, no placement) and the peer needs

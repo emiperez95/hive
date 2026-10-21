@@ -96,7 +96,8 @@ hive task schema|lint [-p <project>]        # the board's header rules / tasks t
 hive task boards                            # which projects have a board
 hive box pack <conv> [--force] [--without-ignored]  # pack a conversation + its tree into ~/.hive/boxes/<id>
 hive box unpack <id|path> [--thaw] [--sandbox]      # restore a box here (runs project hooks, optionally resumes)
-hive box push <conv> <remote> / pull <conv>         # move it to / back from another machine over ssh
+hive box push <conv> <remote> / pull <conv>         # move it to / back from another machine (HTTP if the remote has an api, else ssh)
+hive box send <id> <remote>                         # transfer an already-packed box (push minus the pack)
 hive box list                                       # boxes here, and where each shipped conversation lives
 hive remote add <name> --ssh user@host [--api URL]  # register another machine running hive
 hive remote list
@@ -1964,7 +1965,7 @@ Full design, evidence and **as-built deviations / unverified parts** are in
   of the tree incl. ignored files, transcript + memory, overlay, todos); `unpack` is the inverse
   and refuses anything that would overwrite state existing only on the target. Pack is gated on
   Claude's own status being `idle` with no orphaned background launch (`--force` overrides).
-- `push`/`pull` move a box over ssh (`HIVE_SSH` overrides the program — tests use a fake that
+- `push`/`pull` move a box over HTTP when the remote has an `api` (`serve/boxes_api.rs`; the server must set `[web] accept_boxes = true`; no auth — trusted LAN — but unpack refuses any path outside a registered project) or over ssh (`HIVE_SSH` overrides the program — tests use a fake that
   runs the command under a second `$HOME`). The overlay's `location` records where a shipped
   conversation lives; `reopen_conversation` refuses it.
 - **Federation:** the web server exports `GET /api/registry` (local rows only); each configured

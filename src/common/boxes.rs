@@ -675,6 +675,106 @@ pub fn write_box(plan: &PackPlan) -> Result<PathBuf> {
     }
 }
 
+/// A box id becomes a directory name and a URL segment: hex digits and dashes only.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// `.claude`, `.claude-work`, … — a manifest's `profile` is joined onto `$HOME`.
+fn valid_profile(p: &str) -> bool {
+    p.starts_with(".claude")
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && !p.contains("..")
+}
+
+/// A transcript slug is one directory name.
+fn valid_slug(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\')
+}
+
+/// Where a box may land. A manifest names an absolute path to write a whole working tree
+/// onto, and a box can arrive from another machine, so the target must already belong to a
+/// registered project: its own checkout, anywhere under its worktrees dir or checkout, or a
+/// worktree already registered at exactly that path. Relative paths and `..` are refused
+/// outright rather than normalised.
+pub fn root_allowed(
+    root: &Path,
+    project_root: &Path,
+    worktrees_dir: Option<&Path>,
+    registered: &[PathBuf],
+) -> bool {
+    use std::path::Component;
+    if !root.is_absolute() || root.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    root.starts_with(project_root)
+        || worktrees_dir.is_some_and(|w| root.starts_with(w) && root != w)
+        || registered.iter().any(|r| r == root)
+}
+
+/// `tar` a box directory into `out` (a temp file the caller owns).
+pub fn tar_box(dir: &Path, out: &Path) -> Result<()> {
+    let o = Command::new("tar")
+        .arg("-C")
+        .arg(dir)
+        .arg("-cf")
+        .arg(out)
+        .arg(".")
+        .output()
+        .context("failed to run tar")?;
+    if !o.status.success() {
+        bail!("tar failed: {}", String::from_utf8_lossy(&o.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Extract a tar stream into `dest` (created; must be empty or new). The stream may come
+/// from another machine, so extraction is into a scratch directory the caller validates
+/// before moving it into place — never straight into `~/.hive/boxes`.
+pub fn untar_box(input: &mut dyn std::io::Read, dest: &Path) -> Result<()> {
+    use std::process::Stdio;
+    fs::create_dir_all(dest)?;
+    let mut child = Command::new("tar")
+        .arg("-C")
+        .arg(dest)
+        .arg("-xf")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run tar")?;
+    let copied = std::io::copy(input, child.stdin.as_mut().unwrap());
+    drop(child.stdin.take());
+    let out = child.wait_with_output()?;
+    copied?;
+    if !out.status.success() {
+        bail!(
+            "tar failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Move a freshly extracted box into `~/.hive/boxes/<id>` once its manifest checks out
+/// (right id, supported version). A re-send replaces the earlier copy.
+pub fn install_received_box(scratch: &Path, id: &str) -> Result<PathBuf> {
+    if !valid_id(id) {
+        bail!("invalid box id");
+    }
+    let m = read_manifest(scratch)?;
+    if m.id != id {
+        bail!("box says it is {} but was sent as {id}", m.id);
+    }
+    let dir = boxes_dir()?;
+    fs::create_dir_all(&dir)?;
+    let final_dir = dir.join(id);
+    let _ = fs::remove_dir_all(&final_dir);
+    fs::rename(scratch, &final_dir)?;
+    Ok(final_dir)
+}
+
 pub fn read_manifest(dir: &Path) -> Result<Manifest> {
     let raw = fs::read_to_string(dir.join("manifest.json"))
         .with_context(|| format!("{} has no manifest.json (incomplete box?)", dir.display()))?;
@@ -766,6 +866,31 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
     })?;
     let repo = expand_tilde(&config.project_root);
     let root = PathBuf::from(&m.root);
+    if !valid_id(&m.id) || !valid_profile(&m.profile) || !valid_slug(&m.slug) {
+        bail!("box {} has an unsafe id, profile or slug; refusing", m.id);
+    }
+    let worktrees = WorktreeState::load();
+    let registered: Vec<PathBuf> = worktrees
+        .worktrees
+        .values()
+        .filter(|e| e.project_key == m.project_key)
+        .map(|e| expand_tilde(&e.path))
+        .collect();
+    if !root_allowed(
+        &root,
+        &repo,
+        projects
+            .resolve_worktrees_dir(&m.project_key, config)
+            .as_deref(),
+        &registered,
+    ) {
+        bail!(
+            "{} is outside project '{}' (its checkout {} and worktrees dir); refusing to write there",
+            root.display(),
+            m.project_key,
+            repo.display()
+        );
+    }
     if m.main_checkout && repo != root {
         bail!(
             "project '{}' lives at {} here but the box was packed from {}; \
@@ -1208,5 +1333,36 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         // Resolve /var → /private/var so git's reported paths match ours.
         fs::canonicalize(d).unwrap()
+    }
+
+    #[test]
+    fn boxes_may_only_land_inside_a_registered_project() {
+        let proj = Path::new("/w/proj");
+        let wts = Path::new("/w/worktrees/proj");
+        let reg = [PathBuf::from("/elsewhere/known")];
+        let ok = |r: &str| root_allowed(Path::new(r), proj, Some(wts), &reg);
+        assert!(ok("/w/proj"));
+        assert!(ok("/w/worktrees/proj/feat"));
+        assert!(ok("/elsewhere/known"), "an already-registered worktree");
+        assert!(!ok("/w/worktrees/proj"), "the worktrees dir itself");
+        assert!(!ok("/etc"));
+        assert!(!ok("/Users/someone/.ssh"));
+        assert!(!ok("/w/worktrees/proj/../../../etc"), "no traversal");
+        assert!(!ok("relative/path"));
+        assert!(!root_allowed(
+            Path::new("/w/worktrees/proj/x"),
+            proj,
+            None,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn manifest_names_that_become_paths_are_checked() {
+        assert!(valid_id("aaaaaaaa-2222-3333-4444-555555555555"));
+        assert!(!valid_id("../x") && !valid_id("") && !valid_id("a/b"));
+        assert!(valid_profile(".claude") && valid_profile(".claude-work"));
+        assert!(!valid_profile(".ssh") && !valid_profile(".claude/../.ssh"));
+        assert!(valid_slug("-Users-me-proj") && !valid_slug("../x") && !valid_slug("a/b"));
     }
 }

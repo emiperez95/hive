@@ -39,7 +39,7 @@ pub fn run_box_pack(conv: &str, force: bool, with_ignored: bool) -> Result<()> {
 }
 
 /// Gate → freeze → write. Returns the conversation id, the box dir and its manifest.
-fn pack_conversation(
+pub(crate) fn pack_conversation(
     conv: &str,
     force: bool,
     with_ignored: bool,
@@ -126,9 +126,120 @@ fn pack_conversation(
     }
 }
 
-/// `hive box push`: pack, copy to the remote, unpack (and thaw) there, then record that it
-/// now lives there. The local working copy is left alone unless `remove_local` — nothing
-/// that exists only here is removed by default.
+/// How a box reaches a remote. A remote with an `api` takes boxes over HTTP (no ssh, rsync
+/// or `hive` on its PATH needed — and it works where rsync does not exist); `--via-ssh`
+/// forces the older ssh + rsync path, which is also what a remote without an `api` uses.
+enum Via {
+    Ssh,
+    Http(String),
+}
+
+fn via(r: &crate::common::config::RemoteConfig, force_ssh: bool) -> Via {
+    match (&r.api, force_ssh) {
+        (Some(api), false) => Via::Http(api.clone()),
+        _ => Via::Ssh,
+    }
+}
+
+/// Copy the box directory `dir` to the remote's `~/.hive/boxes/<id>`.
+fn send_box(
+    r: &crate::common::config::RemoteConfig,
+    v: &Via,
+    id: &str,
+    dir: &std::path::Path,
+) -> Result<()> {
+    match v {
+        Via::Ssh => {
+            let out = remote::ssh_output(r, "mkdir -p .hive/boxes")?;
+            if !out.status.success() {
+                bail!(
+                    "cannot reach {}: {}",
+                    r.name,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            remote::rsync_dir_to(r, dir, &format!(".hive/boxes/{id}"))
+        }
+        Via::Http(api) => {
+            let tmp =
+                std::env::temp_dir().join(format!("hive-send-{id}-{}.tar", std::process::id()));
+            boxes::tar_box(dir, &tmp)?;
+            let res = crate::common::federation::put_file(api, &format!("/api/box/{id}"), &tmp);
+            let _ = std::fs::remove_file(&tmp);
+            res.map(|_| ())
+        }
+    }
+}
+
+/// Copy the remote's `~/.hive/boxes/<id>` over `dir`.
+fn fetch_box(
+    r: &crate::common::config::RemoteConfig,
+    v: &Via,
+    id: &str,
+    dir: &std::path::Path,
+) -> Result<()> {
+    match v {
+        Via::Ssh => remote::rsync_dir_from(r, &format!(".hive/boxes/{id}"), dir),
+        Via::Http(api) => {
+            let tmp =
+                std::env::temp_dir().join(format!("hive-fetch-{id}-{}.tar", std::process::id()));
+            let res = crate::common::federation::get_to_file(api, &format!("/api/box/{id}"), &tmp)
+                .and_then(|_| {
+                    let _ = std::fs::remove_dir_all(dir);
+                    boxes::untar_box(&mut std::fs::File::open(&tmp)?, dir)
+                });
+            let _ = std::fs::remove_file(&tmp);
+            res
+        }
+    }
+}
+
+/// Run a box operation on the remote. `args` are the `hive box <op>` arguments for ssh and
+/// the JSON body for HTTP; both describe the same request.
+fn remote_op(
+    r: &crate::common::config::RemoteConfig,
+    v: &Via,
+    op: &str,
+    id: &str,
+    flags: &[(&str, bool)],
+    location: Option<&str>,
+) -> Result<String> {
+    match v {
+        Via::Ssh => {
+            let mut args: Vec<String> = vec!["box".into(), op.into(), id.into()];
+            for (k, on) in flags.iter().filter(|(_, on)| *on) {
+                let _ = on;
+                args.push(format!("--{}", k.replace('_', "-")));
+            }
+            if let Some(l) = location {
+                args.push("--location".into());
+                args.push(l.into());
+            }
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            remote::remote_hive_run(r, &refs)
+        }
+        Via::Http(api) => {
+            let mut body = serde_json::Map::new();
+            for (k, on) in flags {
+                body.insert((*k).to_string(), (*on).into());
+            }
+            if let Some(l) = location {
+                body.insert("location".into(), l.into());
+            }
+            crate::common::federation::http_request(
+                api,
+                "POST",
+                &format!("/api/box/{id}/{op}"),
+                Some(&serde_json::Value::Object(body).to_string()),
+            )
+            .map_err(|e| anyhow!("{}: {e}", r.name))?;
+            Ok(String::new())
+        }
+    }
+}
+
+/// `hive box push`: pack, then `send`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_box_push(
     conv: &str,
     remote: &str,
@@ -137,29 +248,64 @@ pub fn run_box_push(
     thaw: bool,
     remove_local: bool,
     sandbox: bool,
+    via_ssh: bool,
 ) -> Result<()> {
     let r = remote::find_remote(remote)?;
     let (id, dir, m) = pack_conversation(conv, force, with_ignored)?;
-    let rel = format!(".hive/boxes/{id}");
-    let out = remote::ssh_output(&r, "mkdir -p .hive/boxes")?;
-    if !out.status.success() {
-        bail!(
-            "cannot reach {}: {}",
-            r.name,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    remote::rsync_dir_to(&r, &dir, &rel)?;
-    let mut args = vec!["box", "unpack", id.as_str()];
-    if thaw {
-        args.push("--thaw");
-    }
-    if sandbox {
-        args.push("--sandbox");
-    }
-    let out = remote::remote_hive_run(&r, &args)?;
+    ship(&r, &id, &dir, &m, thaw, remove_local, sandbox, via_ssh)
+}
+
+/// `hive box send`: transfer a box that is already packed — the second half of `push`, and
+/// the retry when the transfer failed after the window was already frozen.
+pub fn run_box_send(
+    target: &str,
+    remote: &str,
+    thaw: bool,
+    remove_local: bool,
+    sandbox: bool,
+    via_ssh: bool,
+) -> Result<()> {
+    let r = remote::find_remote(remote)?;
+    let dir = resolve_box(target)?;
+    let m = boxes::read_manifest(&dir)?;
+    ship(
+        &r,
+        &m.id.clone(),
+        &dir,
+        &m,
+        thaw,
+        remove_local,
+        sandbox,
+        via_ssh,
+    )
+}
+
+/// Copy a packed box to the remote, unpack (and thaw) it there, then record that it now
+/// lives there. The local working copy is left alone unless `remove_local` — nothing that
+/// exists only here is removed by default.
+#[allow(clippy::too_many_arguments)]
+fn ship(
+    r: &crate::common::config::RemoteConfig,
+    id: &str,
+    dir: &std::path::Path,
+    m: &boxes::Manifest,
+    thaw: bool,
+    remove_local: bool,
+    sandbox: bool,
+    via_ssh: bool,
+) -> Result<()> {
+    let v = via(r, via_ssh);
+    send_box(r, &v, id, dir)?;
+    let out = remote_op(
+        r,
+        &v,
+        "unpack",
+        id,
+        &[("thaw", thaw), ("sandbox", sandbox)],
+        None,
+    )?;
     print!("{out}");
-    ship_mark(&id, Some(r.name.clone()), remove_local.then_some(&m))?;
+    ship_mark(id, Some(r.name.clone()), remove_local.then_some(m))?;
     println!("{id} now lives on {}", r.name);
     Ok(())
 }
@@ -171,6 +317,7 @@ pub fn run_box_pull(
     from: Option<&str>,
     force: bool,
     remove_remote: bool,
+    via_ssh: bool,
 ) -> Result<()> {
     let sc = crate::common::registry::ConversationSidecar::load();
     let hits: Vec<(&String, &String)> = sc
@@ -185,30 +332,27 @@ pub fn run_box_pull(
         _ => bail!("'{conv}' matches {} shipped conversations", hits.len()),
     };
     let r = remote::find_remote(from.unwrap_or(&loc))?;
-    let mut pack_args = vec!["box", "pack", id.as_str()];
-    if force {
-        pack_args.push("--force");
-    }
-    remote::remote_hive_run(&r, &pack_args)?;
+    let v = via(&r, via_ssh);
+    remote_op(&r, &v, "pack", &id, &[("force", force)], None)?;
     let local_box = boxes::boxes_dir()?.join(&id);
-    remote::rsync_dir_from(&r, &format!(".hive/boxes/{id}"), &local_box)?;
+    fetch_box(&r, &v, &id, &local_box)?;
 
     // The box is on this disk now, so the remote copy is safe to release before unpacking
     // (and must be, when both sides share paths).
     let local = remote::local_name();
-    let mark = |remove: bool| {
-        let mut a = vec!["box", "mark", id.as_str(), "--location", local.as_str()];
-        if remove {
-            a.push("--remove-worktree");
-        }
-        remote::remote_hive_run(&r, &a)
-    };
     if remove_remote {
-        mark(true)?;
+        remote_op(
+            &r,
+            &v,
+            "mark",
+            &id,
+            &[("remove_worktree", true)],
+            Some(&local),
+        )?;
     }
     run_box_unpack(&id, true, false, false)?;
     if !remove_remote {
-        mark(false)?;
+        remote_op(&r, &v, "mark", &id, &[], Some(&local))?;
     }
     boxes::set_location(&id, None)?;
     println!("{id} is back on this machine");

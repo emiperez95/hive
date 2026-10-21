@@ -343,6 +343,11 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         // (or, for `switch`, by opening the local ssh window). Everything else falls
         // through to the local handlers below untouched.
         let mut prebody: Option<String> = None;
+        if path.starts_with(crate::serve::boxes_api::PREFIX) {
+            // Transfers and unpacks take seconds; own thread, so the dashboard never waits.
+            std::thread::spawn(move || crate::serve::boxes_api::handle(request));
+            continue;
+        }
         if method == Method::Get {
             if let Some(resp) = remote_get(&shared_active, &url, path) {
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();

@@ -66,7 +66,10 @@ pub fn http_request(api: &str, method: &str, path: &str, body: Option<&str>) -> 
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     // A write (freeze, thaw) legitimately takes longer than a poll; only the poll is on the
     // 1 s tick and needs the tight bound.
-    stream.set_read_timeout(Some(if method == "POST" {
+    stream.set_read_timeout(Some(if path.starts_with("/api/box/") {
+        // pack / unpack run git, rsync and project hooks on the far side.
+        Duration::from_secs(300)
+    } else if method == "POST" {
         Duration::from_secs(5)
     } else {
         READ_TIMEOUT
@@ -91,7 +94,12 @@ pub fn http_request(api: &str, method: &str, path: &str, body: Option<&str>) -> 
         .ok_or_else(|| anyhow!("malformed response"))?;
     let code = head.split_whitespace().nth(1).unwrap_or("");
     if code != "200" {
-        bail!("{host} answered {code}");
+        // The far side's own explanation (`{"error": "..."}`) is the useful part.
+        let why = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+            .unwrap_or_else(|| body.trim().chars().take(200).collect());
+        bail!("{host} answered {code}: {why}");
     }
     Ok(body.to_string())
 }
@@ -164,6 +172,78 @@ pub fn enc(s: &str) -> String {
         }
     }
     out
+}
+
+/// Generous bound for moving a box: a tree can be hundreds of MB. Applies per read/write,
+/// not to the whole transfer.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn connect(api: &str) -> Result<(TcpStream, String)> {
+    let (host, port) = split_api(api).ok_or_else(|| anyhow!("bad api url '{api}'"))?;
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("cannot resolve {host}"))?;
+    let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    s.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
+    s.set_write_timeout(Some(TRANSFER_TIMEOUT))?;
+    Ok((s, host))
+}
+
+/// Read a response head; returns (status code, the stream positioned at the body).
+fn read_head(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            bail!("connection closed before a response");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let code = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            return Ok((code, buf[pos + 4..].to_vec()));
+        }
+    }
+}
+
+/// Stream a local file as the body of `PUT path`. Returns the response body.
+pub fn put_file(api: &str, path: &str, file: &std::path::Path) -> Result<String> {
+    let (mut s, host) = connect(api)?;
+    let len = std::fs::metadata(file)?.len();
+    write!(
+        s,
+        "PUT {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/x-tar\r\n\
+         Content-Length: {len}\r\n\r\n"
+    )?;
+    std::io::copy(&mut std::fs::File::open(file)?, &mut s)?;
+    let (code, mut rest) = read_head(&mut s)?;
+    s.read_to_end(&mut rest)?;
+    let body = String::from_utf8_lossy(&rest).to_string();
+    if code != "200" {
+        let why = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+            .unwrap_or_else(|| body.trim().to_string());
+        bail!("{host} answered {code}: {why}");
+    }
+    Ok(body)
+}
+
+/// Stream the body of `GET path` into a local file.
+pub fn get_to_file(api: &str, path: &str, dest: &std::path::Path) -> Result<()> {
+    let (mut s, host) = connect(api)?;
+    write!(s, "GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n")?;
+    let (code, first) = read_head(&mut s)?;
+    let mut out = std::fs::File::create(dest)?;
+    out.write_all(&first)?;
+    std::io::copy(&mut s, &mut out)?;
+    if code != "200" {
+        let msg = std::fs::read_to_string(dest).unwrap_or_default();
+        bail!("{host} answered {code}: {}", msg.trim());
+    }
+    Ok(())
 }
 
 /// `host`'s dashboard API, if it is a configured remote with one.

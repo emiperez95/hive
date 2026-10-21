@@ -33,6 +33,12 @@ pub struct WebConfig {
     /// TTS read-aloud host, passed through as `--tts-host`. Off when unset.
     #[serde(default)]
     pub tts_host: Option<String>,
+    /// Accept conversation boxes pushed over HTTP (`PUT /api/box/<id>`, `…/unpack`, `…/pack`).
+    /// Default **off**: those endpoints write files, and the dashboard has no authentication
+    /// (it is a trusted-LAN surface), so a server takes them only if told to. Unpack
+    /// additionally refuses any path outside a registered project or its worktrees dir.
+    #[serde(default)]
+    pub accept_boxes: bool,
 }
 
 impl Default for WebConfig {
@@ -41,6 +47,7 @@ impl Default for WebConfig {
             autostart: false,
             port: default_web_port(),
             tts_host: None,
+            accept_boxes: false,
         }
     }
 }

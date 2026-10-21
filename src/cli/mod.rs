@@ -410,6 +410,23 @@ pub enum BoxCommand {
         /// Have the remote run it under `srt` (a remote with `[sandbox] enabled` always does)
         #[arg(long)]
         sandbox: bool,
+        /// Use ssh + rsync even though the remote has an `api` (the default is HTTP)
+        #[arg(long)]
+        via_ssh: bool,
+    },
+    /// Transfer a box that is already packed to a remote and resume it there
+    Send {
+        /// Box id (or unique prefix) or a path to a box directory
+        target: String,
+        remote: String,
+        #[arg(long)]
+        no_thaw: bool,
+        #[arg(long)]
+        remove_local: bool,
+        #[arg(long)]
+        sandbox: bool,
+        #[arg(long)]
+        via_ssh: bool,
     },
     /// Bring a shipped conversation back from the remote it lives on
     Pull {
@@ -422,6 +439,8 @@ pub enum BoxCommand {
         /// Remove the remote's linked-worktree copy once the box is on this disk
         #[arg(long)]
         remove_remote: bool,
+        #[arg(long)]
+        via_ssh: bool,
     },
     /// Record where a conversation lives (run by push/pull, also over ssh)
     #[command(hide = true)]
