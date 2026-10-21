@@ -224,3 +224,45 @@ pub fn run_project_list(all: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// Print the registry (or one project) as TOML, ready for `hive project import` on another
+/// machine. Paths are written as registered: the other machine must have them at the same
+/// absolute location, which is what a box needs anyway.
+pub fn run_project_export(key: Option<&str>) -> Result<()> {
+    let mut reg = ProjectRegistry::load();
+    if let Some(k) = key {
+        reg.projects.retain(|name, _| name == k);
+        if reg.projects.is_empty() {
+            anyhow::bail!("project '{k}' not found");
+        }
+    }
+    reg.worktrees_root = None;
+    print!("{}", toml::to_string_pretty(&reg)?);
+    Ok(())
+}
+
+/// Merge projects from a TOML file (`-` for stdin). Existing keys are kept unless `force`:
+/// re-adding would clobber local auth profile / ports / worktrees dir.
+pub fn run_project_import(file: &str, force: bool) -> Result<()> {
+    use std::io::Read;
+    let mut text = String::new();
+    if file == "-" {
+        std::io::stdin().read_to_string(&mut text)?;
+    } else {
+        text = std::fs::read_to_string(file)?;
+    }
+    let incoming: ProjectRegistry = toml::from_str(&text)?;
+    let mut reg = ProjectRegistry::load();
+    let (mut added, mut skipped) = (0, 0);
+    for (key, config) in incoming.projects {
+        if reg.projects.contains_key(&key) && !force {
+            skipped += 1;
+            continue;
+        }
+        reg.add_project(key, config);
+        added += 1;
+    }
+    reg.save()?;
+    println!("imported {added} project(s), kept {skipped} existing");
+    Ok(())
+}

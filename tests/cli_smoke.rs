@@ -540,3 +540,511 @@ fn project_add_persists_auth_profile() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// --- Boxes (phase 1 of docs/remote-boxes.md) ---
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// pack → destroy the worktree, its branch and the local transcript → unpack --thaw.
+/// Everything runs against an isolated `$HOME` and a private tmux server (never the
+/// user's): the "target machine" is just the same box with everything removed.
+#[test]
+fn box_pack_unpack_thaw_roundtrip() {
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("hive-smoke-box-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let tmux_dir = root.join("tmux");
+    let bin = root.join("bin");
+    for d in [&home, &tmux_dir, &bin] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    // A stand-in `claude` that records how it was resumed.
+    let argv_log = root.join("claude-argv");
+    let fake = bin.join("claude");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$@\" > '{}'\nsleep 30\n",
+            argv_log.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&fake)
+        .output()
+        .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = |args: &[&str]| {
+        hive_cmd()
+            .args(args)
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .env("SHELL", "/bin/sh")
+            .env("TMUX_TMPDIR", &tmux_dir)
+            .env_remove("TMUX")
+            .output()
+            .unwrap()
+    };
+    let ok = |args: &[&str]| {
+        let o = run(args);
+        assert!(
+            o.status.success(),
+            "hive {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+
+    // A project with a pushed base, plus a linked worktree carrying unpushed commits,
+    // a staged file, an unstaged edit, an untracked file and an ignored one.
+    let origin = root.join("origin.git");
+    let proj = home.join("proj");
+    let wt = home.join("proj-feat");
+    Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&origin)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&proj)
+        .output()
+        .unwrap();
+    git_in(&proj, &["config", "user.email", "a@b"]);
+    git_in(&proj, &["config", "user.name", "t"]);
+    std::fs::write(proj.join("a.txt"), "base\n").unwrap();
+    std::fs::write(proj.join(".gitignore"), "*.log\n").unwrap();
+    git_in(&proj, &["add", "."]);
+    git_in(&proj, &["commit", "-qm", "base"]);
+    git_in(&proj, &["branch", "-M", "main"]);
+    git_in(&proj, &["push", "-q", "origin", "main"]);
+    git_in(
+        &proj,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            wt.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    for n in ["c1", "c2"] {
+        std::fs::write(wt.join(format!("{n}.txt")), n).unwrap();
+        git_in(&wt, &["add", "."]);
+        git_in(&wt, &["commit", "-qm", n]);
+    }
+    std::fs::write(wt.join("s.txt"), "staged").unwrap();
+    git_in(&wt, &["add", "s.txt"]);
+    std::fs::write(wt.join("a.txt"), "edited\n").unwrap();
+    std::fs::write(wt.join("untracked.txt"), "un").unwrap();
+    std::fs::write(wt.join("x.log"), "ignored").unwrap();
+    let status = git_in(&wt, &["status", "--short"]);
+    let log = git_in(&wt, &["log", "--oneline"]);
+    let head = git_in(&wt, &["rev-parse", "HEAD"]);
+
+    // Register the project and the worktree.
+    ok(&[
+        "project",
+        "add",
+        "proj",
+        "--emoji",
+        "📁",
+        "--path",
+        proj.to_str().unwrap(),
+    ]);
+    std::fs::create_dir_all(home.join(".hive/cache")).unwrap();
+    std::fs::write(
+        home.join(".hive/cache/worktrees.json"),
+        format!(
+            r#"{{"worktrees":{{"proj/feat":{{"project_key":"proj","branch":"feat","worktree_type":"worktree","path":"{}","session_name":"wt-sess","created_at":"2026-01-01T00:00:00Z"}}}}}}"#,
+            wt.display()
+        ),
+    )
+    .unwrap();
+
+    // The conversation: a transcript launched in the worktree, under the default profile.
+    let id = "11111111-2222-3333-4444-555555555555";
+    let slug = wt.to_str().unwrap().replace('/', "-");
+    let slug_dir = home.join(".claude/projects").join(&slug);
+    std::fs::create_dir_all(slug_dir.join("memory")).unwrap();
+    std::fs::write(slug_dir.join("memory/MEMORY.md"), "remember\n").unwrap();
+    let transcript = slug_dir.join(format!("{id}.jsonl"));
+    let line = format!(
+        r#"{{"type":"user","cwd":"{}","sessionId":"{id}","timestamp":"2026-10-20T10:00:00Z","message":{{"role":"user","content":"hello"}}}}"#,
+        wt.display()
+    );
+    std::fs::write(&transcript, format!("{line}\n")).unwrap();
+    let transcript_bytes = std::fs::read(&transcript).unwrap();
+
+    // pack
+    let out = ok(&["box", "pack", &id[..8]]);
+    assert!(out.contains("packed"), "{out}");
+    let box_dir = home.join(".hive/boxes").join(id);
+    assert!(box_dir.join("manifest.json").is_file());
+    assert!(box_dir.join("commits.bundle").is_file());
+    assert!(ok(&["box", "list"]).contains("proj/feat"));
+
+    // Destroy everything that makes this "the origin machine".
+    git_in(
+        &proj,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    git_in(&proj, &["branch", "-D", "feat"]);
+    std::fs::remove_dir_all(&slug_dir).unwrap();
+    std::fs::remove_file(home.join(".hive/cache/worktrees.json")).unwrap();
+
+    // unpack + thaw
+    let out = ok(&["box", "unpack", &id[..8], "--thaw"]);
+    assert!(out.contains("resumed in session"), "{out}");
+
+    assert_eq!(git_in(&wt, &["status", "--short"]), status);
+    assert_eq!(git_in(&wt, &["log", "--oneline"]), log);
+    assert_eq!(git_in(&wt, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("x.log")).unwrap(),
+        "ignored"
+    );
+    assert_eq!(std::fs::read(&transcript).unwrap(), transcript_bytes);
+    assert!(slug_dir.join("memory/MEMORY.md").is_file());
+    let wts = std::fs::read_to_string(home.join(".hive/cache/worktrees.json")).unwrap();
+    assert!(wts.contains("proj/feat"), "worktree re-registered: {wts}");
+
+    // thaw ran `claude --resume <id>` in the restored window
+    let mut resumed = String::new();
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(&argv_log) {
+            resumed = s;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(resumed.trim(), format!("--resume {id}"));
+
+    // A second unpack over the restored worktree must refuse, not clobber.
+    let again = run(&["box", "unpack", id]);
+    assert!(!again.status.success());
+
+    // Tear down only the private tmux server (TMUX_TMPDIR is ours).
+    Command::new("tmux")
+        .arg("kill-server")
+        .env("TMUX_TMPDIR", &tmux_dir)
+        .env_remove("TMUX")
+        .output()
+        .ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// push → the other "machine" resumes it → pull brings it back. Two `$HOME`s and a fake
+/// `ssh` that runs the command under the second one stand in for two machines. The repo
+/// and worktree live outside both homes at one shared path (paths must match across
+/// machines), so the shim removes the sender's copy before the receiver unpacks — which on
+/// real hardware is simply a different disk.
+#[test]
+fn box_push_pull_between_two_homes() {
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("hive-smoke-push-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (ha, hb) = (root.join("home-a"), root.join("home-b"));
+    let (ta, tb) = (root.join("tmux-a"), root.join("tmux-b"));
+    let bin = root.join("bin");
+    for d in [&ha, &hb, &ta, &tb, &bin, &hb.join(".claude")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let argv_log = root.join("claude-argv");
+    let fake = bin.join("claude");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$HOME $@\" > '{}'\nsleep 30\n",
+            argv_log.display()
+        ),
+    )
+    .unwrap();
+    let proj = root.join("proj");
+    let wt = root.join("proj-feat");
+    // Fake ssh: `ssh [-o X] host cmd…` → run cmd under machine B's HOME and tmux. Just
+    // before B unpacks, drop the shared-path worktree (A's copy) to model separate disks.
+    let shim = bin.join("fakessh");
+    std::fs::write(
+        &shim,
+        format!(
+            r#"#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in -o|-l|-p|-i) shift 2;; -*) shift;; *) break;; esac; done
+shift
+cd '{hb}' || exit 1
+case "$*" in *unpack*) git -C '{proj}' worktree remove --force '{wt}' 2>/dev/null;; esac
+HOME='{hb}' TMUX_TMPDIR='{tb}' exec sh -c "$*"
+"#,
+            hb = hb.display(),
+            tb = tb.display(),
+            proj = proj.display(),
+            wt = wt.display()
+        ),
+    )
+    .unwrap();
+    for f in [&fake, &shim] {
+        Command::new("chmod").arg("+x").arg(f).output().unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run_as = |home: &std::path::Path, tmux: &std::path::Path, args: &[&str]| {
+        let o = hive_cmd()
+            .args(args)
+            .env("HOME", home)
+            .env("PATH", &path)
+            .env("SHELL", "/bin/sh")
+            .env("TMUX_TMPDIR", tmux)
+            .env("HIVE_SSH", &shim)
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "hive {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let a = |args: &[&str]| run_as(&ha, &ta, args);
+
+    // Repo with a worktree carrying unpushed + dirty state.
+    let origin = root.join("origin.git");
+    Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&origin)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&proj)
+        .output()
+        .unwrap();
+    git_in(&proj, &["config", "user.email", "a@b"]);
+    git_in(&proj, &["config", "user.name", "t"]);
+    std::fs::write(proj.join("a.txt"), "base\n").unwrap();
+    git_in(&proj, &["add", "."]);
+    git_in(&proj, &["commit", "-qm", "base"]);
+    git_in(&proj, &["branch", "-M", "main"]);
+    git_in(&proj, &["push", "-q", "origin", "main"]);
+    git_in(
+        &proj,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            wt.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    std::fs::write(wt.join("c1.txt"), "c1").unwrap();
+    git_in(&wt, &["add", "."]);
+    git_in(&wt, &["commit", "-qm", "c1"]);
+    std::fs::write(wt.join("a.txt"), "edited\n").unwrap();
+    std::fs::write(wt.join("untracked.txt"), "un").unwrap();
+    let status = git_in(&wt, &["status", "--short"]);
+    let log = git_in(&wt, &["log", "--oneline"]);
+
+    // Machine A: project, worktree registry, conversation. Machine B: the project only.
+    for (h, t) in [(&ha, &ta), (&hb, &tb)] {
+        run_as(
+            h,
+            t,
+            &[
+                "project",
+                "add",
+                "proj",
+                "--emoji",
+                "📁",
+                "--path",
+                proj.to_str().unwrap(),
+            ],
+        );
+    }
+    std::fs::create_dir_all(ha.join(".hive/cache")).unwrap();
+    std::fs::write(
+        ha.join(".hive/cache/worktrees.json"),
+        format!(
+            r#"{{"worktrees":{{"proj/feat":{{"project_key":"proj","branch":"feat","worktree_type":"worktree","path":"{}","session_name":"wt-sess","created_at":"2026-01-01T00:00:00Z"}}}}}}"#,
+            wt.display()
+        ),
+    )
+    .unwrap();
+    let id = "aaaaaaaa-2222-3333-4444-555555555555";
+    let slug = wt.to_str().unwrap().replace('/', "-");
+    let slug_a = ha.join(".claude/projects").join(&slug);
+    std::fs::create_dir_all(&slug_a).unwrap();
+    std::fs::write(
+        slug_a.join(format!("{id}.jsonl")),
+        format!(
+            r#"{{"type":"user","cwd":"{}","sessionId":"{id}","timestamp":"2026-10-20T10:00:00Z","message":{{"role":"user","content":"hello"}}}}
+"#,
+            wt.display()
+        ),
+    )
+    .unwrap();
+
+    a(&[
+        "remote",
+        "add",
+        "b",
+        "--ssh",
+        "me@b",
+        "--hive-path",
+        env!("CARGO_BIN_EXE_hive"),
+    ]);
+    assert!(a(&["remote", "list"]).contains("me@b"));
+
+    // push
+    let out = a(&["box", "push", &id[..8], "b"]);
+    assert!(out.contains("now lives on b"), "{out}");
+    assert_eq!(
+        git_in(&wt, &["status", "--short"]),
+        status,
+        "B restored the tree"
+    );
+    assert_eq!(git_in(&wt, &["log", "--oneline"]), log);
+    let slug_b = hb.join(".claude/projects").join(&slug);
+    assert!(
+        slug_b.join(format!("{id}.jsonl")).is_file(),
+        "transcript reached B"
+    );
+    let mut resumed = String::new();
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(&argv_log) {
+            resumed = s;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        resumed.trim(),
+        format!("{} --resume {id}", hb.display()),
+        "resumed on B"
+    );
+    assert!(
+        a(&["box", "list"]).contains("→"),
+        "A records that it lives elsewhere"
+    );
+    let sidecar = std::fs::read_to_string(ha.join(".hive/cache/conversations.json")).unwrap();
+    assert!(sidecar.contains("\"location\""), "{sidecar}");
+
+    // pull
+    std::fs::remove_file(&argv_log).unwrap();
+    let out = a(&["box", "pull", &id[..8], "--remove-remote"]);
+    assert!(out.contains("back on this machine"), "{out}");
+    assert_eq!(
+        git_in(&wt, &["status", "--short"]),
+        status,
+        "A restored the tree"
+    );
+    assert_eq!(git_in(&wt, &["log", "--oneline"]), log);
+    let mut resumed = String::new();
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(&argv_log) {
+            resumed = s;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        resumed.trim(),
+        format!("{} --resume {id}", ha.display()),
+        "resumed on A"
+    );
+    let sidecar = std::fs::read_to_string(ha.join(".hive/cache/conversations.json")).unwrap();
+    assert!(
+        !sidecar.contains("\"location\""),
+        "A owns it again: {sidecar}"
+    );
+    let sidecar_b = std::fs::read_to_string(hb.join(".hive/cache/conversations.json")).unwrap();
+    assert!(
+        sidecar_b.contains("\"location\""),
+        "B records it shipped back: {sidecar_b}"
+    );
+
+    for t in [&ta, &tb] {
+        Command::new("tmux")
+            .arg("kill-server")
+            .env("TMUX_TMPDIR", t)
+            .env_remove("TMUX")
+            .output()
+            .ok();
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn project_export_import_roundtrip() {
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("hive-smoke-pexp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (ha, hb) = (root.join("a"), root.join("b"));
+    std::fs::create_dir_all(&ha).unwrap();
+    std::fs::create_dir_all(&hb).unwrap();
+    let run = |h: &std::path::Path, args: &[&str]| {
+        let o = hive_cmd().args(args).env("HOME", h).output().unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    run(
+        &ha,
+        &[
+            "project",
+            "add",
+            "p1",
+            "--emoji",
+            "🧪",
+            "--path",
+            "/srv/p1",
+            "--auth-profile",
+            "work",
+        ],
+    );
+    let exported = run(&ha, &["project", "export"]);
+    let file = root.join("projects.toml");
+    std::fs::write(&file, &exported).unwrap();
+    assert!(run(&hb, &["project", "import", file.to_str().unwrap()]).contains("imported 1"));
+    assert!(run(&hb, &["project", "list"]).contains("p1"));
+    // Existing keys are kept, not clobbered.
+    assert!(run(&hb, &["project", "import", file.to_str().unwrap()]).contains("kept 1"));
+    std::fs::remove_dir_all(&root).ok();
+}

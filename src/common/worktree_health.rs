@@ -160,7 +160,7 @@ fn git_ok(dir: &str, args: &[&str]) -> bool {
 /// `origin/HEAD` first, because assuming `main` is wrong on real repos — avateen's
 /// default is `origin/production`, so a hardcoded `origin/main` reports every
 /// worktree there as zero-ahead, zero-behind and unmerged.
-fn resolve_base(dir: &str) -> Option<String> {
+pub(crate) fn resolve_base(dir: &str) -> Option<String> {
     if let Some(b) = git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"])
         .as_deref()
         .and_then(base_from_symbolic_ref)

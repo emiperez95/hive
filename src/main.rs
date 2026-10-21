@@ -81,8 +81,24 @@ fn main() -> Result<()> {
             ProjectCommand::Unarchive { key } => {
                 cli::project::run_project_set_archived(&key, false)
             }
+            ProjectCommand::Export { key } => cli::project::run_project_export(key.as_deref()),
+            ProjectCommand::Import { file, force } => {
+                cli::project::run_project_import(&file, force)
+            }
             ProjectCommand::List { all } => cli::project::run_project_list(all),
         },
+        Some(Command::Remote { command }) => {
+            use crate::cli::RemoteCommand;
+            match command {
+                RemoteCommand::Add {
+                    name,
+                    ssh,
+                    api,
+                    hive_path,
+                } => cli::boxes::run_remote_add(&name, &ssh, api, hive_path),
+                RemoteCommand::List => cli::boxes::run_remote_list(),
+            }
+        }
         Some(Command::Todo { command }) => cli::todo::run_todo(command),
         Some(Command::Task { command }) => cli::task::run_task(command),
         Some(Command::Spread { count }) => cli::session::run_spread(count),
@@ -122,6 +138,48 @@ fn main() -> Result<()> {
                 picker: true,
                 ..Default::default()
             })
+        }
+        Some(Command::BoxCmd { command }) => {
+            use crate::cli::BoxCommand;
+            match command {
+                BoxCommand::Pack {
+                    conversation,
+                    force,
+                    without_ignored,
+                } => cli::boxes::run_box_pack(&conversation, force, !without_ignored),
+                BoxCommand::Unpack {
+                    target,
+                    thaw,
+                    force,
+                } => cli::boxes::run_box_unpack(&target, thaw, force),
+                BoxCommand::List => cli::boxes::run_box_list(),
+                BoxCommand::Push {
+                    conversation,
+                    remote,
+                    force,
+                    without_ignored,
+                    no_thaw,
+                    remove_local,
+                } => cli::boxes::run_box_push(
+                    &conversation,
+                    &remote,
+                    force,
+                    !without_ignored,
+                    !no_thaw,
+                    remove_local,
+                ),
+                BoxCommand::Pull {
+                    conversation,
+                    from,
+                    force,
+                    remove_remote,
+                } => cli::boxes::run_box_pull(&conversation, from.as_deref(), force, remove_remote),
+                BoxCommand::Mark {
+                    id,
+                    location,
+                    remove_worktree,
+                } => cli::boxes::run_box_mark(&id, location.as_deref(), remove_worktree),
+            }
         }
         Some(Command::Wt { command }) => {
             use crate::cli::WtCommand;

@@ -161,6 +161,15 @@ pub struct Conversation {
     /// record for it. The only first-party answer to "working since when".
     #[serde(skip)]
     pub status_since_ms: Option<i64>,
+    /// Machine this conversation LIVES on, when not this one (a federated remote's name).
+    /// `None` = here. A remote placement still makes it Live (see `Lifecycle`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Where a packed conversation was shipped to (overlay). `None` = held here. The side
+    /// holding a live placement or an un-shipped box owns the conversation; a shipped one
+    /// must not be offered here as a local thaw or recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 impl Conversation {
@@ -249,6 +258,9 @@ pub struct ConversationOverlay {
     /// any other move so a stale reason never follows the card around.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_note: Option<String>,
+    /// Remote this conversation was shipped to by `hive box push` (see `Conversation::location`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 impl ConversationOverlay {
@@ -405,6 +417,7 @@ impl ConversationRegistry {
             let archive_reason = overlay.and_then(|o| o.archive_reason.clone());
             let forked_from = overlay.and_then(|o| o.forked_from.clone());
             let archived_at = overlay.and_then(|o| o.archived_at.clone());
+            let location = overlay.and_then(|o| o.location.clone());
             conversations.insert(
                 id.to_string(),
                 Conversation {
@@ -430,6 +443,8 @@ impl ConversationRegistry {
                     ports: Vec::new(),
                     pids: Vec::new(),
                     status_since_ms: None,
+                    host: None,
+                    location,
                 },
             );
         }
@@ -489,6 +504,8 @@ impl ConversationRegistry {
                             ports: Vec::new(),
                             pids: Vec::new(),
                             status_since_ms: None,
+                            host: None,
+                            location: None,
                         },
                     );
                 }
@@ -786,6 +803,8 @@ mod tests {
             ports: Vec::new(),
             pids: Vec::new(),
             status_since_ms: None,
+            host: None,
+            location: None,
         }
     }
 
@@ -1222,6 +1241,8 @@ mod tests {
             ports: Vec::new(),
             pids: Vec::new(),
             status_since_ms: None,
+            host: None,
+            location: None,
         }
     }
 

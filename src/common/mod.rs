@@ -1,6 +1,8 @@
 //! Common types and utilities shared between TUI and hook command.
 
 pub mod activity;
+// A conversation packed into a directory that moves between machines.
+pub mod boxes;
 pub mod chrome;
 // Claude's own per-process session registry — the first-party status source.
 pub mod claude_sessions;
@@ -23,6 +25,8 @@ pub mod persistence;
 pub mod ports;
 pub mod process;
 pub mod projects;
+// ssh + rsync to another machine running hive.
+pub mod remote;
 // Leftover Workflow agent worktrees/branches and the rules for removing them.
 pub mod prune;
 // Read-only shadow model (Increment 0); wired into views in a later increment.

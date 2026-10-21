@@ -210,6 +210,24 @@ already includes remote conversations; `web.html` needs only the `@host` tag.
 | 4 | proxied actions + local notifications for remote transitions; recovery frame ignores `location != local` | existing `should_notify` + `mark_pings` tests extended with a remote conversation |
 | 5 | sandbox-defined boxes: thaw on the server launches `srt --settings <per-box>` whose `allowWrite` is exactly the box's path set | `srt` present on the server; box completeness check = no writes outside the set |
 
+## Phase 1 — as built (2026-10-20)
+
+`common/boxes.rs` + `cli/boxes.rs`: `hive box pack <conv> [--force] [--without-ignored]`,
+`hive box unpack <id|path> [--thaw] [--force]`, `hive box list`. Differences from the sketch above,
+found by reproducing against a temp repo first:
+
+- The bundle is `refs/heads/<branch> --not --remotes` ("unpushed" = on no remote, as `prune.rs`
+  asks), **not** `base..HEAD`: a range ending in `HEAD` carries a ref named `HEAD`, so
+  `fetch bundle feat:feat` fails. No bundle at all when nothing is unpushed.
+- rsync runs without `--delete`; unpack instead removes tracked files the box lacks. `--delete`
+  would wipe a main checkout's ignored files when the box was packed `--without-ignored`.
+- Unpack refuses (rather than overwrites) a dirty main checkout, a non-empty worktree path, a
+  diverged branch, a missing profile dir, an unregistered project, and a local transcript that
+  is longer than the box's (`--force` overrides only the last).
+- Pack order is gate → freeze → write; if the write fails the window stays frozen (thawable).
+- Not yet done: `hive wt new --from-box` (project hooks on unpack — unpack uses plain
+  `git worktree add` and registers the worktree), the overlay `location` field (phase 2).
+
 ## Open questions
 
 - Ignored artifacts: rsync (default on same OS/arch, measured cheap) vs rebuild via hooks.

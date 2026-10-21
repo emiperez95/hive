@@ -741,6 +741,8 @@ mod tests {
             attention_rank: None,
             unseen: false,
             status_since_ms: None,
+            host: None,
+            location: None,
         }
     }
 

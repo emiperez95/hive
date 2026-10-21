@@ -559,6 +559,8 @@ mod tests {
             ports: Vec::new(),
             pids: Vec::new(),
             status_since_ms: None,
+            host: None,
+            location: None,
         }
     }
 
