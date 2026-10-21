@@ -151,7 +151,8 @@ fn main() -> Result<()> {
                     target,
                     thaw,
                     force,
-                } => cli::boxes::run_box_unpack(&target, thaw, force),
+                    sandbox,
+                } => cli::boxes::run_box_unpack(&target, thaw, force, sandbox),
                 BoxCommand::List => cli::boxes::run_box_list(),
                 BoxCommand::Push {
                     conversation,
@@ -160,6 +161,7 @@ fn main() -> Result<()> {
                     without_ignored,
                     no_thaw,
                     remove_local,
+                    sandbox,
                 } => cli::boxes::run_box_push(
                     &conversation,
                     &remote,
@@ -167,6 +169,7 @@ fn main() -> Result<()> {
                     !without_ignored,
                     !no_thaw,
                     remove_local,
+                    sandbox,
                 ),
                 BoxCommand::Pull {
                     conversation,

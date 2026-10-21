@@ -386,6 +386,9 @@ pub enum BoxCommand {
         /// Overwrite a longer local transcript
         #[arg(long)]
         force: bool,
+        /// Run the resumed conversation under `srt`, so its write set is exactly the box's
+        #[arg(long)]
+        sandbox: bool,
     },
     /// List boxes on this machine
     List,
@@ -404,6 +407,9 @@ pub enum BoxCommand {
         /// Remove this machine's linked-worktree copy once it is on the remote
         #[arg(long)]
         remove_local: bool,
+        /// Have the remote run it under `srt` (a remote with `[sandbox] enabled` always does)
+        #[arg(long)]
+        sandbox: bool,
     },
     /// Bring a shipped conversation back from the remote it lives on
     Pull {

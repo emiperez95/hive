@@ -565,7 +565,10 @@ pub(crate) fn annotate_attention(
         }
         for w in view.windows.iter_mut() {
             let idle = matches!(w.status, None | Some(SessionStatus::Waiting));
+            // Never probe a remote window: its cwd is a path on ANOTHER machine, and since
+            // boxes need identical paths it may well name a real — unrelated — directory here.
             w.unreviewed_work = idle
+                && w.host.is_none()
                 && w.cwd
                     .as_deref()
                     .is_some_and(|cwd| !cwd.is_empty() && unreviewed(cwd));
@@ -1510,5 +1513,29 @@ mod tests {
         n.observe(&[local.clone()]);
         local.windows[0].status = Some(SessionStatus::PlanReview);
         assert!(n.observe(&[local]).is_empty());
+    }
+
+    #[test]
+    fn a_remote_window_is_never_probed_for_unreviewed_work() {
+        let mut remote = win("r", Some(SessionStatus::Waiting), "/same/path/as/local");
+        remote.host = Some("mini".into());
+        let local = win("l", Some(SessionStatus::Waiting), "/same/path/as/local");
+        let mut views = vec![session("s", false, vec![local, remote])];
+        let mut probed = Vec::new();
+        annotate_attention(
+            &mut views,
+            &mut StateAges::default(),
+            &mut |cwd| {
+                probed.push(cwd.to_string());
+                true
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            probed.len(),
+            1,
+            "only the local window was probed: {probed:?}"
+        );
+        assert!(views[0].windows[0].unreviewed_work && !views[0].windows[1].unreviewed_work);
     }
 }

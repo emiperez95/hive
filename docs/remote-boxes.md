@@ -1,7 +1,8 @@
 # Remote boxes — moving a conversation between machines
 
-Status: design, 2026-10-20. Nothing implemented yet. The two moves it rests on were
-reproduced on this machine (see **Evidence**).
+Status: **implemented, phases 1-5** (2026-10-21) — see **As built** for where the code
+diverges from the sketch and what is not verified. The two moves it rests on were reproduced
+on this machine (see **Evidence**).
 
 ## Context for this branch (read first)
 
@@ -225,8 +226,76 @@ found by reproducing against a temp repo first:
   diverged branch, a missing profile dir, an unregistered project, and a local transcript that
   is longer than the box's (`--force` overrides only the last).
 - Pack order is gate → freeze → write; if the write fails the window stays frozen (thawable).
-- Not yet done: `hive wt new --from-box` (project hooks on unpack — unpack uses plain
-  `git worktree add` and registers the worktree), the overlay `location` field (phase 2).
+- Unpack runs the project's `post-worktree` and `post-copy` hooks on the fresh worktree
+  (before the tree is overlaid, so the box wins), and what they report becomes the registered
+  worktree's metadata. There is no `wt new --from-box`; unpack does it directly.
+
+## As built — phases 2-5
+
+**Phase 2 — transport.** `hive remote add|list` (`[[remotes]]` appended to `config.toml` as
+text, so comments and `[pricing]` survive), `hive box push|pull`, `hive project export|import`.
+`common/remote.rs` runs `ssh -o BatchMode=yes` (never prompts) and `rsync -e`; `HIVE_SSH`
+overrides the program, which is how the tests stand a second `$HOME` in for a second machine.
+- `push` = pack → rsync the box → remote `hive box unpack --thaw` → `box mark` locally
+  (overlay `location = <remote>`, local frozen entry discarded). `pull` is the reverse and
+  marks the remote through `hive box mark` over ssh.
+- Nothing that exists only on a side is removed: the sender's linked worktree is kept unless
+  `push --remove-local` / `pull --remove-remote`. `pull --remove-remote` releases the remote
+  copy once the box is on *this* disk and before unpacking (the box is the backup; and it is
+  what lets two machines sharing paths in a test work).
+- `reopen_conversation` refuses a conversation whose overlay has a `location`: resuming a
+  shipped conversation locally would fork its transcript.
+
+**Phase 3 — federation (read-only).** Deviation: the peer's wire is `GET /api/registry`
+(the registry's own serde `Conversation`s: live + parked, local only), not `/api/active` +
+`/api/conversations` — those are lossy projections (no parent, no placement) and the peer needs
+the model to merge. One poller thread per remote with an `api` (300 ms connect, 800 ms read,
+1 s cadence); the gather only reads the cache, so a down remote contributes nothing and shows
+`@mini ✗`. Only the long-running loops federate (`gather_conversations_stats`); one-shots such as
+`box pack` use the plain gather and so can never pick a remote row.
+- A remote conversation is `Live` with `Conversation.host = Some(name)`. Every local action that
+  takes a placement at face value is guarded: `Conversation::is_remote()` / `flag_session()`.
+- Remote sessions are named `"<session> @<host>"` in `SessionView`, build_active groups and
+  every local flag set, so they cannot collide with a same-named local session.
+- `Enter` → `remote::attach_remote`: a window `@mini:<name>` in the conversation's parent
+  session (else a session `@mini`) running `ssh -t [-L p:localhost:p …] host tmux attach …`.
+  A second `Enter` finds it. The Active view hides these windows (the `@` prefix).
+- The recovery frame, `/metrics` and the attention git probe ignore remote rows.
+
+**Phase 4 — actions.** Web: a request naming a remote session (`/api/send`, `freeze`, `todos`,
+`thaw`, `discard-frozen`, `kill-session`, `switch`, and the GETs `messages`, `session-info`,
+`todos`) is performed by that remote via its own API (`remote_get` / `remote_post`); `switch`
+opens the local ssh window instead; `kill-session` is refused. TUI: `Enter` attaches or thaws on
+the remote, `z` freezes there, `Del` on a parked row discards there; kill-window is refused.
+Notifications: `RemoteNotifier` (web data thread) rings locally on a remote conversation
+*entering* a blocked state, honouring the three mute levels and `M` via `should_notify`; flags
+on a remote row are local files keyed by the `"<session> @<host>"` name.
+
+**Phase 5 — sandbox.** `[sandbox] enabled / allowed_domains / extra_write` and
+`box unpack|push --sandbox`. `common/sandbox.rs` derives the `srt` settings from the manifest:
+`allowWrite` = the worktree (+ the repo's `.git` for a linked worktree, since commits are
+written there) + the profile dir + `~/.hive` + temp + `extra_write`; network = Anthropic's
+domains + `allowed_domains`. Thaw wraps `claude` as `srt --settings … -c 'claude --resume id'`
+(not positional: commander would read `--resume` as its own option) and stays sandboxed across
+freeze → thaw. A box packed from a sandboxed conversation records the set (`manifest.sandbox`)
+and is "complete by construction"; `extra_write` entries are reported as completeness gaps.
+Verified with the real `srt`: a write outside the set is refused by the kernel, and a real
+`claude -p` runs under exactly the derived write set and domains.
+
+**Not done / not verified**
+- Everything ssh was exercised through a shim (a second `$HOME`), not a real second machine or
+  `localhost` sshd (key auth to localhost isn't set up here). Key-based ssh, a PATH where
+  `hive` is missing (`--hive-path` exists for it), and the nested-tmux prefix toggle in the
+  server's `tmux.conf` are documented, not automated or tested.
+- Packing a *running* window (gate against live status, then freeze) is covered by unit tests
+  of the gate and by the code path, but no test can produce a detectable live Claude (detection
+  keys off the real binary's version-string process name).
+- `Ctrl+g` (`cycle-free`) does not visit remote windows; the sidebar/web attention order is
+  merged. Pings on remote rows clear when the conversation goes busy, not when you land on its
+  ssh window. Remote todos are web-proxied only; the TUI detail disables them for remote rows.
+  `todo-dispatch`, `conv-notes` and `conv-stats` are not proxied.
+- `srt` network defaults are Anthropic-only; a sandboxed session that needs git/npm needs
+  `allowed_domains`.
 
 ## Open questions
 

@@ -89,6 +89,9 @@ pub struct RemoteConfig {
 pub struct HiveConfig {
     #[serde(default)]
     pub web: WebConfig,
+    /// `[sandbox]` — run boxes under `srt` so their write set is a fact (see `sandbox`).
+    #[serde(default)]
+    pub sandbox: crate::common::sandbox::SandboxConfig,
     /// `[[remotes]]` — other machines this hive federates with.
     #[serde(default)]
     pub remotes: Vec<RemoteConfig>,

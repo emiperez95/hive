@@ -97,6 +97,26 @@ fn pack_conversation(
         false
     };
 
+    // Say what the box is worth: complete by construction (it ran under `srt`), or only as
+    // complete as what we could see.
+    match &plan.manifest.sandbox {
+        Some(set) => {
+            eprintln!(
+                "sandboxed: box complete by construction ({} writable paths)",
+                set.len()
+            );
+            let extra = crate::common::config::HiveConfig::load()
+                .sandbox
+                .extra_write;
+            for g in extra.iter().filter(|e| set.contains(e)) {
+                eprintln!("  gap: {g} was writable and is not in the box");
+            }
+        }
+        None => eprintln!(
+            "not sandboxed: tree and transcript captured; writes elsewhere can't be ruled out"
+        ),
+    }
+
     match boxes::write_box(&plan) {
         Ok(dir) => Ok((id, dir, plan.manifest)),
         Err(e) if frozen_window => Err(anyhow!(
@@ -116,6 +136,7 @@ pub fn run_box_push(
     with_ignored: bool,
     thaw: bool,
     remove_local: bool,
+    sandbox: bool,
 ) -> Result<()> {
     let r = remote::find_remote(remote)?;
     let (id, dir, m) = pack_conversation(conv, force, with_ignored)?;
@@ -132,6 +153,9 @@ pub fn run_box_push(
     let mut args = vec!["box", "unpack", id.as_str()];
     if thaw {
         args.push("--thaw");
+    }
+    if sandbox {
+        args.push("--sandbox");
     }
     let out = remote::remote_hive_run(&r, &args)?;
     print!("{out}");
@@ -182,7 +206,7 @@ pub fn run_box_pull(
     if remove_remote {
         mark(true)?;
     }
-    run_box_unpack(&id, true, false)?;
+    run_box_unpack(&id, true, false, false)?;
     if !remove_remote {
         mark(false)?;
     }
@@ -215,14 +239,37 @@ fn ship_mark(id: &str, location: Option<String>, remove: Option<&boxes::Manifest
     Ok(())
 }
 
-pub fn run_box_unpack(target: &str, thaw: bool, force: bool) -> Result<()> {
+pub fn run_box_unpack(target: &str, thaw: bool, force: bool, sandbox: bool) -> Result<()> {
     let dir = resolve_box(target)?;
     let m = boxes::read_manifest(&dir)?;
+    let cfg = crate::common::config::HiveConfig::load();
+    let sandboxed = sandbox || cfg.sandbox.enabled;
+    if sandboxed {
+        // Before anything is restored: a missing `srt` should cost nothing.
+        crate::common::sandbox::require_srt()?;
+    }
     let id = boxes::unpack(&dir, &UnpackOptions { force })?;
     println!("unpacked {} onto {}", id, m.root);
+    let settings = if sandboxed {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+        let plan = crate::common::sandbox::plan(&m, &home, &boxes::repo_for(&m)?, &cfg.sandbox);
+        for g in plan.completeness_gaps() {
+            eprintln!("gap: {g} is writable under the sandbox but is not carried by the box");
+        }
+        let path = crate::common::sandbox::write_settings(&id, &plan)?;
+        println!(
+            "sandbox: {} ({} writable paths)",
+            path.display(),
+            plan.write_set().len()
+        );
+        Some(path.to_string_lossy().to_string())
+    } else {
+        None
+    };
     if thaw {
         let mut state = FrozenState::load();
-        let entry = boxes::frozen_entry_for(&m);
+        let mut entry = boxes::frozen_entry_for(&m);
+        entry.sandbox = settings;
         let key = entry.key();
         state.frozen.insert(key.clone(), entry);
         state.save()?;

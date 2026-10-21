@@ -80,6 +80,11 @@ pub struct Manifest {
     pub with_ignored: bool,
     /// Whether `commits.bundle` exists (false when nothing was unpushed).
     pub has_bundle: bool,
+    /// The `allowWrite` set the conversation ran under, when it ran sandboxed. Present ⇒
+    /// the box is complete by construction: nothing outside these paths could have changed,
+    /// and the box carries the ones that hold conversation state. Absent ⇒ best effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Vec<String>>,
 }
 
 // ─── The gate ────────────────────────────────────────────────────────────────
@@ -286,7 +291,17 @@ pub fn pack_worktree(root: &Path, dest: &Path, with_ignored: bool) -> Result<Pac
 ///
 /// `repo` is the project's own checkout: where the bundle is fetched into and, for a
 /// linked worktree, where `git worktree add` runs. For a main-checkout box `repo == root`.
-pub fn unpack_worktree(src: &Path, m: &Manifest, repo: &Path, root: &Path) -> Result<()> {
+///
+/// `after_checkout` runs for a linked worktree right after `git worktree add` and BEFORE the
+/// tree is overlaid: project hooks (ports, env files) get a fresh worktree to act on, and
+/// anything they write is then overwritten by the box, which is the truth.
+pub fn unpack_worktree(
+    src: &Path,
+    m: &Manifest,
+    repo: &Path,
+    root: &Path,
+    after_checkout: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
     if !git_ok(repo, &["rev-parse", "--git-dir"]) {
         bail!("{} is not a git checkout", repo.display());
     }
@@ -390,6 +405,7 @@ pub fn unpack_worktree(src: &Path, m: &Manifest, repo: &Path, root: &Path) -> Re
                 repo,
                 &["worktree", "add", &root.to_string_lossy(), &m.branch],
             )?;
+            after_checkout()?;
         }
 
         // 3. Working tree: overlay the box, then drop tracked files the box doesn't have.
@@ -577,6 +593,7 @@ pub fn plan_pack(src: &PackSource, opts: &PackOptions) -> Result<PackPlan> {
         packed_on: hostname(),
         with_ignored: opts.with_ignored,
         has_bundle: false, // settled by pack_worktree
+        sandbox: crate::common::sandbox::recorded_write_set(src.id),
     };
     Ok(PackPlan {
         manifest,
@@ -717,6 +734,18 @@ pub fn remove_worktree_copy(m: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// The project's own checkout on THIS machine — where a box's bundle is fetched into.
+pub fn repo_for(m: &Manifest) -> Result<PathBuf> {
+    let projects = ProjectRegistry::load();
+    let config = projects.projects.get(&m.project_key).ok_or_else(|| {
+        anyhow!(
+            "project '{}' is not registered here (register it at the same path first)",
+            m.project_key
+        )
+    })?;
+    Ok(expand_tilde(&config.project_root))
+}
+
 pub struct UnpackOptions {
     pub force: bool,
 }
@@ -771,7 +800,39 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
         }
     }
 
-    unpack_worktree(src, &m, &repo, &root)?;
+    // Project hooks, as a fresh `hive wt new` would run them. What they report (allocated
+    // ports, a session-name override) becomes the registered worktree's metadata.
+    let mut metadata = serde_json::json!({ "ports": m.ports });
+    let hooks_dir = crate::common::worktree::resolve_hooks_dir(config, &m.project_key);
+    let registered_branch = m
+        .worktree_key
+        .as_deref()
+        .and_then(|k| k.strip_prefix(&format!("{}/", m.project_key)))
+        .unwrap_or(&m.branch)
+        .to_string();
+    let mut session_name = m.session_name.clone();
+    unpack_worktree(src, &m, &repo, &root, &mut || {
+        if m.worktree_key.is_none() {
+            return Ok(());
+        }
+        let mut env = crate::common::worktree::build_hook_env(
+            &m.project_key,
+            &registered_branch,
+            &root,
+            &repo,
+            &session_name,
+            "worktree",
+            &hooks_dir,
+        );
+        for hook in ["post-worktree", "post-copy"] {
+            metadata = crate::common::worktree::run_hook(&hooks_dir, hook, &env, &metadata)?;
+        }
+        if let Some(name) = metadata.get("session_name").and_then(|v| v.as_str()) {
+            session_name = name.to_string();
+            env.insert("HIVE_SESSION_NAME".to_string(), session_name.clone());
+        }
+        Ok(())
+    })?;
 
     fs::create_dir_all(&slug_dir)?;
     fs::copy(&box_transcript, &target_transcript)?;
@@ -797,8 +858,8 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
                 branch,
                 worktree_type: "worktree".to_string(),
                 path: m.root.clone(),
-                session_name: m.session_name.clone(),
-                metadata: serde_json::json!({ "ports": m.ports }),
+                session_name: session_name.clone(),
+                metadata: metadata.clone(),
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
             state.save()?;
@@ -852,6 +913,7 @@ pub fn frozen_entry_for(m: &Manifest) -> crate::common::frozen::FrozenEntry {
         claude_config_dir,
         note: m.note.clone(),
         frozen_at: chrono::Utc::now().to_rfc3339(),
+        sandbox: None,
     }
 }
 
@@ -914,6 +976,7 @@ mod tests {
             packed_on: String::new(),
             with_ignored: true,
             has_bundle: p.has_bundle,
+            sandbox: None,
         }
     }
 
@@ -1085,7 +1148,7 @@ mod tests {
         );
         sh(&main, &["branch", "-D", "feat"]);
 
-        unpack_worktree(&box_dir, &m, &main, &wt).unwrap();
+        unpack_worktree(&box_dir, &m, &main, &wt, &mut || Ok(())).unwrap();
         assert_eq!(sh(&wt, &["status", "--short"]), status);
         assert_eq!(sh(&wt, &["log", "--oneline"]), log);
         assert_eq!(sh(&wt, &["rev-parse", "HEAD"]), m.head);
@@ -1107,7 +1170,7 @@ mod tests {
         let p = pack_worktree(&main, &box_dir, true).unwrap();
         let m = manifest_for(&main, &p, "id1");
         fs::write(main.join("a.txt"), "local only").unwrap();
-        let err = unpack_worktree(&box_dir, &m, &main, &main).unwrap_err();
+        let err = unpack_worktree(&box_dir, &m, &main, &main, &mut || Ok(())).unwrap_err();
         assert!(err.to_string().contains("uncommitted"), "{err}");
         assert_eq!(
             fs::read_to_string(main.join("a.txt")).unwrap(),
@@ -1135,7 +1198,7 @@ mod tests {
         let box_dir = tmp.join("box");
         let p = pack_worktree(&wt, &box_dir, true).unwrap();
         let m = manifest_for(&wt, &p, "id1");
-        let err = unpack_worktree(&box_dir, &m, &main, &wt).unwrap_err();
+        let err = unpack_worktree(&box_dir, &m, &main, &wt, &mut || Ok(())).unwrap_err();
         assert!(err.to_string().contains("not empty"), "{err}");
     }
 

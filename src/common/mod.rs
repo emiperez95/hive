@@ -34,6 +34,7 @@ pub mod prune;
 // Read-only shadow model (Increment 0); wired into views in a later increment.
 #[allow(dead_code)]
 pub mod registry;
+pub mod sandbox;
 // The terminal emulator around tmux (Ghostty): panes, the sidebar split.
 pub mod terminal;
 // What hive wants from a Ghostty config (read, never written): the sidebar launch setup.

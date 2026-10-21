@@ -701,6 +701,25 @@ fn box_pack_unpack_thaw_roundtrip() {
     std::fs::write(&transcript, format!("{line}\n")).unwrap();
     let transcript_bytes = std::fs::read(&transcript).unwrap();
 
+    // A project hook, as `hive wt new` would run it: unpack must run it on the fresh worktree.
+    let hooks = home.join(".hive/projects/proj/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook_marker = root.join("hook-ran");
+    std::fs::write(
+        hooks.join("post-worktree.sh"),
+        format!(
+            "#!/bin/sh\necho \"$HIVE_PROJECT_KEY $HIVE_BRANCH $HIVE_WORKTREE_PATH\" > '{}'\n",
+            hook_marker.display()
+        ),
+    )
+    .unwrap();
+
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(hooks.join("post-worktree.sh"))
+        .output()
+        .unwrap();
+
     // pack
     let out = ok(&["box", "pack", &id[..8]]);
     assert!(out.contains("packed"), "{out}");
@@ -1239,5 +1258,164 @@ fn federation_lists_a_remote_parked_conversation_and_thaws_it_there() {
             .ok();
     }
     drop((_a, _b));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// --- Sandbox-defined boxes (phase 5) ---
+
+/// Thawing with `--sandbox` runs the conversation under `srt` with a write set derived from
+/// the box: a write inside is allowed, one outside is refused by the kernel. Needs the real
+/// `srt`, so it skips where that is not installed.
+#[test]
+fn sandboxed_thaw_confines_writes_to_the_boxs_path_set() {
+    if !Command::new("srt")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("skipped: srt not installed");
+        return;
+    }
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("hive-smoke-sbx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let tmux = root.join("tmux");
+    let bin = root.join("bin");
+    for d in [&home, &tmux, &bin] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    // Outside every allowed path: not temp, not home, not the project.
+    let outside = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("sbx-outside-{}", std::process::id()));
+    let _ = std::fs::remove_file(&outside);
+    let proj = home.join("proj");
+    let marker = root.join("marker");
+    // `srt` may be a version-manager shim that needs the REAL home; hive runs under an
+    // isolated one, so reach it through a wrapper that restores it.
+    let real_srt = String::from_utf8_lossy(
+        &Command::new("sh")
+            .args(["-c", "command -v srt"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    std::fs::write(
+        bin.join("srt"),
+        format!(
+            "#!/bin/sh\nHOME='{}' exec '{real_srt}' \"$@\"\n",
+            std::env::var("HOME").unwrap()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod")
+        .arg("+x")
+        .arg(bin.join("srt"))
+        .output()
+        .unwrap();
+    let fake = bin.join("claude");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho in > '{}/inside.txt' 2>/dev/null && echo inside-ok >> '{m}'\n\
+             echo out > '{o}' 2>/dev/null && echo outside-WROTE >> '{m}' || echo outside-denied >> '{m}'\n\
+             echo done >> '{m}'\nsleep 30\n",
+            proj.display(),
+            m = marker.display(),
+            o = outside.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&fake).output().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |args: &[&str]| {
+        let o = hive_cmd()
+            .args(args)
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .env("SHELL", "/bin/sh")
+            .env("TMUX_TMPDIR", &tmux)
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "hive {args:?}\n{}\n{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+
+    std::fs::create_dir_all(&proj).unwrap();
+    git_in(&proj, &["init", "-q", "-b", "main"]);
+    git_in(&proj, &["config", "user.email", "a@b"]);
+    git_in(&proj, &["config", "user.name", "t"]);
+    std::fs::write(proj.join("a.txt"), "x\n").unwrap();
+    git_in(&proj, &["add", "."]);
+    git_in(&proj, &["commit", "-qm", "base"]);
+    run(&[
+        "project",
+        "add",
+        "proj",
+        "--emoji",
+        "📁",
+        "--path",
+        proj.to_str().unwrap(),
+    ]);
+    let id = "cccccccc-2222-3333-4444-555555555555";
+    let slug_dir = home
+        .join(".claude/projects")
+        .join(proj.to_str().unwrap().replace('/', "-"));
+    std::fs::create_dir_all(&slug_dir).unwrap();
+    std::fs::write(
+        slug_dir.join(format!("{id}.jsonl")),
+        format!(
+            r#"{{"type":"user","cwd":"{}","sessionId":"{id}","timestamp":"2026-10-20T10:00:00Z","message":{{"role":"user","content":"hi"}}}}
+"#,
+            proj.display()
+        ),
+    )
+    .unwrap();
+
+    let out = run(&["box", "pack", &id[..8]]);
+    assert!(out.contains("packed"), "{out}");
+    let out = run(&["box", "unpack", &id[..8], "--thaw", "--sandbox"]);
+    assert!(out.contains("sandbox:"), "{out}");
+
+    let settings =
+        std::fs::read_to_string(home.join(format!(".hive/cache/sandbox/{id}.json"))).unwrap();
+    assert!(settings.contains(proj.to_str().unwrap()) && settings.contains("deniedDomains"));
+
+    let mut log = String::new();
+    for _ in 0..100 {
+        log = std::fs::read_to_string(&marker).unwrap_or_default();
+        if log.contains("done") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        log.contains("inside-ok"),
+        "write inside the box's set: {log}"
+    );
+    assert!(log.contains("outside-denied"), "write outside it: {log}");
+    assert!(!outside.exists(), "the kernel refused it");
+
+    Command::new("tmux")
+        .arg("kill-server")
+        .env("TMUX_TMPDIR", &tmux)
+        .env_remove("TMUX")
+        .output()
+        .ok();
     std::fs::remove_dir_all(&root).ok();
 }
