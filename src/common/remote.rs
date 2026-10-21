@@ -97,3 +97,168 @@ fn run_rsync(args: &[&str]) -> Result<()> {
 pub fn local_name() -> String {
     crate::common::boxes::hostname()
 }
+
+// ─── Attaching to a remote conversation ──────────────────────────────────────
+
+/// The local window's name for a remote conversation's window: `@mini:server`. The `@`
+/// prefix is how the Active view recognises (and hides) these as ssh plumbing.
+pub fn attach_window_name(host: &str, window_name: &str, window_index: &str) -> String {
+    let label = if window_name.is_empty() {
+        window_index
+    } else {
+        window_name
+    };
+    format!("@{host}:{label}")
+}
+
+/// The shell command a local window runs to land in the remote conversation's window:
+/// `ssh -t [-L p:localhost:p …] <target> tmux attach -t '=<session>:<window>'`.
+///
+/// The `-L` forwards are the conversation's listening ports, so the detail view's port
+/// list, Chrome matching and Enter-on-port keep working against `localhost` as before.
+pub fn attach_command(
+    r: &RemoteConfig,
+    session: &str,
+    window_index: &str,
+    ports: &[u16],
+) -> String {
+    let mut parts = vec![sh_quote(&ssh_program()), "-t".to_string()];
+    for p in ports {
+        parts.push("-L".to_string());
+        parts.push(sh_quote(&format!("{p}:localhost:{p}")));
+    }
+    parts.push(sh_quote(&r.ssh));
+    parts.push(sh_quote(&format!(
+        "tmux attach-session -t {}",
+        sh_quote(&format!("={session}:{window_index}"))
+    )));
+    parts.join(" ")
+}
+
+/// Find or create the local window attached to a remote conversation, in the session
+/// that owns the conversation's project here. Returns `(local session, window index)`
+/// for the caller to switch to; a second call finds the same window.
+pub fn attach_remote(c: &crate::common::registry::Conversation) -> Result<(String, String)> {
+    use crate::common::tmux::exact;
+    let host = c
+        .host
+        .as_deref()
+        .ok_or_else(|| anyhow!("not a remote conversation"))?;
+    let p = c
+        .placement
+        .as_ref()
+        .ok_or_else(|| anyhow!("remote conversation has no window to attach to"))?;
+    let r = find_remote(host)?;
+    let local_session =
+        crate::common::conversations::target_session(c).unwrap_or_else(|| format!("@{host}"));
+    let name = attach_window_name(host, &p.window_name, &p.window_index);
+    let cmd = attach_command(&r, &p.session_name, &p.window_index, &c.ports);
+
+    let tmux = |args: &[&str]| Command::new("tmux").args(args).output();
+    let session_alive = tmux(&["has-session", "-t", &exact(&local_session)])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if session_alive {
+        // An existing attach window for this conversation: just switch to it.
+        let listing = tmux(&[
+            "list-windows",
+            "-t",
+            &exact(&local_session),
+            "-F",
+            "#{window_index}\t#{window_name}",
+        ])?;
+        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+            if let Some((idx, n)) = line.split_once('\t') {
+                if n == name {
+                    return Ok((local_session, idx.to_string()));
+                }
+            }
+        }
+        let out = tmux(&[
+            "new-window",
+            "-P",
+            "-F",
+            "#{window_index}",
+            "-t",
+            &format!("{}:", exact(&local_session)),
+            "-n",
+            &name,
+            &cmd,
+        ])?;
+        if !out.status.success() {
+            bail!(
+                "tmux new-window failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let idx = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok((local_session, idx))
+    } else {
+        let out = tmux(&[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_index}",
+            "-s",
+            &local_session,
+            "-n",
+            &name,
+            &cmd,
+        ])?;
+        if !out.status.success() {
+            bail!(
+                "tmux new-session failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok((
+            local_session,
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote() -> RemoteConfig {
+        RemoteConfig {
+            name: "mini".into(),
+            ssh: "me@mini.local".into(),
+            api: None,
+            hive_path: None,
+        }
+    }
+
+    #[test]
+    fn attach_command_forwards_ports_and_targets_the_exact_window() {
+        let c = attach_command(&remote(), "📊 Avateen", "3", &[3000, 5432]);
+        assert!(c.contains("-L '3000:localhost:3000'") && c.contains("-L '5432:localhost:5432'"));
+        assert!(c.contains("'me@mini.local'"));
+        // `=` keeps tmux from prefix-matching a longer session name on the remote.
+        assert!(c.contains("=📊 Avateen:3"), "{c}");
+        assert!(c.contains("-t"), "{c}");
+    }
+
+    #[test]
+    fn attach_command_survives_a_hostile_session_name() {
+        let c = attach_command(&remote(), "it's $(x)", "1", &[]);
+        // Runs through a real shell: the whole thing must come back as inert words.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- {}; echo $#", c.replace("'ssh'", "'echo'")))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "4");
+    }
+
+    #[test]
+    fn attach_window_names_are_recognisable_plumbing() {
+        assert_eq!(attach_window_name("mini", "server", "2"), "@mini:server");
+        assert_eq!(attach_window_name("mini", "", "2"), "@mini:2");
+    }
+}

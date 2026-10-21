@@ -88,6 +88,7 @@ fn pack_conversation(
                 window_name: p.window_name.clone(),
                 cwd: c.cwd.clone(),
                 claude_session_id: Some(id.clone()),
+                host: None,
             },
             note,
         )?;

@@ -172,7 +172,20 @@ pub fn conv_rows(
     };
     let mut out = Vec::new();
     for s in sessions {
-        let place = place_of(&s.name, projects);
+        // A federated remote's session is `"<session> @<host>"`: place it by the bare name
+        // and carry the host in the label, so it groups with its project but reads as
+        // living elsewhere.
+        let mut place = match &s.host {
+            Some(h) => place_of(
+                s.name.strip_suffix(&format!(" @{h}")).unwrap_or(&s.name),
+                projects,
+            ),
+            None => place_of(&s.name, projects),
+        };
+        if let Some(h) = &s.host {
+            place.key = format!("{} @{h}", place.key);
+            place.label = format!("{} @{h}", place.label);
+        }
         if s.windows.is_empty() {
             out.push(Conv {
                 session: s.name.clone(),
@@ -1105,5 +1118,24 @@ mod tests {
             "needs"
         );
         assert_eq!(dur(3600), "1h");
+    }
+
+    #[test]
+    fn a_remote_session_groups_with_its_project_but_reads_as_living_elsewhere() {
+        let projects = Projects::new(vec![project("ava", "Avateen", false)]);
+        let mut remote = session(
+            "📁 Avateen @mini",
+            false,
+            vec![win("1", "w", 2, None, SessionStatus::Waiting)],
+        );
+        remote.host = Some("mini".into());
+        let rows = conv_rows(&[remote], &projects, chrono::Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].place.label, "Avateen @mini");
+        assert_eq!(rows[0].place.key, "ava @mini");
+        assert_eq!(
+            rows[0].place.emoji, "📁",
+            "the project's own emoji, found by the bare name"
+        );
     }
 }

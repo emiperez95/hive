@@ -49,6 +49,12 @@ pub struct SessionView {
     /// Conversation messages for the dashboard (user + assistant)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<ConversationMessage>,
+    /// Machine this session runs on, when it is a federated remote's (`None` = here).
+    /// The session `name` then reads `"<session> @<host>"` so it never collides with a
+    /// local session of the same name; `pane` stays the REMOTE's coordinates, which is
+    /// what a proxied action sends back to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// One entry per Claude instance running in this tmux session. When more than
     /// one window is present the web dashboard renders the session as an accordion
     /// so a specific window can be selected. Empty when no Claude is running.
@@ -59,6 +65,9 @@ pub struct SessionView {
 /// One Claude instance (tmux window/pane) within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowView {
+    /// Machine this window runs on (`None` = here); see `SessionView::host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// tmux global pane id (e.g. "%1") — the unique selector used by the web API.
     pub pane_id: String,
     /// tmux window index.
@@ -129,6 +138,10 @@ pub struct WindowView {
 pub struct ConversationView {
     /// Claude conversation UUID (the transcript basename) — the stable key.
     pub id: String,
+    /// Machine it lives on, when not this one. Actions on it (`/api/thaw`,
+    /// `/api/discard-frozen`) carry this back as `host` so they reach that machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// First 8 chars of the id ("—" for legacy composite `session#window` keys).
     pub short_id: String,
     /// User/AI conversation title, when the transcript carries one.

@@ -1048,3 +1048,196 @@ fn project_export_import_roundtrip() {
     assert!(run(&hb, &["project", "import", file.to_str().unwrap()]).contains("kept 1"));
     std::fs::remove_dir_all(&root).ok();
 }
+
+// --- Federation (phases 3-4 of docs/remote-boxes.md) ---
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn http(port: u16, method: &str, path: &str, body: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(8)))
+        .unwrap();
+    write!(
+        s,
+        "{method} {path} HTTP/1.0\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out.split_once("\r\n\r\n")
+        .map(|x| x.1.to_string())
+        .unwrap_or_default()
+}
+
+struct Server(std::process::Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[allow(clippy::zombie_processes)] // reaped by `Server::drop`
+fn start_web(home: &std::path::Path, tmux: &std::path::Path, path: &str, port: u16) -> Server {
+    let child = hive_cmd()
+        .args(["web", "--port", &port.to_string()])
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("SHELL", "/bin/sh")
+        .env("TMUX_TMPDIR", tmux)
+        .env("HIVE_NO_NOTIFY", "1")
+        .env_remove("TMUX")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Server(child);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("web server on {port} never came up");
+}
+
+/// Machine B parks a conversation; machine A's dashboard lists it as `host: b`, a dead
+/// remote contributes nothing without stalling A, and thawing it from A runs `claude
+/// --resume` on B (not A) through B's own API.
+#[test]
+fn federation_lists_a_remote_parked_conversation_and_thaws_it_there() {
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("hive-smoke-fed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (ha, hb) = (root.join("home-a"), root.join("home-b"));
+    let (ta, tb) = (root.join("tmux-a"), root.join("tmux-b"));
+    let bin = root.join("bin");
+    let work = root.join("work");
+    for d in [&ha, &hb, &ta, &tb, &bin, &work] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let argv_log = root.join("claude-argv");
+    let fake = bin.join("claude");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$HOME $@\" > '{}'\nsleep 30\n",
+            argv_log.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&fake).output().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // B: a transcript and a frozen entry for it.
+    let id = "bbbbbbbb-2222-3333-4444-555555555555";
+    let slug = work.to_str().unwrap().replace('/', "-");
+    let slug_dir = hb.join(".claude/projects").join(slug);
+    std::fs::create_dir_all(&slug_dir).unwrap();
+    std::fs::write(
+        slug_dir.join(format!("{id}.jsonl")),
+        format!(
+            r#"{{"type":"user","cwd":"{}","sessionId":"{id}","timestamp":"2026-10-20T10:00:00Z","message":{{"role":"user","content":"hi"}}}}
+"#,
+            work.display()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(hb.join(".hive/cache")).unwrap();
+    std::fs::write(
+        hb.join(".hive/cache/frozen.json"),
+        format!(
+            r#"{{"frozen":{{"{id}":{{"session_name":"bsess","window_name":"w","window_index":"1","cwd":"{}","claude_session_id":"{id}","note":"parked on b","frozen_at":"2026-10-20T10:00:00Z"}}}}}}"#,
+            work.display()
+        ),
+    )
+    .unwrap();
+
+    let (pa, pb) = (free_port(), free_port());
+    let _b = start_web(&hb, &tb, &path, pb);
+    // A knows two remotes: the live B, and one nothing listens on.
+    std::fs::create_dir_all(ha.join(".hive")).unwrap();
+    std::fs::write(
+        ha.join(".hive/config.toml"),
+        format!(
+            "[[remotes]]\nname = \"b\"\nssh = \"x@b\"\napi = \"http://127.0.0.1:{pb}\"\n\n\
+             [[remotes]]\nname = \"dead\"\nssh = \"x@dead\"\napi = \"http://127.0.0.1:{}\"\n",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let _a = start_web(&ha, &ta, &path, pa);
+
+    // B's registry export holds the parked conversation, and only local rows.
+    let mut listed = String::new();
+    for _ in 0..80 {
+        listed = http(pa, "GET", "/api/conversations", "");
+        if listed.contains(id) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let views: serde_json::Value = serde_json::from_str(&listed).expect(&listed);
+    let row = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == id)
+        .unwrap_or_else(|| panic!("A never listed B's conversation: {listed}"));
+    assert_eq!(row["host"], "b");
+    assert_eq!(row["frozen"], true);
+    // Nothing of A's own was echoed into B's export.
+    assert!(!http(pb, "GET", "/api/registry", "").contains("\"host\""));
+
+    // Thaw it from A: B resumes it, in B's HOME.
+    let out = http(
+        pa,
+        "POST",
+        "/api/thaw",
+        &format!(r#"{{"key":"{id}","host":"b"}}"#),
+    );
+    assert!(out.contains("\"ok\":true"), "{out}");
+    let mut resumed = String::new();
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(&argv_log) {
+            resumed = s;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(resumed.trim(), format!("{} --resume {id}", hb.display()));
+
+    // An action aimed at a host that isn't there fails cleanly instead of hanging.
+    let t = std::time::Instant::now();
+    let out = http(
+        pa,
+        "POST",
+        "/api/thaw",
+        &format!(r#"{{"key":"{id}","host":"dead"}}"#),
+    );
+    assert!(out.contains("error"), "{out}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(8));
+
+    for t in [&ta, &tb] {
+        Command::new("tmux")
+            .arg("kill-server")
+            .env("TMUX_TMPDIR", t)
+            .env_remove("TMUX")
+            .output()
+            .ok();
+    }
+    drop((_a, _b));
+    std::fs::remove_dir_all(&root).ok();
+}

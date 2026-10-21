@@ -173,6 +173,9 @@ pub struct FreezeTarget {
     pub window_name: String,
     pub cwd: String,
     pub claude_session_id: Option<String>,
+    /// Set when the window runs on a federated remote: the freeze is then performed THERE,
+    /// through its dashboard API, and `session_name` is the remote's own session name.
+    pub host: Option<String>,
 }
 
 /// Freeze one Claude window: record its resume metadata, then kill just that tmux window.
@@ -180,6 +183,21 @@ pub struct FreezeTarget {
 /// The parent session and its other windows are left running; if this was the session's last
 /// window, tmux destroys the (now empty) session on its own. Returns the new entry's key.
 pub fn freeze_window(target: &FreezeTarget, note: &str) -> Result<String> {
+    if let Some(host) = &target.host {
+        crate::common::federation::proxy_post(
+            host,
+            "/api/freeze",
+            &serde_json::json!({
+                "session": target.session_name,
+                "window_index": target.window_index,
+                "window_name": target.window_name,
+                "cwd": target.cwd,
+                "session_id": target.claude_session_id,
+                "note": note,
+            }),
+        )?;
+        return Ok(target.claude_session_id.clone().unwrap_or_default());
+    }
     // Capture the auth profile before we touch the window.
     let claude_config_dir = capture_config_dir(&target.session_name);
 

@@ -88,6 +88,11 @@ pub fn run_conversations(opts: ConvOptions) -> Result<()> {
 enum Action {
     Quit,
     Switch(Box<Conversation>),
+    /// Enter on a conversation that runs on another machine: open (or find) the local
+    /// ssh window attached to it and switch there.
+    AttachRemote(Box<Conversation>),
+    /// Enter on a conversation parked (frozen) on another machine: thaw it THERE.
+    RemoteThaw(Box<Conversation>),
     Reopen(Box<Conversation>),
     /// Split a conversation in two (`F`): a fork beside it, then land in the fork.
     Fork(Box<Conversation>),
@@ -668,6 +673,21 @@ fn unskip_session(name: &str) {
 }
 
 /// Build a freeze target from a live conversation (its window placement + id).
+/// Discard a frozen conversation: here, or on the remote that holds it.
+fn discard_conv(c: &Conversation) -> anyhow::Result<bool> {
+    match &c.host {
+        Some(host) => {
+            crate::common::federation::proxy_post(
+                host,
+                "/api/discard-frozen",
+                &serde_json::json!({ "key": c.id.as_str() }),
+            )?;
+            Ok(true)
+        }
+        None => discard_frozen(c.id.as_str()),
+    }
+}
+
 fn freeze_target_of(c: &Conversation) -> Option<FreezeTarget> {
     let p = c.placement.as_ref()?;
     Some(FreezeTarget {
@@ -676,6 +696,7 @@ fn freeze_target_of(c: &Conversation) -> Option<FreezeTarget> {
         window_name: p.window_name.clone(),
         cwd: c.cwd.clone(),
         claude_session_id: Some(c.id.as_str().to_string()),
+        host: c.host.clone(),
     })
 }
 
@@ -1068,7 +1089,13 @@ fn build_active(
         let key = c
             .placement
             .as_ref()
-            .map(|p| p.session_name.clone())
+            .map(|p| match &c.host {
+                // A remote session gets its own group, so it can neither merge into a
+                // same-named local session nor have its window indexes hide that
+                // session's local windows.
+                Some(h) => format!("{} @{h}", p.session_name),
+                None => p.session_name.clone(),
+            })
             .unwrap_or_else(|| "(detached)".to_string());
         grouped.entry(key).or_default().push(c);
     }
@@ -1114,7 +1141,9 @@ fn build_active(
                 .collect();
             g.windows = wins
                 .iter()
-                .filter(|(idx, _)| !covered.contains(idx))
+                // `@host:…` windows are the ssh attach windows of remote conversations —
+                // those conversations already have a row, a second one would double it.
+                .filter(|(idx, name)| !covered.contains(idx) && !name.starts_with('@'))
                 .map(|(index, name)| WinRow {
                     index: index.clone(),
                     name: name.clone(),
@@ -1570,6 +1599,11 @@ struct ConvDetailState {
 impl ConvDetailState {
     /// The tmux session this conversation runs in (todos are keyed by it).
     fn session(&self) -> Option<&str> {
+        // A remote conversation's session is on another machine: the todos and flags
+        // this screen edits are local files, and a same-named local session would be hit.
+        if self.conv.is_remote() {
+            return None;
+        }
         self.conv
             .placement
             .as_ref()
@@ -1648,6 +1682,7 @@ fn spawn_conv_detail(c: &Conversation) -> ConvDetailState {
     let todos = conv
         .placement
         .as_ref()
+        .filter(|_| !conv.is_remote())
         .map(|p| session_todos(&p.session_name))
         .unwrap_or_default();
     ConvDetailState {
@@ -1832,6 +1867,24 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
                     // Outside tmux (`hive start`): attach (exec, never returns).
                     attach_or_switch(&p.session_name);
                 }
+            }
+        }
+        Action::RemoteThaw(c) => {
+            let host = c.host.as_deref().unwrap_or_default();
+            crate::common::federation::proxy_post(
+                host,
+                "/api/thaw",
+                &serde_json::json!({ "key": c.id.as_str() }),
+            )?;
+            println!("Thawed {} on {host}", short_id(c.id.as_str()));
+        }
+        Action::AttachRemote(c) => {
+            let (session, index) = crate::common::remote::attach_remote(&c)?;
+            if std::env::var_os("TMUX").is_some() {
+                switch_to_session(&session);
+                select_window(&session, &index);
+            } else {
+                attach_or_switch(&session);
             }
         }
         Action::Reopen(c) => {
@@ -2062,7 +2115,11 @@ fn conversations_loop(
         if c.archived {
             set_conversation_archived(c.id.as_str(), false, None);
         }
-        if c.lifecycle.is_actionable_here() {
+        if c.is_remote() && c.lifecycle.is_actionable_here() {
+            Action::AttachRemote(Box::new(c.clone()))
+        } else if c.is_remote() {
+            Action::RemoteThaw(Box::new(c.clone()))
+        } else if c.lifecycle.is_actionable_here() {
             Action::Switch(Box::new(c.clone()))
         } else {
             Action::Reopen(Box::new(c.clone()))
@@ -2249,7 +2306,7 @@ fn conversations_loop(
                 KeyCode::Delete => {
                     let c = conv_detail.as_ref().unwrap().conv.clone();
                     if c.is_frozen() {
-                        let _ = discard_frozen(c.id.as_str());
+                        let _ = discard_conv(&c);
                         conv_detail = None;
                         reg = gather_conversations_stats(&mut sys);
                         flags = Flags::load();
@@ -2625,7 +2682,7 @@ fn conversations_loop(
                         wt_confirm = Some((d.key.clone(), w.branch.clone()));
                     } else if let Some(c) = d.selected_conv().cloned() {
                         if c.is_frozen() {
-                            let _ = discard_frozen(c.id.as_str());
+                            let _ = discard_conv(&c);
                             reg = gather_conversations_stats(&mut sys);
                             flags = Flags::load();
                             let key = detail.as_ref().unwrap().key.clone();
@@ -3185,7 +3242,7 @@ fn conversations_loop(
                     Some(Row::Conv { ci, .. }) => {
                         let c = convs[*ci].clone();
                         if c.is_frozen() {
-                            let _ = discard_frozen(c.id.as_str());
+                            let _ = discard_conv(&c);
                             reg = gather_conversations_stats(&mut sys);
                             flags = Flags::load();
                             (groups, convs, collapsed) =
@@ -3421,10 +3478,7 @@ fn conversations_loop(
             // `v` favorites (★) — `f` is hint-jump, mirroring Vimium.
             KeyCode::Char('v') | KeyCode::Char('m') | KeyCode::Char('s') | KeyCode::Char('!') => {
                 let session = match rows.get(sel) {
-                    Some(Row::Conv { ci, .. }) => convs[*ci]
-                        .placement
-                        .as_ref()
-                        .map(|p| p.session_name.clone()),
+                    Some(Row::Conv { ci, .. }) => convs[*ci].flag_session(),
                     // A window or session header (Active) resolves to its session —
                     // these flags are session-level, so skipping a plain window
                     // skips its whole session.
@@ -3519,7 +3573,7 @@ fn conversations_loop(
             KeyCode::Delete => {
                 if let Some(c) = selected_conv(&rows, &convs) {
                     if c.is_frozen() {
-                        let _ = discard_frozen(c.id.as_str());
+                        let _ = discard_conv(&c);
                         reg = gather_conversations_stats(&mut sys);
                         flags = Flags::load();
                         (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
@@ -3609,6 +3663,15 @@ fn draw(
     if is_globally_muted() {
         header_spans.push(Span::raw("   "));
         header_spans.push(Span::styled("🔇 muted", Style::default().fg(Color::Yellow)));
+    }
+    // A configured remote that isn't answering. Its rows are simply absent, which would
+    // otherwise read as "nothing is running there".
+    for name in crate::common::federation::down_remotes() {
+        header_spans.push(Span::raw("   "));
+        header_spans.push(Span::styled(
+            format!("@{name} ✗"),
+            Style::default().fg(Color::Red),
+        ));
     }
     let hint = match view {
         View::Active => "  ( / search )",
@@ -5303,9 +5366,8 @@ fn env_label(c: &Conversation) -> Option<String> {
 
 /// Whether the conversation's tmux session is skipped (from cycling).
 fn is_skipped(c: &Conversation, skipped: &HashSet<String>) -> bool {
-    c.placement
-        .as_ref()
-        .map(|p| skipped.contains(&p.session_name))
+    c.flag_session()
+        .map(|s| skipped.contains(&s))
         .unwrap_or(false)
 }
 
@@ -5538,8 +5600,8 @@ fn conv_line(
     project: Option<&str>,
 ) -> Line<'static> {
     // Session-level flags apply to a live conversation's tmux session.
-    let session = c.placement.as_ref().map(|p| p.session_name.as_str());
-    let has = |set: &HashSet<String>| session.map(|s| set.contains(s)).unwrap_or(false);
+    let session = c.flag_session();
+    let has = |set: &HashSet<String>| session.as_deref().map(|s| set.contains(s)).unwrap_or(false);
     let favorite = has(&flags.favorite);
     let muted = has(&flags.muted);
     let auto = has(&flags.auto_approve);
@@ -5691,6 +5753,14 @@ fn conv_line(
             Style::default().fg(Color::Magenta)
         };
         spans.push(Span::styled(format!("  [{env}]"), col));
+    }
+    if let Some(host) = &c.host {
+        let col = if selected {
+            base
+        } else {
+            Style::default().fg(Color::Magenta)
+        };
+        spans.push(Span::styled(format!("  @{host}"), col));
     }
     let tag = |on: bool, text: &'static str, fg: Color| -> Option<Span<'static>> {
         on.then(|| {
@@ -5985,6 +6055,14 @@ fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
 /// if it was the last window, tmux drops the session. History stays on disk, so
 /// the conversation becomes Closed and is resumable.
 fn close_conversation(conv: &Conversation) -> Result<String> {
+    if conv.is_remote() {
+        // Its window is on another machine; a local kill-window would hit whatever local
+        // session shares the name.
+        return Err(anyhow!(
+            "runs on {} — close it there",
+            conv.host.as_deref().unwrap_or("a remote")
+        ));
+    }
     let p = conv
         .placement
         .as_ref()
@@ -6300,6 +6378,40 @@ mod tests {
             groups.iter().any(|g| g.key == "00-main"),
             "non-skipped bare live session shows in the other bucket"
         );
+    }
+
+    #[test]
+    fn test_build_active_groups_a_remote_session_apart_from_a_same_named_local_one() {
+        let mk = |id: &str, host: Option<&str>| -> Conversation {
+            let mut c: Conversation = serde_json::from_value(serde_json::json!({
+                "id": id, "cwd": "/p", "lifecycle": "Live",
+                "placement": {"session_name": "📊 Avateen", "window_index": "1",
+                              "window_name": "w"},
+            }))
+            .unwrap();
+            c.host = host.map(String::from);
+            c
+        };
+        let reg = registry_of(vec![mk("here", None), mk("there", Some("mini"))]);
+        // The local session has windows 1 (the conversation) and 2 (a server), plus the
+        // ssh plumbing window for the remote conversation.
+        let (groups, _) = build_active(
+            &reg,
+            &HashSet::new(),
+            &win_map(&[(
+                "📊 Avateen",
+                &[("1", "w"), ("2", "server"), ("3", "@mini:w")],
+            )]),
+        );
+        let keys: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
+        assert!(
+            keys.contains(&"📊 Avateen") && keys.contains(&"📊 Avateen @mini"),
+            "{keys:?}"
+        );
+        let local = groups.iter().find(|g| g.key == "📊 Avateen").unwrap();
+        // The remote's window index 1 did not hide anything, and the ssh window isn't a row.
+        let names: Vec<&str> = local.windows.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["server"], "{names:?}");
     }
 
     #[test]

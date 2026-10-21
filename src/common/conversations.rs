@@ -35,17 +35,20 @@ use crate::ipc::messages::{HookState, SessionStatus};
 /// disk existence + live placements + overlay, with parents resolved, live
 /// status recovered from transcripts, and the Closed set bounded.
 pub fn gather_conversations() -> ConversationRegistry {
-    gather_conversations_inner(None)
+    gather_conversations_inner(None, false)
 }
 
 /// Like [`gather_conversations`], but also samples live CPU/mem/ports into each
 /// live conversation's runtime fields. `sys` must be kept alive across calls so
 /// `cpu_percent` is a real delta (the TUI keeps its `System` alive too).
+///
+/// This is the gather for the long-running loops, so it is also the one that folds in
+/// federated remotes (see `federation`). One-shot callers use [`gather_conversations`].
 pub fn gather_conversations_stats(sys: &mut System) -> ConversationRegistry {
-    gather_conversations_inner(Some(sys))
+    gather_conversations_inner(Some(sys), true)
 }
 
-fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistry {
+fn gather_conversations_inner(stats: Option<&mut System>, federate: bool) -> ConversationRegistry {
     let hook = HookState::load();
     // Cached scan: unchanged transcripts (by mtime) skip the head+tail re-parse,
     // so repeat refreshes and popup re-opens stay snappy.
@@ -308,6 +311,12 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
         }
     }
 
+    // Last, so nothing above (parent settling, bounding, the resource sample) ever sees a
+    // row that isn't on this machine.
+    if federate {
+        crate::common::federation::merge_into(&mut reg);
+    }
+
     reg
 }
 
@@ -486,6 +495,9 @@ pub fn live_windows(reg: &ConversationRegistry) -> Vec<WindowSeen> {
         .conversations
         .values()
         .filter(|c| c.lifecycle == Lifecycle::Live)
+        // A remote window is not ours to restore: the machine that runs it has its own
+        // frame, and replaying it here would reopen it a second time.
+        .filter(|c| !c.is_remote())
         .filter_map(|c| {
             let p = c.placement.as_ref()?;
             Some(WindowSeen {
@@ -572,6 +584,15 @@ pub fn target_session(c: &Conversation) -> Option<String> {
 /// must not). `fallback_session` is used when the conversation has no resolvable
 /// parent (the TUI passes the current tmux session; the web passes None).
 pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -> Result<String> {
+    // Shipped away by `hive box push`: the other side owns it, and resuming here would fork
+    // the transcript. Bringing it back is an explicit `box pull`.
+    if let Some(loc) = &c.location {
+        anyhow::bail!(
+            "{} was shipped to '{loc}'; run `hive box pull {}` to bring it back",
+            c.id.as_str(),
+            c.id.as_str()
+        );
+    }
     // Resuming work in a project un-archives it — same rule as opening an archived
     // conversation, one level up. Shared by the TUI and the web's /api/resume.
     if let Some(parent) = c.parent.as_deref() {
@@ -790,5 +811,25 @@ mod tests {
             });
             assert!(!read, "{status:?} must not read the transcript");
         }
+    }
+
+    #[test]
+    fn remote_windows_never_enter_the_recovery_frame() {
+        let mk = |id: &str, host: Option<&str>| -> Conversation {
+            let mut c: Conversation = serde_json::from_value(serde_json::json!({
+                "id": id, "cwd": "/p", "lifecycle": "Live",
+                "placement": {"session_name": "s", "window_index": "1", "window_name": "w"},
+            }))
+            .unwrap();
+            c.host = host.map(String::from);
+            c
+        };
+        let mut reg = ConversationRegistry::default();
+        reg.conversations.insert("here".into(), mk("here", None));
+        reg.conversations
+            .insert("there".into(), mk("there", Some("mini")));
+        let seen = live_windows(&reg);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].claude_session_id, "here");
     }
 }

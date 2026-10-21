@@ -143,14 +143,15 @@ pub struct Conversation {
     #[serde(default)]
     pub auth_config_dir: Option<String>,
     /// Runtime-only live resource sample (summed over the window's process tree);
-    /// 0 for closed conversations. Not persisted.
-    #[serde(skip)]
+    /// 0 for closed conversations. Not persisted, but sent to a federating peer.
+    #[serde(default)]
     pub cpu: f32,
-    #[serde(skip)]
+    #[serde(default)]
     pub mem_kb: u64,
     /// Runtime-only listening TCP ports for this live conversation's process tree;
-    /// empty for closed conversations. Not persisted.
-    #[serde(skip)]
+    /// empty for closed conversations. Not persisted, but sent to a federating peer —
+    /// `attach_remote` tunnels exactly these.
+    #[serde(default)]
     pub ports: Vec<u16>,
     /// Runtime-only process ids of this live conversation's window tree; empty for
     /// closed. Not persisted. Lets the web build the per-process breakdown.
@@ -159,7 +160,7 @@ pub struct Conversation {
     /// Runtime-only: when Claude last changed this conversation's status (epoch ms),
     /// from its own `sessions/<pid>.json` `statusUpdatedAt`. `None` when Claude has no
     /// record for it. The only first-party answer to "working since when".
-    #[serde(skip)]
+    #[serde(default)]
     pub status_since_ms: Option<i64>,
     /// Machine this conversation LIVES on, when not this one (a federated remote's name).
     /// `None` = here. A remote placement still makes it Live (see `Lifecycle`).
@@ -374,7 +375,55 @@ pub struct ConversationRegistry {
     pub pending_parents: Vec<(String, String)>,
 }
 
+impl Conversation {
+    /// Lives on another machine (a federated remote). Such a conversation is `Live` —
+    /// its placement is real, just not on this tmux server — so every local action that
+    /// takes a placement at face value (kill-window, freeze, flags, switch) must check
+    /// this first.
+    pub fn is_remote(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// The session name this conversation goes by in every LOCAL flag set (favorite, mute,
+    /// skip, auto-approve) and in the web views. A remote session is `"<session> @<host>"`
+    /// — the bare name would collide with, and flag, a local session of the same name.
+    pub fn flag_session(&self) -> Option<String> {
+        let p = self.placement.as_ref()?;
+        Some(match &self.host {
+            Some(h) => format!("{} @{h}", p.session_name),
+            None => p.session_name.clone(),
+        })
+    }
+}
+
 impl ConversationRegistry {
+    /// Fold another machine's conversations in, tagged with `host`.
+    ///
+    /// Only what the remote is *holding* is taken: live windows and parked (frozen) ones.
+    /// A remote's closed history is its own. Where an id is also live here, the local
+    /// window wins — a conversation is held by exactly one side, and the side with the
+    /// running process is the one that can act on it. Anything else under that id (the
+    /// stale local copy of a conversation that was pushed away) is replaced.
+    pub fn merge_remote(&mut self, host: &str, remote: Vec<Conversation>) {
+        for mut c in remote {
+            if c.host.is_some() {
+                continue; // never re-export a third machine's rows
+            }
+            if !(c.lifecycle.is_actionable_here() || c.is_frozen()) {
+                continue;
+            }
+            if self
+                .conversations
+                .get(c.id.as_str())
+                .is_some_and(|l| l.lifecycle.is_actionable_here() && l.host.is_none())
+            {
+                continue;
+            }
+            c.host = Some(host.to_string());
+            self.conversations.insert(c.id.as_str().to_string(), c);
+        }
+    }
+
     pub fn from_shadow(
         hook: &crate::ipc::messages::HookState,
         disk_ids: &[String],
@@ -1648,5 +1697,96 @@ mod tests {
         reg.apply_frozen(&fs);
 
         assert!(!reg.conversations["live1"].is_frozen());
+    }
+
+    // ── Federation: merging another machine's conversations ──
+
+    fn wire_conv(id: &str, live: bool, session: &str, frozen: bool) -> Conversation {
+        let mut v = serde_json::json!({
+            "id": id, "cwd": "/p",
+            "lifecycle": if live { "Live" } else { "Closed" },
+        });
+        if live {
+            v["placement"] = serde_json::json!({
+                "session_name": session, "window_index": "1", "window_name": "w"
+            });
+        }
+        if frozen {
+            v["frozen"] = serde_json::json!({
+                "note": "parked", "pinned": true, "frozen_at": "2026-10-20T00:00:00Z"
+            });
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn merge_remote_tags_host_and_keeps_the_placement_live() {
+        let mut reg = ConversationRegistry::default();
+        reg.merge_remote("mini", vec![wire_conv("r1", true, "📊 Avateen", false)]);
+        let c = &reg.conversations["r1"];
+        assert_eq!(c.host.as_deref(), Some("mini"));
+        assert!(c.is_remote() && c.lifecycle.is_actionable_here());
+        assert_eq!(c.flag_session().as_deref(), Some("📊 Avateen @mini"));
+    }
+
+    #[test]
+    fn merge_remote_takes_only_what_the_remote_is_holding() {
+        let mut reg = ConversationRegistry::default();
+        reg.merge_remote(
+            "mini",
+            vec![
+                wire_conv("live", true, "s", false),
+                wire_conv("parked", false, "s", true),
+                wire_conv("history", false, "s", false), // the remote's own closed past
+            ],
+        );
+        assert!(reg.conversations.contains_key("live"));
+        assert!(reg.conversations.contains_key("parked"));
+        assert!(!reg.conversations.contains_key("history"));
+    }
+
+    #[test]
+    fn a_local_live_window_beats_a_remote_claim_but_a_stale_local_copy_does_not() {
+        let mut reg = ConversationRegistry::default();
+        reg.conversations
+            .insert("both".into(), wire_conv("both", true, "local", false));
+        reg.conversations
+            .insert("pushed".into(), wire_conv("pushed", false, "", false));
+        reg.merge_remote(
+            "mini",
+            vec![
+                wire_conv("both", true, "remote", false),
+                wire_conv("pushed", true, "remote", false),
+            ],
+        );
+        assert!(
+            reg.conversations["both"].host.is_none(),
+            "local process wins"
+        );
+        assert_eq!(
+            reg.conversations["pushed"].host.as_deref(),
+            Some("mini"),
+            "the closed local copy of a pushed conversation yields to the live remote one"
+        );
+    }
+
+    #[test]
+    fn merge_remote_never_reexports_a_third_machines_rows() {
+        let mut c = wire_conv("x", true, "s", false);
+        c.host = Some("other".into());
+        let mut reg = ConversationRegistry::default();
+        reg.merge_remote("mini", vec![c]);
+        assert!(reg.conversations.is_empty());
+    }
+
+    #[test]
+    fn host_and_location_survive_the_wire_and_default_when_absent() {
+        let c = wire_conv("x", true, "s", false);
+        let back: Conversation = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(back.host.is_none() && back.location.is_none());
+        let mut c = c;
+        c.ports = vec![3000];
+        let back: Conversation = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.ports, vec![3000], "attach_remote tunnels these");
     }
 }

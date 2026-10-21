@@ -203,8 +203,13 @@ pub(crate) fn gather_active_views(reg: &ConversationRegistry, sys: &System) -> V
 
     // Group live conversations by the tmux session running them.
     let mut convs_by_session: HashMap<String, Vec<&Conversation>> = HashMap::new();
+    let mut remote_convs: Vec<&Conversation> = Vec::new();
     for c in reg.conversations.values() {
         if !c.lifecycle.is_actionable_here() {
+            continue;
+        }
+        if c.is_remote() {
+            remote_convs.push(c);
             continue;
         }
         if let Some(p) = &c.placement {
@@ -301,11 +306,70 @@ pub(crate) fn gather_active_views(reg: &ConversationRegistry, sys: &System) -> V
                 .map(|t| t.len() as u32)
                 .unwrap_or(0),
             messages: Vec::new(),
+            host: None,
             windows,
         });
     }
 
+    results.extend(remote_session_views(&remote_convs));
     results
+}
+
+/// What a federating peer should see of this machine: its own live windows and parked
+/// (frozen) conversations, never another machine's rows and never closed history.
+pub(crate) fn local_registry_json(reg: &ConversationRegistry) -> String {
+    let mine: Vec<&Conversation> = reg
+        .conversations
+        .values()
+        .filter(|c| !c.is_remote() && (c.lifecycle.is_actionable_here() || c.is_frozen()))
+        .collect();
+    serde_json::to_string(&mine).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// One [`SessionView`] per (host, remote session), named `"<session> @<host>"` so it can't
+/// collide with a local session of the same name (every lookup in the API is by name).
+/// There is no local tmux session behind these, hence no processes, todos, attach flag or
+/// skip state — those belong to the machine that runs them.
+fn remote_session_views(convs: &[&Conversation]) -> Vec<SessionView> {
+    let mut by_session: std::collections::BTreeMap<(String, String), Vec<&Conversation>> =
+        Default::default();
+    for c in convs {
+        if let (Some(host), Some(p)) = (&c.host, &c.placement) {
+            by_session
+                .entry((host.clone(), p.session_name.clone()))
+                .or_default()
+                .push(c);
+        }
+    }
+    by_session
+        .into_iter()
+        .map(|((host, session), mut cs)| {
+            cs.sort_by(|a, b| window_index_of(a).cmp(window_index_of(b)));
+            let windows: Vec<WindowView> =
+                cs.iter().map(|c| conv_to_window_view(c, false)).collect();
+            let mut ports: Vec<u16> = windows.iter().flat_map(|w| w.ports.clone()).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            SessionView {
+                name: format!("{session} @{host}"),
+                status: aggregate_status(&windows),
+                cpu: windows.iter().map(|w| w.cpu).sum(),
+                mem_kb: windows.iter().map(|w| w.mem_kb).sum(),
+                ports,
+                processes: Vec::new(),
+                cwd: cs.first().map(|c| c.cwd.clone()).filter(|c| !c.is_empty()),
+                last_activity: windows.iter().filter_map(|w| w.last_activity.clone()).max(),
+                attached: false,
+                pane: windows.first().and_then(|w| w.pane.clone()),
+                claude_continue_failed: false,
+                skipped: false,
+                todo_count: 0,
+                messages: Vec::new(),
+                host: Some(host),
+                windows,
+            }
+        })
+        .collect()
 }
 
 /// A live conversation's tmux window index (for ordering windows within a session).
@@ -330,6 +394,7 @@ fn conv_to_window_view(c: &Conversation, is_auto_approve: bool) -> WindowView {
     };
     let status = mask_auto_approve(c.status.as_ref().map(|s| s.status.clone()), is_auto_approve);
     WindowView {
+        host: c.host.clone(),
         pane_id: pane_id.clone(),
         window_index: window_index.clone(),
         window_name,
@@ -593,6 +658,84 @@ pub(crate) fn mark_pings(
     pings.unseen.retain(|id| live.contains(id));
 }
 
+/// A remote conversation that just started waiting on a decision.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RemoteAlert {
+    pub id: String,
+    /// The view name (`"<session> @<host>"`) — also the key local session mutes use.
+    pub session: String,
+    pub text: String,
+}
+
+/// Spots remote conversations entering a blocked state, so the local machine can raise the
+/// notification the remote's own screen would otherwise swallow.
+///
+/// Mirrors the local hook notifier on purpose: it rings for conversations that need a
+/// human, not for every finished turn. A first sighting never rings (the remote may have
+/// been blocked for hours before hive started watching), and a conversation that stays
+/// blocked rings once. In memory, like `UnseenPings`.
+#[derive(Default)]
+pub(crate) struct RemoteNotifier {
+    blocked: HashMap<String, bool>,
+}
+
+impl RemoteNotifier {
+    pub(crate) fn observe(&mut self, views: &[SessionView]) -> Vec<RemoteAlert> {
+        let mut alerts = Vec::new();
+        let mut seen = HashSet::new();
+        for v in views.iter().filter(|v| v.host.is_some()) {
+            for w in &v.windows {
+                let Some(id) = &w.session_id else { continue };
+                let now = w.status.as_ref().is_some_and(SessionStatus::blocks_human);
+                if self.blocked.insert(id.clone(), now) == Some(false) && now {
+                    alerts.push(RemoteAlert {
+                        id: id.clone(),
+                        session: v.name.clone(),
+                        text: match &w.status {
+                            Some(SessionStatus::NeedsPermission { tool_name, .. }) => {
+                                format!("needs permission: {tool_name}")
+                            }
+                            Some(SessionStatus::EditApproval { filename }) => {
+                                format!("edit approval: {filename}")
+                            }
+                            Some(SessionStatus::PlanReview) => "plan ready".to_string(),
+                            Some(SessionStatus::QuestionAsked) => "question asked".to_string(),
+                            _ => "needs attention".to_string(),
+                        },
+                    });
+                }
+                seen.insert(id.clone());
+            }
+        }
+        self.blocked.retain(|id, _| seen.contains(id));
+        alerts
+    }
+}
+
+/// Ring for `alert` unless a mute level silences it (global / project / session, with the
+/// per-conversation `M` override winning over all three — the local hook's own rule).
+pub(crate) fn deliver_remote_alert(alert: &RemoteAlert, reg: &ConversationRegistry) {
+    use crate::common::persistence::{is_globally_muted, load_muted_projects, load_muted_sessions};
+    let global = is_globally_muted();
+    let session_muted = load_muted_sessions().contains(&alert.session);
+    let project_muted = reg
+        .conversations
+        .get(&alert.id)
+        .and_then(|c| c.parent.as_deref())
+        .map(|p| p.split('/').next().unwrap_or(p).to_string())
+        .is_some_and(|k| load_muted_projects().contains(&k));
+    let overridden = (global || session_muted || project_muted)
+        && crate::common::registry::ConversationSidecar::load().notify_override(&alert.id);
+    if crate::cli::hook::should_notify(global, project_muted, session_muted, overridden) {
+        let text = if overridden {
+            format!("🔔 {}", alert.text)
+        } else {
+            alert.text.clone()
+        };
+        crate::daemon::notifier::notify_needs_attention(&alert.session, &text);
+    }
+}
+
 /// Assign each rankable window its position in the attention order.
 ///
 /// Done here, over every session at once, because the order is **global** — that is
@@ -689,6 +832,7 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
         pane_id: p.pane_id.clone(),
     });
     ConversationView {
+        host: c.host.clone(),
         id: c.id.as_str().to_string(),
         short_id,
         title: c.title.clone(),
@@ -742,7 +886,6 @@ mod tests {
             unseen: false,
             status_since_ms: None,
             host: None,
-            location: None,
         }
     }
 
@@ -762,6 +905,7 @@ mod tests {
             skipped,
             todo_count: 0,
             messages: vec![],
+            host: None,
             windows,
         }
     }
@@ -1270,5 +1414,101 @@ mod tests {
         assert!(!ping_step(Some(SessionStatus::Working), &mut p, false));
         // A turn ending in the window you're on is not news.
         assert!(!ping_step(Some(SessionStatus::Waiting), &mut p, true));
+    }
+
+    // ── Federation views + notifier ──
+
+    fn wire(id: &str, session: &str, idx: &str, host: &str) -> Conversation {
+        let mut c: Conversation = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": "/p", "lifecycle": "Live",
+            "placement": {"session_name": session, "window_index": idx, "window_name": "w",
+                          "pane_id": "%9"},
+        }))
+        .unwrap();
+        c.host = Some(host.to_string());
+        c
+    }
+
+    #[test]
+    fn remote_sessions_are_named_with_their_host_and_keep_remote_coordinates() {
+        let a = wire("a", "📊 Avateen", "2", "mini");
+        let b = wire("b", "📊 Avateen", "1", "mini");
+        let views = remote_session_views(&[&a, &b]);
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        assert_eq!(
+            v.name, "📊 Avateen @mini",
+            "can't collide with a local session"
+        );
+        assert_eq!(v.host.as_deref(), Some("mini"));
+        assert_eq!(v.windows[0].window_index, "1", "ordered by window index");
+        assert!(v.windows.iter().all(|w| w.host.as_deref() == Some("mini")));
+        // The pane is the REMOTE's: a proxied action sends it straight back.
+        assert_eq!(v.pane.as_ref().unwrap().0, "📊 Avateen");
+    }
+
+    #[test]
+    fn two_hosts_with_the_same_session_name_stay_apart() {
+        let a = wire("a", "s", "1", "mini");
+        let b = wire("b", "s", "1", "nuc");
+        assert_eq!(remote_session_views(&[&a, &b]).len(), 2);
+    }
+
+    #[test]
+    fn the_peer_registry_is_local_only_and_holds_no_history() {
+        let mut reg = ConversationRegistry::default();
+        reg.conversations.insert("l".into(), {
+            let mut c = wire("l", "s", "1", "x");
+            c.host = None;
+            c
+        });
+        reg.conversations
+            .insert("r".into(), wire("r", "s", "1", "mini"));
+        let json = local_registry_json(&reg);
+        assert!(json.contains("\"l\"") && !json.contains("\"r\""), "{json}");
+    }
+
+    fn blocked_view(id: &str, blocked: bool) -> SessionView {
+        let mut w = win(
+            id,
+            Some(if blocked {
+                SessionStatus::PlanReview
+            } else {
+                SessionStatus::Waiting
+            }),
+            "/p",
+        );
+        w.session_id = Some(id.to_string());
+        let mut v = session("s @mini", false, vec![w]);
+        v.host = Some("mini".into());
+        v
+    }
+
+    #[test]
+    fn remote_notifier_rings_once_on_entering_blocked_and_never_on_first_sight() {
+        let mut n = RemoteNotifier::default();
+        assert!(
+            n.observe(&[blocked_view("a", true)]).is_empty(),
+            "first sighting"
+        );
+        assert!(
+            n.observe(&[blocked_view("a", true)]).is_empty(),
+            "still blocked"
+        );
+        assert!(n.observe(&[blocked_view("a", false)]).is_empty());
+        let alerts = n.observe(&[blocked_view("a", true)]);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].session, "s @mini");
+        assert_eq!(alerts[0].text, "plan ready");
+    }
+
+    #[test]
+    fn remote_notifier_ignores_local_windows() {
+        let mut n = RemoteNotifier::default();
+        let mut local = blocked_view("a", false);
+        local.host = None;
+        n.observe(&[local.clone()]);
+        local.windows[0].status = Some(SessionStatus::PlanReview);
+        assert!(n.observe(&[local]).is_empty());
     }
 }

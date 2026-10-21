@@ -15,7 +15,7 @@ use crate::ipc::messages::{HookEvent, HookState, SessionStatus};
 /// Mute has three coarse levels (global `M`, project, session) and one fine
 /// escape hatch: a conversation's `notify_override`, which wins over all of them.
 /// That's the whole point — silence everything, then let one conversation through.
-fn should_notify(
+pub(crate) fn should_notify(
     global_mute: bool,
     project_muted: bool,
     session_muted: bool,

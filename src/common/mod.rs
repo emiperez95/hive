@@ -13,6 +13,8 @@ pub mod debug;
 // Split a conversation in two: `--resume <id> --fork-session` in another window.
 #[allow(dead_code)]
 pub mod fork;
+// Other machines' conversations, merged into this registry.
+pub mod federation;
 pub mod frozen;
 // How hive runs git against trees it didn't make: no fsmonitor/hooks, no locks, capped network.
 pub mod gitcmd;
