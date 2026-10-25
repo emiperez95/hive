@@ -714,8 +714,13 @@ pub fn root_allowed(
 }
 
 /// `tar` a box directory into `out` (a temp file the caller owns).
+///
+/// `COPYFILE_DISABLE`: macOS `tar` otherwise stores extended attributes and resource forks
+/// as extra `._name` entries (AppleDouble). GNU tar on the receiving Linux box extracts
+/// those as real files, and every tracked file grows an untracked `._` twin in the worktree.
 pub fn tar_box(dir: &Path, out: &Path) -> Result<()> {
     let o = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
         .arg("-C")
         .arg(dir)
         .arg("-cf")
@@ -1364,5 +1369,49 @@ mod tests {
         assert!(valid_profile(".claude") && valid_profile(".claude-work"));
         assert!(!valid_profile(".ssh") && !valid_profile(".claude/../.ssh"));
         assert!(valid_slug("-Users-me-proj") && !valid_slug("../x") && !valid_slug("a/b"));
+    }
+
+    /// Entry names of an (uncompressed) tar file, read straight from the headers —
+    /// macOS `tar -t` silently merges AppleDouble entries and would hide exactly what
+    /// this checks for.
+    fn raw_tar_names(path: &Path) -> Vec<String> {
+        let b = fs::read(path).unwrap();
+        let (mut off, mut names) = (0usize, Vec::new());
+        while off + 512 <= b.len() && b[off] != 0 {
+            let name = String::from_utf8_lossy(&b[off..off + 100])
+                .trim_end_matches('\0')
+                .to_string();
+            let size = usize::from_str_radix(
+                String::from_utf8_lossy(&b[off + 124..off + 135])
+                    .trim_matches(|c| c == '\0' || c == ' '),
+                8,
+            )
+            .unwrap_or(0);
+            names.push(name);
+            off += 512 + size.div_ceil(512) * 512;
+        }
+        names
+    }
+
+    /// A file with an extended attribute must not travel as a `._` twin: the receiving
+    /// Linux tar would write it into the working tree. (Only macOS can set the attribute.)
+    #[test]
+    fn tar_box_carries_no_appledouble_entries() {
+        let tmp = tempdir("tarxattr");
+        let src = tmp.join("box");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.txt"), "x").unwrap();
+        let set = Command::new("xattr")
+            .args(["-w", "com.apple.test", "1"])
+            .arg(src.join("a.txt"))
+            .output();
+        if !set.map(|o| o.status.success()).unwrap_or(false) {
+            return; // no xattr tool here: nothing to prove
+        }
+        let out = tmp.join("box.tar");
+        tar_box(&src, &out).unwrap();
+        let names = raw_tar_names(&out);
+        assert!(names.iter().any(|n| n.ends_with("a.txt")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("._")), "{names:?}");
     }
 }
