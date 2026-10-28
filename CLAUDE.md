@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 452 tests (427 unit + 25 CLI smoke)
+cargo test                # 468 tests (441 unit + 27 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 747 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 427 unit + 25 smoke.
+> `cargo test` prints 775 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 441 unit + 27 smoke.
 
 ## The TUI (conversation-first)
 
@@ -80,6 +80,9 @@ hive project unarchive <key> # unarchive a project
 hive project list [--all]    # list configured projects (--all includes archived)
 hive wt new <project> <branch>  # create worktree + tmux session (hooks), switch into it
 hive wt new <project> <branch> --no-switch  # …and stay where you are
+hive fork [-- <directive>]                  # split the conversation running this in two: fork in a new window beside it
+hive fork --wt <branch> [-- <directive>]    # …into a NEW worktree branched off the source's checked-out branch
+hive fork --to <project|project/branch>     # …into a registered project / worktree   (--switch: land in the fork)
 hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
 hive wt prune [project] # remove leftover Workflow agent worktrees + worktree-wf_* / wf/* branches (plan, then y/N)
@@ -151,11 +154,57 @@ Two guards keep it from acting at a distance:
 - **Only inside tmux** (`$TMUX` set). `switch-client` with no current client falls back to
   tmux's best guess, so a script, a CI run, or a bare terminal would otherwise yank
   whichever client happens to be attached.
-- **`--no-switch`** opts out — used by `/hive:fork-to-worktree`, whose whole contract is
-  that the conversation you forked from stays put.
+- **`--no-switch`** opts out — for callers that create a worktree on someone else's
+  behalf and must leave the client where it is.
 
 The TUI's `w` goes through `attach_or_switch` instead, so creating a worktree from a
 picker launched outside tmux (`hive start`) attaches rather than no-ops.
+
+## Forking — splitting a conversation in two (`/hive:fork`, `hive fork`, `F`)
+
+A fork is a second conversation that starts with the first one's whole history and then goes
+its own way, in its own tmux window. The main entry point is **inside Claude**:
+`/hive:fork [--wt <branch> | --to <key>] [--switch] [directive]` (installed globally by
+`hive setup`) runs `hive fork`, which forks *the conversation running it*. The directive becomes
+the fork's first message; this conversation reports where the fork went and stops. The TUI's
+`F` (`f` in the conversation detail) forks the selected conversation into a window beside it and lands you there.
+
+Claude Code's own commands don't cover this: `/branch` forks inside the same process and the
+same directory, and `/fork` is a *background agent* that inherits the context — not a
+conversation you can switch to. The mechanism is `claude --resume <src> --fork-session
+--session-id <new> '<orientation>'`, typed into the target pane (`common/fork.rs`). What was
+measured, and what it shapes:
+
+- **Lookup is by id across the profile, not by cwd.** Run from another directory, `--resume`
+  still finds the transcript, and the fork's transcript is written under the NEW cwd's slug —
+  so a fork into a worktree is filed under that worktree by `resolve_parent` with no extra
+  code, and nothing has to be copied. (The old `/hive:fork-to-worktree` copied
+  `ls -t | head -1` — the newest transcript in the dir, i.e. often a *sibling's* — and then ran
+  `claude -c`, the same guess again.)
+- **It is profile-scoped.** Under another `CLAUDE_CONFIG_DIR` the same command says "No
+  conversation found", so a fork into a project on another auth profile first copies the
+  transcript into that profile, under the source's slug (`ForkPlan::copy_to`).
+- **A conversation can fork itself mid-turn.** The `hive fork` Bash call is still running when
+  the fork reads the transcript, so the fork sees a call with no result. The orientation says
+  it succeeded — otherwise the fork reasonably retries it and forks again. `mid_turn` is "the
+  source IS the conversation running us", from `$CLAUDE_PID`'s own `sessions/<pid>.json`
+  (which follows `/clear`) before the inherited `$CLAUDE_CODE_SESSION_ID`.
+- **`--session-id` with `--fork-session` is honoured**, so hive mints the fork's id itself.
+  That is what lets `forked_from` land in the overlay before Claude starts (rendered as `⑂` on
+  rows and `forked ⑂ from …` in the detail — the transcript keeps no link back), and it is
+  what keeps the window attributed to the fork: **`parse_resume_id` returns `--session-id`
+  when `--fork-session` is present** — `--resume` there names the SOURCE, which is still live
+  in its own window. Without a `--session-id` it returns None rather than the source.
+- **The orientation is one line.** It is typed by `send-keys`, where a newline is an Enter;
+  zsh happens to keep reading inside the quotes, but nothing should depend on that. A fork
+  whose cwd differs is told its paths moved: the history is full of absolute paths into the
+  old checkout, and uncommitted changes there did not come along.
+- **The window is opened with `new-window -d -P -F '#{pane_id}'`** and the keys go to that
+  pane id, never to "the session's current window" — the source usually sits in the very
+  session being forked into. `--wt` instead types into the fresh session's own shell
+  (`hive wt new --no-startup`), so there's no empty window beside it.
+- **Default is to stay** (`--switch` opts in): splitting means the original carries on where
+  you are. The TUI's `F` does land in the fork — there the TUI was going to exit anyway.
 
 ## Janus WT Portal
 
@@ -175,6 +224,7 @@ src/
 │   ├── conversations.rs    ★ conversation-first TUI (self-contained: gather, views, render, keys) — ~7.4k lines
 │   ├── sidebar/            terminal sidebar for a Ghostty split: api (HTTP client) · model (pure rows/views) ·
 │   │                         render (draw + click map) · editor (notes text editor) · mod (state, input)
+│   ├── fork.rs             run_fork(): `hive fork` — source from $CLAUDE_PID, target beside / --wt / --to
 │   ├── hook.rs             run_hook(): parse stdin JSON, update state, notify (honors muted projects)
 │   ├── setup.rs            run_setup(), run_uninstall(), is_hive_hook_command()
 │   ├── worktree.rs         run_wt_new/delete/list/import(): full worktree lifecycle
@@ -188,6 +238,7 @@ src/
 │   ├── registry.rs         ★ conversation model: Conversation, ConversationId, Lifecycle, TmuxPlacement,
 │   │                         ConversationRegistry::from_shadow(), resolve_parent(), sidecar/overlay
 │   ├── instances.rs        ★ per-WINDOW Claude detection (a session may host many); HookIndex pane→id resolve
+│   ├── fork.rs             split a conversation: ForkSource/ForkTarget, plan (pure), launch, forked_from
 │   ├── frozen.rs           freeze/thaw one Claude window (FrozenState/FrozenEntry, frozen.json)
 │   ├── activity.rs         append-only activity log + open-windows snapshot; compute_stats()
 │   ├── machine.rs          machine sleep/wake intervals from `pmset -g log` (macOS), for accurate usage time
@@ -469,6 +520,7 @@ the cwd's shared-prefix remainder just restates the project).
 | `Enter`/`→` on a worktree row | project detail: open that worktree's own detail (`Esc` pops back) |
 | `v` `m` `s` `!` | favorite · mute · skip · auto-approve (session-level) |
 | `M` | mute override 🔔 (per conversation) · `G` global mute · `P` pin conversation · `e` edit note |
+| `F` | fork the conversation — same history, new window beside it, and land there (see **Forking**). In the conversation detail plain `f` works too (no hint-jump there) |
 | `z`/`Z` | freeze a Claude window (prompts for a note) |
 | `t` | todos screen — every project's todos in one list (see below) |
 | `R` | recovery screen — reopen the windows that were open when hive last saw the machine |
@@ -1661,13 +1713,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-452 distinct tests. Run with `cargo test`.
+468 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 747 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 295 · bin 427 (the superset — adds cli/daemon/serve)
-> · smoke 25.
+> `cargo test` prints 775 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 307 · bin 441 (the superset — adds cli/daemon/serve)
+> · smoke 27.
 
-**Unit tests (427)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (441)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs
@@ -1737,6 +1789,12 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   cwd's owner beats the recorded session name, agreeing entries unchanged, unclaimed cwd
   falls back), activity (incl. `entry_line` single-line/one-syscall invariant), config
   (`[web]` parse, defaults-off, legacy `[defaults]` ignored)
+- `common/fork.rs`: the command resumes the source under the minted id (and `parse_resume_id`
+  attributes it to the fork), same-profile forks copy nothing even across directories, a
+  cross-profile fork copies under the source's slug, the prompt is one quoted shell word with
+  no newline, orientation names a move only when there is one and tells a self-fork its call
+  succeeded; `common/process.rs`: a `--fork-session` argv is named by `--session-id`, never
+  by its source
 - `ipc/messages.rs`: HookState operations, cleanup, serialization roundtrips
 - `daemon/hooks.rs`: all HookEvent variants, status transitions, session lifecycle
 - `cli/hook.rs`: `should_notify` — each mute level silences, and the per-conversation
@@ -1768,14 +1826,15 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   blocked-vs-working split, closed convs contributing no status/resources, auth-profile
   defaulting, payload-free status labels)
 
-**Integration tests (25)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (27)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
 - Todo full roundtrip (add → list → next → done → clear)
 - Project archive roundtrip (add → archive → list hides → `--all` shows → unarchive), isolated via a temp `$HOME`
 - `--auth-profile` persists to `projects.toml`, and is absent from the TOML when the flag is omitted
-- `wt new --help` still lists `--no-switch` (the opt-out `/hive:fork-to-worktree` relies on)
+- `wt new --help` still lists `--no-switch`
+- `fork --help` lists `--wt` / `--to` / `--id` / `--switch`; `fork` outside a conversation fails pointing at `--id`
 - `wt prune --dry-run` over an empty registry is a no-op (isolated `$HOME`)
 
 No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test

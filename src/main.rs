@@ -43,6 +43,21 @@ fn main() -> Result<()> {
             cli::session::run_window_cycle(false, pane.as_deref())
         }
         Some(Command::Connect { key }) => cli::session::run_connect(&key),
+        Some(Command::Fork {
+            wt,
+            base,
+            to,
+            id,
+            switch,
+            directive,
+        }) => cli::fork::run_fork(cli::fork::ForkArgs {
+            id,
+            wt,
+            base,
+            to,
+            switch,
+            directive: (!directive.is_empty()).then(|| directive.join(" ")),
+        }),
         Some(Command::Project { command }) => match *command {
             cmd @ ProjectCommand::Add { .. } => cli::project::run_project_add(cmd),
             ProjectCommand::Remove { key } => cli::project::run_project_remove(&key),

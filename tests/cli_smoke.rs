@@ -136,6 +136,29 @@ fn wt_new_help_lists_no_switch() {
 }
 
 #[test]
+fn fork_help_lists_its_targets() {
+    let output = hive_cmd().args(["fork", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--wt", "--to", "--id", "--switch"] {
+        assert!(stdout.contains(flag), "Missing fork flag '{}'", flag);
+    }
+}
+
+#[test]
+fn fork_outside_a_conversation_says_how_to_name_one() {
+    let output = hive_cmd()
+        .arg("fork")
+        .env_remove("CLAUDE_PID")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--id"), "unhelpful error: {stderr}");
+}
+
+#[test]
 fn todo_help_exits_zero() {
     let output = hive_cmd().args(["todo", "--help"]).output().unwrap();
     assert!(output.status.success());

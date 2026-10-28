@@ -89,6 +89,8 @@ enum Action {
     Quit,
     Switch(Box<Conversation>),
     Reopen(Box<Conversation>),
+    /// Split a conversation in two (`F`): a fork beside it, then land in the fork.
+    Fork(Box<Conversation>),
     /// Start a fresh conversation in the given project (key).
     NewInProject(String),
     /// Start a fresh conversation in a tmux session (name) with an initial prompt —
@@ -1833,6 +1835,21 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
             }
             println!("{}", reopen(&c)?)
         }
+        Action::Fork(c) => {
+            let f = fork_beside(&c)?;
+            println!(
+                "Forked {} → {}",
+                short_id(c.id.as_str()),
+                short_id(&f.new_id)
+            );
+            unskip_session(&f.session);
+            if let Some(pane) = &f.pane {
+                let _ = Command::new("tmux")
+                    .args(["select-window", "-t", pane])
+                    .output();
+            }
+            attach_or_switch(&f.session);
+        }
         Action::NewInProject(key) => println!("{}", new_conversation(&key)?),
         Action::NewTask(session, prompt) => {
             unskip_session(&session);
@@ -2235,6 +2252,12 @@ fn conversations_loop(
                     } else if c.lifecycle.is_actionable_here() {
                         confirm = Some(c);
                     }
+                }
+                // Fork. `f` here because the detail has no hint-jump to collide with;
+                // `F` too, so the list's key also works here.
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    let c = conv_detail.as_ref().unwrap().conv.clone();
+                    return Ok(Action::Fork(Box::new(c)));
                 }
                 // `P` pins/unpins the conversation (persisted overlay); `e` edits
                 // its note. Both surface a closed conversation regardless of age.
@@ -3453,6 +3476,13 @@ fn conversations_loop(
                     (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
                 }
             }
+            // `F` splits the selected conversation in two: a fork with the same history
+            // in a new window beside it (`hive fork --wt/--to` reaches further).
+            KeyCode::Char('F') => {
+                if let Some(c) = selected_conv(&rows, &convs) {
+                    return Ok(Action::Fork(Box::new(c)));
+                }
+            }
             // `P` pins/unpins the selected conversation (persisted overlay). A pinned
             // conversation sorts to the top of its group and survives age-bounding.
             KeyCode::Char('P') => {
@@ -3540,7 +3570,7 @@ fn draw(
         View::Active => (
             "active",
             format!("{live} running · {} sessions", groups.len()),
-            " → detail · Enter switch · f jump · z freeze · R recover · t todos · P pin · Del close · v★ m ! s · M ring · G mute-all · / search · ? · q",
+            " → detail · Enter switch · f jump · z freeze · R recover · t todos · P pin · F fork · Del close · v★ m ! s · M ring · G mute-all · / search · ? · q",
         ),
         View::Browse => (
             "projects",
@@ -4791,6 +4821,12 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState, flags: &Fl
             lines.push(field("flags", fs));
         }
     }
+    if let Some(src) = &c.forked_from {
+        lines.push(field(
+            "forked",
+            vec![Span::raw(format!("⑂ from {}", short_id(src)))],
+        ));
+    }
 
     // Todos — session-level, surfaced here (only for a conversation with a session).
     if cd.session().is_some() {
@@ -4860,7 +4896,7 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState, flags: &Fl
         ))
     } else {
         Line::from(Span::styled(
-            " Enter switch · v★ m ! s · z freeze · P pin · M ring · e note · a/1-9/d todo · o chrome · Del close · Esc back",
+            " Enter switch · v★ m ! s · z freeze · P pin · f fork · M ring · e note · a/1-9/d todo · o chrome · Del close · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -5666,6 +5702,14 @@ fn conv_line(
         };
         spans.push(Span::styled("  🔔", col));
     }
+    if c.forked_from.is_some() {
+        let col = if selected {
+            base
+        } else {
+            Style::default().fg(Color::Blue)
+        };
+        spans.push(Span::styled("  ⑂", col));
+    }
     // Overlay: a pin marker and the free-text note (persisted per-conversation).
     if c.pinned {
         let col = if selected {
@@ -5781,6 +5825,21 @@ fn reopen(c: &Conversation) -> Result<String> {
     attach_or_switch(&session);
     let verb = if frozen { "Thawed" } else { "Reopened" };
     Ok(format!("{verb} {} in {session}", short_id(c.id.as_str())))
+}
+
+/// Fork `c` into a new window beside it: the session it runs in, else the one its
+/// project / worktree is registered under, else the caller's.
+fn fork_beside(c: &Conversation) -> Result<crate::common::fork::Forked> {
+    use crate::common::fork::{fork, ForkSource, ForkTarget};
+    let src = ForkSource::locate(c.id.as_str())?;
+    let session = c
+        .placement
+        .as_ref()
+        .map(|p| p.session_name.clone())
+        .or_else(|| crate::common::conversations::target_session(c))
+        .or_else(get_current_tmux_session)
+        .ok_or_else(|| anyhow!("no session to fork {} into", short_id(c.id.as_str())))?;
+    fork(&src, &ForkTarget::beside(&src, session), None, false)
 }
 
 /// Start a fresh conversation in a project: if its session is alive, open a new
@@ -6801,6 +6860,7 @@ mod tests {
             archived: false,
             notify_override: false,
             archive_reason: None,
+            forked_from: None,
             archived_at: None,
             title: None,
             auth_config_dir: None,

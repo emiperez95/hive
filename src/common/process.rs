@@ -95,12 +95,23 @@ pub fn build_cmdline_map() -> HashMap<u32, String> {
 
 /// Extract the `--resume <id>` (or `--resume=<id>`) Claude session id from a command
 /// line, validated as UUID-shaped. None for `claude -c` / plain `claude` (no id in argv).
+///
+/// With `--fork-session` the resumed id is the SOURCE, not what this process runs: the
+/// id that names it is `--session-id`, and without one it is unknowable from argv
+/// (None, so the window falls to the other resolution steps rather than claiming its
+/// source — which is still live in its own window).
 pub fn parse_resume_id(cmd: &str) -> Option<String> {
     let toks: Vec<&str> = cmd.split_whitespace().collect();
+    let flag = if toks.contains(&"--fork-session") {
+        "--session-id"
+    } else {
+        "--resume"
+    };
+    let eq = format!("{flag}=");
     for (i, t) in toks.iter().enumerate() {
-        let id = if let Some(rest) = t.strip_prefix("--resume=") {
+        let id = if let Some(rest) = t.strip_prefix(eq.as_str()) {
             Some(rest.to_string())
-        } else if *t == "--resume" {
+        } else if *t == flag {
             toks.get(i + 1).map(|s| s.to_string())
         } else {
             None
@@ -208,6 +219,31 @@ mod tests {
         // A non-UUID resume argument must not be mistaken for a session id.
         assert_eq!(parse_resume_id("claude --resume latest"), None);
         assert_eq!(parse_resume_id("claude --resume"), None);
+    }
+
+    #[test]
+    fn a_fork_is_named_by_its_session_id_never_by_its_source() {
+        let src = "11111111-2222-3333-4444-555555555555";
+        let new = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+        assert_eq!(
+            parse_resume_id(&format!(
+                "claude --resume {src} --fork-session --session-id {new} 'hi'"
+            ))
+            .as_deref(),
+            Some(new)
+        );
+        assert_eq!(
+            parse_resume_id(&format!(
+                "claude --fork-session --session-id={new} --resume {src}"
+            ))
+            .as_deref(),
+            Some(new)
+        );
+        // No id given: the fork's id is Claude's choice, so argv can't name it.
+        assert_eq!(
+            parse_resume_id(&format!("claude --resume {src} --fork-session")),
+            None
+        );
     }
 
     #[test]

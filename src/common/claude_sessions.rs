@@ -153,6 +153,16 @@ pub fn load_all() -> Vec<ClaudeSession> {
     load_from(&session_dirs())
 }
 
+/// The record of one Claude process, whichever profile it runs under. Its
+/// `sessionId` follows the process through `/clear` and `/resume`, which the
+/// `CLAUDE_CODE_SESSION_ID` its children inherited at spawn time does not.
+pub fn for_pid(pid: u32) -> Option<ClaudeSession> {
+    session_dirs().into_iter().find_map(|dir| {
+        let text = fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
+        serde_json::from_str(&text).ok()
+    })
+}
+
 /// Index the records hive can **confirm** are live, by conversation id.
 ///
 /// `id_pids` is the gather's own map of conversation id → the pids of its pane's

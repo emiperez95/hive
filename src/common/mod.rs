@@ -8,6 +8,9 @@ pub mod config;
 // Shared gather: builds the ConversationRegistry for both the TUI and the web.
 pub mod conversations;
 pub mod debug;
+// Split a conversation in two: `--resume <id> --fork-session` in another window.
+#[allow(dead_code)]
+pub mod fork;
 pub mod frozen;
 // Shared multi-Claude-per-session detection (consumed by the web server; TUI next).
 pub mod instances;

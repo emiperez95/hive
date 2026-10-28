@@ -550,6 +550,7 @@ mod tests {
             archived: false,
             notify_override: false,
             archive_reason: None,
+            forked_from: None,
             archived_at: None,
             title: None,
             auth_config_dir: None,

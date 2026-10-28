@@ -4,6 +4,7 @@
 //! subcommand handlers. `main.rs` parses args and dispatches here.
 
 pub mod conversations;
+pub mod fork;
 pub mod hook;
 pub mod project;
 pub mod session;
@@ -142,6 +143,30 @@ pub enum Command {
         /// Shrink this split to the sidebar's width on startup (used by --split)
         #[arg(long, hide = true)]
         fit: bool,
+    },
+    /// Split a conversation in two: the fork continues the same history in another
+    /// window — beside it, in a new worktree, or in another project. Run from inside
+    /// Claude (`/hive:fork`) it forks the conversation running it.
+    Fork {
+        /// Fork into a NEW worktree of the conversation's project, branched off the
+        /// branch it has checked out
+        #[arg(long, value_name = "BRANCH", conflicts_with = "to")]
+        wt: Option<String>,
+        /// Base branch for --wt (default: the source's checked-out branch)
+        #[arg(long, requires = "wt")]
+        base: Option<String>,
+        /// Fork into a registered project or worktree (`project` or `project/branch`)
+        #[arg(long, value_name = "KEY")]
+        to: Option<String>,
+        /// Conversation to fork (default: the Claude conversation running this command)
+        #[arg(long)]
+        id: Option<String>,
+        /// Switch the tmux client to the fork (default: stay — the original carries on)
+        #[arg(long)]
+        switch: bool,
+        /// What the fork should do — sent as its first message
+        #[arg(trailing_var_arg = true)]
+        directive: Vec<String>,
     },
     /// Show usage stats from the activity log
     Stats {

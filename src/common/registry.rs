@@ -130,6 +130,9 @@ pub struct Conversation {
     /// Hive overlay: why it was archived — free text captured when archiving.
     #[serde(default)]
     pub archive_reason: Option<String>,
+    /// Hive overlay: the conversation this was forked from (`hive fork`).
+    #[serde(default)]
+    pub forked_from: Option<String>,
     /// Hive overlay: when it was archived (RFC3339).
     #[serde(default)]
     pub archived_at: Option<String>,
@@ -230,6 +233,10 @@ pub struct ConversationOverlay {
     /// cards, where a newline would break the row.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// The conversation this one was forked from (`hive fork`). Claude's transcript
+    /// keeps no link back — a fork is a copy under a new id — so hive records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 impl ConversationSidecar {
@@ -353,6 +360,7 @@ impl ConversationRegistry {
             let archived = overlay.map(|o| o.archived).unwrap_or(false);
             let notify_override = overlay.map(|o| o.notify_override).unwrap_or(false);
             let archive_reason = overlay.and_then(|o| o.archive_reason.clone());
+            let forked_from = overlay.and_then(|o| o.forked_from.clone());
             let archived_at = overlay.and_then(|o| o.archived_at.clone());
             conversations.insert(
                 id.to_string(),
@@ -370,6 +378,7 @@ impl ConversationRegistry {
                     archived,
                     notify_override,
                     archive_reason,
+                    forked_from,
                     archived_at,
                     title: None,
                     auth_config_dir: None,
@@ -428,6 +437,7 @@ impl ConversationRegistry {
                             archived: false,
                             notify_override: false,
                             archive_reason: None,
+                            forked_from: None,
                             archived_at: None,
                             title,
                             auth_config_dir: entry.claude_config_dir.clone(),
@@ -692,6 +702,7 @@ mod tests {
             archived: false,
             notify_override: false,
             archive_reason: None,
+            forked_from: None,
             archived_at: None,
             title: None,
             auth_config_dir: None,
@@ -823,6 +834,7 @@ mod tests {
                 archived: false,
                 notify_override: false,
                 archive_reason: None,
+                forked_from: None,
                 archived_at: None,
                 parent: Some("hive/CSD-1".to_string()),
                 frozen_at: Some("2026-07-01T00:00:00Z".to_string()),
@@ -982,6 +994,7 @@ mod tests {
             archived: false,
             notify_override: false,
             archive_reason: None,
+            forked_from: None,
             archived_at: None,
             parent: parent.map(|s| s.to_string()),
             frozen_at: None,
@@ -1123,6 +1136,7 @@ mod tests {
             archived: false,
             notify_override: false,
             archive_reason: None,
+            forked_from: None,
             archived_at: None,
             title: None,
             auth_config_dir: None,

@@ -5,9 +5,22 @@ use anyhow::{bail, Result};
 /// Bundled janus-wt-portal agent definition, embedded at compile time.
 const JANUS_AGENT_CONTENT: &str = include_str!("../../.claude/agents/janus-wt-portal.md");
 
-/// Bundled create-project command, embedded at compile time.
-const CREATE_PROJECT_CMD_CONTENT: &str =
-    include_str!("../../.claude/commands/hive/create-project.md");
+/// Bundled `/hive:*` slash commands, embedded at compile time and installed to
+/// `~/.claude/commands/hive/` so they work in every project, not just this repo.
+const BUNDLED_COMMANDS: &[(&str, &str)] = &[
+    (
+        "create-project.md",
+        include_str!("../../.claude/commands/hive/create-project.md"),
+    ),
+    (
+        "fork.md",
+        include_str!("../../.claude/commands/hive/fork.md"),
+    ),
+];
+
+fn commands_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".claude").join("commands").join("hive")
+}
 
 /// Bundled iTerm2 AutoLaunch script that registers the Toolbelt sidebar panel.
 const ITERM_SIDEBAR_SCRIPT: &str = include_str!("../../assets/iterm-sidebar.py");
@@ -463,27 +476,20 @@ pub fn run_setup(yes: bool) -> Result<()> {
         _ => println!("  [missing] janus-wt-portal agent"),
     }
 
-    // Check create-project command
-    let cmd_dest = home
-        .join(".claude")
-        .join("commands")
-        .join("hive")
-        .join("create-project.md");
-    let cmd_status = if cmd_dest.exists() {
-        let existing = fs::read_to_string(&cmd_dest).unwrap_or_default();
-        if existing == CREATE_PROJECT_CMD_CONTENT {
-            "ok"
+    // Check the bundled /hive:* commands
+    let mut cmds_to_install: Vec<(&str, &str)> = Vec::new();
+    for &(file, content) in BUNDLED_COMMANDS {
+        let dest = commands_dir(&home).join(file);
+        let name = file.trim_end_matches(".md");
+        if !dest.exists() {
+            println!("  [missing] /hive:{name} command");
+        } else if fs::read_to_string(&dest).unwrap_or_default() != content {
+            println!("  [update]  /hive:{name} command (content differs)");
         } else {
-            "update"
+            println!("  [ok]      /hive:{name} command");
+            continue;
         }
-    } else {
-        "missing"
-    };
-
-    match cmd_status {
-        "ok" => println!("  [ok]      create-project command"),
-        "update" => println!("  [update]  create-project command (content differs)"),
-        _ => println!("  [missing] create-project command"),
+        cmds_to_install.push((file, content));
     }
 
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();
@@ -495,7 +501,7 @@ pub fn run_setup(yes: bool) -> Result<()> {
         && tmux_wn_bound
         && tmux_cf_bound;
     let agent_needs_install = agent_status != "ok";
-    let cmd_needs_install = cmd_status != "ok";
+    let cmd_needs_install = !cmds_to_install.is_empty();
     // `n/a` (no iTerm) is not work; "missing" and "update" both are. Leaving the
     // sidebar out of this check made a version-only change unreachable: the status
     // block printed `[update]`, the early return fired anyway, and setup announced
@@ -768,18 +774,19 @@ pub fn run_setup(yes: bool) -> Result<()> {
         }
     }
 
-    // Install create-project command
+    // Install the bundled /hive:* commands
     if cmd_needs_install {
         println!();
-        print!("Install create-project command to ~/.claude/commands/hive/? [Y/n] ");
+        print!("Install /hive:* commands to ~/.claude/commands/hive/? [Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
         if read_yn(yes)? {
-            if let Some(parent) = cmd_dest.parent() {
-                fs::create_dir_all(parent)?;
+            let dir = commands_dir(&home);
+            fs::create_dir_all(&dir)?;
+            for (file, content) in &cmds_to_install {
+                fs::write(dir.join(file), content)?;
+                println!("Command installed to {:?}", dir.join(file));
             }
-            fs::write(&cmd_dest, CREATE_PROJECT_CMD_CONTENT)?;
-            println!("Command installed to {:?}", cmd_dest);
         } else {
             println!("Skipped command installation.");
         }
@@ -992,23 +999,25 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
         }
     }
 
-    // --- create-project command -------------------------------------
-    let cmd_path = home
-        .join(".claude")
-        .join("commands")
-        .join("hive")
-        .join("create-project.md");
-    if cmd_path.exists() {
+    // --- /hive:* commands -------------------------------------------
+    let installed: Vec<std::path::PathBuf> = BUNDLED_COMMANDS
+        .iter()
+        .map(|(file, _)| commands_dir(&home).join(file))
+        .filter(|p| p.exists())
+        .collect();
+    if !installed.is_empty() {
         println!();
-        print!("Remove create-project command? [Y/n] ");
+        print!("Remove /hive:* commands? [Y/n] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
         if read_yn(yes)? {
-            fs::remove_file(&cmd_path)?;
-            println!("Removed {:?}", cmd_path);
-            rmdir_if_empty(cmd_path.parent());
+            for path in &installed {
+                fs::remove_file(path)?;
+                println!("Removed {:?}", path);
+            }
+            rmdir_if_empty(Some(&commands_dir(&home)));
         } else {
-            println!("Skipped create-project command removal.");
+            println!("Skipped /hive:* command removal.");
         }
     }
 
