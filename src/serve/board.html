@@ -158,7 +158,7 @@
     display: flex; flex-direction: column; gap: 6px;
     transition: background .1s, box-shadow .1s;
   }
-  .no-lanes .cell { min-height: calc(100vh - 150px); }
+  .no-lanes .cell { min-height: calc(100vh - 190px); }
   .cell.over { background: var(--drop); box-shadow: inset 0 0 0 2px var(--accent); }
   .cell .empty { color: var(--faint); font-size: 12px; text-align: center; padding: 14px 0; }
 
@@ -254,6 +254,26 @@
   .toast.show { opacity: 1; }
   .offline { color: var(--s-blocked); font-size: 12px; font-weight: 600; }
 
+  /* ---- project filter ---- */
+  .filters {
+    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    padding: 8px 16px; border-bottom: 1px solid var(--line);
+  }
+  .filters .label { font-size: 12px; color: var(--faint); margin-right: 2px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font: inherit; font-size: 12px; font-weight: 500; color: var(--text);
+    background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+    padding: 3px 10px; cursor: pointer; user-select: none;
+  }
+  .chip:hover { border-color: var(--accent); }
+  .chip .n { color: var(--faint); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .chip.on .n { color: rgba(255,255,255,.8); }
+  .chip.all.on { background: var(--text); border-color: var(--text); color: var(--bg); }
+  .chip.idle { opacity: .55; }
+  .filters .hint { font-size: 11px; color: var(--faint); margin-left: auto; }
+
   @media (max-width: 700px) {
     header { padding: 10px 16px; }
     input.search { width: 100%; }
@@ -276,6 +296,7 @@
     </div>
   </div>
 </header>
+<nav class="filters" id="filters"></nav>
 <main><div class="board" id="board"></div></main>
 
 <div class="scrim" id="scrim">
@@ -314,6 +335,9 @@ let cards = [];
 let lastJson = '';
 let dragging = null;
 let query = '';
+// Projects to show; empty = all. `?projects=a,b` wins, so a filtered view can be bookmarked.
+const urlProjects = new URLSearchParams(location.search).get('projects');
+let projectFilter = new Set(urlProjects != null ? urlProjects.split(',').filter(Boolean) : store.get('projects', []));
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -344,9 +368,12 @@ function placeLabel(c) {
   return `${c.emoji ? c.emoji + ' ' : ''}${proj || 'unassigned'}${branch ? ' / ' + branch : ''}`;
 }
 
+// A worktree's card belongs to its project. '' = unassigned.
+const projectOf = c => c.project_key || (c.parent || '').split('/')[0] || '';
+
 function laneOf(c) {
   if (laneMode === 'project') {
-    const k = c.project_key || (c.parent || '').split('/')[0] || '';
+    const k = projectOf(c);
     return { key: 'p:' + k, label: (c.emoji ? c.emoji + ' ' : '') + (k || '(unassigned)') };
   }
   if (laneMode === 'env') {
@@ -357,6 +384,7 @@ function laneOf(c) {
 }
 
 function matches(c) {
+  if (projectFilter.size && !projectFilter.has(projectOf(c))) return false;
   if (!query) return true;
   const hay = [c.title, c.parent, c.project_key, c.auth_profile, c.note, c.stage_note, c.frozen_note, c.short_id]
     .filter(Boolean).join(' ').toLowerCase();
@@ -396,7 +424,35 @@ function cellHtml(list, stageKey, nextId) {
   </div>`;
 }
 
+// One chip per project on the board, busiest first. Counts are over the whole
+// board (not the filtered view), so an unselected chip still says what it holds.
+// A selected project that has emptied out keeps its chip, or it couldn't be undone.
+function renderFilters() {
+  const projects = new Map();
+  for (const c of cards) {
+    const k = projectOf(c);
+    if (!projects.has(k)) projects.set(k, { key: k, emoji: c.emoji, n: 0, open: 0 });
+    const p = projects.get(k);
+    p.n++;
+    if (!p.emoji && c.emoji) p.emoji = c.emoji;
+    if (c.kind !== 'frozen' && c.stage !== 'done') p.open++;
+  }
+  for (const k of projectFilter) if (!projects.has(k)) projects.set(k, { key: k, emoji: '', n: 0, open: 0 });
+  const list = [...projects.values()].sort((a, b) =>
+    b.open - a.open || b.n - a.n || (a.key || '~').localeCompare(b.key || '~'));
+  const chips = list.map(p =>
+    `<button class="chip ${projectFilter.has(p.key) ? 'on' : ''} ${p.open ? '' : 'idle'}" data-project="${esc(p.key)}"
+       title="${p.open} active · ${p.n} total">${p.emoji ? esc(p.emoji) + ' ' : ''}${esc(p.key || '(unassigned)')}<span class="n">${p.n}</span></button>`
+  ).join('');
+  document.getElementById('filters').innerHTML =
+    `<span class="label">Projects</span>
+     <button class="chip all ${projectFilter.size ? '' : 'on'}" data-project-all>All<span class="n">${cards.length}</span></button>
+     ${chips}
+     <span class="hint">click to filter · click more to add · ⌥-click for just one</span>`;
+}
+
 function render() {
+  renderFilters();
   const visible = cards.filter(matches);
   const byStage = k => visible.filter(c => (c.stage ?? null) === k);
 
@@ -586,6 +642,25 @@ document.getElementById('lanes').addEventListener('click', e => {
   if (!v) return;
   laneMode = v;
   store.set('lanes', v);
+  render();
+});
+document.getElementById('filters').addEventListener('click', e => {
+  const chip = e.target.closest('.chip');
+  if (!chip) return;
+  if (chip.hasAttribute('data-project-all')) {
+    projectFilter.clear();
+  } else {
+    const k = chip.dataset.project;
+    // Plain click toggles (so several can be picked); ⌥/Alt-click shows only that one.
+    if (e.altKey) projectFilter = new Set([k]);
+    else projectFilter.has(k) ? projectFilter.delete(k) : projectFilter.add(k);
+  }
+  store.set('projects', [...projectFilter]);
+  // Keep the URL in step so the view can be bookmarked or shared as-is.
+  const url = new URL(location.href);
+  if (projectFilter.size) url.searchParams.set('projects', [...projectFilter].join(','));
+  else url.searchParams.delete('projects');
+  history.replaceState(null, '', url);
   render();
 });
 document.getElementById('search').addEventListener('input', e => {
