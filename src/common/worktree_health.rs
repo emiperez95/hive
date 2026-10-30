@@ -134,13 +134,11 @@ pub fn base_from_symbolic_ref(out: &str) -> Option<String> {
 ///
 /// It also keeps hive out of a fight over `index.lock` with the Claude running in that
 /// same tree.
+///
+/// Goes through `gitcmd::read_only`, which also pins `core.fsmonitor`/`core.hooksPath`
+/// off: `dir` comes from a transcript's cwd, so its config is not ours to trust.
 fn git_cmd(dir: &str, args: &[&str]) -> Command {
-    let mut c = Command::new("git");
-    c.env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(dir)
-        .args(args);
-    c
+    crate::common::gitcmd::read_only(dir, args)
 }
 
 fn git(dir: &str, args: &[&str]) -> Option<String> {

@@ -327,7 +327,7 @@ pub fn create_git_worktree(
         args.push("-b".to_string());
         args.push(branch.to_string());
         args.push(worktree_path.to_string_lossy().to_string());
-        args.push(base.to_string());
+        args.push(fresh_start_point(project_root, base));
     }
 
     let output = Command::new("git")
@@ -342,6 +342,88 @@ pub fn create_git_worktree(
     }
 
     Ok(worktree_path)
+}
+
+/// Network cap for each git call that talks to the remote.
+const FETCH_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Set to skip the pre-create fetch (offline work, slow remotes).
+pub const NO_FETCH_ENV: &str = "HIVE_WT_NO_FETCH";
+
+/// The rev a NEW branch should start from, so it doesn't begin behind the remote.
+///
+/// A worktree branched off a stale `production` starts out behind and pays for it at
+/// merge time. Best effort and never fatal: offline, a dead remote or an odd setup
+/// all fall back to `base` as given.
+///
+/// - `origin/x` (a remote-tracking ref): fetch that branch, keep the name.
+/// - local `x`: ask the remote for its tip; when ours is an ancestor of it (or equal),
+///   start from the remote's commit. Local commits the remote lacks (diverged or ahead)
+///   keep `base` — we never discard work.
+///
+/// The local branch is not moved: it may be checked out in the project root, where
+/// updating the ref underneath would desync that tree's index.
+fn fresh_start_point(project_root: &Path, base: &str) -> String {
+    if std::env::var_os(NO_FETCH_ENV).is_some() {
+        return base.to_string();
+    }
+    let root = project_root.to_string_lossy().to_string();
+    let git = |args: &[&str]| crate::common::gitcmd::read_only(&root, args);
+    let out = |args: &[&str]| {
+        crate::common::gitcmd::run_capped(git(args), FETCH_LIMIT).map(|s| s.trim().to_string())
+    };
+
+    let remotes: Vec<String> = out(&["remote"])
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+
+    // origin/production → refresh the tracking ref.
+    if let Some((remote, branch)) = base.split_once('/') {
+        if remotes.iter().any(|r| r == remote) {
+            if out(&["fetch", "--no-tags", "--quiet", remote, branch]).is_none() {
+                eprintln!("  (could not fetch {base}; branching from the local copy)");
+            }
+            return base.to_string();
+        }
+    }
+
+    // Local branch → compare with the remote's tip.
+    let full = format!("refs/heads/{base}");
+    let Some(local) = out(&["rev-parse", "--verify", "--quiet", &full]).filter(|s| !s.is_empty())
+    else {
+        return base.to_string();
+    };
+    let remote = out(&["config", &format!("branch.{base}.remote")])
+        .filter(|r| remotes.contains(r))
+        .or_else(|| remotes.iter().find(|r| *r == "origin").cloned());
+    let Some(remote) = remote else {
+        return base.to_string();
+    };
+    let tip = out(&["ls-remote", "--exit-code", &remote, &full])
+        .and_then(|s| s.split_whitespace().next().map(str::to_string));
+    let Some(tip) = tip else {
+        eprintln!("  (could not reach {remote}; branching from local {base})");
+        return base.to_string();
+    };
+    if tip == local {
+        return base.to_string();
+    }
+    // The tip's objects must be here to compare against.
+    if out(&["fetch", "--no-tags", "--quiet", &remote, &full]).is_none() {
+        return base.to_string();
+    }
+    let ancestor = crate::common::gitcmd::run_capped(
+        git(&["merge-base", "--is-ancestor", &local, &tip]),
+        FETCH_LIMIT,
+    )
+    .is_some();
+    if ancestor {
+        println!("  {base} was behind {remote}; branching from its tip");
+        tip
+    } else {
+        eprintln!("  (local {base} has commits {remote} lacks; branching from local)");
+        base.to_string()
+    }
 }
 
 /// Delete a git worktree and optionally its branch.
@@ -373,7 +455,12 @@ pub fn delete_git_worktree(
 
     // Optionally delete the branch
     if !keep_branch {
-        let delete_flag = if force { "-D" } else { "-d" };
+        let root = project_root.to_string_lossy();
+        // `-d` asks "merged into the current HEAD?", the wrong question: a branch started
+        // from the remote's tip (see `fresh_start_point`) is unmerged into a stale local
+        // base yet loses nothing. What matters is whether every commit is on a remote.
+        let safe = crate::common::prune::branch_unpushed(&root, branch) == Some(0);
+        let delete_flag = if force || safe { "-D" } else { "-d" };
         let output = Command::new("git")
             .args(["branch", delete_flag, branch])
             .current_dir(project_root)
@@ -1142,5 +1229,134 @@ mod tests {
         let result = run_hook(&hooks_dir, "nonexistent", &HashMap::new(), &metadata).unwrap();
         assert_eq!(result["existing"], true);
         let _ = std::fs::remove_dir_all(&hooks_dir);
+    }
+
+    // ── fresh_start_point ────────────────────────────────────────────────────
+
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// bare remote + a clone with one commit pushed + a second clone, under one temp dir.
+    fn remote_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("hive-fresh-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (bare, a, b) = (root.join("remote.git"), root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&bare).unwrap();
+        sh(&bare, &["init", "-q", "--bare", "-b", "main"]);
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        sh(&a, &["init", "-q", "-b", "main"]);
+        sh(&a, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        sh(&a, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        sh(&a, &["push", "-q", "origin", "main"]);
+        sh(&b, &["init", "-q", "-b", "main"]);
+        sh(&b, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        sh(&b, &["pull", "-q", "origin", "main"]);
+        (root, a, b)
+    }
+
+    #[test]
+    fn fresh_start_uses_remote_tip_when_local_is_behind() {
+        let (root, a, b) = remote_fixture("behind");
+        sh(&b, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        sh(&b, &["push", "-q", "origin", "main"]);
+        let tip = sh(&b, &["rev-parse", "HEAD"]);
+        // `a` still has only commit one.
+        assert_eq!(fresh_start_point(&a, "main"), tip);
+        // The local branch itself is untouched.
+        assert_ne!(sh(&a, &["rev-parse", "main"]), tip);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fresh_start_keeps_local_when_it_has_unpushed_commits() {
+        let (root, a, b) = remote_fixture("ahead");
+        sh(&b, &["commit", "-q", "--allow-empty", "-m", "remote-two"]);
+        sh(&b, &["push", "-q", "origin", "main"]);
+        sh(&a, &["commit", "-q", "--allow-empty", "-m", "local-only"]);
+        assert_eq!(fresh_start_point(&a, "main"), "main");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fresh_start_is_a_no_op_when_in_sync_or_unknown() {
+        let (root, a, _b) = remote_fixture("sync");
+        assert_eq!(fresh_start_point(&a, "main"), "main");
+        // not a branch, not a remote ref
+        assert_eq!(fresh_start_point(&a, "no-such"), "no-such");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fresh_start_refreshes_a_remote_tracking_base() {
+        let (root, a, b) = remote_fixture("tracking");
+        sh(&b, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        sh(&b, &["push", "-q", "origin", "main"]);
+        let tip = sh(&b, &["rev-parse", "HEAD"]);
+        sh(&a, &["fetch", "-q", "origin"]);
+        // rewind the tracking ref to simulate a stale one
+        let one = sh(&a, &["rev-parse", "main"]);
+        sh(&a, &["update-ref", "refs/remotes/origin/main", &one]);
+        assert_eq!(fresh_start_point(&a, "origin/main"), "origin/main");
+        assert_eq!(sh(&a, &["rev-parse", "origin/main"]), tip);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fresh_start_without_a_remote_falls_back() {
+        let root = std::env::temp_dir().join(format!("hive-fresh-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        sh(&root, &["init", "-q", "-b", "main"]);
+        sh(&root, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        assert_eq!(fresh_start_point(&root, "main"), "main");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_removes_a_branch_started_from_the_remote_tip() {
+        let (root, a, b) = remote_fixture("delete");
+        sh(&b, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        sh(&b, &["push", "-q", "origin", "main"]);
+        let wt_dir = root.join("wts");
+        let path = create_git_worktree(&a, &wt_dir, "feat", "main", false).unwrap();
+        // started from the tip, which the stale local `main` doesn't contain
+        assert_eq!(
+            sh(&path, &["rev-parse", "HEAD"]),
+            sh(&b, &["rev-parse", "HEAD"])
+        );
+        delete_git_worktree(&a, &path, "feat", false, false).unwrap();
+        assert_eq!(sh(&a, &["branch", "--list", "feat"]), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_keeps_a_branch_with_unpushed_commits() {
+        let (root, a, _b) = remote_fixture("keep");
+        let wt_dir = root.join("wts");
+        let path = create_git_worktree(&a, &wt_dir, "feat", "main", false).unwrap();
+        sh(&path, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+        delete_git_worktree(&a, &path, "feat", false, false).unwrap();
+        assert_ne!(
+            sh(&a, &["branch", "--list", "feat"]),
+            "",
+            "unpushed work must survive"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

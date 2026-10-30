@@ -146,13 +146,7 @@ pub fn human(d: Duration) -> String {
 /// would reset the very idle clock this module reads, and contend with an agent
 /// working there. Same reason as `worktree_health::git_cmd`.
 fn git(dir: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = crate::common::gitcmd::read_only(dir, args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())

@@ -66,7 +66,7 @@ pub fn run_fork(args: ForkArgs) -> Result<()> {
 
 /// The conversation whose Bash tool is running us. `CLAUDE_PID`'s own session record
 /// first — it follows `/clear` — then the id the shell inherited at spawn.
-fn running_conversation_id() -> Option<String> {
+pub(crate) fn running_conversation_id() -> Option<String> {
     let from_record = std::env::var("CLAUDE_PID")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -130,9 +130,7 @@ fn new_worktree_target(src: &ForkSource, branch: &str, base: Option<&str>) -> Re
 }
 
 fn current_branch(cwd: &str) -> Result<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", cwd, "branch", "--show-current"])
-        .output()?;
+    let out = crate::common::gitcmd::read_only(cwd, &["branch", "--show-current"]).output()?;
     let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || b.is_empty() {
         bail!("{cwd} has no branch checked out (detached HEAD?) — pass --base");

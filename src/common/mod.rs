@@ -12,6 +12,8 @@ pub mod debug;
 #[allow(dead_code)]
 pub mod fork;
 pub mod frozen;
+// How hive runs git against trees it didn't make: no fsmonitor/hooks, no locks, capped network.
+pub mod gitcmd;
 // Shared multi-Claude-per-session detection (consumed by the web server; TUI next).
 pub mod instances;
 #[allow(dead_code)]

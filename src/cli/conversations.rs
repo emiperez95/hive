@@ -1726,10 +1726,7 @@ fn gather_live_resources(
 
 /// The last few commits in a repo (`git -C <cwd> log --oneline -10`).
 fn recent_commits(cwd: &str) -> Vec<String> {
-    match Command::new("git")
-        .args(["-C", cwd, "log", "--oneline", "-10"])
-        .output()
-    {
+    match crate::common::gitcmd::read_only(cwd, &["log", "--oneline", "-10"]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .map(|l| l.to_string())

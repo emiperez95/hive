@@ -143,6 +143,34 @@ The rule is **nothing that exists only here is removed** (`common/prune.rs`):
 ## Worktree creation switches you into it
 
 `hive wt new` ends by switching the tmux client to the session it just made — creating a
+## `hive wt new` branches from a fresh base
+
+A new branch used to start from whatever the local base branch happened to be, so a stale
+`production` meant a worktree born behind. `fresh_start_point` (`common/worktree.rs`) fixes
+that, best effort and never fatal (15s cap per network call, prompts disabled):
+
+- base `origin/x` → `git fetch origin x`, keep the name.
+- base local `x` → `ls-remote` the remote's tip; if local is equal or an **ancestor**, start
+  from the remote's commit. Local commits the remote lacks (ahead/diverged) keep local `x`.
+- offline, no remote, or unknown base → base as given. `HIVE_WT_NO_FETCH=1` skips it.
+
+The local branch is deliberately **not** fast-forwarded: it may be checked out in the project
+root, and moving the ref under that tree desyncs its index. (Claude's desktop app does
+fast-forward it; starting from the tip gets the same worktree without that risk.)
+
+`wt delete` therefore deletes the branch with `-D` when `prune::branch_unpushed == Some(0)` (every
+commit is on a remote) instead of `-d`, which asks "merged into the current HEAD?" and rejects a
+branch started from a tip the stale local base lacks. Unpushed commits still keep the branch.
+
+## Probing trees we didn't make (`common/gitcmd.rs`)
+
+Every read-only probe (`worktree_health`, `prune`, the detail's commits, fork's branch lookup)
+runs git in a directory taken from a transcript's cwd, so its `.git/config` is untrusted.
+`core.fsmonitor` runs a program on a plain `git status`. `gitcmd::read_only` pins
+`core.fsmonitor=false` and `core.hooksPath=/dev/null` per call (and keeps
+`GIT_OPTIONAL_LOCKS=0`); a test plants an fsmonitor script and asserts it never runs. New git
+probes should go through it. `run_capped` is the timeout runner for anything touching a remote.
+
 worktree is choosing to work there, the same as `hive connect` or any TUI "start work
 here" action, and it's usually run *from another Claude window* (the janus agent), where
 being left behind in the window you asked from is the wrong place to be. `run_wt_new`
