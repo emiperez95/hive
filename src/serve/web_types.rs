@@ -230,6 +230,9 @@ pub struct BoardCard {
     pub last_activity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<PlacementView>,
+    /// Working directory — what `/api/freeze` records for the thaw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Swimlane keys: project (`project_key`, else the parent, else none) and env.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,

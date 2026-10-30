@@ -1209,7 +1209,13 @@ A Jira/Trello-style board at `http://localhost:8375/board`: one card per **conve
 (live, skipped and frozen — plain closed ones are not on it), in six columns: Unsorted ·
 Todo · Planning · In progress · Blocked · Done. Swimlanes toggle between none, **project**
 and **env** (= auth profile); `?lanes=project` bookmarks one. Drag a card to move it;
-dropping on Blocked asks what it's blocked on. Click switches the tmux client to it; a
+dropping on Blocked asks what it's blocked on, with a **💤 Freeze** switch under the
+reason (remembered per browser): the stage is set first, then `/api/freeze` closes the
+window with `Blocked: <reason>` as its note — the overlay is keyed by conversation id,
+so the card stays in Blocked as a frozen card to thaw later, and the card hides a note
+that only restates its reason. Project chips filter the board (click adds, ⌘-click
+shows just one, `?projects=a,b` bookmarks); they scroll away while the column names
+stay pinned. Click switches the tmux client to it; a
 frozen card has a Thaw button instead.
 
 **The stage is set by hand, never inferred.** It lives in the conversation's overlay
@@ -1217,8 +1223,9 @@ frozen card has a Thaw button instead.
 Unsorted. It is deliberately separate from the runtime status: each card also shows what
 Claude is doing *now* (needs you · review · idle · working · flow · frozen), because a card
 in In progress whose Claude is waiting on a permission is exactly what the board must not
-hide. The highlighted **next** card is the first non-Done card in the attention order —
-`build_board` emits cards in `Ctrl+g`'s order, frozen last.
+hide. Within a column cards keep the attention order — `build_board` emits them in
+`Ctrl+g`'s order, frozen last. (A highlighted "next" card was tried and removed: it
+read as a stage of its own.)
 
 - Its own page (`board.html`), not a mode of `web.html`: that one is built mobile-first
   for the phone and the 280px sidebar, a board is wide. `--dev` re-reads it from disk too.

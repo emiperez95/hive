@@ -154,6 +154,7 @@ pub(crate) fn build_board(
                 state_secs: win.and_then(|(w, _)| w.state_secs),
                 last_activity: c.last_activity.clone(),
                 placement: c.placement.clone(),
+                cwd: c.cwd.clone(),
                 project_key: c.project_key.clone(),
                 parent: c.parent.clone(),
                 emoji: c.emoji.clone(),

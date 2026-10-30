@@ -119,16 +119,23 @@
   input.search:focus { border-color: var(--accent); background: var(--card); }
 
   /* ---- board ---- */
-  main { flex: 1; overflow: auto; padding: 12px 16px 24px; }
+  main { flex: 1; overflow: auto; padding: 0 16px 24px; }
   .board { min-width: 1080px; }
   .cols, .lane-cells {
     display: grid;
     grid-template-columns: repeat(6, minmax(170px, 1fr));
     gap: 10px;
   }
-  .colhead {
-    position: sticky; top: -12px; z-index: 2;
+  /* The header ROW sticks, not each cell: a sticky element only sticks within its
+     parent, and a cell's parent is this one-row grid. The project chips above it
+     scroll away; the column names stay. */
+  .cols {
+    position: sticky; top: 0; z-index: 3;
     background: var(--bg);
+    border-bottom: 1px solid transparent;
+  }
+  .cols.stuck { border-bottom-color: var(--line); }
+  .colhead {
     padding: 12px 4px 8px;
     display: flex; align-items: center; gap: 8px;
     font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
@@ -180,7 +187,6 @@
   .card:hover { background: var(--card-hover); }
   .card.dragging { opacity: .4; }
   .card.frozen { opacity: .78; }
-  .card.next { box-shadow: var(--shadow), 0 0 0 2px var(--accent); }
   .card .top { display: flex; align-items: center; gap: 6px; min-width: 0; }
   .card .place {
     flex: 1; min-width: 0; font-size: 11px; color: var(--muted);
@@ -213,7 +219,6 @@
     font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
     padding: 1px 5px; border-radius: 3px; background: var(--col); color: var(--muted);
   }
-  .tag.next { background: var(--accent); color: #fff; }
   .foot .age { margin-left: auto; font-variant-numeric: tabular-nums; }
   .card button.thaw {
     font: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
@@ -240,6 +245,24 @@
   }
   .dialog input:focus { border-color: var(--accent); }
   .dialog .row { display: flex; justify-content: flex-end; gap: 8px; }
+  .switch {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
+    font-size: 12px; font-weight: 600; color: var(--muted);
+  }
+  .switch[hidden] { display: none; }
+  .switch input { position: absolute; opacity: 0; pointer-events: none; }
+  .switch .track {
+    width: 30px; height: 18px; border-radius: 999px; background: var(--line);
+    position: relative; transition: background .15s; flex-shrink: 0;
+  }
+  .switch .track::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+    border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform .15s;
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::after { transform: translateX(12px); }
+  .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .switch input:checked ~ .lbl { color: var(--text); }
   .dialog button {
     font: inherit; font-size: 13px; font-weight: 600; border-radius: 6px; padding: 6px 12px; cursor: pointer;
     border: 1px solid var(--line); background: var(--card); color: var(--text);
@@ -257,7 +280,7 @@
   /* ---- project filter ---- */
   .filters {
     display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
-    padding: 8px 16px; border-bottom: 1px solid var(--line);
+    padding: 10px 0; border-bottom: 1px solid var(--line);
   }
   .filters .label { font-size: 12px; color: var(--faint); margin-right: 2px; }
   .chip {
@@ -296,14 +319,19 @@
     </div>
   </div>
 </header>
-<nav class="filters" id="filters"></nav>
-<main><div class="board" id="board"></div></main>
+<main>
+  <nav class="filters" id="filters"></nav>
+  <div class="board" id="board"></div>
+</main>
 
 <div class="scrim" id="scrim">
   <form class="dialog" id="dialog">
     <h2>Blocked on what?</h2>
     <p id="dialogFor"></p>
     <input id="reason" placeholder="e.g. waiting on staging creds" autocomplete="off">
+    <label class="switch" id="freezeSwitch" title="Close the window and keep the conversation to thaw later — the reason becomes its freeze note">
+      <input type="checkbox" id="freezeToggle"><span class="track"></span><span class="lbl">💤 Freeze the conversation until unblocked</span>
+    </label>
     <div class="row">
       <button type="button" id="cancel">Cancel</button>
       <button type="submit" class="primary">Move to Blocked</button>
@@ -391,16 +419,19 @@ function matches(c) {
   return query.split(/\s+/).every(t => hay.includes(t));
 }
 
-function cardHtml(c, nextId) {
+function cardHtml(c) {
   const rt = runtime(c);
   const stageAge = c.stage_at ? ago(since(c.stage_at)) : '';
   const tags = [];
-  if (c.id === nextId) tags.push('<span class="tag next">next</span>');
   if (c.kind === 'frozen') tags.push('<span class="tag">💤 frozen</span>');
   if (c.kind === 'skipped') tags.push('<span class="tag">skipped</span>');
   if (c.auth_profile) tags.push(`<span class="tag">${esc(c.auth_profile)}</span>`);
-  const note = c.frozen_note || c.note;
-  return `<div class="card ${c.kind === 'frozen' ? 'frozen' : ''} ${c.id === nextId ? 'next' : ''}"
+  // A card frozen from the Blocked dialog carries `Blocked: <reason>` as its freeze
+  // note — the same words as the reason line above it, so don't print them twice.
+  const restates = n => c.stage === 'blocked' &&
+    n.replace(/^Blocked:?\s*/i, '').trim() === (c.stage_note || '').trim();
+  const note = [c.frozen_note, c.note].find(n => n && !restates(n));
+  return `<div class="card ${c.kind === 'frozen' ? 'frozen' : ''}"
       draggable="true" data-id="${esc(c.id)}" style="--stage:${stageVar(c.stage)}">
     <div class="top">
       <span class="place" title="${esc(c.parent || '')}">${esc(placeLabel(c))}</span>
@@ -418,9 +449,9 @@ function cardHtml(c, nextId) {
   </div>`;
 }
 
-function cellHtml(list, stageKey, nextId) {
+function cellHtml(list, stageKey) {
   return `<div class="cell" data-stage="${stageKey ?? ''}">
-    ${list.length ? list.map(c => cardHtml(c, nextId)).join('') : '<div class="empty">—</div>'}
+    ${list.length ? list.map(c => cardHtml(c)).join('') : '<div class="empty">—</div>'}
   </div>`;
 }
 
@@ -448,18 +479,13 @@ function renderFilters() {
     `<span class="label">Projects</span>
      <button class="chip all ${projectFilter.size ? '' : 'on'}" data-project-all>All<span class="n">${cards.length}</span></button>
      ${chips}
-     <span class="hint">click to filter · click more to add · ⌥-click for just one</span>`;
+     <span class="hint">click to filter · click more to add · ⌘-click for just one</span>`;
 }
 
 function render() {
   renderFilters();
   const visible = cards.filter(matches);
   const byStage = k => visible.filter(c => (c.stage ?? null) === k);
-
-  // The one card to pick up next: highest in the attention order that isn't
-  // finished. Cards arrive in that order, so it's the first match.
-  const next = visible.find(c => c.stage !== 'done' && c.attention_rank != null && c.attention <= 1);
-  const nextId = next ? next.id : null;
 
   document.getElementById('strip').innerHTML = STAGES.map(s =>
     `<span class="pill"><i style="background:${stageVar(s.key)}"></i>${s.label} <b>${byStage(s.key).length}</b></span>`
@@ -471,7 +497,7 @@ function render() {
 
   let body;
   if (laneMode === 'none') {
-    body = `<div class="lane-cells">${STAGES.map(s => cellHtml(byStage(s.key), s.key, nextId)).join('')}</div>`;
+    body = `<div class="lane-cells">${STAGES.map(s => cellHtml(byStage(s.key), s.key)).join('')}</div>`;
   } else {
     const lanes = new Map();
     for (const c of visible) {
@@ -492,7 +518,7 @@ function render() {
       return `<section class="lane ${folded.has(l.key) ? 'folded' : ''}" data-lane="${esc(l.key)}">
         <div class="lane-head"><span class="caret">▾</span>${esc(l.label)}<span class="n">${l.cards.length}</span><span class="mini">${mini}</span></div>
         <div class="lane-cells">${STAGES.map(s =>
-          cellHtml(l.cards.filter(c => (c.stage ?? null) === s.key), s.key, nextId)).join('')}</div>
+          cellHtml(l.cards.filter(c => (c.stage ?? null) === s.key), s.key)).join('')}</div>
       </section>`;
     }).join('') || '<div class="empty" style="padding:40px;text-align:center;color:var(--faint)">No conversations</div>';
   }
@@ -502,6 +528,7 @@ function render() {
   const scroll = document.querySelector('main').scrollTop;
   board.innerHTML = heads + body;
   document.querySelector('main').scrollTop = scroll;
+  syncStuck();
 
   document.querySelectorAll('#lanes button').forEach(b => b.classList.toggle('on', b.dataset.v === laneMode));
 }
@@ -555,17 +582,51 @@ function askReason(c) {
   document.getElementById('dialogFor').textContent = c.title || c.short_id;
   const input = document.getElementById('reason');
   input.value = c.stage_note || '';
+  // Only a running window can be frozen; a frozen card already is.
+  const canFreeze = !!c.placement && c.kind !== 'frozen';
+  document.getElementById('freezeSwitch').hidden = !canFreeze;
+  document.getElementById('freezeToggle').checked = canFreeze && store.get('freezeOnBlock', false);
+  updateSubmit();
   document.getElementById('scrim').classList.add('open');
   input.focus();
 }
 function closeDialog() { pendingBlock = null; document.getElementById('scrim').classList.remove('open'); }
-document.getElementById('dialog').addEventListener('submit', e => {
+function updateSubmit() {
+  const freeze = document.getElementById('freezeToggle').checked;
+  document.querySelector('#dialog button.primary').textContent = freeze ? 'Block & freeze' : 'Move to Blocked';
+}
+document.getElementById('freezeToggle').addEventListener('change', e => {
+  store.set('freezeOnBlock', e.target.checked);
+  updateSubmit();
+});
+document.getElementById('dialog').addEventListener('submit', async e => {
   e.preventDefault();
   const id = pendingBlock;
-  const note = document.getElementById('reason').value;
+  const note = document.getElementById('reason').value.trim();
+  const freeze = !document.getElementById('freezeSwitch').hidden && document.getElementById('freezeToggle').checked;
   closeDialog();
-  if (id) setStage(id, 'blocked', note);
+  if (!id) return;
+  const c = cards.find(c => c.id === id);
+  // Stage first: the overlay is keyed by conversation id, so the card stays in
+  // Blocked when it comes back as a frozen card.
+  await setStage(id, 'blocked', note);
+  if (freeze && c && c.placement) await freezeCard(c, note);
 });
+
+async function freezeCard(c, note) {
+  const p = c.placement;
+  const res = await post('/api/freeze', {
+    session: p.session_name,
+    window_index: p.window_index,
+    window_name: p.window_name,
+    cwd: c.cwd || '',
+    session_id: c.id,
+    note: note ? 'Blocked: ' + note : 'Blocked',
+  });
+  toast(res.ok ? '💤 Frozen — thaw it from the card when unblocked' : (res.error || 'Freeze failed'));
+  lastJson = '';
+  setTimeout(load, 600);
+}
 document.getElementById('cancel').addEventListener('click', closeDialog);
 document.getElementById('scrim').addEventListener('mousedown', e => { if (e.target.id === 'scrim') closeDialog(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDialog(); });
@@ -651,8 +712,8 @@ document.getElementById('filters').addEventListener('click', e => {
     projectFilter.clear();
   } else {
     const k = chip.dataset.project;
-    // Plain click toggles (so several can be picked); ⌥/Alt-click shows only that one.
-    if (e.altKey) projectFilter = new Set([k]);
+    // Plain click toggles (so several can be picked); ⌘-click (or ⌥/Ctrl) shows only that one.
+    if (e.metaKey || e.ctrlKey || e.altKey) projectFilter = new Set([k]);
     else projectFilter.has(k) ? projectFilter.delete(k) : projectFilter.add(k);
   }
   store.set('projects', [...projectFilter]);
@@ -667,6 +728,13 @@ document.getElementById('search').addEventListener('input', e => {
   query = e.target.value.trim().toLowerCase();
   render();
 });
+
+// A hairline under the pinned column names once the board has scrolled under them.
+function syncStuck() {
+  const main = document.querySelector('main');
+  document.querySelector('.cols')?.classList.toggle('stuck', main.scrollTop > document.getElementById('filters').offsetHeight);
+}
+document.querySelector('main').addEventListener('scroll', syncStuck, { passive: true });
 
 load();
 setInterval(load, 2000);
