@@ -59,22 +59,31 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
     // Full process argv (one `ps`) so we can read `claude --resume <id>` — the
     // per-window conversation id that survives hook-state pruning.
     let cmdlines = build_cmdline_map();
+    let claude_records = claude_sessions::load_all();
     let instances = instances::detect_all_instances();
     // `claimed` prevents two windows resolving to the same transcript.
     let mut claimed: HashSet<String> = HashSet::new();
 
-    // Pass 1 — EXACT ids: the hook-resolved id, else `--resume <id>` from the
-    // process argv (validated: the transcript must exist). Both are per-window
-    // exact, so they always beat the recency guess below.
+    // Pass 1 — EXACT ids: Claude's own record for a process in the window's tree,
+    // else the hook-resolved id, else `--resume <id>` from the process argv (each
+    // validated: the transcript must exist). All are per-window exact, so they
+    // always beat the recency guess below.
     let mut pending: Vec<(Option<String>, instances::ClaudeInstance)> = Vec::new();
     for inst in instances {
-        let sid = inst.session_id.clone().or_else(|| {
-            inst.pids
-                .iter()
-                .filter_map(|pid| cmdlines.get(pid))
-                .find_map(|cmd| parse_resume_id(cmd))
-                .filter(|id| jsonl::find_jsonl_by_session_id(&inst.cwd, id).is_some())
-        });
+        // Claude's own record first: it follows `/clear`, which the hook entry (pruned
+        // after 10 min idle) and argv (`--resume <id>` is the LAUNCH id) do not.
+        let has_transcript = |id: &str| jsonl::find_jsonl_by_session_id(&inst.cwd, id).is_some();
+        let sid = claude_sessions::session_in_tree(&claude_records, &inst.pids)
+            .filter(|id| has_transcript(id))
+            .map(str::to_string)
+            .or_else(|| inst.session_id.clone())
+            .or_else(|| {
+                inst.pids
+                    .iter()
+                    .filter_map(|pid| cmdlines.get(pid))
+                    .find_map(|cmd| parse_resume_id(cmd))
+                    .filter(|id| has_transcript(id))
+            });
         if let Some(s) = &sid {
             claimed.insert(s.clone());
         }
@@ -146,7 +155,7 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
     // Claude's own account of what each live conversation is doing. Confirmed
     // against `id_pids` so a record left behind by a dead process — the files have
     // no heartbeat — can't be mistaken for a live one. See `claude_sessions`.
-    let first_party = claude_sessions::index_confirmed(claude_sessions::load_all(), &id_pids);
+    let first_party = claude_sessions::index_confirmed(claude_records, &id_pids);
 
     // Recover live status for conversations whose hook entry was pruned (state.json
     // drops entries after ~10 min idle), and overlay a RunningWorkflow badge when

@@ -163,6 +163,27 @@ pub fn for_pid(pid: u32) -> Option<ClaudeSession> {
     })
 }
 
+/// The conversation a window's Claude is running NOW, from the record of a process
+/// in that window's tree.
+///
+/// This is the id that survives `/clear`: the process keeps its pid and argv — so a
+/// window launched as `claude --resume A` still advertises `A` after `/clear` moved it
+/// on to `B` — but Claude rewrites its record. Reading argv instead froze the wrong
+/// conversation once the hook entry had been pruned, and thawing it brought back a
+/// conversation the window had left behind days earlier.
+///
+/// `None` when no record is in the tree, or when more than one is: two Claude
+/// processes in one window can't be told apart here, and a guess would be worse
+/// than the other evidence the caller falls back to.
+pub fn session_in_tree<'a>(sessions: &'a [ClaudeSession], pids: &[u32]) -> Option<&'a str> {
+    let mut found = sessions
+        .iter()
+        .filter(|s| pids.contains(&s.pid))
+        .filter_map(|s| s.session_id.as_deref());
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
 /// Index the records hive can **confirm** are live, by conversation id.
 ///
 /// `id_pids` is the gather's own map of conversation id → the pids of its pane's
@@ -225,6 +246,21 @@ mod tests {
             .iter()
             .map(|(id, p)| (id.to_string(), p.to_vec()))
             .collect()
+    }
+
+    #[test]
+    fn a_window_runs_what_its_process_record_says_not_what_argv_said() {
+        // The window was launched `--resume old`, then `/clear`ed: Claude's record
+        // for that pid now names the new conversation.
+        let all = vec![
+            rec(100, "new-after-clear", "idle"),
+            rec(200, "elsewhere", "busy"),
+        ];
+        assert_eq!(session_in_tree(&all, &[99, 100]), Some("new-after-clear"));
+        // No record in the tree → no answer (the caller falls back to hook / argv).
+        assert_eq!(session_in_tree(&all, &[300]), None);
+        // Two Claude processes in one tree can't be told apart → no guess.
+        assert_eq!(session_in_tree(&all, &[100, 200]), None);
     }
 
     #[test]

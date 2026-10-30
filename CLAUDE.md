@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 472 tests (445 unit + 27 CLI smoke)
+cargo test                # 471 tests (444 unit + 27 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints 775 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 445 unit + 27 smoke.
+> bin targets and run twice. Distinct tests: 444 unit + 27 smoke.
 
 ## The TUI (conversation-first)
 
@@ -644,8 +644,15 @@ Archiving stays a display preference, never a bound on the registry — same as 
 run), and a cwd shared by several Claude windows makes "newest transcript in this cwd" ambiguous.
 Resolution order per window:
 
+0. **Claude's own record** — the `~/.claude*/sessions/<pid>.json` of a process in the
+   window's tree (`claude_sessions::session_in_tree`). The only source that follows
+   **`/clear`**: the process keeps its pid and its argv, so a window launched
+   `--resume A` still advertises `A` after `/clear` moved it to `B`. Ranked below argv,
+   that froze `A` (a light-mode conversation) for a window running `B` (Thorsten Ball),
+   and thawing brought back the wrong one. Ambiguous (two records in one tree) → skipped.
 1. **Hook id** — pane-bound `state.json` entry (authoritative when present).
-2. **`claude --resume <id>` from process argv** — pruning-proof and per-window exact. Read via
+2. **`claude --resume <id>` from process argv** — pruning-proof, but it is the LAUNCH id
+   and goes stale on `/clear`; hence below the record. Read via
    `process::build_cmdline_map()` (`ps -axww`), because **sysinfo's `cmd()` is empty for claude
    on macOS** — which is also why `is_claude_process` falls back to the version-string process
    *name*. Validated against an on-disk transcript. Covers every hive thaw/reopen (they launch
