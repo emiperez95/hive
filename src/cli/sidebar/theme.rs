@@ -36,6 +36,9 @@ pub(crate) struct Theme {
     pub idle: Color,
     pub busy: Color,
     pub attention: Color,
+    /// Whether the background these were mixed from is dark — so a caller
+    /// can tell a stale read (the old theme) from the one it expects.
+    pub dark: bool,
 }
 
 /// What the terminal said about its theme.
@@ -78,6 +81,7 @@ impl Theme {
             idle: Color::Green,
             busy: Color::Red,
             attention: Color::Yellow,
+            dark,
         }
     }
 }
@@ -205,5 +209,7 @@ mod tests {
         // Text is the terminal's, so a theme change moves it with everything else.
         assert_eq!(light.text, Color::Reset);
         assert_eq!(light.idle, Color::Green);
+        assert!(!light.dark);
+        assert!(Theme::default().dark, "an unanswered query reads as dark");
     }
 }

@@ -279,6 +279,12 @@ pub(crate) struct App {
     /// (tests, which have no terminal to ask).
     os_dark: Option<bool>,
     os_dark_at: Option<Instant>,
+    /// Re-reads left while the theme disagrees with the OS after a flip.
+    theme_retries: u8,
+    /// Drop ratatui's buffer before the next draw: something wrote to the
+    /// terminal outside it (OSC theme queries) or the terminal may have lost
+    /// cells (focus), and its diff would otherwise never repaint them.
+    repaint: bool,
 
     frozen_at: Option<Instant>,
     projects_at: Option<Instant>,
@@ -363,6 +369,11 @@ pub fn run_sidebar(split: bool, fit: bool) -> Result<()> {
         fit_width();
     }
     let mut app = App::new(api);
+    // A first read that came back as the wrong mode (no answer in time reads
+    // as dark) gets the same retries as a flip.
+    if palette.dark != os_dark {
+        app.theme_retries = 20;
+    }
     app.theme = palette;
     app.os_dark = Some(os_dark);
     let result = app.run(&mut term, &rx);
@@ -456,6 +467,8 @@ impl App {
             theme: theme::Theme::default(),
             os_dark: None,
             os_dark_at: None,
+            theme_retries: 0,
+            repaint: false,
             drag: None,
             frozen_at: None,
             projects_at: None,
@@ -476,6 +489,9 @@ impl App {
             }
             dirty |= self.tick();
             if dirty {
+                if std::mem::take(&mut self.repaint) {
+                    term.clear()?;
+                }
                 term.draw(|f| self.draw(f))?;
                 dirty = false;
             }
@@ -664,14 +680,32 @@ impl App {
             self.api.fetch_frozen();
         }
         // Light/dark switch: Ghostty recolours itself, the palette has to follow.
+        // The OS flag flips before Ghostty has swapped themes, so one read at
+        // the flip can still get the old background — and the dark cards then
+        // stuck under light text for good. Keep re-reading (1s apart, ~20s at
+        // most) until the background agrees with the OS; the cap is for a
+        // terminal theme that is fixed dark or light regardless of the OS.
         if let Some(was) = self.os_dark {
-            if stale(self.os_dark_at, 3) {
+            let every = if self.theme_retries > 0 { 1 } else { 3 };
+            if stale(self.os_dark_at, every) {
                 self.os_dark_at = Some(Instant::now());
                 let now = theme::os_dark();
                 if now != was {
                     self.os_dark = Some(now);
-                    self.theme = theme::detect();
+                    self.theme_retries = 20;
+                }
+                if self.theme_retries > 0 {
+                    self.theme_retries -= 1;
+                    let fresh = theme::detect();
+                    if fresh.dark == now {
+                        self.theme_retries = 0;
+                    }
+                    // The OSC round-trip writes to the tty behind ratatui's back.
+                    self.repaint = true;
                     changed = true;
+                    if fresh != self.theme {
+                        self.theme = fresh;
+                    }
                 }
             }
         }
@@ -1058,7 +1092,10 @@ impl App {
                 }
                 _ => return false,
             },
-            Event::FocusGained => self.on_focus_gained(),
+            Event::FocusGained => {
+                self.repaint = true;
+                self.on_focus_gained()
+            }
             Event::Resize(..) => {}
             _ => return false,
         }
