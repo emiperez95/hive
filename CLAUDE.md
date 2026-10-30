@@ -143,9 +143,6 @@ The rule is **nothing that exists only here is removed** (`common/prune.rs`):
 > `logs/HEAD`), and inspection runs with `GIT_OPTIONAL_LOCKS=0`. A plain `git status` refreshes
 > the index and would reset the clock it is reading.
 
-## Worktree creation switches you into it
-
-`hive wt new` ends by switching the tmux client to the session it just made — creating a
 ## `hive wt new` branches from a fresh base
 
 A new branch used to start from whatever the local base branch happened to be, so a stale
@@ -174,6 +171,9 @@ runs git in a directory taken from a transcript's cwd, so its `.git/config` is u
 `GIT_OPTIONAL_LOCKS=0`); a test plants an fsmonitor script and asserts it never runs. New git
 probes should go through it. `run_capped` is the timeout runner for anything touching a remote.
 
+## Worktree creation switches you into it
+
+`hive wt new` ends by switching the tmux client to the session it just made — creating a
 worktree is choosing to work there, the same as `hive connect` or any TUI "start work
 here" action, and it's usually run *from another Claude window* (the janus agent), where
 being left behind in the window you asked from is the wrong place to be. `run_wt_new`
