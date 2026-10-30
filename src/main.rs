@@ -58,6 +58,24 @@ fn main() -> Result<()> {
             switch,
             directive: (!directive.is_empty()).then(|| directive.join(" ")),
         }),
+        Some(Command::Stage {
+            stage,
+            freeze,
+            id,
+            now,
+            reason,
+        }) => cli::stage::run_stage(
+            &stage,
+            (!reason.is_empty()).then(|| reason.join(" ")),
+            freeze,
+            id,
+            now,
+        ),
+        Some(Command::Freeze { id, now, note }) => {
+            cli::stage::run_freeze((!note.is_empty()).then(|| note.join(" ")), id, now)
+        }
+        Some(Command::Close { id, now }) => cli::stage::run_close(id, now),
+        Some(Command::WaitTurn { pid, timeout }) => cli::stage::run_wait_turn(pid, timeout),
         Some(Command::Project { command }) => match *command {
             cmd @ ProjectCommand::Add { .. } => cli::project::run_project_add(cmd),
             ProjectCommand::Remove { key } => cli::project::run_project_remove(&key),

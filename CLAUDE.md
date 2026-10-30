@@ -83,6 +83,9 @@ hive wt new <project> <branch> --no-switch  # …and stay where you are
 hive fork [-- <directive>]                  # split the conversation running this in two: fork in a new window beside it
 hive fork --wt <branch> [-- <directive>]    # …into a NEW worktree branched off the source's checked-out branch
 hive fork --to <project|project/branch>     # …into a registered project / worktree   (--switch: land in the fork)
+hive stage <todo|planning|in-progress|blocked|done> [--freeze] [-- reason]  # move the conversation running this on the board
+hive freeze [-- note]                       # freeze the conversation running this — once its turn ends
+hive close                                  # close the conversation running this — once its turn ends (all three take --id / --now)
 hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
 hive wt prune [project] # remove leftover Workflow agent worktrees + worktree-wf_* / wf/* branches (plan, then y/N)
@@ -233,6 +236,31 @@ measured, and what it shapes:
   (`hive wt new --no-startup`), so there's no empty window beside it.
 - **Default is to stay** (`--switch` opts in): splitting means the original carries on where
   you are. The TUI's `F` does land in the fork — there the TUI was going to exit anyway.
+
+## Acting on yourself — `hive stage` / `freeze` / `close` (`/hive:stage`, `/hive:freeze`, `/hive:close`)
+
+The board's actions, from inside the conversation (or on another with `--id`, which also
+takes the 8-char short id). The conversation is found the way `hive fork` finds it
+(`running_conversation_id`: `$CLAUDE_PID`'s record, which follows `/clear`). `stage`
+writes the overlay directly, so none of this needs the web server. Claude runs these when
+you ask — moving cards stays a human decision (see **Board**).
+
+**Freeze and close are deferred when they target the conversation running them.** An
+immediate kill cuts the reply off and leaves the transcript ending on an unfinished
+`hive freeze` call, which a thawed Claude reasonably retries — freezing itself again (the
+same trap as fork's `mid_turn`). Instead the command queues
+`hive wait-turn <pid> && hive freeze --now --id <id>` with **`tmux run-shell -b`** and
+returns "will freeze when this turn ends"; the reply finishes, the transcript ends on a
+successful call, then the window goes. Measured in an isolated tmux server: a
+`run-shell -b` job **survives killing the window it came from**, and its `$TMUX` names
+the server it came from, so the deferred `--now` acts on the right one. Output lands in
+`~/.hive/cache/after-turn.log`, since there's no window left to show it.
+
+`wait-turn` (hidden) polls Claude's `sessions/<pid>.json`: done at `idle` or `shell`,
+never at `waiting` (a prompt is mid-turn). A record that already reads idle when the
+waiter starts is only believed after 5s — the waiter is launched mid-turn, so the honest
+first reading is `busy`. A vanished process or the 30-min timeout exits non-zero, and the
+`&&` means nothing is killed — the safe direction.
 
 ## Janus WT Portal
 

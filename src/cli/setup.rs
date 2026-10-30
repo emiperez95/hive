@@ -16,6 +16,18 @@ const BUNDLED_COMMANDS: &[(&str, &str)] = &[
         "fork.md",
         include_str!("../../.claude/commands/hive/fork.md"),
     ),
+    (
+        "stage.md",
+        include_str!("../../.claude/commands/hive/stage.md"),
+    ),
+    (
+        "freeze.md",
+        include_str!("../../.claude/commands/hive/freeze.md"),
+    ),
+    (
+        "close.md",
+        include_str!("../../.claude/commands/hive/close.md"),
+    ),
 ];
 
 fn commands_dir(home: &std::path::Path) -> std::path::PathBuf {

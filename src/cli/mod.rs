@@ -10,6 +10,7 @@ pub mod project;
 pub mod session;
 pub mod setup;
 pub mod sidebar;
+pub mod stage;
 pub mod stats;
 pub mod todo;
 pub mod update;
@@ -167,6 +168,56 @@ pub enum Command {
         /// What the fork should do — sent as its first message
         #[arg(trailing_var_arg = true)]
         directive: Vec<String>,
+    },
+    /// Move a conversation on the board (`/board`): todo, planning, in-progress,
+    /// blocked or done. Run from inside Claude (`/hive:stage`) it moves the
+    /// conversation running it.
+    Stage {
+        /// todo | planning | in-progress | blocked | done
+        stage: String,
+        /// Also freeze the window — at the end of this turn when run from inside it
+        #[arg(long)]
+        freeze: bool,
+        /// Conversation to move (default: the Claude conversation running this command)
+        #[arg(long)]
+        id: Option<String>,
+        /// Freeze right away instead of at the end of the turn
+        #[arg(long, requires = "freeze")]
+        now: bool,
+        /// What it's blocked on (kept only for `blocked`)
+        #[arg(trailing_var_arg = true)]
+        reason: Vec<String>,
+    },
+    /// Freeze a conversation's window: close it, keeping the conversation to thaw
+    /// later. From inside Claude (`/hive:freeze`) it waits for the turn to end.
+    Freeze {
+        /// Conversation to freeze (default: the Claude conversation running this command)
+        #[arg(long)]
+        id: Option<String>,
+        /// Act right away — from inside, this cuts the reply off
+        #[arg(long)]
+        now: bool,
+        /// Why it's parked — shown on its frozen card
+        #[arg(trailing_var_arg = true)]
+        note: Vec<String>,
+    },
+    /// Close a conversation's window. The transcript stays on disk and it can be
+    /// resumed. From inside Claude (`/hive:close`) it waits for the turn to end.
+    Close {
+        /// Conversation to close (default: the Claude conversation running this command)
+        #[arg(long)]
+        id: Option<String>,
+        /// Act right away — from inside, this cuts the reply off
+        #[arg(long)]
+        now: bool,
+    },
+    /// Block until Claude process <pid> ends its turn (used by deferred freeze/close)
+    #[command(hide = true)]
+    WaitTurn {
+        pid: u32,
+        /// Give up after this many seconds (default 1800)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Show usage stats from the activity log
     Stats {

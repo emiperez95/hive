@@ -159,6 +159,53 @@ fn fork_outside_a_conversation_says_how_to_name_one() {
 }
 
 #[test]
+fn stage_freeze_close_help_list_their_flags() {
+    for (cmd, flags) in [
+        ("stage", &["--freeze", "--id", "--now"][..]),
+        ("freeze", &["--id", "--now"][..]),
+        ("close", &["--id", "--now"][..]),
+    ] {
+        let output = hive_cmd().args([cmd, "--help"]).output().unwrap();
+        assert!(output.status.success(), "{cmd} --help failed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for flag in flags {
+            assert!(stdout.contains(flag), "Missing {cmd} flag '{flag}'");
+        }
+    }
+}
+
+/// Outside a conversation there's no "me" to act on: each says how to name one
+/// instead of guessing — and never reaches tmux.
+#[test]
+fn stage_freeze_close_outside_a_conversation_point_at_id() {
+    for args in [&["stage", "done"][..], &["freeze"][..], &["close"][..]] {
+        let output = hive_cmd()
+            .args(args)
+            .env_remove("CLAUDE_PID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--id"),
+            "unhelpful error for {args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn stage_rejects_an_unknown_stage_before_touching_anything() {
+    let output = hive_cmd()
+        .args(["stage", "unsorted", "--id", "x"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown stage"), "{stderr}");
+}
+
+#[test]
 fn todo_help_exits_zero() {
     let output = hive_cmd().args(["todo", "--help"]).output().unwrap();
     assert!(output.status.success());
