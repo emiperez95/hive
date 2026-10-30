@@ -237,6 +237,29 @@ pub struct ConversationOverlay {
     /// keeps no link back — a fork is a copy under a new id — so hive records it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// Where this conversation's WORK stands on the board (`/board`), set by hand.
+    /// Distinct from `status`, which is what the Claude process is doing right now:
+    /// an idle conversation may be done, blocked on someone else, or not started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<Stage>,
+    /// When `stage` was last set (RFC3339) — the card's "in this column for 3d".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_at: Option<String>,
+    /// What it's blocked on. Asked for when a card moves to Blocked, cleared on
+    /// any other move so a stale reason never follows the card around.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_note: Option<String>,
+}
+
+/// A board column. Unset (`None` on the overlay) is the Unsorted column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Todo,
+    Planning,
+    InProgress,
+    Blocked,
+    Done,
 }
 
 impl ConversationSidecar {
@@ -839,6 +862,7 @@ mod tests {
                 parent: Some("hive/CSD-1".to_string()),
                 frozen_at: Some("2026-07-01T00:00:00Z".to_string()),
                 notes: "line one\nline two".to_string(),
+                ..Default::default()
             },
         );
         let json = serde_json::to_string(&sc).unwrap();
@@ -999,6 +1023,7 @@ mod tests {
             parent: parent.map(|s| s.to_string()),
             frozen_at: None,
             notes: String::new(),
+            ..Default::default()
         }
     }
 

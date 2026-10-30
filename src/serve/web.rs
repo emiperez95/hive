@@ -151,10 +151,18 @@ pub fn ensure_web_autostart() {
 
 /// Embedded HTML frontend, included at compile time.
 const WEB_HTML: &str = include_str!("web.html");
+/// The board (`/board`) — its own page rather than a mode of `web.html`, which is
+/// built mobile-first for the phone and the 280px sidebar; a board is wide.
+const BOARD_HTML: &str = include_str!("board.html");
 
 /// In dev mode, re-read web.html from disk on every request.
 /// Falls back to the embedded version if the file isn't found.
 fn get_html(dev_path: &Option<PathBuf>) -> String {
+    get_page(dev_path, WEB_HTML)
+}
+
+/// `get_html` for any embedded page: in dev mode `dev_path` names it on disk.
+fn get_page(dev_path: &Option<PathBuf>, embedded: &str) -> String {
     if let Some(path) = dev_path {
         match std::fs::read_to_string(path) {
             Ok(contents) => return contents,
@@ -167,7 +175,7 @@ fn get_html(dev_path: &Option<PathBuf>) -> String {
             }
         }
     }
-    WEB_HTML.to_string()
+    embedded.to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +328,64 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
                 let response = Response::from_string(html).with_header(header);
                 let _ = request.respond(response);
+            }
+
+            (Method::Get, _) if path == "/board" => {
+                let dev_board = dev_path.as_ref().map(|p| p.with_file_name("board.html"));
+                let html = get_page(&dev_board, BOARD_HTML);
+                let header =
+                    Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
+                let _ = request.respond(Response::from_string(html).with_header(header));
+            }
+
+            // The board's cards: the data thread's two projections joined with the
+            // overlay, read here rather than in the thread so a move shows at once.
+            (Method::Get, "/api/board") => {
+                let active = shared_active.lock().map(|d| d.clone()).unwrap_or_default();
+                let convs = shared_conversations
+                    .lock()
+                    .map(|d| d.clone())
+                    .unwrap_or_default();
+                let sidecar = crate::common::registry::ConversationSidecar::load();
+                let cards = crate::serve::server::build_board(&convs, &active, &sidecar);
+                let json = serde_json::to_string(&cards).unwrap_or_else(|_| "[]".to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // Move a card: `{"id", "stage": "todo"|…|null, "note"?}`. `null` puts it
+            // back in Unsorted. The note is kept only for Blocked.
+            (Method::Post, "/api/stage") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    use crate::common::registry::{ConversationSidecar, Stage};
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let id = req.get("id")?.as_str()?.to_string();
+                    let stage: Option<Stage> =
+                        serde_json::from_value(req.get("stage")?.clone()).ok()?;
+                    // Only for a conversation on the board — same reason as conv-notes:
+                    // a LAN-reachable endpoint shouldn't mint records in the overlay.
+                    let on_board = shared_conversations.lock().ok()?.iter().any(|c| c.id == id);
+                    if !on_board {
+                        return None;
+                    }
+                    let note = req
+                        .get("note")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let ok = ConversationSidecar::edit(&id, |o| {
+                        o.stage = stage;
+                        o.stage_at = stage.map(|_| chrono::Utc::now().to_rfc3339());
+                        o.stage_note = note.filter(|_| stage == Some(Stage::Blocked));
+                    })
+                    .is_ok();
+                    Some(format!(r#"{{"ok":{ok}}}"#))
+                })()
+                .unwrap_or_else(|| r#"{"error":"invalid request"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
             (Method::Get, "/metrics") => {

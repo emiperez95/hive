@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hive Board</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --lane: #ebecf0;
+    --col: #f0f1f4;
+    --card: #ffffff;
+    --card-hover: #fafbfc;
+    --text: #172b4d;
+    --muted: #5e6c84;
+    --faint: #8993a4;
+    --line: #dfe1e6;
+    --shadow: 0 1px 1px rgba(9,30,66,.18), 0 0 1px rgba(9,30,66,.25);
+    --shadow-lift: 0 8px 16px -4px rgba(9,30,66,.25), 0 0 1px rgba(9,30,66,.3);
+    --accent: #0c66e4;
+    --drop: rgba(12,102,228,.08);
+
+    --s-unsorted: #8993a4;
+    --s-todo: #6b778c;
+    --s-planning: #8f7ee7;
+    --s-in_progress: #0c66e4;
+    --s-blocked: #c9372c;
+    --s-done: #1f845a;
+
+    --rt-working: #0c66e4;
+    --rt-idle: #1f845a;
+    --rt-needs: #c9372c;
+    --rt-flow: #8f7ee7;
+    --rt-off: #a5adba;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1d2125;
+      --lane: #22272b;
+      --col: #282e33;
+      --card: #313840;
+      --card-hover: #38414a;
+      --text: #dee4ea;
+      --muted: #9fadbc;
+      --faint: #738496;
+      --line: #3b444c;
+      --shadow: 0 1px 1px rgba(0,0,0,.4), 0 0 1px rgba(0,0,0,.5);
+      --shadow-lift: 0 8px 16px -4px rgba(0,0,0,.55), 0 0 1px rgba(0,0,0,.6);
+      --accent: #579dff;
+      --drop: rgba(87,157,255,.12);
+      --s-unsorted: #738496;
+      --s-todo: #8c9bab;
+      --s-planning: #9f8fef;
+      --s-in_progress: #579dff;
+      --s-blocked: #f87168;
+      --s-done: #4bce97;
+      --rt-working: #579dff;
+      --rt-idle: #4bce97;
+      --rt-needs: #f87168;
+      --rt-flow: #9f8fef;
+      --rt-off: #596773;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #1d2125; --lane: #22272b; --col: #282e33; --card: #313840; --card-hover: #38414a;
+    --text: #dee4ea; --muted: #9fadbc; --faint: #738496; --line: #3b444c;
+    --shadow: 0 1px 1px rgba(0,0,0,.4), 0 0 1px rgba(0,0,0,.5);
+    --shadow-lift: 0 8px 16px -4px rgba(0,0,0,.55), 0 0 1px rgba(0,0,0,.6);
+    --accent: #579dff; --drop: rgba(87,157,255,.12);
+    --s-unsorted: #738496; --s-todo: #8c9bab; --s-planning: #9f8fef; --s-in_progress: #579dff;
+    --s-blocked: #f87168; --s-done: #4bce97;
+    --rt-working: #579dff; --rt-idle: #4bce97; --rt-needs: #f87168; --rt-flow: #9f8fef; --rt-off: #596773;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+  /* ---- top bar ---- */
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 16px; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
+  h1 span { color: var(--faint); font-weight: 500; }
+  .strip { display: flex; gap: 6px; flex-wrap: wrap; }
+  .strip .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; color: var(--muted);
+    padding: 3px 9px; border-radius: 999px; background: var(--col);
+  }
+  .strip .pill i { width: 8px; height: 8px; border-radius: 50%; display: block; }
+  .strip .pill b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .spacer { flex: 1; }
+  .seg { display: inline-flex; background: var(--col); border-radius: 6px; padding: 2px; }
+  .seg button {
+    border: 0; background: none; color: var(--muted); font: inherit; font-size: 12px; font-weight: 600;
+    padding: 4px 10px; border-radius: 4px; cursor: pointer;
+  }
+  .seg button.on { background: var(--card); color: var(--text); box-shadow: var(--shadow); }
+  .seg-label { font-size: 12px; color: var(--faint); margin-right: 6px; }
+  input.search {
+    font: inherit; font-size: 13px; color: var(--text);
+    background: var(--col); border: 1px solid transparent; border-radius: 6px;
+    padding: 5px 10px; width: 180px; outline: none;
+  }
+  input.search:focus { border-color: var(--accent); background: var(--card); }
+
+  /* ---- board ---- */
+  main { flex: 1; overflow: auto; padding: 12px 16px 24px; }
+  .board { min-width: 1080px; }
+  .cols, .lane-cells {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(170px, 1fr));
+    gap: 10px;
+  }
+  .colhead {
+    position: sticky; top: -12px; z-index: 2;
+    background: var(--bg);
+    padding: 12px 4px 8px;
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  }
+  .colhead i { width: 10px; height: 3px; border-radius: 2px; display: block; }
+  .colhead .n { color: var(--faint); font-weight: 600; }
+
+  .lane { margin-top: 10px; }
+  .lane-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 4px; cursor: pointer; user-select: none;
+    font-weight: 600; font-size: 13px;
+  }
+  .lane-head .caret { color: var(--faint); width: 12px; transition: transform .12s; }
+  .lane.folded .caret { transform: rotate(-90deg); }
+  .lane-head .n { color: var(--faint); font-weight: 500; font-size: 12px; }
+  .lane-head .mini { display: flex; gap: 8px; margin-left: 6px; font-size: 11px; font-weight: 600; color: var(--muted); }
+  .lane-head .mini span { display: inline-flex; align-items: center; gap: 4px; }
+  .lane-head .mini i { width: 6px; height: 6px; border-radius: 50%; display: block; }
+  .lane.folded .lane-cells { display: none; }
+
+  .cell {
+    background: var(--col);
+    border-radius: 8px;
+    padding: 6px;
+    min-height: 64px;
+    display: flex; flex-direction: column; gap: 6px;
+    transition: background .1s, box-shadow .1s;
+  }
+  .no-lanes .cell { min-height: calc(100vh - 150px); }
+  .cell.over { background: var(--drop); box-shadow: inset 0 0 0 2px var(--accent); }
+  .cell .empty { color: var(--faint); font-size: 12px; text-align: center; padding: 14px 0; }
+
+  /* ---- card ---- */
+  .card {
+    position: relative;
+    background: var(--card);
+    border-radius: 6px;
+    box-shadow: var(--shadow);
+    padding: 8px 10px 8px 12px;
+    cursor: grab;
+    flex-shrink: 0;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .card::before {
+    content: ''; position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px;
+    border-radius: 0 2px 2px 0; background: var(--stage);
+  }
+  .card:hover { background: var(--card-hover); }
+  .card.dragging { opacity: .4; }
+  .card.frozen { opacity: .78; }
+  .card.next { box-shadow: var(--shadow), 0 0 0 2px var(--accent); }
+  .card .top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .card .place {
+    flex: 1; min-width: 0; font-size: 11px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .rt {
+    display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+    font-size: 11px; font-weight: 600; color: var(--rt);
+  }
+  .rt i { width: 7px; height: 7px; border-radius: 50%; background: var(--rt); display: block; }
+  .rt.pulse i { animation: pulse 1.6s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--rt) 60%, transparent); }
+    70% { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+  .card .title {
+    font-size: 13px; font-weight: 500; line-height: 1.35;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+    word-break: break-word;
+  }
+  .card .title.untitled { color: var(--faint); font-style: italic; }
+  .card .reason {
+    font-size: 12px; color: var(--s-blocked); background: color-mix(in srgb, var(--s-blocked) 10%, transparent);
+    border-radius: 4px; padding: 3px 6px; line-height: 1.35;
+  }
+  .card .note { font-size: 12px; color: var(--muted); line-height: 1.35; }
+  .card .foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; color: var(--faint); }
+  .tag {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+    padding: 1px 5px; border-radius: 3px; background: var(--col); color: var(--muted);
+  }
+  .tag.next { background: var(--accent); color: #fff; }
+  .foot .age { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .card button.thaw {
+    font: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--line); background: var(--card); color: var(--text);
+    border-radius: 4px; padding: 2px 8px;
+  }
+  .card button.thaw:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---- blocked-reason dialog ---- */
+  .scrim {
+    position: fixed; inset: 0; background: rgba(9,30,66,.45);
+    display: none; align-items: center; justify-content: center; z-index: 10; padding: 16px;
+  }
+  .scrim.open { display: flex; }
+  .dialog {
+    background: var(--card); color: var(--text); border-radius: 8px; box-shadow: var(--shadow-lift);
+    width: 100%; max-width: 420px; padding: 16px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .dialog h2 { font-size: 15px; }
+  .dialog p { font-size: 12px; color: var(--muted); }
+  .dialog input {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 10px; outline: none;
+  }
+  .dialog input:focus { border-color: var(--accent); }
+  .dialog .row { display: flex; justify-content: flex-end; gap: 8px; }
+  .dialog button {
+    font: inherit; font-size: 13px; font-weight: 600; border-radius: 6px; padding: 6px 12px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--card); color: var(--text);
+  }
+  .dialog button.primary { background: var(--s-blocked); border-color: var(--s-blocked); color: #fff; }
+
+  .toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: var(--bg); font-size: 13px; padding: 8px 14px; border-radius: 6px;
+    opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .offline { color: var(--s-blocked); font-size: 12px; font-weight: 600; }
+
+  @media (max-width: 700px) {
+    header { padding: 10px 16px; }
+    input.search { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐝 hive <span>board</span></h1>
+  <div class="strip" id="strip"></div>
+  <span class="offline" id="offline" hidden>offline</span>
+  <div class="spacer"></div>
+  <input class="search" id="search" placeholder="Filter…" autocomplete="off">
+  <div>
+    <span class="seg-label">Lanes</span>
+    <div class="seg" id="lanes">
+      <button data-v="none">None</button>
+      <button data-v="project">Project</button>
+      <button data-v="env">Env</button>
+    </div>
+  </div>
+</header>
+<main><div class="board" id="board"></div></main>
+
+<div class="scrim" id="scrim">
+  <form class="dialog" id="dialog">
+    <h2>Blocked on what?</h2>
+    <p id="dialogFor"></p>
+    <input id="reason" placeholder="e.g. waiting on staging creds" autocomplete="off">
+    <div class="row">
+      <button type="button" id="cancel">Cancel</button>
+      <button type="submit" class="primary">Move to Blocked</button>
+    </div>
+  </form>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const STAGES = [
+  { key: null,          label: 'Unsorted' },
+  { key: 'todo',        label: 'Todo' },
+  { key: 'planning',    label: 'Planning' },
+  { key: 'in_progress', label: 'In progress' },
+  { key: 'blocked',     label: 'Blocked' },
+  { key: 'done',        label: 'Done' },
+];
+const stageVar = k => `var(--s-${k || 'unsorted'})`;
+
+// Per-viewer conveniences only; the page works without storage.
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('hiveBoard:' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('hiveBoard:' + k, JSON.stringify(v)); } catch {} },
+};
+// `?lanes=project|env|none` wins, so a lane view can be bookmarked.
+let laneMode = new URLSearchParams(location.search).get('lanes') || store.get('lanes', 'none');
+let folded = new Set(store.get('folded', []));
+let cards = [];
+let lastJson = '';
+let dragging = null;
+let query = '';
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// What Claude is doing right now — separate from the stage you set.
+function runtime(c) {
+  if (c.kind === 'frozen') return { label: 'frozen', v: '--rt-off' };
+  const st = c.status;
+  if (c.attention === 0) return { label: 'needs you', v: '--rt-needs' };
+  if (st && st.RunningWorkflow) return { label: 'flow', v: '--rt-flow' };
+  if (st === 'Working') return { label: 'working', v: '--rt-working' };
+  if (c.attention === 1) return { label: 'review', v: '--rt-idle' };
+  return { label: 'idle', v: '--rt-idle' };
+}
+
+function ago(secs) {
+  if (secs == null || secs < 0) return '';
+  if (secs < 60) return 'now';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h';
+  return Math.floor(secs / 86400) + 'd';
+}
+const since = iso => iso ? (Date.now() - Date.parse(iso)) / 1000 : null;
+
+function placeLabel(c) {
+  const p = c.parent || c.project_key || '';
+  const [proj, ...rest] = p.split('/');
+  const branch = rest.join('/');
+  return `${c.emoji ? c.emoji + ' ' : ''}${proj || 'unassigned'}${branch ? ' / ' + branch : ''}`;
+}
+
+function laneOf(c) {
+  if (laneMode === 'project') {
+    const k = c.project_key || (c.parent || '').split('/')[0] || '';
+    return { key: 'p:' + k, label: (c.emoji ? c.emoji + ' ' : '') + (k || '(unassigned)') };
+  }
+  if (laneMode === 'env') {
+    const p = c.auth_profile || 'default';
+    return { key: 'e:' + p, label: p };
+  }
+  return { key: 'all', label: '' };
+}
+
+function matches(c) {
+  if (!query) return true;
+  const hay = [c.title, c.parent, c.project_key, c.auth_profile, c.note, c.stage_note, c.frozen_note, c.short_id]
+    .filter(Boolean).join(' ').toLowerCase();
+  return query.split(/\s+/).every(t => hay.includes(t));
+}
+
+function cardHtml(c, nextId) {
+  const rt = runtime(c);
+  const stageAge = c.stage_at ? ago(since(c.stage_at)) : '';
+  const tags = [];
+  if (c.id === nextId) tags.push('<span class="tag next">next</span>');
+  if (c.kind === 'frozen') tags.push('<span class="tag">💤 frozen</span>');
+  if (c.kind === 'skipped') tags.push('<span class="tag">skipped</span>');
+  if (c.auth_profile) tags.push(`<span class="tag">${esc(c.auth_profile)}</span>`);
+  const note = c.frozen_note || c.note;
+  return `<div class="card ${c.kind === 'frozen' ? 'frozen' : ''} ${c.id === nextId ? 'next' : ''}"
+      draggable="true" data-id="${esc(c.id)}" style="--stage:${stageVar(c.stage)}">
+    <div class="top">
+      <span class="place" title="${esc(c.parent || '')}">${esc(placeLabel(c))}</span>
+      <span class="rt ${c.unseen ? 'pulse' : ''}" style="--rt:var(${rt.v})"><i></i>${rt.label}</span>
+    </div>
+    <div class="title ${c.title ? '' : 'untitled'}">${esc(c.title || '(untitled)')}</div>
+    ${c.stage === 'blocked' && c.stage_note ? `<div class="reason">⛔ ${esc(c.stage_note)}</div>` : ''}
+    ${note ? `<div class="note">📝 ${esc(note)}</div>` : ''}
+    <div class="foot">
+      ${tags.join('')}
+      <span class="mono">${esc(c.short_id)}</span>
+      ${c.kind === 'frozen' ? '<button class="thaw" data-thaw>Thaw</button>' : ''}
+      <span class="age" title="${c.stage_at ? 'in this column since ' + esc(c.stage_at) : ''}">${stageAge}</span>
+    </div>
+  </div>`;
+}
+
+function cellHtml(list, stageKey, nextId) {
+  return `<div class="cell" data-stage="${stageKey ?? ''}">
+    ${list.length ? list.map(c => cardHtml(c, nextId)).join('') : '<div class="empty">—</div>'}
+  </div>`;
+}
+
+function render() {
+  const visible = cards.filter(matches);
+  const byStage = k => visible.filter(c => (c.stage ?? null) === k);
+
+  // The one card to pick up next: highest in the attention order that isn't
+  // finished. Cards arrive in that order, so it's the first match.
+  const next = visible.find(c => c.stage !== 'done' && c.attention_rank != null && c.attention <= 1);
+  const nextId = next ? next.id : null;
+
+  document.getElementById('strip').innerHTML = STAGES.map(s =>
+    `<span class="pill"><i style="background:${stageVar(s.key)}"></i>${s.label} <b>${byStage(s.key).length}</b></span>`
+  ).join('');
+
+  const heads = `<div class="cols">${STAGES.map(s =>
+    `<div class="colhead"><i style="background:${stageVar(s.key)}"></i>${s.label}<span class="n">${byStage(s.key).length}</span></div>`
+  ).join('')}</div>`;
+
+  let body;
+  if (laneMode === 'none') {
+    body = `<div class="lane-cells">${STAGES.map(s => cellHtml(byStage(s.key), s.key, nextId)).join('')}</div>`;
+  } else {
+    const lanes = new Map();
+    for (const c of visible) {
+      const l = laneOf(c);
+      if (!lanes.has(l.key)) lanes.set(l.key, { ...l, cards: [] });
+      lanes.get(l.key).cards.push(c);
+    }
+    // Lanes with open work first, then by size, then by name.
+    const open = l => l.cards.filter(c => c.stage !== 'done').length;
+    const sorted = [...lanes.values()].sort((a, b) =>
+      open(b) - open(a) || b.cards.length - a.cards.length || a.label.localeCompare(b.label));
+    body = sorted.map(l => {
+      // Per-stage counts, only the non-empty ones — readable even when folded.
+      const mini = STAGES.map(s => {
+        const n = l.cards.filter(c => (c.stage ?? null) === s.key).length;
+        return n ? `<span title="${s.label}"><i style="background:${stageVar(s.key)}"></i>${n}</span>` : '';
+      }).join('');
+      return `<section class="lane ${folded.has(l.key) ? 'folded' : ''}" data-lane="${esc(l.key)}">
+        <div class="lane-head"><span class="caret">▾</span>${esc(l.label)}<span class="n">${l.cards.length}</span><span class="mini">${mini}</span></div>
+        <div class="lane-cells">${STAGES.map(s =>
+          cellHtml(l.cards.filter(c => (c.stage ?? null) === s.key), s.key, nextId)).join('')}</div>
+      </section>`;
+    }).join('') || '<div class="empty" style="padding:40px;text-align:center;color:var(--faint)">No conversations</div>';
+  }
+
+  const board = document.getElementById('board');
+  board.className = 'board ' + (laneMode === 'none' ? 'no-lanes' : '');
+  const scroll = document.querySelector('main').scrollTop;
+  board.innerHTML = heads + body;
+  document.querySelector('main').scrollTop = scroll;
+
+  document.querySelectorAll('#lanes button').forEach(b => b.classList.toggle('on', b.dataset.v === laneMode));
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/board');
+    const text = await r.text();
+    document.getElementById('offline').hidden = true;
+    if (text === lastJson || dragging) return;
+    lastJson = text;
+    cards = JSON.parse(text);
+    render();
+  } catch {
+    document.getElementById('offline').hidden = false;
+  }
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+async function post(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return r.json().catch(() => ({}));
+}
+
+async function setStage(id, stage, note) {
+  // Optimistic: move it now, the next poll confirms.
+  const c = cards.find(c => c.id === id);
+  if (c) {
+    c.stage = stage || undefined;
+    c.stage_at = stage ? new Date().toISOString() : undefined;
+    c.stage_note = stage === 'blocked' ? note : undefined;
+    render();
+  }
+  const res = await post('/api/stage', { id, stage, note });
+  if (!res.ok) toast(res.error || 'Could not move card');
+  lastJson = '';
+  load();
+}
+
+// ---- blocked reason dialog ----
+let pendingBlock = null;
+function askReason(c) {
+  pendingBlock = c.id;
+  document.getElementById('dialogFor').textContent = c.title || c.short_id;
+  const input = document.getElementById('reason');
+  input.value = c.stage_note || '';
+  document.getElementById('scrim').classList.add('open');
+  input.focus();
+}
+function closeDialog() { pendingBlock = null; document.getElementById('scrim').classList.remove('open'); }
+document.getElementById('dialog').addEventListener('submit', e => {
+  e.preventDefault();
+  const id = pendingBlock;
+  const note = document.getElementById('reason').value;
+  closeDialog();
+  if (id) setStage(id, 'blocked', note);
+});
+document.getElementById('cancel').addEventListener('click', closeDialog);
+document.getElementById('scrim').addEventListener('mousedown', e => { if (e.target.id === 'scrim') closeDialog(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDialog(); });
+
+// ---- drag & drop ----
+const board = document.getElementById('board');
+board.addEventListener('dragstart', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  dragging = card.dataset.id;
+  card.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', dragging);
+});
+board.addEventListener('dragend', e => {
+  e.target.closest('.card')?.classList.remove('dragging');
+  document.querySelectorAll('.cell.over').forEach(c => c.classList.remove('over'));
+  dragging = null;
+});
+board.addEventListener('dragover', e => {
+  const cell = e.target.closest('.cell');
+  if (!cell || !dragging) return;
+  e.preventDefault();
+  document.querySelectorAll('.cell.over').forEach(c => c !== cell && c.classList.remove('over'));
+  cell.classList.add('over');
+});
+board.addEventListener('dragleave', e => {
+  const cell = e.target.closest('.cell');
+  if (cell && !cell.contains(e.relatedTarget)) cell.classList.remove('over');
+});
+board.addEventListener('drop', e => {
+  const cell = e.target.closest('.cell');
+  if (!cell || !dragging) return;
+  e.preventDefault();
+  cell.classList.remove('over');
+  const id = dragging;
+  dragging = null;
+  const stage = cell.dataset.stage || null;
+  const c = cards.find(c => c.id === id);
+  if (!c || (c.stage ?? null) === stage) return;
+  if (stage === 'blocked') askReason(c);
+  else setStage(id, stage);
+});
+
+// ---- click: switch to the window, or thaw ----
+board.addEventListener('click', async e => {
+  const lane = e.target.closest('.lane-head');
+  if (lane) {
+    const key = lane.parentElement.dataset.lane;
+    folded.has(key) ? folded.delete(key) : folded.add(key);
+    store.set('folded', [...folded]);
+    lane.parentElement.classList.toggle('folded');
+    return;
+  }
+  const el = e.target.closest('.card');
+  if (!el) return;
+  const c = cards.find(c => c.id === el.dataset.id);
+  if (!c) return;
+  if (e.target.closest('[data-thaw]')) {
+    toast('Thawing…');
+    const res = await post('/api/thaw', { key: c.id });
+    toast(res.ok ? `Thawed into ${res.session}` : (res.error || 'Thaw failed'));
+    lastJson = '';
+    setTimeout(load, 800);
+    return;
+  }
+  if (!c.placement) { if (c.kind === 'frozen') toast('Frozen — use Thaw to reopen it'); return; }
+  const res = await post('/api/switch', { session: c.placement.session_name, window_index: c.placement.window_index });
+  toast(res.ok ? `Switched to ${c.placement.session_name}` : (res.error || 'Switch failed'));
+});
+
+document.getElementById('lanes').addEventListener('click', e => {
+  const v = e.target.closest('button')?.dataset.v;
+  if (!v) return;
+  laneMode = v;
+  store.set('lanes', v);
+  render();
+});
+document.getElementById('search').addEventListener('input', e => {
+  query = e.target.value.trim().toLowerCase();
+  render();
+});
+
+load();
+setInterval(load, 2000);
+</script>
+</body>
+</html>

@@ -197,6 +197,57 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+/// One card on the board (`/board`, `GET /api/board`): a live, skipped or frozen
+/// conversation plus the stage set on it by hand. Built from the same gather as
+/// `/api/active` — the runtime fields (`status`, `attention`, `unseen`) are what
+/// Claude is doing now, `stage` is where the work stands; the board shows both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardCard {
+    pub id: String,
+    pub short_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// `None` = the Unsorted column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<crate::common::registry::Stage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_note: Option<String>,
+    /// `live` | `skipped` | `frozen`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SessionStatus>,
+    /// Attention tier as in [`WindowView::attention`]; frozen cards report idle.
+    pub attention: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_rank: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unseen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementView>,
+    /// Swimlane keys: project (`project_key`, else the parent, else none) and env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// `.claude-<name>` suffix; `None` = the default `~/.claude`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_relative: Option<String>,
+}
+
 /// Where a live conversation currently runs, for routing send/switch/freeze.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementView {

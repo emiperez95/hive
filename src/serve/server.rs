@@ -14,7 +14,7 @@ use crate::common::registry::{Conversation, ConversationRegistry};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::SessionStatus;
 use crate::serve::web_types::{
-    ConversationView, PlacementView, ProcessView, SessionView, WindowView,
+    BoardCard, ConversationView, PlacementView, ProcessView, SessionView, WindowView,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -99,6 +99,84 @@ pub(crate) fn build_conversation_views(reg: &ConversationRegistry) -> Vec<Conver
             .then_with(|| a.id.cmp(&b.id))
     });
     views
+}
+
+/// The board (`/api/board`): every live, skipped and frozen conversation as a card,
+/// joined with the stage set on it by hand. Pure over the two projections the data
+/// thread already publishes plus the overlay, which the caller loads per request so
+/// a card moved a moment ago is already in its new column.
+///
+/// Order is the attention order (the same one `Ctrl+g` walks), then frozen cards by
+/// recency — the board sorts within a column by this, so "what next" reads top-down.
+pub(crate) fn build_board(
+    convs: &[ConversationView],
+    active: &[SessionView],
+    sidecar: &crate::common::registry::ConversationSidecar,
+) -> Vec<BoardCard> {
+    let mut windows: HashMap<&str, (&WindowView, bool)> = HashMap::new();
+    for s in active {
+        for w in &s.windows {
+            if let Some(id) = &w.session_id {
+                windows.insert(id.as_str(), (w, s.skipped));
+            }
+        }
+    }
+    let mut cards: Vec<BoardCard> = convs
+        .iter()
+        .filter_map(|c| {
+            let win = windows.get(c.id.as_str()).copied();
+            let kind = if c.lifecycle == "live" {
+                if win.is_some_and(|(_, skipped)| skipped) {
+                    "skipped"
+                } else {
+                    "live"
+                }
+            } else if c.frozen {
+                "frozen"
+            } else {
+                return None;
+            };
+            let overlay = sidecar.conversations.get(&c.id);
+            Some(BoardCard {
+                id: c.id.clone(),
+                short_id: c.short_id.clone(),
+                title: c.title.clone(),
+                stage: overlay.and_then(|o| o.stage),
+                stage_at: overlay.and_then(|o| o.stage_at.clone()),
+                stage_note: overlay.and_then(|o| o.stage_note.clone()),
+                kind: kind.to_string(),
+                status: win
+                    .and_then(|(w, _)| w.status.clone())
+                    .or_else(|| c.status.clone()),
+                attention: win.map_or(AttentionTier::Idle as u8, |(w, _)| w.attention),
+                attention_rank: win.and_then(|(w, _)| w.attention_rank),
+                unseen: win.is_some_and(|(w, _)| w.unseen),
+                state_secs: win.and_then(|(w, _)| w.state_secs),
+                last_activity: c.last_activity.clone(),
+                placement: c.placement.clone(),
+                project_key: c.project_key.clone(),
+                parent: c.parent.clone(),
+                emoji: c.emoji.clone(),
+                auth_profile: c.auth_profile.clone(),
+                note: c.note.clone(),
+                frozen_note: c.frozen_note.clone(),
+                frozen_relative: c.frozen_relative.clone(),
+            })
+        })
+        .collect();
+    cards.sort_by(|a, b| {
+        (a.kind == "frozen")
+            .cmp(&(b.kind == "frozen"))
+            .then_with(|| match (a.attention_rank, b.attention_rank) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    cards
 }
 
 /// Project the registry's LIVE conversations into the session-grouped
@@ -691,6 +769,83 @@ mod tests {
             messages: vec![],
             windows,
         }
+    }
+
+    fn conv(id: &str, lifecycle: &str, frozen: bool) -> ConversationView {
+        ConversationView {
+            id: id.into(),
+            short_id: id.chars().take(8).collect(),
+            title: None,
+            cwd: None,
+            lifecycle: lifecycle.into(),
+            status: None,
+            needs_attention: false,
+            last_activity: None,
+            placement: None,
+            parent: None,
+            project_key: None,
+            emoji: String::new(),
+            frozen,
+            frozen_note: None,
+            frozen_relative: None,
+            note: String::new(),
+            pinned: false,
+            archived: false,
+            auth_profile: None,
+            cpu: 0.0,
+            mem_kb: 0,
+            ports: vec![],
+        }
+    }
+
+    #[test]
+    fn board_holds_live_skipped_and_frozen_only() {
+        use crate::common::registry::ConversationSidecar;
+        let convs = vec![
+            conv("live", "live", false),
+            conv("skip", "live", false),
+            conv("ice", "closed", true),
+            conv("gone", "closed", false),
+        ];
+        let active = vec![
+            session("a", false, vec![win("live", None, "")]),
+            session("b", true, vec![win("skip", None, "")]),
+        ];
+        let cards = build_board(&convs, &active, &ConversationSidecar::default());
+        let kinds: Vec<(&str, &str)> = cards
+            .iter()
+            .map(|c| (c.id.as_str(), c.kind.as_str()))
+            .collect();
+        // A plain closed conversation is not on the board; frozen sorts last.
+        assert_eq!(kinds.len(), 3);
+        assert!(kinds.contains(&("live", "live")));
+        assert!(kinds.contains(&("skip", "skipped")));
+        assert_eq!(kinds.last(), Some(&("ice", "frozen")));
+    }
+
+    #[test]
+    fn board_takes_stage_from_the_overlay_and_orders_by_attention() {
+        use crate::common::registry::{ConversationOverlay, ConversationSidecar, Stage};
+        let convs = vec![conv("x", "live", false), conv("y", "live", false)];
+        let mut wx = win("x", None, "");
+        wx.attention_rank = Some(1);
+        let mut wy = win("y", None, "");
+        wy.attention_rank = Some(0);
+        let active = vec![session("a", false, vec![wx, wy])];
+        let mut sc = ConversationSidecar::default();
+        sc.conversations.insert(
+            "x".into(),
+            ConversationOverlay {
+                stage: Some(Stage::Blocked),
+                stage_note: Some("creds".into()),
+                ..Default::default()
+            },
+        );
+        let cards = build_board(&convs, &active, &sc);
+        assert_eq!(cards[0].id, "y");
+        assert_eq!(cards[0].stage, None);
+        assert_eq!(cards[1].stage, Some(Stage::Blocked));
+        assert_eq!(cards[1].stage_note.as_deref(), Some("creds"));
     }
 
     #[test]

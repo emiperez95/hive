@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 468 tests (441 unit + 27 CLI smoke)
+cargo test                # 472 tests (445 unit + 27 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -14,7 +14,7 @@ hive setup                # register hooks + tmux keybinding
 ```
 
 > `cargo test` prints 775 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 441 unit + 27 smoke.
+> bin targets and run twice. Distinct tests: 445 unit + 27 smoke.
 
 ## The TUI (conversation-first)
 
@@ -1132,6 +1132,9 @@ into explicitly.
 | POST | `/api/switch` | Move the attached tmux client: `{"session","window_index"}` |
 | POST | `/api/toggle-mute` | Toggle global mute (`muted-global`) |
 | POST | `/api/toggle-project-mute` | Toggle a project's mute: `{"key": "..."}` |
+| GET | `/board` | The board page (`board.html`, its own page — see **Board**) |
+| GET | `/api/board` | Board cards: live + skipped + frozen conversations, each with its hand-set `stage` |
+| POST | `/api/stage` | Move a card: `{"id", "stage": "todo"\|"planning"\|"in_progress"\|"blocked"\|"done"\|null, "note"?}` — note kept only for blocked |
 | GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
 | GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
 
@@ -1192,6 +1195,33 @@ into explicitly.
 - Edit HTML/CSS/JS → refresh phone browser → see changes (no recompile needed)
 - Falls back to embedded HTML if file not found
 - For web development without affecting installed binary: `cargo run -- web --dev`
+
+## Board — project management over conversations (`/board`)
+
+A Jira/Trello-style board at `http://localhost:8375/board`: one card per **conversation**
+(live, skipped and frozen — plain closed ones are not on it), in six columns: Unsorted ·
+Todo · Planning · In progress · Blocked · Done. Swimlanes toggle between none, **project**
+and **env** (= auth profile); `?lanes=project` bookmarks one. Drag a card to move it;
+dropping on Blocked asks what it's blocked on. Click switches the tmux client to it; a
+frozen card has a Thaw button instead.
+
+**The stage is set by hand, never inferred.** It lives in the conversation's overlay
+(`stage` / `stage_at` / `stage_note` in `conversations.json`, `registry::Stage`); unset is
+Unsorted. It is deliberately separate from the runtime status: each card also shows what
+Claude is doing *now* (needs you · review · idle · working · flow · frozen), because a card
+in In progress whose Claude is waiting on a permission is exactly what the board must not
+hide. The highlighted **next** card is the first non-Done card in the attention order —
+`build_board` emits cards in `Ctrl+g`'s order, frozen last.
+
+- Its own page (`board.html`), not a mode of `web.html`: that one is built mobile-first
+  for the phone and the 280px sidebar, a board is wide. `--dev` re-reads it from disk too.
+- `/api/board` joins the data thread's two projections (`/api/active` for attention,
+  skipped and pings; `/api/conversations` for title/project/profile/frozen) with the
+  overlay **loaded per request**, so a moved card is in its new column on the next poll
+  rather than after the next gather.
+- `/api/stage` only accepts an id that is on the board — a LAN-reachable endpoint must
+  not mint overlay records (same rule as `/api/conv-notes`). Any move other than to
+  Blocked clears the note, so a stale reason never follows a card.
 
 ## Sidebar — the iTerm2 Toolbelt panel (`/?sidebar=1`)
 
@@ -1739,7 +1769,8 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   thinking not double-counted, zero-usage `<synthetic>` entries dropped, unlabelled
   model bucketed as `unknown`) and `scan_from` (stops at the last complete line, so a
   transcript caught mid-write counts that line exactly once on the next pass)
-- `serve/server.rs`: `tier_for` (blocked outranks a dirty tree; busy is never
+- `serve/server.rs`: `build_board` (live/skipped/frozen only, frozen last, stage + note
+  from the overlay, attention order), `tier_for` (blocked outranks a dirty tree; busy is never
   ready; idle splits on unreviewed work), `AttentionTier` ordering (working sorts
   BELOW idle — it is the tier that needs nothing from you), `rank_attention`
   (blocked → ready → idle → working; ranks are global across sessions and dense,
