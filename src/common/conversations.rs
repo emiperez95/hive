@@ -202,6 +202,14 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
         }
     }
 
+    // Overlay the frozen facet (note + timestamp) so frozen windows read as
+    // Closed+frozen (💤). Must run BEFORE bounding, since a pinned freeze is one
+    // of the reasons a Closed conversation is surfaced — and before parents are
+    // settled: a freeze whose transcript is gone is added here as a synthetic
+    // conversation, and settling is what gives it a project from its frozen cwd.
+    // Run after, it stayed parentless and showed as `(unassigned)`.
+    reg.apply_frozen(&FrozenState::load());
+
     // Settle each conversation's parent against the one cached in the overlay (see
     // `registry::settle_parent`): a cached parent is never re-derived from a shifting cwd.
     // New or refined parents are only RECORDED here — the gather stays read-only — and
@@ -231,11 +239,6 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
         }
     }
     reg.pending_parents = pending;
-
-    // Overlay the frozen facet (note + timestamp) so frozen windows read as
-    // Closed+frozen (💤). Must run BEFORE bounding, since a pinned freeze is one
-    // of the reasons a Closed conversation is surfaced.
-    reg.apply_frozen(&FrozenState::load());
 
     // Bound the (unbounded) on-disk Closed set: Live is always shown; a Closed
     // conversation is kept only if recently active, parented, or a pinned freeze.
