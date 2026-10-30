@@ -388,6 +388,38 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
+            // Close a live conversation's tmux window (the board's "Close window"):
+            // the TUI's `Del`. The window is looked up from the gather by id, never
+            // taken from the client — it is the target of a `kill-window`. History
+            // stays on disk, so the conversation becomes Closed and resumable.
+            (Method::Post, "/api/close-window") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> Option<String> {
+                    let req: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    let id = req.get("id")?.as_str()?;
+                    let placement = shared_conversations
+                        .lock()
+                        .ok()?
+                        .iter()
+                        .find(|c| c.id == id && c.lifecycle == "live")?
+                        .placement
+                        .clone()?;
+                    let target = crate::common::tmux::exact_window(
+                        &placement.session_name,
+                        &placement.window_index,
+                    );
+                    let ok = std::process::Command::new("tmux")
+                        .args(["kill-window", "-t", &target])
+                        .output()
+                        .is_ok_and(|o| o.status.success());
+                    Some(format!(r#"{{"ok":{ok}}}"#))
+                })()
+                .unwrap_or_else(|| r#"{"error":"not a live conversation"}"#.to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
             (Method::Get, "/metrics") => {
                 // Prometheus scrape target — hive's own view of the work (concurrency, active
                 // time, worktree debt, conversation registry), collected alongside Claude

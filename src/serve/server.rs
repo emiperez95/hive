@@ -141,7 +141,7 @@ pub(crate) fn build_board(
                 id: c.id.clone(),
                 short_id: c.short_id.clone(),
                 title: c.title.clone(),
-                stage: overlay.and_then(|o| o.stage),
+                stage: overlay.and_then(|o| o.stage).unwrap_or_default(),
                 stage_at: overlay.and_then(|o| o.stage_at.clone()),
                 stage_note: overlay.and_then(|o| o.stage_note.clone()),
                 kind: kind.to_string(),
@@ -844,8 +844,9 @@ mod tests {
         );
         let cards = build_board(&convs, &active, &sc);
         assert_eq!(cards[0].id, "y");
-        assert_eq!(cards[0].stage, None);
-        assert_eq!(cards[1].stage, Some(Stage::Blocked));
+        // Never placed → Todo; there is no Unsorted column.
+        assert_eq!(cards[0].stage, Stage::Todo);
+        assert_eq!(cards[1].stage, Stage::Blocked);
         assert_eq!(cards[1].stage_note.as_deref(), Some("creds"));
     }
 

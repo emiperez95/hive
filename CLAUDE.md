@@ -1141,6 +1141,7 @@ into explicitly.
 | POST | `/api/toggle-project-mute` | Toggle a project's mute: `{"key": "..."}` |
 | GET | `/board` | The board page (`board.html`, its own page — see **Board**) |
 | GET | `/api/board` | Board cards: live + skipped + frozen conversations, each with its hand-set `stage` |
+| POST | `/api/close-window` | Close a live conversation's tmux window by id (board menu; the window is looked up server-side) |
 | POST | `/api/stage` | Move a card: `{"id", "stage": "todo"\|"planning"\|"in_progress"\|"blocked"\|"done"\|null, "note"?}` — note kept only for blocked |
 | GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
 | GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
@@ -1206,8 +1207,8 @@ into explicitly.
 ## Board — project management over conversations (`/board`)
 
 A Jira/Trello-style board at `http://localhost:8375/board`: one card per **conversation**
-(live, skipped and frozen — plain closed ones are not on it), in six columns: Unsorted ·
-Todo · Planning · In progress · Blocked · Done. Swimlanes toggle between none, **project**
+(live, skipped and frozen — plain closed ones are not on it), in five columns: Todo ·
+Planning · In progress · Blocked · Done. Swimlanes toggle between none, **project**
 and **env** (= auth profile); `?lanes=project` bookmarks one. Drag a card to move it;
 dropping on Blocked asks what it's blocked on, with a **💤 Freeze** switch under the
 reason (remembered per browser): the stage is set first, then `/api/freeze` closes the
@@ -1215,12 +1216,16 @@ window with `Blocked: <reason>` as its note — the overlay is keyed by conversa
 so the card stays in Blocked as a frozen card to thaw later, and the card hides a note
 that only restates its reason. Project chips filter the board (click adds, ⌘-click
 shows just one, `?projects=a,b` bookmarks); they scroll away while the column names
-stay pinned. Click switches the tmux client to it; a
+stay pinned. **Right-click a card** for its menu: Open / Resume (thaw), Move to any
+stage, Freeze… (asks a note), Skip/Unskip session, and Close window… (live) or
+Discard… (frozen), both confirmed in-page. Click switches the tmux client to it; a
 frozen card has a Thaw button instead.
 
 **The stage is set by hand, never inferred.** It lives in the conversation's overlay
-(`stage` / `stage_at` / `stage_note` in `conversations.json`, `registry::Stage`); unset is
-Unsorted. It is deliberately separate from the runtime status: each card also shows what
+(`stage` / `stage_at` / `stage_note` in `conversations.json`, `registry::Stage`); unset
+reads as **Todo** (`Stage::default`), so a new conversation lands there with no write and
+`/api/board` never sends an unset stage. (An Unsorted column for unset was tried and
+removed — every new conversation needed filing before the board said anything.) It is deliberately separate from the runtime status: each card also shows what
 Claude is doing *now* (needs you · review · idle · working · flow · frozen), because a card
 in In progress whose Claude is waiting on a permission is exactly what the board must not
 hide. Within a column cards keep the attention order — `build_board` emits them in

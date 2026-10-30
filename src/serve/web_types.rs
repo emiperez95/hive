@@ -207,9 +207,8 @@ pub struct BoardCard {
     pub short_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// `None` = the Unsorted column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stage: Option<crate::common::registry::Stage>,
+    /// Never unset on the wire: a conversation nobody has placed is in Todo.
+    pub stage: crate::common::registry::Stage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

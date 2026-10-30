@@ -21,7 +21,6 @@
     --accent: #0c66e4;
     --drop: rgba(12,102,228,.08);
 
-    --s-unsorted: #8993a4;
     --s-todo: #6b778c;
     --s-planning: #8f7ee7;
     --s-in_progress: #0c66e4;
@@ -49,7 +48,6 @@
       --shadow-lift: 0 8px 16px -4px rgba(0,0,0,.55), 0 0 1px rgba(0,0,0,.6);
       --accent: #579dff;
       --drop: rgba(87,157,255,.12);
-      --s-unsorted: #738496;
       --s-todo: #8c9bab;
       --s-planning: #9f8fef;
       --s-in_progress: #579dff;
@@ -68,7 +66,7 @@
     --shadow: 0 1px 1px rgba(0,0,0,.4), 0 0 1px rgba(0,0,0,.5);
     --shadow-lift: 0 8px 16px -4px rgba(0,0,0,.55), 0 0 1px rgba(0,0,0,.6);
     --accent: #579dff; --drop: rgba(87,157,255,.12);
-    --s-unsorted: #738496; --s-todo: #8c9bab; --s-planning: #9f8fef; --s-in_progress: #579dff;
+    --s-todo: #8c9bab; --s-planning: #9f8fef; --s-in_progress: #579dff;
     --s-blocked: #f87168; --s-done: #4bce97;
     --rt-working: #579dff; --rt-idle: #4bce97; --rt-needs: #f87168; --rt-flow: #9f8fef; --rt-off: #596773;
   }
@@ -123,7 +121,7 @@
   .board { min-width: 1080px; }
   .cols, .lane-cells {
     display: grid;
-    grid-template-columns: repeat(6, minmax(170px, 1fr));
+    grid-template-columns: repeat(5, minmax(170px, 1fr));
     gap: 10px;
   }
   /* The header ROW sticks, not each cell: a sticky element only sticks within its
@@ -269,6 +267,36 @@
   }
   .dialog button.primary { background: var(--s-blocked); border-color: var(--s-blocked); color: #fff; }
 
+  /* ---- right-click menu ---- */
+  .menu {
+    position: fixed; z-index: 20; min-width: 210px; padding: 4px;
+    background: var(--card); color: var(--text); border-radius: 8px;
+    box-shadow: var(--shadow-lift); border: 1px solid var(--line);
+    font-size: 13px; display: none;
+  }
+  .menu.open { display: block; }
+  .menu .sec {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--faint); padding: 6px 10px 3px;
+  }
+  .menu button {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    font: inherit; color: inherit; text-align: left;
+    background: none; border: 0; border-radius: 5px; padding: 6px 10px; cursor: pointer;
+  }
+  .menu button:hover, .menu button:focus-visible { background: var(--col); outline: none; }
+  .menu button .ic { width: 16px; text-align: center; flex-shrink: 0; }
+  .menu button .dot { width: 8px; height: 8px; border-radius: 50%; margin: 0 4px; flex-shrink: 0; }
+  .menu button .check { margin-left: auto; color: var(--accent); font-weight: 700; }
+  .menu button.cur { font-weight: 600; }
+  .menu button.danger { color: var(--s-blocked); }
+  .menu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
+  .menu .who {
+    padding: 6px 10px 4px; font-size: 12px; font-weight: 600; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px;
+  }
+  .dialog button.primary.calm { background: var(--accent); border-color: var(--accent); }
+
   .toast {
     position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
     background: var(--text); color: var(--bg); font-size: 13px; padding: 8px 14px; border-radius: 6px;
@@ -338,18 +366,29 @@
     </div>
   </form>
 </div>
+<div class="scrim" id="askScrim">
+  <form class="dialog" id="ask">
+    <h2 id="askTitle"></h2>
+    <p id="askSub"></p>
+    <input id="askInput" autocomplete="off">
+    <div class="row">
+      <button type="button" id="askCancel">Cancel</button>
+      <button type="submit" class="primary" id="askOk"></button>
+    </div>
+  </form>
+</div>
+<div class="menu" id="menu" role="menu"></div>
 <div class="toast" id="toast"></div>
 
 <script>
 const STAGES = [
-  { key: null,          label: 'Unsorted' },
   { key: 'todo',        label: 'Todo' },
   { key: 'planning',    label: 'Planning' },
   { key: 'in_progress', label: 'In progress' },
   { key: 'blocked',     label: 'Blocked' },
   { key: 'done',        label: 'Done' },
 ];
-const stageVar = k => `var(--s-${k || 'unsorted'})`;
+const stageVar = k => `var(--s-${k || 'todo'})`;
 
 // Per-viewer conveniences only; the page works without storage.
 const store = {
@@ -613,7 +652,7 @@ document.getElementById('dialog').addEventListener('submit', async e => {
   if (freeze && c && c.placement) await freezeCard(c, note);
 });
 
-async function freezeCard(c, note) {
+async function freezeCard(c, note, raw = false) {
   const p = c.placement;
   const res = await post('/api/freeze', {
     session: p.session_name,
@@ -621,7 +660,7 @@ async function freezeCard(c, note) {
     window_name: p.window_name,
     cwd: c.cwd || '',
     session_id: c.id,
-    note: note ? 'Blocked: ' + note : 'Blocked',
+    note: raw ? note : (note ? 'Blocked: ' + note : 'Blocked'),
   });
   toast(res.ok ? '💤 Frozen — thaw it from the card when unblocked' : (res.error || 'Freeze failed'));
   lastJson = '';
@@ -727,6 +766,155 @@ document.getElementById('filters').addEventListener('click', e => {
 document.getElementById('search').addEventListener('input', e => {
   query = e.target.value.trim().toLowerCase();
   render();
+});
+
+// ---- right-click menu ----
+// A small in-page dialog for a note or a confirmation (no input). Resolves to the
+// text, or null when cancelled.
+function ask({ title, sub = '', placeholder = '', value = '', ok, danger = false, input = true }) {
+  return new Promise(resolve => {
+    const scrim = document.getElementById('askScrim');
+    const field = document.getElementById('askInput');
+    document.getElementById('askTitle').textContent = title;
+    document.getElementById('askSub').textContent = sub;
+    const okBtn = document.getElementById('askOk');
+    okBtn.textContent = ok;
+    okBtn.classList.toggle('calm', !danger);
+    field.hidden = !input;
+    field.placeholder = placeholder;
+    field.value = value;
+    const done = v => {
+      scrim.classList.remove('open');
+      form.removeEventListener('submit', onSubmit);
+      cancel.removeEventListener('click', onCancel);
+      scrim.removeEventListener('mousedown', onScrim);
+      document.removeEventListener('keydown', onKey);
+      resolve(v);
+    };
+    const form = document.getElementById('ask');
+    const cancel = document.getElementById('askCancel');
+    const onSubmit = e => { e.preventDefault(); done(field.value.trim()); };
+    const onCancel = () => done(null);
+    const onScrim = e => { if (e.target === scrim) done(null); };
+    const onKey = e => { if (e.key === 'Escape') done(null); };
+    form.addEventListener('submit', onSubmit);
+    cancel.addEventListener('click', onCancel);
+    scrim.addEventListener('mousedown', onScrim);
+    document.addEventListener('keydown', onKey);
+    scrim.classList.add('open');
+    (input ? field : okBtn).focus();
+  });
+}
+
+const menu = document.getElementById('menu');
+let menuCard = null;
+
+function closeMenu() { menu.classList.remove('open'); menuCard = null; }
+
+function openMenu(c, x, y) {
+  menuCard = c;
+  const live = c.kind !== 'frozen' && !!c.placement;
+  const cur = c.stage ?? null;
+  const item = (act, ic, label, extra = '') =>
+    `<button role="menuitem" data-act="${act}" ${extra}><span class="ic">${ic}</span>${label}</button>`;
+  const parts = [`<div class="who">${esc(c.title || c.short_id)}</div>`];
+  if (live) parts.push(item('open', '↗', 'Open'));
+  else parts.push(item('thaw', '▶', 'Resume (thaw)'));
+  parts.push('<hr><div class="sec">Move to</div>');
+  for (const s of STAGES) {
+    parts.push(`<button role="menuitem" data-act="stage" data-stage="${s.key ?? ''}" class="${cur === s.key ? 'cur' : ''}">
+      <span class="dot" style="background:${stageVar(s.key)}"></span>${s.label}${cur === s.key ? '<span class="check">✓</span>' : ''}</button>`);
+  }
+  parts.push('<hr>');
+  if (live) {
+    parts.push(item('freeze', '💤', 'Freeze…'));
+    parts.push(item('skip', c.kind === 'skipped' ? '↩' : '⏭', c.kind === 'skipped' ? 'Unskip session' : 'Skip session'));
+    parts.push('<hr>');
+    parts.push(item('close', '✕', 'Close window…', 'class="danger"'));
+  } else {
+    parts.push(item('discard', '🗑', 'Discard…', 'class="danger"'));
+  }
+  menu.innerHTML = parts.join('');
+  menu.classList.add('open');
+  // Keep it on screen: flip left/up when it would overflow.
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + 'px';
+  menu.style.top = Math.max(8, y + r.height > innerHeight - 8 ? y - r.height : y) + 'px';
+}
+
+board.addEventListener('contextmenu', e => {
+  const el = e.target.closest('.card');
+  if (!el) return;
+  const c = cards.find(c => c.id === el.dataset.id);
+  if (!c) return;
+  e.preventDefault();
+  openMenu(c, e.clientX, e.clientY);
+});
+document.addEventListener('mousedown', e => { if (!menu.contains(e.target)) closeMenu(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenu(); });
+window.addEventListener('blur', closeMenu);
+document.querySelector('main').addEventListener('scroll', closeMenu, { passive: true });
+
+menu.addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-act]');
+  const c = menuCard;
+  if (!btn || !c) return;
+  closeMenu();
+  const label = c.title || c.short_id;
+  const refresh = () => { lastJson = ''; setTimeout(load, 600); };
+  switch (btn.dataset.act) {
+    case 'open': {
+      const res = await post('/api/switch', { session: c.placement.session_name, window_index: c.placement.window_index });
+      toast(res.ok ? `Switched to ${c.placement.session_name}` : (res.error || 'Switch failed'));
+      break;
+    }
+    case 'thaw': {
+      toast('Thawing…');
+      const res = await post('/api/thaw', { key: c.id });
+      toast(res.ok ? `Thawed into ${res.session}` : (res.error || 'Thaw failed'));
+      refresh();
+      break;
+    }
+    case 'stage': {
+      const stage = btn.dataset.stage || null;
+      if ((c.stage ?? null) === stage) break;
+      if (stage === 'blocked') askReason(c);
+      else setStage(c.id, stage);
+      break;
+    }
+    case 'freeze': {
+      const note = await ask({ title: 'Freeze this conversation?', sub: label,
+        placeholder: 'Why are you parking it? (optional)', value: c.stage === 'blocked' && c.stage_note ? 'Blocked: ' + c.stage_note : '',
+        ok: '💤 Freeze' });
+      if (note == null) break;
+      await freezeCard(c, note, true);
+      break;
+    }
+    case 'skip': {
+      const res = await post('/api/toggle-flag', { session: c.placement.session_name, flag: 'skip' });
+      toast(res.ok ? `${res.value ? 'Skipped' : 'Unskipped'} ${c.placement.session_name}` : (res.error || 'Failed'));
+      refresh();
+      break;
+    }
+    case 'close': {
+      const ok = await ask({ title: 'Close this window?', input: false, danger: true, ok: 'Close window',
+        sub: `${label} — the Claude process stops and the card leaves the board. Its history stays on disk and it can be resumed from the TUI.` });
+      if (ok == null) break;
+      const res = await post('/api/close-window', { id: c.id });
+      toast(res.ok ? 'Window closed' : (res.error || 'Close failed'));
+      refresh();
+      break;
+    }
+    case 'discard': {
+      const ok = await ask({ title: 'Discard this frozen conversation?', input: false, danger: true, ok: 'Discard',
+        sub: `${label} — it leaves the board and the 💤 list. Its history stays on disk.` });
+      if (ok == null) break;
+      const res = await post('/api/discard-frozen', { key: c.id });
+      toast(res.ok ? 'Discarded' : (res.error || 'Discard failed'));
+      refresh();
+      break;
+    }
+  }
 });
 
 // A hairline under the pinned column names once the board has scrolled under them.

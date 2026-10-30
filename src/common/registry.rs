@@ -251,10 +251,12 @@ pub struct ConversationOverlay {
     pub stage_note: Option<String>,
 }
 
-/// A board column. Unset (`None` on the overlay) is the Unsorted column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A board column. Unset (`None` on the overlay) reads as `Todo` — so a new
+/// conversation lands there with no write, and placing one is the only write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
+    #[default]
     Todo,
     Planning,
     InProgress,
