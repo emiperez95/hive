@@ -429,6 +429,11 @@ pub fn get_other_client_sessions() -> HashSet<String> {
 /// The locale matters just as much: with no UTF-8 in `LC_ALL` / `LC_CTYPE` /
 /// `LANG`, tmux prints every non-ASCII character as `_` — `⛅ AWS Hub` comes
 /// back `__ AWS Hub` — so no session name matches anything hive knows.
+///
+/// hive's own directory goes on PATH too. A tmux server started from here
+/// (`hive start` with no server running) inherits this environment as its global
+/// one, and every `run-shell "hive …"` binding in `~/.tmux.conf` resolves `hive`
+/// against it: without `~/.local/bin`, `C-n` failed with `returned 127`.
 pub fn ensure_tmux_env() {
     let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"].iter().any(|k| {
         std::env::var(k).is_ok_and(|v| {
@@ -439,26 +444,27 @@ pub fn ensure_tmux_env() {
     if !utf8 {
         std::env::set_var("LC_CTYPE", "UTF-8");
     }
-    let tmux = resolve_tmux_path();
-    let Some(dir) = std::path::Path::new(&tmux)
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-    else {
-        return;
-    };
+    let tmux = std::path::PathBuf::from(resolve_tmux_path());
+    let hive = std::env::current_exe().ok();
     let path = std::env::var("PATH").unwrap_or_default();
-    if path.split(':').any(|p| std::path::Path::new(p) == dir) {
+    let mut dirs: Vec<String> = Vec::new();
+    for bin in std::iter::once(&tmux).chain(hive.as_ref()) {
+        let Some(dir) = bin.parent().filter(|d| !d.as_os_str().is_empty()) else {
+            continue;
+        };
+        let dir = dir.display().to_string();
+        let on_path = path.split(':').any(|p| p == dir);
+        if !on_path && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    if dirs.is_empty() {
         return;
     }
-    let dir = dir.display();
-    std::env::set_var(
-        "PATH",
-        if path.is_empty() {
-            dir.to_string()
-        } else {
-            format!("{dir}:{path}")
-        },
-    );
+    if !path.is_empty() {
+        dirs.push(path);
+    }
+    std::env::set_var("PATH", dirs.join(":"));
 }
 
 /// Resolve the absolute path to tmux by searching PATH.
