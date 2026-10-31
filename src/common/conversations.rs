@@ -19,7 +19,9 @@ use crate::common::frozen::FrozenState;
 use crate::common::instances;
 use crate::common::jsonl;
 use crate::common::ports::get_listening_ports_for_pids;
-use crate::common::process::{build_cmdline_map, get_process_info, parse_resume_id};
+use crate::common::process::{
+    build_cmdline_map, get_process_info, parse_attach_id, parse_resume_id,
+};
 use crate::common::projects::{activate_project, ensure_tmux_session, ProjectRegistry};
 use crate::common::registry::{
     self, Conversation, ConversationRegistry, ConversationSidecar, ConversationStatus, Lifecycle,
@@ -69,21 +71,43 @@ fn gather_conversations_inner(stats: Option<&mut System>) -> ConversationRegistr
     // validated: the transcript must exist). All are per-window exact, so they
     // always beat the recency guess below.
     let mut pending: Vec<(Option<String>, instances::ClaudeInstance)> = Vec::new();
-    for inst in instances {
+    for mut inst in instances {
+        let argv = || inst.pids.iter().filter_map(|pid| cmdlines.get(pid));
         // Claude's own record first: it follows `/clear`, which the hook entry (pruned
         // after 10 min idle) and argv (`--resume <id>` is the LAUNCH id) do not.
         let has_transcript = |id: &str| jsonl::find_jsonl_by_session_id(&inst.cwd, id).is_some();
-        let sid = claude_sessions::session_in_tree(&claude_records, &inst.pids)
+        let mut sid = claude_sessions::session_in_tree(&claude_records, &inst.pids)
             .filter(|id| has_transcript(id))
             .map(str::to_string)
             .or_else(|| inst.session_id.clone())
             .or_else(|| {
-                inst.pids
-                    .iter()
-                    .filter_map(|pid| cmdlines.get(pid))
+                argv()
                     .find_map(|cmd| parse_resume_id(cmd))
                     .filter(|id| has_transcript(id))
             });
+        // `claude attach <job>`: the window is a viewer onto a background session
+        // whose process lives outside tmux, so neither the id nor the process that
+        // writes the transcript is in this pane's tree. Claude's record links them;
+        // its pid joins the window's tree so status confirmation and CPU/mem follow
+        // the process doing the work. The transcript sits under the bg session's own
+        // launch dir, not the pane's, hence the cwd-independent lookup.
+        if sid.is_none() {
+            let attached = argv()
+                .find_map(|cmd| parse_attach_id(cmd))
+                .and_then(|h| claude_sessions::resolve_attach(&claude_records, &h))
+                .filter(|r| {
+                    r.session_id
+                        .as_deref()
+                        .is_some_and(|id| jsonl::find_jsonl_by_session_id_anywhere(id).is_some())
+                })
+                .map(|r| (r.session_id.clone(), r.pid));
+            if let Some((id, pid)) = attached {
+                sid = id;
+                if !inst.pids.contains(&pid) {
+                    inst.pids.push(pid);
+                }
+            }
+        }
         if let Some(s) = &sid {
             claimed.insert(s.clone());
         }
@@ -627,6 +651,7 @@ mod tests {
             status: Some(status),
             status_updated_at: Some(1),
             waiting_for: None,
+            job_id: None,
         }
     }
 

@@ -125,6 +125,23 @@ pub fn parse_resume_id(cmd: &str) -> Option<String> {
     None
 }
 
+/// Extract the session handle from `claude attach <id>` — a viewer onto a background
+/// (`claude --bg`) session that runs in a separate, tmux-less process. The handle is
+/// Claude's short job id (or a session id / prefix of one), not necessarily a UUID, so
+/// it can only be resolved through Claude's own session records
+/// (`claude_sessions::resolve_attach`).
+pub fn parse_attach_id(cmd: &str) -> Option<String> {
+    let mut toks = cmd.split_whitespace();
+    let bin = toks.next()?;
+    if bin.rsplit('/').next() != Some("claude") {
+        return None;
+    }
+    if toks.next()? != "attach" {
+        return None;
+    }
+    toks.find(|t| !t.starts_with('-')).map(str::to_string)
+}
+
 /// Canonical 8-4-4-4-12 hex UUID shape (a Claude session id), so a stray `--resume`
 /// argument can't be mistaken for one.
 fn is_uuidish(s: &str) -> bool {
@@ -200,6 +217,17 @@ mod tests {
     fn test_is_claude_command_contains() {
         assert!(is_claude_process(&make_proc("node", "/path/to/claude")));
         assert!(is_claude_process(&make_proc("node", "claude -c")));
+    }
+
+    #[test]
+    fn test_parse_attach_id() {
+        assert_eq!(
+            parse_attach_id("/Users/x/.local/bin/claude attach 897ea620").as_deref(),
+            Some("897ea620")
+        );
+        assert_eq!(parse_attach_id("claude attach").as_deref(), None);
+        assert_eq!(parse_attach_id("claude --resume abc").as_deref(), None);
+        assert_eq!(parse_attach_id("vim attach foo").as_deref(), None);
     }
 
     #[test]

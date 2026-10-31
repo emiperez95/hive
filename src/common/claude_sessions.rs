@@ -77,6 +77,10 @@ pub struct ClaudeSession {
     /// What the session is waiting on, when Claude supplies it.
     #[serde(rename = "waitingFor")]
     pub waiting_for: Option<String>,
+    /// The short handle of a background (`kind: "bg"`) session — what
+    /// `claude attach <id>` names it by.
+    #[serde(rename = "jobId")]
+    pub job_id: Option<String>,
 }
 // The record carries more than this — `cwd`, `tmux`, `version`, `name`,
 // `messagingSocketPath`, `formerNames`. They're deliberately not fields: an unread
@@ -184,6 +188,32 @@ pub fn session_in_tree<'a>(sessions: &'a [ClaudeSession], pids: &[u32]) -> Optio
     found.next().is_none().then_some(first)
 }
 
+/// The session a `claude attach <handle>` viewer is showing.
+///
+/// A background session runs in its own process, outside tmux, and the tmux window
+/// only hosts the attach client — so the window's process tree holds neither the
+/// conversation id nor the process that writes the transcript. The record is the one
+/// place that links them. The handle is matched as a job id first, then as a session
+/// id or an unambiguous prefix of one.
+pub fn resolve_attach<'a>(
+    sessions: &'a [ClaudeSession],
+    handle: &str,
+) -> Option<&'a ClaudeSession> {
+    if let Some(s) = sessions
+        .iter()
+        .find(|s| s.job_id.as_deref() == Some(handle))
+    {
+        return Some(s);
+    }
+    let mut by_id = sessions.iter().filter(|s| {
+        s.session_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(handle))
+    });
+    let first = by_id.next()?;
+    by_id.next().is_none().then_some(first)
+}
+
 /// Index the records hive can **confirm** are live, by conversation id.
 ///
 /// `id_pids` is the gather's own map of conversation id → the pids of its pane's
@@ -261,6 +291,24 @@ mod tests {
         assert_eq!(session_in_tree(&all, &[300]), None);
         // Two Claude processes in one tree can't be told apart → no guess.
         assert_eq!(session_in_tree(&all, &[100, 200]), None);
+    }
+
+    #[test]
+    fn attach_resolves_by_job_id_then_unambiguous_id_prefix() {
+        let mut bg = rec(47259, "897ea620-f5cd-4678-8fa1-f0ff8abc7e07", "shell");
+        bg.job_id = Some("job1".into());
+        let other = rec(68637, "2f08c15b-263a-4fac-aad5-c9adf27ac9b4", "busy");
+        let twin = rec(1, "2f08aaaa-263a-4fac-aad5-c9adf27ac9b4", "busy");
+        let all = vec![bg, other, twin];
+        assert_eq!(resolve_attach(&all, "job1").map(|s| s.pid), Some(47259));
+        assert_eq!(resolve_attach(&all, "897ea620").map(|s| s.pid), Some(47259));
+        assert_eq!(
+            resolve_attach(&all, "2f08").map(|s| s.pid),
+            None,
+            "ambiguous"
+        );
+        assert_eq!(resolve_attach(&all, "2f08c").map(|s| s.pid), Some(68637));
+        assert!(resolve_attach(&all, "ffff").is_none());
     }
 
     #[test]
