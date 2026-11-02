@@ -270,6 +270,19 @@ pub fn save_skipped_sessions(sessions: &HashSet<String>) {
     }
 }
 
+/// Un-skip a session if it is skipped, logging the toggle. Switching to a session
+/// means you're using it, so it should re-enter cycling. Returns true if it changed.
+pub fn unskip_session(name: &str) -> bool {
+    let mut skipped = load_skipped_sessions();
+    if skipped.remove(name) {
+        save_skipped_sessions(&skipped);
+        crate::common::activity::log_skip(name, false);
+        true
+    } else {
+        false
+    }
+}
+
 /// Get the path to the global mute flag file
 pub fn get_global_mute_path() -> Option<PathBuf> {
     cache_dir().map(|p| p.join("muted-global"))

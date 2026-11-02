@@ -878,7 +878,10 @@ impl App {
     fn switch_to(&mut self, session: &str, window: Option<&str>) {
         let clients = tmux::list_clients();
         if let Some(c) = tmux::pick_client(&clients) {
-            tmux::switch_client_to(&c.tty, session, window);
+            if tmux::switch_client_to(&c.tty, session, window) {
+                // Opening a skipped conversation is choosing to work in it.
+                crate::common::persistence::unskip_session(session);
+            }
         }
         // Optimistic: move the marker now rather than when the push arrives.
         self.focus.session = Some(session.to_string());

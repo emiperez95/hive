@@ -953,6 +953,10 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     let tty = client.tty.clone();
                     let ok =
                         crate::common::tmux::switch_client_to(&tty, session, window.as_deref());
+                    // Opening a skipped conversation is choosing to work in it.
+                    if ok {
+                        crate::common::persistence::unskip_session(session);
+                    }
                     // The click left keyboard focus in the sidebar's webview; give it
                     // back to the terminal so tmux bindings keep working. Off-thread:
                     // osascript costs ~100ms and the response shouldn't wait on it.
