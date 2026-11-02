@@ -3611,7 +3611,8 @@ function sbProjectsHtml() {
   const seen = new Set(order);
   const empties = (sbProjectList || [])
     .filter(p => !seen.has(p.key) && visible(p.key))
-    .sort((a, b) => String(a.display_name).localeCompare(String(b.display_name)));
+    .sort((a, b) => String(a.auth_profile || '').localeCompare(String(b.auth_profile || '')) ||
+      String(a.display_name).localeCompare(String(b.display_name)));
 
   const head = (key, place, count) => {
     const open = sbExpandedProjects.has(key);

@@ -342,6 +342,21 @@ pub struct ListState<'a> {
 
 const TIERS: [u8; 4] = [0, 1, 2, 3];
 
+/// The project's env (auth profile), lowercased; empty = default, so it sorts first.
+fn env_of(projects: &Projects, key: &str) -> String {
+    projects
+        .list
+        .iter()
+        .find(|p| p.key == key)
+        .map(|p| p.auth_profile.to_lowercase())
+        .unwrap_or_default()
+}
+
+/// Env first, then project name — the one order every project list uses.
+fn project_order(projects: &Projects, place: &Place) -> (String, String) {
+    (env_of(projects, &place.key), place.label.to_lowercase())
+}
+
 pub fn build_items(
     st: &ListState,
     convs: &[Conv],
@@ -386,7 +401,9 @@ pub fn build_items(
             }
         }
         View::Live => {
-            let live: Vec<usize> = (0..convs.len()).filter(|&i| !convs[i].skipped).collect();
+            let mut live: Vec<usize> = (0..convs.len()).filter(|&i| !convs[i].skipped).collect();
+            // Stable, so a session's windows (and sessions of one project) stay together.
+            live.sort_by_cached_key(|&i| project_order(projects, &convs[i].place));
             if live.is_empty() {
                 items.push(Item::Note("No live conversations".into()));
             }
@@ -444,7 +461,7 @@ pub fn build_items(
                     )
                 })
                 .collect();
-            nested(&mut items, entries);
+            nested(&mut items, entries, projects);
         }
     }
     if !frozen.is_empty() {
@@ -465,14 +482,15 @@ pub fn build_items(
                     )
                 })
                 .collect();
-            nested(&mut items, entries);
+            nested(&mut items, entries, projects);
         }
     }
     items
 }
 
 /// Entries bucketed by project, then worktree — source order kept at every level.
-fn nested(items: &mut Vec<Item>, entries: Vec<(Place, Item)>) {
+fn nested(items: &mut Vec<Item>, mut entries: Vec<(Place, Item)>, projects: &Projects) {
+    entries.sort_by_cached_key(|(p, _)| project_order(projects, p));
     for g in bucket(entries) {
         items.push(Item::Group {
             emoji: g.place.emoji.clone(),
@@ -533,8 +551,8 @@ fn push_body(items: &mut Vec<Item>, b: Bucket) {
 }
 
 /// Every registered project, project → worktree → conversation, one project
-/// open at a time. Projects with something in them come first in list order,
-/// the rest alphabetically. Archived ones hide unless shown — but never one
+/// open at a time. Projects with something in them come first, the rest after;
+/// each group is ordered by env (auth profile), then name. Archived ones hide unless shown — but never one
 /// with conversations: you can't hide what's running.
 fn projects_view(
     items: &mut Vec<Item>,
@@ -563,7 +581,10 @@ fn projects_view(
             Item::Frozen { idx: i, indent: 2 },
         )
     }));
-    let buckets = bucket(entries);
+    let mut buckets = bucket(entries);
+    // Env first (the project's auth profile), then name — the same key the
+    // empty projects below use, so the whole list reads as one ordering.
+    buckets.sort_by_cached_key(|b| project_order(projects, &b.place));
     let archived: HashSet<&str> = projects
         .list
         .iter()
@@ -576,7 +597,7 @@ fn projects_view(
         .iter()
         .filter(|p| !seen.contains(&p.key) && (st.show_archived || !p.archived))
         .collect();
-    empties.sort_by_key(|p| p.display_name.to_lowercase());
+    empties.sort_by_key(|p| (p.auth_profile.to_lowercase(), p.display_name.to_lowercase()));
 
     let total = buckets.len() + empties.len();
     let hidden = if st.show_archived {
@@ -688,6 +709,7 @@ mod tests {
             display_name: name.into(),
             session_name: format!("📁 {name}"),
             archived,
+            auth_profile: String::new(),
         }
     }
 

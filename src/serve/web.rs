@@ -776,6 +776,8 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             // Archived is a display preference, never a filter here: the
                             // endpoint reports it and each surface decides what to hide.
                             "archived": config.archived,
+                            // The env: sorts group by it before the project name.
+                            "auth_profile": config.auth_profile.as_deref().unwrap_or(""),
                         })
                     })
                     .collect();

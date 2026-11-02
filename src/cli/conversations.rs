@@ -807,11 +807,20 @@ fn build_browse(
     let named =
         |k: &String| matched_projects.contains(k) || (!include_empty && worktrees.contains_key(k));
     let recency = |g: &[&Conversation]| g.iter().filter_map(|c| c.last_activity.clone()).max();
+    let env_of = |k: &String| {
+        projects
+            .projects
+            .get(k)
+            .and_then(|c| c.auth_profile.as_deref())
+            .unwrap_or("")
+            .to_lowercase()
+    };
     let mut keyed: Vec<(String, Vec<&Conversation>)> = grouped.into_iter().collect();
     keyed.sort_by(|(ka, a), (kb, b)| {
         named(kb)
             .cmp(&named(ka))
             .then_with(|| recency(b).cmp(&recency(a)))
+            .then_with(|| env_of(ka).cmp(&env_of(kb)))
             .then_with(|| ka.to_lowercase().cmp(&kb.to_lowercase()))
     });
 

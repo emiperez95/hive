@@ -44,6 +44,9 @@ pub struct ProjectItem {
     pub session_name: String,
     #[serde(default)]
     pub archived: bool,
+    /// The project's env (auth profile); empty = default.
+    #[serde(default)]
+    pub auth_profile: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
