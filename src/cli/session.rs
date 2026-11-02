@@ -28,6 +28,41 @@ fn current_window(pane: Option<&str>) -> Option<String> {
     }
 }
 
+/// The sort key the sidebar's project lists use: the project's env (auth profile),
+/// then its name. A worktree session (`📊 [key] branch`) takes its project's; a
+/// session no project claims sorts by its own name, in the default env.
+fn project_sort_key(session: &str, projects: &ProjectRegistry) -> (String, String) {
+    let tagged = match (session.find('['), session.find(']')) {
+        (Some(o), Some(c)) if o < c => Some(&session[o + 1..c]),
+        _ => None,
+    };
+    let found = tagged
+        .and_then(|k| projects.projects.get_key_value(k))
+        .or_else(|| {
+            projects
+                .projects
+                .iter()
+                .find(|(k, c)| ProjectRegistry::session_name(k, c) == session)
+        });
+    match found {
+        Some((key, c)) => (
+            c.auth_profile.as_deref().unwrap_or("").to_lowercase(),
+            c.display_name.as_deref().unwrap_or(key).to_lowercase(),
+        ),
+        None => {
+            let name = session.split_once(' ').map_or(session, |(_, r)| r);
+            (String::new(), tagged.unwrap_or(name).to_lowercase())
+        }
+    }
+}
+
+/// Sessions in the order the sidebar's Live view lists them, so `cycle-next` /
+/// `cycle-prev` walk what's on screen. Stable: sessions of one project keep tmux order.
+fn sidebar_order(mut sessions: Vec<String>, projects: &ProjectRegistry) -> Vec<String> {
+    sessions.sort_by_cached_key(|s| project_sort_key(s, projects));
+    sessions
+}
+
 /// Cycle to next/prev tmux session, skipping skipped sessions.
 /// `pane` is the triggering pane (`#{pane_id}`) used to locate the current session.
 pub fn run_cycle(forward: bool, pane: Option<&str>) -> Result<()> {
@@ -148,7 +183,7 @@ fn cycle_among(
     current: Option<String>,
     eligible: impl Fn(&String) -> bool,
 ) -> Result<()> {
-    let all_sessions = get_current_tmux_session_names();
+    let all_sessions = sidebar_order(get_current_tmux_session_names(), &ProjectRegistry::load());
 
     let filtered: Vec<&String> = all_sessions.iter().filter(|name| eligible(name)).collect();
 
@@ -307,4 +342,41 @@ pub fn run_start() -> Result<Option<String>> {
         .or_else(|| sessions.first());
 
     Ok(target.cloned())
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use crate::common::projects::ProjectConfig;
+
+    fn reg(entries: &[(&str, &str, Option<&str>)]) -> ProjectRegistry {
+        let mut r = ProjectRegistry::default();
+        for (key, emoji, env) in entries {
+            r.projects.insert(
+                key.to_string(),
+                ProjectConfig {
+                    emoji: emoji.to_string(),
+                    auth_profile: env.map(str::to_string),
+                    ..Default::default()
+                },
+            );
+        }
+        r
+    }
+
+    #[test]
+    fn cycle_follows_env_then_name_and_keeps_worktrees_with_their_project() {
+        let r = reg(&[
+            ("aws-hub", "⛅", Some("work")),
+            ("hive", "🐝", None),
+            ("network", "🌐", None),
+        ]);
+        let tmux = ["⛅ aws-hub", "🐝 hive", "🌐 [network] wt", "🌐 network"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            sidebar_order(tmux, &r),
+            ["🐝 hive", "🌐 [network] wt", "🌐 network", "⛅ aws-hub"]
+        );
+    }
 }
