@@ -28,7 +28,7 @@ pub mod prune;
 // Read-only shadow model (Increment 0); wired into views in a later increment.
 #[allow(dead_code)]
 pub mod registry;
-// The terminal emulator around tmux (iTerm2 or Ghostty): panes, focus.
+// The terminal emulator around tmux (Ghostty): panes, the sidebar split.
 pub mod terminal;
 // Every session's todos regrouped by the project that owns the session.
 pub mod task_schema;

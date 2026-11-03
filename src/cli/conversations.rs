@@ -5963,8 +5963,9 @@ fn connect_worktree(project: &str, branch: &str) -> Result<String> {
 }
 
 /// Start a fresh conversation in `session` with an initial `prompt`, then switch to
-/// it. The window-opening half lives in `common::conversations` so the web sidebar
-/// can dispatch a todo the same way (and switch a specific client instead).
+/// it. The window-opening half lives in `common::conversations` so the dashboard's
+/// todo dispatch (the sidebar's start dialog) can do the same and switch a
+/// specific client instead.
 fn new_task_in_session(session: &str, prompt: &str) -> Result<String> {
     let msg = crate::common::conversations::start_task_in_session(session, prompt)?;
     attach_or_switch(session);

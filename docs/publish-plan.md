@@ -6,7 +6,7 @@ Working document for the "make hive public-ready" effort. A fresh session can pi
 
 **v0.1.0 is macOS-only.** Linux is deferred.
 
-- Signature features (Chrome tab matching, iTerm2 spread/collapse, port detection) are mac-only via JXA/AppleScript/libproc. Linux gets `#[cfg]` stubs.
+- Signature features (Chrome tab matching, Ghostty spread/collapse, port detection) are mac-only via JXA/AppleScript/libproc. Linux gets `#[cfg]` stubs.
 - Linux CI job stays as a compile gate; no Linux tarballs in the release.
 - README, Cargo.toml `categories`, announcement copy all assume macOS.
 

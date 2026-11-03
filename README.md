@@ -19,7 +19,8 @@ The base entity is the **conversation**, not the tmux session — so a conversat
 - **Project registry** — emoji identifiers, startup commands, per-project auth profiles
 - **Worktree management** — create/delete git worktrees with tmux sessions and lifecycle hooks
 - **Mobile dashboard** — `hive web` exposes a phone-friendly UI with conversation view, TTS playback, and remote session control
-- **iTerm2 pane spread** — split into N panes, each auto-attaching to a session
+- **Ghostty pane spread** — split into N panes, each auto-attaching to a session
+- **Terminal sidebar** — `hive sidebar` keeps the attention list (who needs you, what is idle, what is running) in a split beside tmux; it sits outside tmux, so it stays put as you switch sessions
 - **Notifications** — native macOS notifications when sessions need attention
 - **Hook-based status** — Claude Code hooks push status into hive in real time
 - **Port + Chrome matching** — discovers each session's listening TCP ports and maps them to Chrome tabs
@@ -30,7 +31,7 @@ The base entity is the **conversation**, not the tmux session — so a conversat
 - **[tmux](https://github.com/tmux/tmux)** on your `PATH`.
 - **[Claude Code](https://docs.claude.com/en/docs/claude-code/overview)** CLI on your `PATH`.
 - `curl` and `tar` (installed by default on macOS) for the prebuilt install path.
-- Optional: iTerm2 for pane spread/collapse; Chrome for tab matching.
+- Optional: Ghostty for pane spread/collapse and the terminal sidebar; Chrome for tab matching.
 
 ## Install
 
@@ -129,11 +130,12 @@ hive cycle-prev         # switch to previous tmux session
 hive connect <key>      # create/attach tmux session for a registered project
 ```
 
-### iTerm2 Panes
+### Ghostty Panes and Sidebar
 
 ```bash
-hive spread <N>         # split into N vertical iTerm2 panes (each runs hive start)
+hive spread <N>         # split into N vertical Ghostty panes (each runs hive start)
 hive collapse           # close all panes except the current one
+hive sidebar --split    # open the sidebar in a split on the right of this tab
 ```
 
 ### Project Registry
@@ -215,7 +217,7 @@ Two views: **Active** (live conversations grouped by their tmux session) and **B
 | `v` `m` `s` `!` | Favorite · mute · skip from cycling · auto-approve (session-level) |
 | `M` / `P` | Global mute / pin the conversation |
 | `Del` | Close a live conversation (kills its window) · discard a frozen one |
-| `L` / `N` | Spread / collapse iTerm2 panes · new-project wizard |
+| `L` / `N` | Spread / collapse Ghostty panes · new-project wizard |
 | `Ctrl+R` | Browse: reveal / hide archived projects |
 | `r` / `?` / `q` | Refresh · help · quit |
 
@@ -288,7 +290,7 @@ No background daemon. No async runtime. No Unix sockets. Just a state file.
 
 ## Platform support
 
-v0.1.0 is **macOS-only** (Apple Silicon and Intel). Linux is deferred — the signature integrations (port detection, Chrome tab matching, iTerm pane spread) all rely on macOS-specific APIs.
+v0.1.0 is **macOS-only** (Apple Silicon and Intel). Linux is deferred — the signature integrations (port detection, Chrome tab matching, Ghostty pane spread) all rely on macOS-specific APIs.
 
 ## Troubleshooting + contributing
 

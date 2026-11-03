@@ -1,6 +1,5 @@
-//! Colours, laid out like the web sidebar's tokens (`web.html` `:root`) but
-//! taken from the terminal's own theme, the way Claude Code and every other
-//! terminal program follow it.
+//! Colours taken from the terminal's own theme, the way Claude Code and every
+//! other terminal program follow it.
 //!
 //! Text and accents are the default foreground and the ANSI palette (`Reset`,
 //! `Red`, `Blue`…), so the theme decides them and they keep their place

@@ -333,13 +333,13 @@ pub const EVENT_FOCUS: &str = "focus";
 pub const EVENT_WEB_VIEW: &str = "web_view";
 /// Web: the browser lost focus (tab hidden) or closed — stop counting web viewing time.
 pub const EVENT_WEB_BLUR: &str = "web_blur";
-/// tmux: the client stopped looking at tmux — detached (iTerm closed, `prefix+d`) or the
+/// tmux: the client stopped looking at tmux — detached (terminal closed, `prefix+d`) or the
 /// terminal lost OS focus (`client-focus-out`). Bounds a focus interval. From tmux hooks.
 pub const EVENT_BLUR: &str = "blur";
 /// A session was skipped / unskipped (set aside from cycling).
 pub const EVENT_SKIP: &str = "skip";
 pub const EVENT_UNSKIP: &str = "unskip";
-/// iTerm panes spread into N / collapsed back to one.
+/// Terminal panes spread into N / collapsed back to one.
 pub const EVENT_SPREAD: &str = "spread";
 pub const EVENT_COLLAPSE: &str = "collapse";
 
@@ -528,7 +528,7 @@ pub fn log_skip(session: &str, skipped: bool) {
     append_event(&ActivityEntry::new(event, Utc::now()).with("", session, "", ""));
 }
 
-/// Log an iTerm spread (into `count` panes) or collapse.
+/// Log a terminal pane spread (into `count` panes) or collapse.
 pub fn log_spread(count: usize) {
     append_event(&ActivityEntry::new(EVENT_SPREAD, Utc::now()).with(
         "",

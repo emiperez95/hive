@@ -318,10 +318,10 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     for mut request in server.incoming_requests() {
         let url = request.url().to_string();
         let method = request.method().clone();
-        // The page is also served with a query string (`/?sidebar=1` selects the
-        // Toolbelt panel layout), and tiny_http hands us path+query as one string —
-        // so the root arm matches on the path alone. Every other arm keeps matching
-        // the full URL, because the API endpoints parse their own query params.
+        // tiny_http hands us path+query as one string, and the page may be opened
+        // with a query string — so the root arm matches on the path alone. Every
+        // other arm keeps matching the full URL, because the API endpoints parse
+        // their own query params.
         let path = url.split('?').next().unwrap_or("/");
 
         match (method, url.as_str()) {
@@ -1109,17 +1109,6 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     if ok {
                         crate::common::persistence::unskip_session(session);
                     }
-                    // The click left keyboard focus in the sidebar's webview; give it
-                    // back to the terminal so tmux bindings keep working. Off-thread:
-                    // osascript costs ~100ms and the response shouldn't wait on it.
-                    if ok
-                        && req
-                            .get("refocus")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                    {
-                        std::thread::spawn(crate::common::terminal::focus_current_session);
-                    }
                     Some(format!(
                         r#"{{"ok":{},"client":{}}}"#,
                         ok,
@@ -1342,7 +1331,6 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                 return Err("it's waiting on a decision — answer that first".into());
                             }
                             send_text_to_pane(&pane.0, &pane.1, &pane.2, &text);
-                            std::thread::spawn(crate::common::terminal::focus_current_session);
                             Ok(r#"{"ok":true}"#.into())
                         }
                         "new" => {
@@ -1353,7 +1341,6 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                             let clients = crate::common::tmux::list_clients();
                             if let Some(c) = crate::common::tmux::pick_client(&clients) {
                                 crate::common::tmux::switch_client_to(&c.tty, &session, None);
-                                std::thread::spawn(crate::common::terminal::focus_current_session);
                             }
                             Ok(r#"{"ok":true}"#.into())
                         }

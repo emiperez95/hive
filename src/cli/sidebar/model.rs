@@ -2,9 +2,9 @@
 //!
 //! [`conv_rows`] flattens `/api/active` into one row per conversation, and
 //! [`build_items`] turns rows + frozen + projects into the flat item list for
-//! the current view. Both mirror the web sidebar (`sbConvRows`, `sbNest`,
-//! `sbProjectsHtml`, `renderSidebarList`) so the two surfaces never disagree
-//! about what is where.
+//! the current view. The attention order is computed server-side
+//! (`serve::server::rank_attention`), so this only groups and nests what the
+//! API already ranked — it never re-derives a tier.
 
 use std::collections::{HashMap, HashSet};
 
@@ -235,7 +235,9 @@ pub fn dur(s: u64) -> String {
     }
 }
 
-/// The web sidebar's state words, so both surfaces read the same.
+/// Compact state vocabulary, matching the TUI's: idle / work / flow / perm /
+/// plan / ask / edit. The dashboard's longer labels ("Edit Approval") don't
+/// fit a panel column.
 pub fn state_word(st: &Option<SessionStatus>) -> &'static str {
     match st {
         None => "—",

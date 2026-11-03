@@ -283,7 +283,7 @@ pub fn run_event(kind: &str, session: Option<&str>, window: Option<&str>) -> Res
     Ok(())
 }
 
-/// Spread tmux sessions into N side-by-side terminal panes (iTerm2 or Ghostty)
+/// Spread tmux sessions into N side-by-side terminal panes (Ghostty)
 pub fn run_spread(count: usize) -> Result<()> {
     if count <= 1 {
         return Ok(());

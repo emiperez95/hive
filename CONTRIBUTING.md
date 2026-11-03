@@ -6,7 +6,7 @@ The [README](./README.md) is for users. For architectural context before diving 
 
 ## Dev environment
 
-- **macOS** (Apple Silicon or Intel). Linux compiles via CI as a regression canary but the signature features (Chrome tabs, iTerm pane spread, port detection) are mac-only.
+- **macOS** (Apple Silicon or Intel). Linux compiles via CI as a regression canary but the signature features (Chrome tabs, Ghostty pane spread, port detection) are mac-only.
 - **Rust 1.82+** via [rustup](https://rustup.rs).
 - **tmux** and the **Claude Code CLI** on your `PATH` for manual testing.
 
@@ -78,23 +78,40 @@ See the [Project Structure](./CLAUDE.md#project-structure) section of CLAUDE.md 
 
 ## Adding a terminal emulator backend
 
-The iTerm2 pane spread/collapse feature lives in `src/common/iterm.rs` and is guarded behind `#[cfg(target_os = "macos")]`. To add support for another terminal emulator:
+Everything that scripts the terminal emulator lives in `src/common/terminal.rs`, guarded behind
+`#[cfg(target_os = "macos")]`. Ghostty is the only backend, but `Terminal` is an enum on purpose:
+to add another, add a variant and let the compiler list what is missing.
 
-1. **Create a new module** (e.g., `src/common/wezterm.rs` or `src/common/kitty.rs`) implementing:
-   - `get_pane_count() -> usize` — return the number of panes/splits in the current tab/window.
-   - `spread_panes(n: usize) -> bool` — open `n` new panes, each running `hive start` with the current PATH.
-   - `collapse_panes() -> bool` — close all panes except the current one.
-2. **Register the module** in `src/common/mod.rs`.
-3. **Wire it up** in `src/cli/session.rs` (`run_spread` / `run_collapse`) and in the TUI's `L` key handler at `src/tui/event_loop.rs`.
+1. **Add a variant** to `Terminal`. Every `match` on it then fails to compile until it has an arm:
+   - `app()` — the application name (AppleScript addresses it).
+   - `pane_count()` — the number of panes/splits in the current tab.
+   - `spread_panes(n)` — open `n` new panes, each running `hive start` with the current `PATH`.
+   - `collapse_panes()` — close every pane except the focused one.
+2. **Teach detection** to recognise it: `from_term_program` (`$TERM_PROGRAM`), `from_tmux_client`
+   (the tmux client's `#{client_termtype}`, i.e. the terminal's XTVERSION reply) and the
+   `$HIVE_TERMINAL` override in `detect()`. Most calls run inside tmux or the detached `__hive_web`
+   session, where `$TERM_PROGRAM` says nothing, so the tmux client is the path that matters.
+3. **Add tests** beside the existing ones for the new classifier arms.
+
+`hive spread` / `hive collapse` and the TUI's `L` key all go through `run_spread` / `run_collapse`
+in `src/cli/session.rs`, which call `terminal::spread_panes` / `collapse_panes` (and handle the tmux
+layout and activity log) — nothing else to wire up.
+
+The terminal sidebar's split helpers (`open_sidebar_split`, `resize_sidebar_split`,
+`focus_work_split`) are Ghostty-only today: they find the sidebar's split by its terminal title
+(`SIDEBAR_TITLE`). A backend that lacks them just can't open the sidebar automatically —
+`hive sidebar` itself is a plain terminal program and runs in a split you make by hand.
 
 Automation APIs to look at:
 
-- **iTerm2**: AppleScript (`tell application "iTerm2"`).
+- **Ghostty**: AppleScript (`tell application "Ghostty"`); there is no CLI for splits.
 - **WezTerm**: CLI (`wezterm cli split-pane`) or Lua scripting.
 - **Kitty**: Remote control protocol (`kitten @ launch`, `kitten @ close-window`).
-- **Alacritty / tmux-only**: No native terminal splits — fall back to tmux splits instead.
+- **Alacritty / tmux-only**: No native terminal splits — nothing to script.
 
-Gotcha: new panes need the full `PATH` to find `tmux`. iTerm2 split panes get a minimal environment, so hive passes `env PATH='...'` explicitly. Other terminals may or may not have this issue.
+Gotcha: new panes need the full `PATH` to find `tmux`. Ghostty splits start with launchd's `PATH`
+(no Homebrew), so hive passes `env PATH='...'` explicitly. Other terminals may or may not have this
+issue.
 
 ## Filing bugs / feature requests
 

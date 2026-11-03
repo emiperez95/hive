@@ -291,7 +291,7 @@ file). Six hooks map to a hidden `hive event <kind> [session] [window]` command:
 | `client-session-changed` | `focus` | any session switch (hive **and** native `prefix s`, click, external `switch-client`) |
 | `after-select-window` | `focus` | any window switch (hive `window-next/prev` **and** native `prefix n`/`p`) |
 | `client-attached` / `client-focus-in` | `focus` | re-attach / terminal regained OS focus |
-| `client-detached` | `blur` | **iTerm closed / `prefix+d`** — stop counting |
+| `client-detached` | `blur` | **terminal closed / `prefix+d`** — stop counting |
 | `client-focus-out` | `blur` | **alt-tabbed away from the terminal** — stop counting |
 
 Quoting was the hard part: the run-shell command carries single-quoted `#{format}` args inside
@@ -325,7 +325,7 @@ carries the window's total sleep. Unit-tested (aggregation caps, sleep subtracti
 
 | Event | Captured now? | How |
 |---|---|---|
-| Close iTerm / `prefix+d` | ✅ | `client-detached` → `blur` |
+| Close the terminal / `prefix+d` | ✅ | `client-detached` → `blur` |
 | Alt-tab away from terminal | ✅ | `client-focus-out` → `blur` |
 | Native tmux switch (`prefix s`/`n`, click) | ✅ | `client-session-changed` / `after-select-window` |
 | Lid close / sleep | ✅ subtracted | read from `pmset -g log` at report time; exact sleep removed from intervals |

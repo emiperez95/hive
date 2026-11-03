@@ -63,7 +63,7 @@ hive sidebar            # the sidebar as a terminal UI (see Terminal sidebar)
 hive sidebar --split    # open it on the right of the current Ghostty tab (no-op if there is one)
 hive --debug            # enable debug logging
 hive hook <event>       # process hook event from stdin (Stop, PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Notification)
-hive setup              # register hooks, agent, tmux keybindings, iTerm sidebar panel
+hive setup              # register hooks, agent, tmux keybindings
 hive uninstall          # remove hooks + tmux keybindings
 hive update             # update to latest version from GitHub + re-run setup
 hive --version          # print current version
@@ -100,7 +100,7 @@ hive todo next [--session <name>]           # print first active todo (exit 1 if
 hive todo add <text> [--session <name>]     # add a todo
 hive todo done [index] [--session <name>]   # mark todo as done (default: 1)
 hive todo clear [--session <name>]          # clear completed todos
-hive spread <N>                             # spread N sessions into side-by-side terminal panes (iTerm2 / Ghostty)
+hive spread <N>                             # spread N sessions into side-by-side terminal panes (Ghostty)
 hive collapse                               # collapse terminal panes back to one
 hive web                                    # start web dashboard on port 8375
 hive web --dev                              # dev mode: serve HTML from disk (live reload)
@@ -431,7 +431,7 @@ src/
 │   ├── process.rs          Claude process detection, process tree, build_cmdline_map/parse_resume_id
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
-│   ├── terminal.rs         the emulator around tmux — iTerm2 or Ghostty (detect, spread/collapse, focus, sidebar split)
+│   ├── terminal.rs         the emulator around tmux — Ghostty (detect, spread/collapse, sidebar split)
 │   ├── jsonl.rs            JSONL parsing + transcript scan (all auth profiles), mtime-keyed scan cache
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml)
@@ -547,7 +547,7 @@ Files are created on demand — `muted-projects.txt` only exists once you mute a
 macOS-only features use `#[cfg(target_os = "macos")]` with empty stubs for other platforms:
 - `ports.rs`: `get_listening_ports_for_pids()` — uses `libproc`
 - `chrome.rs`: `get_chrome_tabs()`, `focus_all_matched_tabs()` — uses JXA (sees all Chrome profiles)
-- `terminal.rs`: `pane_count()`, `spread_panes()`, `collapse_panes()`, `focus_current_session()`, the Ghostty sidebar split helpers — AppleScript against whichever emulator `detect()` finds
+- `terminal.rs`: `pane_count()`, `spread_panes()`, `collapse_panes()`, the Ghostty sidebar split helpers — AppleScript against the emulator `detect()` finds (Ghostty)
 
 ## Conversations TUI (`hive` / `hive conversations`, `prefix + s`, `prefix + d`, `prefix + a`)
 
@@ -1177,7 +1177,7 @@ independently. It has no equivalent of tier 2's git-derived "unreviewed work".
 
 ## `hive start`
 
-Auto-attach to a tmux session. Designed as iTerm2's startup command for new tabs/panes.
+Auto-attach to a tmux session. Designed as the terminal's startup command for new tabs/panes (Ghostty's `initial-command`, and each pane `hive spread` opens).
 
 1. Find the first non-skipped session **not attached** to another client → `exec tmux attach`
 2. If all non-skipped sessions are attached, attach to **any** non-skipped session (duplicates are fine)
@@ -1190,7 +1190,7 @@ TUI's own `Action` enum is the only post-exit dispatch.)
 
 ## `hive spread/collapse`
 
-`hive spread N` opens N-1 new side-by-side panes via AppleScript — iTerm2's `split vertically`, or Ghostty's `split … direction right` followed by `equalize_splits` (each split halves the last). Each new pane runs `env PATH='...' /path/to/hive start` — PATH is captured from the current process since iTerm split panes have minimal environment. Each `hive start` independently picks a session.
+`hive spread N` opens N-1 new side-by-side panes via AppleScript — Ghostty's `split … direction right` followed by `equalize_splits` (each split halves the last). Each new pane runs `env PATH='...' /path/to/hive start` — PATH is captured from the current process since a new split starts with launchd's PATH (no Homebrew, so no tmux). Each `hive start` independently picks a session.
 
 `hive collapse` closes all terminal panes in the tab except the focused one. Tmux sessions stay alive (just detached).
 
@@ -1198,7 +1198,7 @@ In the TUI, `L` toggles: if multiple panes exist → collapse, otherwise → sho
 
 **Tmux pane layout adjustment**: Spread and collapse also rearrange tmux panes within each session to optimize for the available space. Only windows with 2 or 3 panes are affected (1 or 4+ are left untouched):
 
-| Panes | Spread (narrow iTerm columns) | Collapse (full width) |
+| Panes | Spread (narrow terminal columns) | Collapse (full width) |
 |-------|-------------------------------|----------------------|
 | 2 | top 70% / bottom 30% | left 70% / right 30% |
 | 3 | top 70% / bottom two side-by-side in 30% | left 70% / right two stacked in 30% |
@@ -1423,7 +1423,7 @@ hide. Within a column cards keep the attention order — `build_board` emits the
 read as a stage of its own.)
 
 - Its own page (`board.html`), not a mode of `web.html`: that one is built mobile-first
-  for the phone and the 280px sidebar, a board is wide. `--dev` re-reads it from disk too.
+  for the phone, a board is wide. `--dev` re-reads it from disk too.
 - `/api/board` joins the data thread's two projections (`/api/active` for attention,
   skipped and pings; `/api/conversations` for title/project/profile/frozen) with the
   overlay **loaded per request**, so a moved card is in its new column on the next poll
@@ -1432,35 +1432,34 @@ read as a stage of its own.)
   not mint overlay records (same rule as `/api/conv-notes`). Any move other than to
   Blocked clears the note, so a stale reason never follows a card.
 
-## Sidebar — the iTerm2 Toolbelt panel (`/?sidebar=1`)
+## Sidebar — `hive sidebar`, a terminal UI in a Ghostty split
 
 The always-visible counterpart to the TUI, which is a popup and so is gone the
 moment you pick something. A narrow column of live conversations, what each is
-doing, and which one you're on. It is **the same `web.html`** in a `body.sidebar`
-mode, served by the dashboard that already autostarts — not a second frontend.
+doing, and which one you're on.
 
-**Why the Toolbelt and not a pane.** A TUI in an iTerm split needs AppleScript
-pane tagging plus teaching `collapse_panes` to spare it, and being a pane *inside*
-the terminal forces a focus round-trip on every click. The Toolbelt is iTerm's own
-extension point (`iterm2.tool.async_register_web_view_tool`). Forking a terminal
-was considered and rejected: the generic "scriptable sidebar" already exists in
-iTerm2, kitty and WezTerm alike.
+> **History.** It began as an iTerm2 Toolbelt panel: `web.html` in a `body.sidebar` mode
+> (`/?sidebar=1`), registered by an AutoLaunch script. Ghostty has no Toolbelt, so the
+> terminal form below was built to match it feature for feature; once it did, the web mode,
+> the script and the iTerm-only focus handoff (`focus_current_session`, the `refocus` flag on
+> `/api/switch`) were deleted. `hive setup` and `hive uninstall` still sweep a leftover
+> `hive_sidebar.py`. The old design is in `git log -- assets/iterm-sidebar.py`.
 
-**There is no daemon.** iTerm stores the registration in its own prefs
-(`NoSyncDynamicTools`), so the panel keeps working after the registering script
-exits. `hive setup` installs `assets/iterm-sidebar.py` to
-`~/Library/Application Support/iTerm2/Scripts/AutoLaunch/hive_sidebar.py`; it
-registers and exits. Requires a one-time "Enable Python API" in iTerm's settings.
+tmux can't host a pane outside its windows (every pane belongs to one window; the status line
+is the only per-client chrome). So the sidebar lives in a **Ghostty split** beside the one
+running `tmux attach`: outside tmux, it never moves when the client switches sessions, with no
+extra layer. `hive start --sidebar` opens it before attaching; `hive sidebar --split` adds it to
+the current tab. It has Live / Attention / Projects views, folded Skipped and Frozen sections
+(click thaws), global and per-project mute, the archived filter, Details (spend + git chips),
+Notes, Todos with the start-todo dialog, and resizable panes.
 
-> **Gotcha — the webview never reloads on its own.** An already-registered tool
-> keeps serving the page it first loaded, so a shipped change is invisible. The
-> URL therefore carries hive's version (`&v=0.1.27`), and re-registering with the
-> changed URL is what forces the reload — which is why the AutoLaunch script runs
-> every launch even though the registration persists. `hive uninstall` removes the
-> script, but iTerm has **no API to unregister a tool identifier**, so `hive` stays
-> in the Toolbelt's tool list to be unticked by hand.
+**It decides nothing.** Every row, tier, rank, age, ping, figure and dispatch rule comes
+from the dashboard's JSON API (`cli/sidebar/api.rs`), computed by the web data thread's one
+gather — so its attention order is `Ctrl+g`'s, and one sidebar per tab costs one HTTP poll
+each. Focus is pushed over the `/api/ambient-wait` long-poll (see **Focus is pushed**). It
+needs `__hive_web`, and calls `ensure_web_autostart` on launch.
 
-**Three views**, switched by header buttons whose positions are fixed (see below):
+**Three views:**
 
 - **Attention** — the same live conversations, ordered by how much they want a
   human instead of by which tmux session hosts them. Four tiers: **blocked**
@@ -1475,7 +1474,6 @@ registers and exits. Requires a one-time "Enable Python API" in iTerm's settings
   it's the tail you never act on — but it is exactly the list of free windows,
   which is half of what this view is for, and a fold is one click between you and
   it every time the panel rebuilds.
-
 
 - **Live** — conversations grouped by session, then folded `Skipped` / `Frozen`
   sections. One row per CONVERSATION, not per session: a session hosting three of
@@ -1496,19 +1494,13 @@ conversations is never hidden even when archived: you can't hide what's running.
 **Mute is surfaced here** because it is invisible and sticky — the flag had been on
 for nine days unnoticed when this was built. The header carries global mute and
 every project header its own, writing the same `muted-global` / `muted-projects.txt`
-the TUI's `G` and project `m` write. Muted renders as the same icon in red: no
-label, no background change, or a tinted pill per project would stripe the panel.
-
-**Header control order is archived · view · mute**, in a flex box that carries the
-`margin-left: auto`. The view button is the way back, and hanging the auto margin
-off whichever button came first meant revealing the archived filter shoved it
-sideways — a way back that moves is the one control you can't afford to hunt for.
+the TUI's `G` and project `m` write.
 
 ### The attention view — ranking, and what keeps it usable
 
 **The tier AND the order are computed in Rust** (`serve/server.rs::tier_for` and
-`attention_key`, shipped as `WindowView.attention` / `attention_rank`), never in
-`web.html` — which now just sorts by the rank it is handed.
+`attention_key`, shipped as `WindowView.attention` / `attention_rank`), never in a
+client — the sidebar just sorts by the rank it is handed.
 
 > **The order has two consumers and they must agree.** `Ctrl+g` (`cycle-free`)
 > walks the same ranked list the panel draws; a keybinding that visits
@@ -1529,10 +1521,9 @@ sideways — a way back that moves is the one control you can't afford to hunt f
 > leaving it, is gone. That was a consequence of tmux ordering, never the goal:
 > priority doesn't stop at a session boundary.
 
-The frontend has no test harness, and a second definition of "blocked" would
-drift from `SessionStatus::blocks_human` — itself now the single canonical
-predicate, after being written out independently in `common/conversations.rs`,
-`serve/server.rs` and `serve/metrics.rs`.
+A client that defined "blocked" itself would drift from `SessionStatus::blocks_human` —
+itself now the single canonical predicate, after being written out independently in
+`common/conversations.rs`, `serve/server.rs` and `serve/metrics.rs`.
 
 **The git probe runs only for idle windows** (`annotate_attention`). It costs
 ~0.045s per working tree and there are 13 live trees here, so probing busy and
@@ -1561,13 +1552,12 @@ or ranked — the same rule `cycle-free` follows.
 > branch that is *not* the base branch; on a feature branch it is exactly the
 > finished work that wants merging.
 
-**Rows don't move under the pointer.** The list is rebuilt wholesale every 1.5s.
-In the grouped views order is near-static, but here a row can change tier and jump
-the height of the panel between deciding to click and clicking — so `sbSwapList`
-skips the DOM swap while the pointer is over the list, and preserves `scrollTop`
-across it. `attention_key` is also a **total** order (tier, then age, then session
-and window index): a merely "mostly sorted" comparator reshuffles ties on every
-poll. Measured 20 samples over 20s with zero reorders.
+**Rows don't move under the pointer.** The data is regathered every second, and in
+Attention a row can change tier and jump the height of the panel between deciding to
+click and clicking — so a refresh that lands while the pointer was over the list in the
+last 2s is held (`pending`) until it leaves. `attention_key` is also a **total** order
+(tier, then age, then session and window index): a merely "mostly sorted" comparator
+reshuffles ties on every poll. Measured 20 samples over 20s with zero reorders.
 
 Within a tier, **oldest first, in every tier**: blocked and working by how long
 they've held that state (a two-hour wait outranks a ten-second one, a long job is
@@ -1581,37 +1571,20 @@ pulsing dot, sticky until a tmux client *lands* on that window — clicking the 
 from the phone). A transition in the window you're already on never marks, and a
 first sighting never does either. In memory in the data thread, like `StateAges`.
 
-**Clicking a row fires on `mousedown`**, not `click`: the list is rebuilt on each
-poll, and a click whose mouseup lands after a rebuild is silently dropped. The
-switch also sends `refocus: true`, which runs `terminal::focus_current_session` so the
-keyboard goes back to the terminal — otherwise the Toolbelt webview keeps it and
-every tmux binding goes to the panel.
-
 **An ungrouped row is TWO lines**, and the second one is the project and worktree
-(`sb-place`). Once the ordering stops being by project, "where is this" is the first
-thing you need, and at 280px it cannot share a line with a title without one of them
-being cut to nothing. The grouped views keep their single-line rows — there the
-session header above already answers it, and density is the point.
-
-> An earlier pass tried to keep one line by swapping the status dot for the project
-> emoji and putting the full place in a tooltip. It fits, but an emoji alone doesn't
-> distinguish the four `avateen` worktrees from each other or from the project, which
-> is exactly the distinction an unsorted list needs — and a tooltip is not a glance.
-> The dot is back to being the status dot, aligned to the first line (`align-items:
-> flex-start` plus a 5px nudge) so a column of rows still reads as a column of marks.
-
-> **Gotcha — `.map(sbRowHtml)` passes the array index.** `sbRowHtml` gained an
-> optional second parameter (`flat`), which silently turned every row after the
-> first into an attention-view row at three existing call sites. They now pass
-> `r => sbRowHtml(r)`.
+(`Item::Conv { flat }`, `model::place_of`). Once the ordering stops being by project,
+"where is this" is the first thing you need, and at 40 columns it cannot share a line
+with a title without one of them being cut to nothing. The grouped views keep their
+single-line rows — there the session header above already answers it, and density is
+the point. Swapping the status dot for the project emoji was tried and rejected: an
+emoji doesn't tell the four `avateen` worktrees apart, which is exactly the
+distinction an unsorted list needs.
 
 ### The stats pane — spend for the conversation you're on
 
-A second horizontal band under the list (`#sbStats`), showing token usage and cost
-for whichever conversation the tmux client is currently on. The list keeps
-`flex: 1` and scrolls; the pane is capped at 45% so a long breakdown can never
-squeeze out the list the panel exists for. Collapsible, remembered in
-`localStorage` (wrapped in try/catch — a webview can refuse storage).
+A pane under the list (`GET /api/conv-stats`) showing token usage and cost for
+whichever conversation the tmux client is currently on. It never squeezes the list below
+its minimum: `render::layout` shrinks the tallest pane first. Collapsible.
 
 **Four token classes, never one number.** Measured on a live conversation here,
 cache reads outran output tokens by ~340x (160M vs 464k). A summed "tokens" figure
@@ -1677,28 +1650,26 @@ attention-ordered cycle key over every live conversation — affordable.
 
 ### The notes pane — a scratchpad per conversation
 
-A third band under the stats pane (`#sbNotes`): a textarea holding free-form notes
-for whichever conversation the client is on. Stored as `notes` in that
+A pane under the stats: a textarea holding free-form notes for whichever
+conversation the client is on (`GET`/`POST /api/conv-notes`). Stored as `notes` in that
 conversation's overlay in `conversations.json` — **not** the existing `note`, which
 is a one-line label rendered inline on TUI rows, frozen cards and search, where a
 newline would break the row. Writes go through `ConversationSidecar::edit`
 (load-modify-save, the same helper the TUI's `edit_overlay` now uses), so they merge
 with a pin or cached parent written in between.
 
-The textarea is built **once** and only its value swaps on a focus change —
-re-rendering on the 1.5s poll would drop the caret mid-sentence. Saves debounce at
-700ms while typing and flush on blur and before switching conversations.
+The editor (`sidebar/editor.rs`) keeps its buffer across refreshes — a redraw on every
+poll would drop the caret mid-sentence. Saves debounce at 700ms while typing and flush
+(`flush_notes`) when the focused conversation changes, when the pane loses the keyboard,
+and on exit.
 
-### The todos pane, and resizing the panes
+### The todos pane
 
-A fourth band (`#sbTodos`): the **session's** todos — the same `todos.txt` /
-`todos-done.txt` as `hive todo`, the TUI project detail and the phone dashboard, so
-there is one list, not a sidebar-private one. It follows the client's *session*
-(todos are session-level everywhere in hive), not its conversation. Add with Enter,
-the circle marks done, `×` deletes, and a folded `Done (n)` tail lists finished items
-newest-first — clicking one reopens it. Refetched on a session change and every 5s,
-so a `hive todo add` from a terminal shows up. Same build-once rule as notes: only
-the list re-renders, never the add input.
+The **session's** todos — the same `todos.txt` / `todos-done.txt` as `hive todo`, the TUI
+project detail and the phone dashboard, so there is one list, not a sidebar-private one.
+It follows the client's *session* (todos are session-level everywhere in hive), not its
+conversation, and re-reads periodically so a `hive todo add` from a terminal shows up.
+Finished items sit in a `Done (n)` tail, newest first.
 
 **Starting a todo** (the ▶ on each row) opens a dialog with three ways to turn it
 into work (`serve/dispatch.rs`):
@@ -1734,19 +1705,16 @@ the todo stays active until it's ticked off by hand.
 > command now goes through `tmux::sh_quote` (single quotes), whose test runs the
 > output through a real `sh`.
 
-Each pane has a **drag grip above it** (`sbInitGrips`): drag up to grow the pane,
-the list (`flex: 1`) gives up the space, clamped so the list keeps ≥80px.
-Heights persist per pane in `localStorage` (`hiveSbH:<id>`); double-click resets.
-Grips hide via `:has(+ [hidden])` / `:has(+ .collapsed)` — nothing to size there.
+### Switching the tmux client
 
-### Clicking a row switches the tmux client
-
-`POST /api/switch` resolves a concrete client and runs
-`switch-client -c <tty> -t =session:window`. It cannot use a bare `switch-client`:
-that acts on "the current client" as derived from the caller's `$TMUX`, and this
-server runs inside the detached `__hive_web` session where that is nobody. Focus is
-logged by the `after-select-window` hook, so there is deliberately no `log_focus`
-call — it would double-count.
+The sidebar switches the client itself (`App::switch_to`: `tmux::list_clients` →
+`pick_client` → `switch_client_to`, i.e. `switch-client -c <tty> -t =session:window`);
+`POST /api/switch` takes the same path for the board's cards. Neither can use a bare
+`switch-client`: that acts on "the current client" as derived from the caller's `$TMUX`,
+and the sidebar runs outside tmux while the web server runs inside the detached
+`__hive_web` session — in both, that is nobody. Focus is logged by the
+`after-select-window` hook, so there is deliberately no `log_focus` call — it would
+double-count.
 
 > **Gotcha — `display-message -c <tty>` does NOT report that client's position.**
 > `-c` only chooses which client the message is shown to; the format is still
@@ -1764,11 +1732,11 @@ then take the most recently active, which is also right after `hive spread`.
 ### Focus is pushed, not polled
 
 The "you are here" marker used to move on the next 1.5s poll — 0.75s behind a
-keyboard switch on average, 1.5s at worst — while the page redraws in ~3ms. All
+keyboard switch on average, 1.5s at worst — while a redraw takes ~3ms. All
 of that lag was waiting. tmux already reports every switch (`after-select-window`,
 `client-session-changed`, `client-focus-in` → `hive event focus`), so the hook now
 also POSTs `/api/focus-nudge`, which bumps a generation counter (`FocusSignal`, a
-`Mutex<u64>` + `Condvar`). The page keeps one `GET /api/ambient-wait?gen=N` open;
+`Mutex<u64>` + `Condvar`). The sidebar keeps one `GET /api/ambient-wait?gen=N` open;
 it answers the moment the counter passes N. Measured: 5ms nudge → answer, 20ms
 nudge → marker moved.
 
@@ -1784,28 +1752,7 @@ nudge → marker moved.
 - The nudge is bounded (100ms connect, `ECONNREFUSED` when nothing listens) and
   runs under `run-shell -b`, so it can never delay tmux.
 
-> **Gotcha — the attention view's hover freeze swallowed clicks.** `sbSwapList`
-> skips the DOM swap while the pointer is over the list, and the pointer is always
-> over the list when you click — so the click's own optimistic redraw was dropped
-> and the marker waited for the mouse to leave. A render the user caused sets
-> `sbForceSwap` and always lands; so does a pushed focus change.
-
-## Terminal sidebar — `hive sidebar` in a Ghostty split
-
-Ghostty has no Toolbelt, and tmux can't host a pane outside its windows (every pane belongs
-to one window; the status line is the only per-client chrome). So the sidebar's terminal
-form lives in a **Ghostty split** beside the one running `tmux attach`: outside tmux, it
-never moves when the client switches sessions — the Toolbelt's permanence, with no extra
-layer. `hive start --sidebar` opens it before attaching; `hive sidebar --split` adds it to
-the current tab. It reaches feature parity with the web sidebar: Live / Attention / Projects,
-folded Skipped and Frozen (click thaws), global and per-project mute, the archived filter,
-Details (spend + git chips), Notes, Todos and the start-todo dialog, resizable panes.
-
-**It decides nothing.** Every row, tier, rank, age, ping, figure and dispatch rule comes
-from the dashboard's JSON API (`cli/sidebar/api.rs`), computed by the web data thread's one
-gather — so its attention order is `Ctrl+g`'s, and one sidebar per tab costs one HTTP poll
-each. Focus is pushed over the same `/api/ambient-wait` long-poll the web page holds. It
-needs `__hive_web`, and calls `ensure_web_autostart` on launch.
+### The Ghostty split
 
 Things that shaped it:
 
@@ -1827,8 +1774,6 @@ Things that shaped it:
 - **Every draw records a click map** (`App::hits`: spans per screen row), so mouse handling
   never re-derives layout. The dialog clears the rows it covers first, so nothing behind it
   is clickable.
-- **Rows don't move under the pointer**: in Attention, a refresh that lands while the
-  pointer was over the list in the last 2s is held (`pending`) until it leaves.
 - **Colours come from the terminal's theme** (`sidebar/theme.rs`), like Claude Code's: text and
   accents are the default foreground + ANSI palette (`Reset`, `Red`, `Blue`…), so they keep their
   place relative to everything else when the theme changes. Only the surfaces the palette can't
@@ -1836,14 +1781,13 @@ Things that shaped it:
   card is the background 6% toward the foreground, the current row the background tinted blue. Ghostty's `theme = light:…,dark:…` follows macOS appearance; the sidebar polls
   `AppleInterfaceStyle` every 3s and re-asks when it flips (a query mid-loop is safe only
   between crossterm reads — the main thread is the only stdin reader).
-- **Prefs persist** in `~/.hive/cache/sidebar.json` (view, folds, pane heights) — the web
-  page keeps the same in localStorage. Pane headers are the resize grips: drag to resize,
-  click to fold.
+- **Prefs persist** in `~/.hive/cache/sidebar.json` (view, folds, pane heights). Pane headers
+  are the resize grips: drag to resize, click to fold.
 - **Detection** (`terminal::detect`): `$HIVE_TERMINAL` → `$TERM_PROGRAM` → the most recent
-  tmux client's `#{client_termtype}`. Inside tmux `$TERM_PROGRAM` is `tmux`, and iTerm's
-  `$TERM` is a generic `xterm-256color`, so the XTVERSION reply is the reliable signal — and
-  the only one available to the detached `__hive_web` server.
-
+  tmux client's `#{client_termtype}`. Inside tmux `$TERM_PROGRAM` is `tmux`, so the XTVERSION
+  reply (or Ghostty's own `xterm-ghostty` `$TERM`) is the reliable signal — and the only one
+  available to the detached `__hive_web` server. Ghostty is the only backend, but `Terminal`
+  is still an enum so the next one is compile-guided (see `CONTRIBUTING.md`).
 - **Launch**: Ghostty's `initial-command = …/hive start --sidebar` gives the first window
   tmux + sidebar; later windows, tabs and splits stay plain shells (`command` would apply to
   every split too). `open_split_on_start` retries briefly, since the first window isn't yet
@@ -1969,7 +1913,8 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   matching the screen, the dialog owning its clicks, done todos newest-first with the server's
   index, no panic down to 4×3
 - `common/terminal.rs`: emulator detection — `$TERM_PROGRAM`, a tmux client's
-  `client_termtype`/`termname` (iTerm's `$TERM` is generic), the most recent non-control client
+  `client_termtype`/`termname` (Ghostty by either; an unrecognised terminal is `None`, never mistaken
+  for Ghostty), and the most recent non-control client wins even over an older attached Ghostty one
 - `common/prune.rs`: `git worktree list --porcelain` parsing (detached, valued `locked`,
   `prunable`, slashed branches), only `.claude/worktrees/` counts as an agent worktree, and the
   keep rules — dirty, unpushed, locked, recently used or unreadable all keep; a branch goes only

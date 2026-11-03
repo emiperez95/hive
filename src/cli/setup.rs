@@ -38,33 +38,23 @@ fn commands_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".claude").join("commands").join("hive")
 }
 
-/// Bundled iTerm2 AutoLaunch script that registers the Toolbelt sidebar panel.
-const ITERM_SIDEBAR_SCRIPT: &str = include_str!("../../assets/iterm-sidebar.py");
-
-/// The AutoLaunch script, with the configured web port and this build's version
-/// baked in. The version is what makes an upgrade reload the panel: iTerm's
-/// webview does not refresh on its own, so a changed URL is the only way a new
-/// release's page reaches an already-registered tool.
-fn iterm_sidebar_script() -> String {
-    let port = crate::common::config::HiveConfig::load().web.port;
-    ITERM_SIDEBAR_SCRIPT
-        .replace("__PORT__", &port.to_string())
-        .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
-}
-
-/// Where iTerm2 looks for scripts to run at launch.
-fn iterm_sidebar_path(home: &std::path::Path) -> std::path::PathBuf {
-    home.join("Library")
+/// Remove the AutoLaunch script of the retired iTerm2 Toolbelt sidebar, if an
+/// older hive left one. The terminal sidebar (`hive sidebar`) replaced it; the
+/// script would keep registering a panel that now loads the phone dashboard at
+/// sidebar width. hive wrote the file under this fixed name, so it is safe to
+/// remove unprompted. iTerm has no API to unregister a tool, so the empty
+/// "hive" entry in its Toolbelt list is the one thing left to untick by hand.
+///
+/// Returns the path removed, or `None` when there was nothing to do.
+fn remove_legacy_iterm_sidebar(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = home
+        .join("Library")
         .join("Application Support")
         .join("iTerm2")
         .join("Scripts")
         .join("AutoLaunch")
-        .join("hive_sidebar.py")
-}
-
-/// Only offer the panel where it can actually work.
-fn iterm_installed() -> bool {
-    cfg!(target_os = "macos") && std::path::Path::new("/Applications/iTerm.app").exists()
+        .join("hive_sidebar.py");
+    std::fs::remove_file(&path).ok().map(|_| path)
 }
 
 /// Check if a hook command belongs to hive
@@ -467,23 +457,10 @@ pub fn run_setup(yes: bool) -> Result<()> {
         "missing"
     };
 
-    // iTerm2 Toolbelt sidebar (macOS + iTerm only)
-    let sidebar_dest = iterm_sidebar_path(&home);
-    let sidebar_wanted = iterm_sidebar_script();
-    let sidebar_status = if !iterm_installed() {
-        "n/a"
-    } else if !sidebar_dest.exists() {
-        "missing"
-    } else if fs::read_to_string(&sidebar_dest).unwrap_or_default() == sidebar_wanted {
-        "ok"
-    } else {
-        "update"
-    };
-    match sidebar_status {
-        "ok" => println!("  [ok]      iTerm2 sidebar panel"),
-        "update" => println!("  [update]  iTerm2 sidebar panel (port or version changed)"),
-        "missing" => println!("  [missing] iTerm2 sidebar panel"),
-        _ => {}
+    // Runs before the "already set up" early return, so it always happens once.
+    if let Some(path) = remove_legacy_iterm_sidebar(&home) {
+        println!("  [removed] retired iTerm2 sidebar script {:?}", path);
+        println!("            (untick 'hive' in iTerm's Toolbelt list if you ever open it)");
     }
 
     match agent_status {
@@ -518,20 +495,8 @@ pub fn run_setup(yes: bool) -> Result<()> {
         && tmux_cf_bound;
     let agent_needs_install = agent_status != "ok";
     let cmd_needs_install = !cmds_to_install.is_empty();
-    // `n/a` (no iTerm) is not work; "missing" and "update" both are. Leaving the
-    // sidebar out of this check made a version-only change unreachable: the status
-    // block printed `[update]`, the early return fired anyway, and setup announced
-    // "Everything is already set up!" without ever offering the install. Since the
-    // version in the URL is the ONLY thing that forces iTerm's webview to reload,
-    // that silently pinned the panel to whatever page it first loaded.
-    let sidebar_needs_install = sidebar_status == "missing" || sidebar_status == "update";
 
-    if !needs_hook_changes
-        && all_tmux_bound
-        && !agent_needs_install
-        && !cmd_needs_install
-        && !sidebar_needs_install
-    {
+    if !needs_hook_changes && all_tmux_bound && !agent_needs_install && !cmd_needs_install {
         println!();
         println!("Everything is already set up!");
         return Ok(());
@@ -753,26 +718,6 @@ pub fn run_setup(yes: bool) -> Result<()> {
         }
     }
 
-    // Install the iTerm2 Toolbelt sidebar panel
-    if sidebar_status == "missing" || sidebar_status == "update" {
-        println!();
-        print!("Install the iTerm2 Toolbelt sidebar panel? [Y/n] ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-
-        if read_yn(yes)? {
-            if let Some(parent) = sidebar_dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&sidebar_dest, &sidebar_wanted)?;
-            println!("Sidebar script installed to {:?}", sidebar_dest);
-            println!("  Enable it once: iTerm2 > Settings > General > Magic > 'Enable Python API'");
-            println!("  Then restart iTerm2 (or run Scripts > AutoLaunch > hive_sidebar),");
-            println!("  and show it with Cmd+Shift+B.");
-        } else {
-            println!("Skipped iTerm2 sidebar panel.");
-        }
-    }
-
     // Install janus-wt-portal agent
     if agent_needs_install {
         println!();
@@ -977,23 +922,10 @@ pub fn run_uninstall(yes: bool) -> Result<()> {
         println!("Skipped focus-hook removal.");
     }
 
-    // --- iTerm2 Toolbelt sidebar ------------------------------------
-    let sidebar_path = iterm_sidebar_path(&home);
-    if sidebar_path.exists() {
+    // --- retired iTerm2 Toolbelt sidebar ----------------------------
+    if let Some(path) = remove_legacy_iterm_sidebar(&home) {
         println!();
-        print!("Remove the iTerm2 sidebar AutoLaunch script? [Y/n] ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-
-        if read_yn(yes)? {
-            fs::remove_file(&sidebar_path)?;
-            println!("Removed {:?}", sidebar_path);
-            // iTerm2 has no API to unregister a tool identifier, so the entry
-            // stays in the Toolbelt's tool list. Untick it there; without this
-            // script it will not re-register and the panel stays empty.
-            println!("  Note: iTerm keeps 'hive' in its Toolbelt tool list — untick it there.");
-        } else {
-            println!("Skipped sidebar removal.");
-        }
+        println!("Removed retired iTerm2 sidebar script {:?}", path);
     }
 
     // --- janus-wt-portal agent --------------------------------------
@@ -1063,5 +995,56 @@ fn rmdir_if_empty(path: Option<&std::path::Path>) {
         if entries.next().is_none() {
             let _ = std::fs::remove_dir(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_home() -> std::path::PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("hive-setup-test-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn autolaunch(home: &std::path::Path) -> std::path::PathBuf {
+        home.join("Library")
+            .join("Application Support")
+            .join("iTerm2")
+            .join("Scripts")
+            .join("AutoLaunch")
+    }
+
+    #[test]
+    fn legacy_iterm_script_is_removed_once_and_only_that_file() {
+        let home = temp_home();
+        let dir = autolaunch(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("hive_sidebar.py");
+        let other = dir.join("someone_elses.py");
+        std::fs::write(&legacy, "# written by an older hive").unwrap();
+        std::fs::write(&other, "# not ours").unwrap();
+
+        assert_eq!(remove_legacy_iterm_sidebar(&home), Some(legacy.clone()));
+        assert!(!legacy.exists(), "the stale script is gone");
+        assert!(other.exists(), "a neighbouring script is never touched");
+
+        // Idempotent: a second sweep has nothing to do and reports so.
+        assert_eq!(remove_legacy_iterm_sidebar(&home), None);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_sweep_is_a_no_op_without_iterm() {
+        let home = temp_home();
+        assert_eq!(remove_legacy_iterm_sidebar(&home), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

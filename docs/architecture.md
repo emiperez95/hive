@@ -21,7 +21,7 @@ flowchart TB
 
     subgraph terminal["Terminal stack (local)"]
         tmux["tmux"]:::ext
-        iterm["iTerm2"]:::ext
+        ghostty["Ghostty"]:::ext
         chrome["Chrome"]:::ext
     end
 
@@ -39,7 +39,7 @@ flowchart TB
     phone -->|HTTP LAN| hive
 
     hive <-->|list/switch/send-keys| tmux
-    hive -->|AppleScript: split/close| iterm
+    hive -->|AppleScript: split/close| ghostty
     hive -->|JXA: list/focus tabs| chrome
 
     claude -->|hook events: stdin JSON| hive
@@ -73,7 +73,7 @@ C4Container
 
     System_Ext(claude, "Claude Code CLI")
     System_Ext(tmux, "tmux")
-    System_Ext(iterm, "iTerm2")
+    System_Ext(ghostty, "Ghostty")
     System_Ext(chrome, "Chrome")
     System_Ext(tts, "TTSQwen")
     System_Ext(github, "GitHub releases")
@@ -96,7 +96,7 @@ C4Container
     Rel(web, tmux, "send-keys, new-session, kill")
     Rel(cli, tmux, "wt new → new-session with hooks")
 
-    Rel(tui, iterm, "spread / collapse panes")
+    Rel(tui, ghostty, "spread / collapse panes")
     Rel(tui, chrome, "list / focus tabs by port")
 
     Rel(web, tts, "POST /api/tts-hls → proxy /hls/*")

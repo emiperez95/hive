@@ -1,15 +1,12 @@
 //! `hive sidebar` — the sidebar as a terminal UI, for a Ghostty split.
 //!
-//! The terminal-native counterpart of the web sidebar (`/?sidebar=1`), for
-//! terminals with no Toolbelt to host a webview. It sits in its own Ghostty
-//! split beside the one running `tmux attach`, so it is outside tmux and stays
-//! put while the client moves between sessions — the permanence the Toolbelt had.
+//! It sits in its own Ghostty split beside the one running `tmux attach`, so it
+//! is outside tmux and stays put while the client moves between sessions.
 //!
-//! It draws and decides nothing the web sidebar doesn't: rows, tiers, ranks,
-//! held-for ages, pings, spend, todos and dispatch all come from the dashboard's
-//! JSON API ([`api`]), computed by the web data thread's one gather. That keeps
-//! the attention order identical to `Ctrl+g`, and N sidebars (one per tab) as
-//! cheap as N HTTP polls.
+//! It draws, and decides nothing: rows, tiers, ranks, held-for ages, pings,
+//! spend, todos and dispatch all come from the dashboard's JSON API ([`api`]),
+//! computed by the web data thread's one gather. That keeps the attention order
+//! identical to `Ctrl+g`, and N sidebars (one per tab) as cheap as N HTTP polls.
 //!
 //! Layout, top to bottom: header (counts + view / archived / mute toggles), the
 //! list (Live · Attention · Projects, with Skipped and Frozen folded below), then
@@ -40,8 +37,8 @@ use api::{Api, Focus, FrozenItem, Msg, Stats, Todos};
 use editor::Editor;
 use model::{Conv, Item, ListState, Projects, Sect, View};
 
-/// Width the sidebar settles at when it opens as a split, in columns. Matches
-/// the web sidebar's ~280px at a typical cell width.
+/// Width the sidebar settles at when it opens as a split, in columns — about
+/// 280px at a typical cell width.
 const SIDEBAR_COLS: u16 = 40;
 
 /// A click this soon after the pointer was over a spot counts as a click there

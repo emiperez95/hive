@@ -130,7 +130,7 @@ pub enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
-    /// Spread tmux sessions into N side-by-side terminal panes (iTerm2 or Ghostty)
+    /// Spread tmux sessions into N side-by-side terminal panes (Ghostty)
     Spread {
         /// Number of panes (1-9)
         count: usize,
