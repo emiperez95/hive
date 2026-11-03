@@ -41,10 +41,7 @@
   </div>
   <div>
     <span class="seg-label">Lanes</span>
-    <div class="seg" id="lanes">
-      <button data-v="none">None</button>
-      <button data-v="on" id="laneBtn">Area</button>
-    </div>
+    <div class="seg" id="lanes"><button data-v="none">None</button></div>
   </div>
 </header>
 <main>
@@ -74,7 +71,7 @@ const store = Board.store('hiveTasks:');
 let project = '', data = null, tasks = [];
 let lastJson = '', query = '', pendingBlock = null, menuTask = null;
 let sortMode = store.get('sort', 'priority');
-let laneOn = true;
+let laneBy = '';          // header field the lanes group by; '' = no lanes
 let folded = new Set();
 
 // Board columns reuse the conversation board's stage colours.
@@ -90,7 +87,23 @@ const PRIO = {
 const prioRank = { high: 0, medium: 1, low: 2, none: 3 };
 
 const field = (t, k) => { const f = t.fields.find(f => f[0].toLowerCase() === k.toLowerCase()); return f ? f[1] : ''; };
-const laneField = () => ((data && data.group_by) || 'area').toLowerCase();
+// Lanes group by one header field. The board's `group_by` leads (area when unset); the others
+// are offered once some task carries them, so a board with no `type` never shows an empty Type.
+const LANE_FIELDS = ['area', 'epic', 'type'];
+const defaultLane = () => ((data && data.group_by) || 'area').toLowerCase();
+const laneChoices = () => [...new Set([defaultLane(), ...LANE_FIELDS])]
+  .filter(k => k === defaultLane() || k === laneBy || tasks.some(t => field(t, k)));
+// Folded lanes are remembered per field. The default field keeps the original key, so
+// what was folded before lanes could switch field still is.
+const foldKey = () => 'folded:' + project + (laneBy && laneBy !== defaultLane() ? ':' + laneBy : '');
+let laneSegKey = '';
+function renderLaneSeg() {
+  const fields = laneChoices(), key = fields.join(',');
+  if (key === laneSegKey) return;
+  laneSegKey = key;
+  $('#lanes').innerHTML = '<button data-v="none">None</button>' +
+    fields.map(k => `<button data-v="${esc(k)}">${esc(label(k))}</button>`).join('');
+}
 const ageDays = t => t.modified ? Math.max(0, Math.floor((Date.now() - Date.parse(t.modified)) / 864e5)) : null;
 const isOpen = t => !t.completed && t.column !== 'done';
 const issuesOf = t => data.schema_on ? (t.issues || []).filter(i => i.level === 'error') : [];
@@ -111,13 +124,12 @@ function matches(t) {
 }
 
 function cardHtml(t) {
-  const lf = laneOn ? laneField() : '';
-  const place = ['area', 'epic'].filter(k => k !== lf).map(k => field(t, k)).filter(Boolean).join(' / ');
+  const place = ['area', 'epic'].filter(k => k !== laneBy).map(k => field(t, k)).filter(Boolean).join(' / ');
   const p = PRIO[t.priority];
   const age = ageDays(t);
   const stale = age !== null && isOpen(t) && age >= (data.stale_days || 7);
   const tags = [];
-  for (const k of ['type', 'size', 'est']) { const v = field(t, k); if (v) tags.push(`<span class="tag" title="${k}">${esc(v)}</span>`); }
+  for (const k of ['type', 'size', 'est'].filter(k => k !== laneBy)) { const v = field(t, k); if (v) tags.push(`<span class="tag" title="${k}">${esc(v)}</span>`); }
   if (t.due) {
     const d = t.due.slice(0, 10);
     tags.push(`<span class="tag ${isOpen(t) && d < new Date().toISOString().slice(0, 10) ? 'late' : ''}" title="due">⏰ ${d}</span>`);
@@ -155,7 +167,6 @@ function render() {
   const visible = tasks.filter(matches);
   const count = c => visible.filter(t => t.column === c).length;
   const by = (list, c) => list.filter(t => t.column === c).sort(sortTasks);
-  const lf = laneField();
 
   $('#strip').innerHTML = cols.map(c =>
     `<span class="pill"><i style="background:${colVar(c)}"></i>${label(c)} <b>${count(c)}</b></span>`).join('');
@@ -163,39 +174,44 @@ function render() {
     `<div class="colhead"><i style="background:${colVar(c)}"></i>${label(c)}<span class="n">${count(c)}</span></div>`).join('')}</div>`;
 
   let body;
-  if (!laneOn) {
+  if (!laneBy) {
     body = `<div class="lane-cells">${cols.map(c => cellHtml(by(visible, c), c)).join('')}</div>`;
   } else {
     const lanes = new Map();
     for (const t of visible) {
-      const v = field(t, lf) || '(none)';
+      const v = field(t, laneBy) || '(none)';
       if (!lanes.has(v)) lanes.set(v, { key: v, cards: [] });
       lanes.get(v).cards.push(t);
     }
     const open = l => l.cards.filter(isOpen).length;
     const sorted = [...lanes.values()].sort((a, b) => open(b) - open(a) || b.cards.length - a.cards.length || a.key.localeCompare(b.key));
     body = sorted.map(l => {
-      const mini = cols.map(c => {
+      // Finished work isn't workload: the dots and the big number count what's still open, and
+      // the total with the done ones follows in parentheses only when there are any.
+      const mini = cols.filter(c => c !== 'done').map(c => {
         const n = l.cards.filter(t => t.column === c).length;
         return n ? `<span title="${label(c)}"><i style="background:${colVar(c)}"></i>${n}</span>` : '';
       }).join('');
+      const o = open(l), all = l.cards.length, fin = all - o;
+      const count = fin ? `${o} (${all})` : `${o}`;
+      const tip = fin ? `${o} open · ${all} including ${fin} done` : `${o} open`;
       return `<section class="lane ${folded.has(l.key) ? 'folded' : ''}" data-lane="${esc(l.key)}">
-        <div class="lane-head"><span class="caret">▾</span>${esc(l.key)}<span class="n">${l.cards.length}</span><span class="mini">${mini}</span></div>
+        <div class="lane-head"><span class="caret">▾</span>${esc(l.key)}<span class="n" title="${tip}">${count}</span><span class="mini">${mini}</span></div>
         <div class="lane-cells">${cols.map(c => cellHtml(by(l.cards, c), c)).join('')}</div>
       </section>`;
     }).join('') || '<div style="padding:40px;text-align:center;color:var(--faint)">No tasks</div>';
   }
 
   const boardEl = $('#board');
-  boardEl.className = 'board ' + (laneOn ? '' : 'no-lanes');
+  boardEl.className = 'board ' + (laneBy ? '' : 'no-lanes');
   boardEl.style.setProperty('--ncols', cols.length);
   const scroll = $('main').scrollTop;
   boardEl.innerHTML = heads + body;
   $('main').scrollTop = scroll;
   Board.syncStuck();
 
-  $('#laneBtn').textContent = label(lf);
-  Board.segMark('#lanes', v => (v === 'on') === laneOn);
+  renderLaneSeg();
+  Board.segMark('#lanes', v => (v === 'none' ? '' : v) === laneBy);
   Board.segMark('#sorts', v => v === sortMode);
 }
 
@@ -213,8 +229,16 @@ async function load() {
     $('#offline').hidden = true;
     if (text === lastJson || Board.dragging()) return;
     lastJson = text;
-    if (data === null) laneOn = store.get('lanes:' + project, !!r.group_by);
+    const first = data === null;
     data = r; tasks = r.tasks;
+    if (first) {
+      const v = store.get('lanes:' + project, null);   // 'none' | a field; true/false from older builds
+      laneBy = v === null ? (r.group_by ? defaultLane() : '')
+        : v === true ? defaultLane()
+        : v === false || v === 'none' ? ''
+        : LANE_FIELDS.concat(defaultLane()).includes(String(v).toLowerCase()) ? String(v).toLowerCase() : defaultLane();
+      folded = new Set(store.get(foldKey(), []));
+    }
     render();
   } catch { $('#offline').hidden = false; $('#offline').textContent = 'offline'; }
 }
@@ -272,14 +296,19 @@ Board.wireDnD(board, (id, cell) => {
 });
 board.addEventListener('click', e => {
   const lane = e.target.closest('.lane-head');
-  if (lane) { Board.toggleLane(lane, folded, () => store.set('folded:' + project, [...folded])); return; }
+  if (lane) { Board.toggleLane(lane, folded, () => store.set(foldKey(), [...folded])); return; }
   const el = e.target.closest('.card');
   const t = el && tasks.find(t => t.id === el.dataset.id);
   if (t) showDetail(t);
 });
 
 // ---- toolbar ----
-Board.seg('#lanes', v => { laneOn = v === 'on'; store.set('lanes:' + project, laneOn); render(); });
+Board.seg('#lanes', v => {
+  laneBy = v === 'none' ? '' : v;
+  store.set('lanes:' + project, v);
+  folded = new Set(store.get(foldKey(), []));
+  render();
+});
 Board.seg('#sorts', v => { sortMode = v; store.set('sort', v); render(); });
 $('#search').addEventListener('input', e => { query = e.target.value.trim().toLowerCase(); render(); });
 
@@ -311,7 +340,6 @@ Board.menu.el.addEventListener('click', e => {
   const boards = await Board.switcher();
   project = pathProject() || (boards[0] && boards[0].key) || '';
   Board.pick('/tasks/' + encodeURIComponent(project));
-  folded = new Set(store.get('folded:' + project, []));
   await load();
   setInterval(load, 3000);
 })();

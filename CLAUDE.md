@@ -321,8 +321,17 @@ filter = { project = "symposium" }           # one list shared by several projec
   shadow list in both states). Under macOS **Reduce Motion** it degrades to a 0.18s fade/collapse
   with no sliding or stagger rather than switching off — the setting was ON in the browser this was
   tested in, and "off" would have shown the user no animation at all. The task page has a column strip with
-  counts, a `Lanes: None | <group_by>` toggle (default `area`), a Priority/Stalest sort, details
+  counts, a `Lanes: None | Area | Type | …` toggle (see below), a Priority/Stalest sort, details
   on click, drag between columns, and ⚠ chips only once a board declares a schema (`schema_on`).
+- **Lanes group by one header field, switchable on the page.** `group_by` is the board's lead
+  field (`area` when unset); `area`, `epic` and `type` are offered too, once at least one task
+  carries them, so a board with no `type` never shows an empty Type button. The chosen field is
+  remembered per board (`lanes:<project>`; older builds stored a boolean, read as the lead field),
+  and folded lanes per field — the lead field keeps the original `folded:<project>` key, the others
+  get `folded:<project>:<field>`. A card drops whichever field its lane already names. Lanes
+  still start OFF unless the board sets `group_by`. A lane header counts what is still OPEN —
+  the big number and the per-column dots both leave out done; the total follows in parentheses
+  (`2 (4)`) only when something in the lane is finished.
 - **Agents**: `/hive:tasks` (installed by `hive setup`) tells Claude how to read and write the
   board. Only the completed tasks within the latest 15 are loaded; older ones aren't addressable.
 
