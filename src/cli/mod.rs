@@ -471,12 +471,23 @@ pub enum TaskCommand {
         #[arg(long, value_name = "REASON")]
         by: Option<String>,
     },
-    /// Set header fields (`key=value`; `key=` removes) and the Reminders fields
-    /// `priority=` (none|low|medium|high), `due=` (ISO date; empty clears) and `title=`
+    /// Set header fields (`key=value`; `key=` removes), the Reminders fields
+    /// `priority=` (none|low|medium|high), `due=` (ISO date; empty clears) and `title=`,
+    /// and the markdown body (`--append` adds to it, `--body` rewrites it)
     Set {
         id: String,
-        #[arg(required = true, value_name = "KEY=VALUE")]
+        #[arg(
+            required_unless_present_any = ["body", "append"],
+            value_name = "KEY=VALUE"
+        )]
         fields: Vec<String>,
+        /// Replace the body. `-` reads it from stdin; an empty value clears it. The old
+        /// text is not kept anywhere — it is echoed to stderr, and that is the only copy
+        #[arg(long, conflicts_with = "append", allow_hyphen_values = true)]
+        body: Option<String>,
+        /// Add to the end of the body, after a blank line. `-` reads it from stdin
+        #[arg(long, allow_hyphen_values = true)]
+        append: Option<String>,
         #[arg(short, long)]
         project: Option<String>,
     },

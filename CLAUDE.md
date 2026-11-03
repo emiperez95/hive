@@ -91,6 +91,7 @@ hive wt list [project]  # list registered worktrees with tmux status
 hive wt prune [project] # remove leftover Workflow agent worktrees + worktree-wf_* / wf/* branches (plan, then y/N)
 hive wt prune --branches 'review-*' --dry-run  # extra branch globs; show the plan only
 hive task list|show|add|move|set|done|link [-p <project>]  # the project's task board (Apple Reminders); project defaults to the cwd's
+hive task set <id> --append '…'|-           # add to a task's body (`-` = stdin); --body rewrites it, '' clears
 hive task schema|lint [-p <project>]        # the board's header rules / tasks that break them (read-only)
 hive task boards                            # which projects have a board
 hive todo list [--session <name>] [--done]  # list active (or completed) todos
@@ -351,6 +352,19 @@ schema can be reviewed with `hive task lint` first (draft + migration table:
   `due=` (ISO date or datetime; empty clears) and `title=` (`tasks::edit_native`). Those three
   names are reserved — never written to the header. A title edit may not lose or change a
   leading `[PREFIX-nnn]` id (ids are cited in notes and PRs).
+- **`hive task set --append` / `--body` edit the body** (`tasks::edit_body`, `Notes::set_body` /
+  `append_body`) — the free markdown after the `---` fence, which no other command could change
+  (a `/hive:tasks` agent told "put it in the body" had no way to). `--append` adds after a blank
+  line and leaves what is there byte-for-byte; `--body` rewrites it (`''` clears, fence included).
+  `-` as the value reads stdin, since a review or a rationale is long and multi-line.
+  - **Reminders keeps no history**, so a rewrite echoes the old body to stderr — that output is
+    the only copy. The `/hive:tasks` command tells agents to append and to rewrite only when asked.
+  - **The header is not touched**: no reordering on a strict board, no schema validation (the
+    body is free text). A body edit that changes nothing writes nothing, because Reminders'
+    `modified` is the staleness clock and any write resets it.
+  - **The fence is always written.** A body with no `---` above it would be re-read as header
+    fields if its first line looked like `Summary: …`. An existing fence is kept as written.
+  - Not in the web page: `tasks.html` shows the body but can't edit it.
 - **Custom metadata, two ways.** A board *declares* a field (`fields.<name>` in `projects.toml`,
   optionally typed / restricted — Thesis `log`, AWS `parent`), or a task carries a one-off
   **`x-` field** (`--field x-reviewer=niko`) that no schema needs to know about: free text,

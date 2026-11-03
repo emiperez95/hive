@@ -165,6 +165,44 @@ impl Notes {
         let r = r.strip_prefix("---").unwrap_or(r);
         r.trim().to_string()
     }
+
+    /// The existing text through its `---` fence (kept as written, so a replaced body
+    /// doesn't reformat the line above it), else a fresh fence. The fence is always
+    /// there when a body is written: without it, a body whose first line reads
+    /// `Summary: …` would be taken for a header field the next time it is parsed.
+    fn fence(&self) -> String {
+        if let Some(r) = &self.rest {
+            let t = r.trim_start_matches('\n');
+            if t.starts_with("---") {
+                return r[..r.len() - t.len() + 3].to_string();
+            }
+        }
+        "---".to_string()
+    }
+
+    /// Replace the body. Empty clears it, fence included. The header is untouched.
+    pub fn set_body(&mut self, body: &str) {
+        let body = body.trim();
+        self.rest = (!body.is_empty()).then(|| format!("{}\n{body}", self.fence()));
+    }
+
+    /// Add `text` after the existing body, separated by a blank line. What is already
+    /// there stays byte-for-byte (only trailing whitespace is dropped to place the gap).
+    pub fn append_body(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let has_body = !self.body().is_empty();
+        match &mut self.rest {
+            Some(r) if has_body => {
+                r.truncate(r.trim_end().len());
+                r.push_str("\n\n");
+                r.push_str(text);
+            }
+            _ => self.set_body(text),
+        }
+    }
 }
 
 // ----------------------------------------------------------------------- tasks
@@ -613,6 +651,34 @@ pub fn edit_native(cfg: &TasksConfig, id: &str, e: &NativeEdit) -> Result<Task> 
     get_owned(cfg, id)
 }
 
+/// A change to a task's body (the free markdown under the header).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BodyEdit {
+    /// Rewrite it. Empty clears it.
+    Replace(String),
+    /// Add to the end of what is there.
+    Append(String),
+}
+
+/// Edit the body of a task of this board. The header is left exactly as it was — no
+/// reordering on a strict board either, since nothing in it changed. A write that would
+/// change nothing is skipped: Reminders' `modified` date is the board's staleness clock
+/// and any write resets it.
+pub fn edit_body(cfg: &TasksConfig, id: &str, e: &BodyEdit) -> Result<Task> {
+    let t = get_owned(cfg, id)?;
+    let mut notes = t.notes.clone();
+    match e {
+        BodyEdit::Replace(b) => notes.set_body(b),
+        BodyEdit::Append(a) => notes.append_body(a),
+    }
+    if notes == t.notes {
+        return Ok(t);
+    }
+    write_notes(id, &notes)?;
+    invalidate(cfg);
+    get_owned(cfg, id)
+}
+
 pub struct NewTask {
     pub title: String,
     pub column: Option<String>,
@@ -854,6 +920,89 @@ mod tests {
             "## Goal\nHave enough context.\n\n- one\n- two"
         );
         assert_eq!(Notes::parse(THESIS).body(), "");
+    }
+
+    #[test]
+    fn set_body_rewrites_the_body_and_nothing_above_it() {
+        let mut n = Notes::parse(AWS);
+        n.set_body("## Review\nNiko's answers.");
+        assert_eq!(
+            n.render(),
+            "project: symposium\ntype: sync\nstatus: todo\nsize: S\nlinks: https://hedgedoc.symposium.dev/Q7q\n---\n## Review\nNiko's answers."
+        );
+        assert_eq!(n.fields(), Notes::parse(AWS).fields());
+    }
+
+    #[test]
+    fn set_body_fences_a_body_under_a_bare_header_or_none() {
+        let mut n = Notes::parse(THESIS);
+        n.set_body("hello");
+        assert_eq!(n.render(), format!("{THESIS}\n---\nhello"));
+        // No header at all: the fence is what stops a first line like this reading as a field.
+        let mut bare = Notes::parse("");
+        bare.set_body("Summary: it works");
+        let again = Notes::parse(&bare.render());
+        assert!(again.fields().is_empty(), "{:?}", again.fields());
+        assert_eq!(again.body(), "Summary: it works");
+    }
+
+    #[test]
+    fn set_body_keeps_the_fence_as_it_was_written() {
+        let mut n = Notes::parse("a: 1\n\n---\nold");
+        n.set_body("new");
+        assert_eq!(n.render(), "a: 1\n\n---\nnew");
+    }
+
+    #[test]
+    fn an_empty_body_clears_it_fence_included() {
+        let mut n = Notes::parse(AWS);
+        n.set_body("  \n");
+        assert_eq!(n.body(), "");
+        assert_eq!(
+            n.render(),
+            "project: symposium\ntype: sync\nstatus: todo\nsize: S\nlinks: https://hedgedoc.symposium.dev/Q7q"
+        );
+    }
+
+    #[test]
+    fn append_body_adds_after_a_blank_line_and_keeps_what_was_there() {
+        let mut n = Notes::parse(AWS);
+        n.append_body("## Review\nNiko's answers.\n");
+        assert_eq!(
+            n.render(),
+            format!("{AWS}\n\n## Review\nNiko's answers."),
+            "existing body byte-for-byte, one blank line, then the addition"
+        );
+        n.append_body("- more");
+        assert!(n.render().ends_with("Niko's answers.\n\n- more"));
+    }
+
+    #[test]
+    fn append_body_to_an_empty_body_starts_it() {
+        let mut a = Notes::parse(THESIS);
+        a.append_body("first");
+        assert_eq!(a.render(), format!("{THESIS}\n---\nfirst"));
+        let mut b = Notes::parse("a: 1\n---\n");
+        b.append_body("first");
+        assert_eq!(b.render(), "a: 1\n---\nfirst");
+    }
+
+    #[test]
+    fn append_of_nothing_changes_nothing() {
+        let mut n = Notes::parse(AWS);
+        n.append_body(" \n ");
+        assert_eq!(n, Notes::parse(AWS));
+    }
+
+    #[test]
+    fn a_replaced_body_survives_a_parse_round_trip() {
+        for body in ["plain", "## H\n\n- a\n- b", "---\nnot a fence", "k: v"] {
+            let mut n = Notes::parse(AWS);
+            n.set_body(body);
+            let back = Notes::parse(&n.render());
+            assert_eq!(back.body(), body);
+            assert_eq!(back.fields(), Notes::parse(AWS).fields());
+        }
     }
 
     fn reminder(notes: &str, completed: bool) -> Value {

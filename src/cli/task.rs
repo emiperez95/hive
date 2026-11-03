@@ -7,7 +7,7 @@
 use crate::cli::TaskCommand;
 use crate::common::projects::{ProjectRegistry, TasksConfig};
 use crate::common::task_schema;
-use crate::common::tasks::{self, NewTask, Task};
+use crate::common::tasks::{self, BodyEdit, NewTask, Task};
 use anyhow::{anyhow, bail, Result};
 
 /// The board to act on: `--project`, else the cwd's project.
@@ -62,6 +62,45 @@ fn resolve<'a>(tasks: &'a [Task], id: &str) -> Result<&'a Task> {
 
 fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
+}
+
+/// A text argument. `-` reads stdin to the end, so a long multi-line body needs no shell
+/// quoting: `hive task set <id> --append - <<'EOF' … EOF`.
+fn text_arg(v: String) -> Result<String> {
+    if v != "-" {
+        return Ok(v);
+    }
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        eprintln!("reading the text from stdin — end with Ctrl-D");
+    }
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text)?;
+    Ok(text)
+}
+
+fn line_count(s: &str) -> usize {
+    s.lines().count()
+}
+
+fn lines(n: usize) -> String {
+    format!("{n} line{}", if n == 1 { "" } else { "s" })
+}
+
+/// One line saying what a body edit did, from the body before and after.
+fn body_change(before: &str, after: &str, edit: &BodyEdit) -> String {
+    if before == after {
+        return "body: unchanged".into();
+    }
+    match edit {
+        BodyEdit::Replace(_) if after.is_empty() => "body: cleared".into(),
+        BodyEdit::Replace(_) => format!("body: replaced ({})", lines(line_count(after))),
+        BodyEdit::Append(a) => format!(
+            "body: +{} ({} total)",
+            lines(line_count(a.trim())),
+            line_count(after)
+        ),
+    }
 }
 
 fn line(t: &Task, group_by: Option<&str>, stale: bool) -> String {
@@ -215,11 +254,26 @@ pub fn run_task(cmd: TaskCommand) -> Result<()> {
         TaskCommand::Set {
             id,
             fields,
+            body,
+            append,
             project,
         } => {
             let (_, cfg) = board(project)?;
+            // Read stdin before touching Reminders: a failure here writes nothing.
+            let body_edit = match (body, append) {
+                (Some(b), _) => Some(BodyEdit::Replace(text_arg(b)?)),
+                (None, Some(a)) => {
+                    let a = text_arg(a)?;
+                    if a.trim().is_empty() {
+                        bail!("--append got no text");
+                    }
+                    Some(BodyEdit::Append(a))
+                }
+                (None, None) => None,
+            };
             let all = tasks::fetch(&cfg)?;
-            let full = resolve(&all, &id)?.id.clone();
+            let before = resolve(&all, &id)?;
+            let (full, old_body) = (before.id.clone(), before.body.clone());
             let (mut sets, mut removes) = (Vec::new(), Vec::new());
             let mut native = tasks::NativeEdit::default();
             for f in fields {
@@ -244,6 +298,9 @@ pub fn run_task(cmd: TaskCommand) -> Result<()> {
             if !native.is_empty() {
                 t = Some(tasks::edit_native(&cfg, &full, &native)?);
             }
+            if let Some(e) = &body_edit {
+                t = Some(tasks::edit_body(&cfg, &full, e)?);
+            }
             let t = t.ok_or_else(|| anyhow!("nothing to set"))?;
             println!("{}", t.title);
             println!(
@@ -256,6 +313,13 @@ pub fn run_task(cmd: TaskCommand) -> Result<()> {
             );
             for (k, v) in &t.fields {
                 println!("  {k}: {v}");
+            }
+            if let Some(e) = &body_edit {
+                println!("  {}", body_change(&old_body, &t.body, e));
+                // Reminders keeps no history: a rewrite's old text lives only in this output.
+                if matches!(e, BodyEdit::Replace(_)) && !old_body.is_empty() && old_body != t.body {
+                    eprintln!("\nprevious body (not kept anywhere else):\n{old_body}");
+                }
             }
             Ok(())
         }
@@ -380,5 +444,35 @@ pub fn run_task(cmd: TaskCommand) -> Result<()> {
             println!("linked {} to conversation {}", t.title, short(&conv));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_change_says_what_happened() {
+        let rep = BodyEdit::Replace(String::new());
+        let app = |t: &str| BodyEdit::Append(t.into());
+        assert_eq!(body_change("a", "a", &rep), "body: unchanged");
+        assert_eq!(body_change("a\nb", "", &rep), "body: cleared");
+        assert_eq!(body_change("a", "x", &rep), "body: replaced (1 line)");
+        assert_eq!(
+            body_change("a", "x\ny\nz", &rep),
+            "body: replaced (3 lines)"
+        );
+        // The blank separator is not counted as added text.
+        assert_eq!(
+            body_change("a\nb", "a\nb\n\nc\nd\n", &app("c\nd\n")),
+            "body: +2 lines (5 total)"
+        );
+        assert_eq!(body_change("", "x", &app("x")), "body: +1 line (1 total)");
+    }
+
+    #[test]
+    fn text_that_is_not_a_dash_passes_through() {
+        assert_eq!(text_arg("## Review".into()).unwrap(), "## Review");
+        assert_eq!(text_arg("".into()).unwrap(), "");
     }
 }

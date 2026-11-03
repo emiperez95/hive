@@ -1,6 +1,6 @@
 ---
 description: Read and update this project's task board (Apple Reminders) — what's todo, doing, blocked, how stale; create, move, edit or complete tasks following the board's schema; link this conversation to one. Use when asked about tasks, the backlog, what's next or blocked, or to record follow-up work.
-argument-hint: "[list | show <id> | add <title> | move <id> <column> | set <id> k=v | done <id> | schema | lint]"
+argument-hint: "[list | show <id> | add <title> | move <id> <column> | set <id> k=v [--append …] | done <id> | schema | lint]"
 allowed-tools: Bash(hive task:*)
 ---
 
@@ -50,6 +50,10 @@ hive task add [-c doing] [--field area=ops --field type=chore --field size=S] [-
 hive task move <id> <column> [--by '<what it waits on>']   # `done` completes; `blocked` needs --by
 hive task set <id> size=M epic=onboarding       # header fields; `key=` removes one
 hive task set <id> priority=high due=2026-12-01 # the Reminders fields, same command
+hive task set <id> --append - <<'EOF'           # add to the body (stdin; or --append '…')
+## Review — Niko
+- what was decided, and why
+EOF
 hive task done <id>
 hive task link <id>            # records this conversation as working on it
 ```
@@ -63,9 +67,16 @@ hive task link <id>            # records this conversation as working on it
 - Move a task when its real state changed: `doing` when you start it (and `hive task link`),
   `blocked --by …` when you hit a wall, `done` when finished and verified. Add a task for
   follow-up you discover but aren't doing now.
+- The body is the free markdown under the header: context, reasoning, review notes — whatever
+  doesn't fit a field. **`--append` adds to it** (after a blank line, what is there stays as
+  written); that is the normal way to record something on a task. `--body` *rewrites* it, and
+  Reminders keeps no history — the old text is echoed once to stderr and is gone after that.
+  Rewrite only when asked to, or on a task you created; otherwise append. `--body ''` clears it.
+  Pass long text on stdin (`-`) rather than quoting it. Run `show <id>` first so you add to
+  what is there instead of repeating it.
 - Don't reshuffle, complete, retitle or rewrite tasks you haven't worked on; they're the
   user's plan. Never delete a task or drop information from one — if something doesn't fit a
-  field, put it in the body.
+  field, append it to the body.
 - If a command is refused, fix the call from its message — don't work around it. If you keep
   needing a field the board lacks, tell the user; it belongs in the schema.
 

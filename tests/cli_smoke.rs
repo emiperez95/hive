@@ -135,6 +135,32 @@ fn wt_new_help_lists_no_switch() {
     assert!(stdout.contains("--no-switch"), "Missing --no-switch flag");
 }
 
+/// `task set` is the only way to edit a task's body; agents are told about these flags by
+/// `/hive:tasks`, so they must stay on the help page.
+#[test]
+fn task_set_help_lists_the_body_flags() {
+    let output = hive_cmd().args(["task", "set", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--body", "--append"] {
+        assert!(stdout.contains(flag), "Missing {flag}");
+    }
+}
+
+/// A body edit counts as something to set, but nothing at all is still a usage error,
+/// and replacing and appending together is ambiguous.
+#[test]
+fn task_set_needs_something_to_set_and_body_excludes_append() {
+    let bare = hive_cmd().args(["task", "set", "abc"]).output().unwrap();
+    assert!(!bare.status.success());
+    let both = hive_cmd()
+        .args(["task", "set", "abc", "--body", "x", "--append", "y"])
+        .output()
+        .unwrap();
+    assert!(!both.status.success());
+    assert!(String::from_utf8_lossy(&both.stderr).contains("cannot be used with"));
+}
+
 #[test]
 fn fork_help_lists_its_targets() {
     let output = hive_cmd().args(["fork", "--help"]).output().unwrap();
