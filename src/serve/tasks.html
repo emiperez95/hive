@@ -140,8 +140,14 @@ function cardHtml(t) {
   </div>`;
 }
 
-const cellHtml = (list, col) => `<div class="cell" data-col="${esc(col)}">
-  ${list.length ? list.map(cardHtml).join('') : '<div class="empty">—</div>'}</div>`;
+// Finished work stacks (see board-common.css): the most recently finished task in front.
+const finishedAt = t => Date.parse(t.completed_at || t.modified || 0) || 0;
+const cellHtml = (list, col) => {
+  const stack = col === 'done' && list.length > 1;
+  if (stack) list = [...list].sort((a, b) => finishedAt(b) - finishedAt(a));
+  return `<div class="cell ${stack ? 'stack' : ''}" data-col="${esc(col)}" ${stack ? `data-hint="+${list.length - 1} more · hover"` : ''}>
+    ${list.length ? list.map(cardHtml).join('') : '<div class="empty">—</div>'}</div>`;
+};
 
 function render() {
   if (!data) return;

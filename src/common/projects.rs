@@ -65,8 +65,10 @@ pub struct TasksConfig {
     pub source: String,
     /// Reminders list name.
     pub list: String,
-    /// Board columns, in order. Default: todo, doing, blocked, done. A column named
-    /// `done` is the one that completes the reminder.
+    /// Extra columns for this board, or a reordering. Every board always has the generic
+    /// set (todo, doing, blocked, tracking, done): a core column left out here is put
+    /// back in its canonical place, so a board can add columns but never lose one.
+    /// `done` is the column that completes the reminder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
     /// Header field the board groups into swimlanes (e.g. `epic`, `area`).
@@ -118,7 +120,30 @@ fn default_tasks_source() -> String {
     "reminders".into()
 }
 
-pub const DEFAULT_TASK_COLUMNS: [&str; 4] = ["todo", "doing", "blocked", "done"];
+/// The columns every task board has. What each means:
+///   todo      not started
+///   doing     being worked on now; the next move is ours
+///   blocked   we want to move but something specific stands in the way (`blocked-by`)
+///   tracking  watching only: nothing is owed and it resolves by an outside event
+///   done      finished; completes the reminder
+pub const CORE_TASK_COLUMNS: [&str; 5] = ["todo", "doing", "blocked", "tracking", "done"];
+
+/// Configured columns with every core column guaranteed. A missing core column goes
+/// right after the nearest core column before it that is present (or first).
+fn with_core_columns(configured: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = configured.iter().map(|c| c.to_lowercase()).collect();
+    for (i, core) in CORE_TASK_COLUMNS.iter().enumerate() {
+        if out.iter().any(|c| c == core) {
+            continue;
+        }
+        let after = CORE_TASK_COLUMNS[..i]
+            .iter()
+            .rev()
+            .find_map(|prev| out.iter().position(|c| c == prev));
+        out.insert(after.map_or(0, |p| p + 1), core.to_string());
+    }
+    out
+}
 
 impl TasksConfig {
     pub fn stale_days(&self) -> u32 {
@@ -126,11 +151,49 @@ impl TasksConfig {
     }
 
     pub fn columns(&self) -> Vec<String> {
-        if self.columns.is_empty() {
-            DEFAULT_TASK_COLUMNS.iter().map(|s| s.to_string()).collect()
-        } else {
-            self.columns.iter().map(|c| c.to_lowercase()).collect()
-        }
+        with_core_columns(&self.columns)
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    fn cols(v: &[&str]) -> Vec<String> {
+        with_core_columns(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    const GENERIC: [&str; 5] = ["todo", "doing", "blocked", "tracking", "done"];
+
+    #[test]
+    fn no_config_is_the_generic_set() {
+        assert_eq!(cols(&[]), GENERIC);
+    }
+
+    #[test]
+    fn a_board_cannot_lose_a_core_column() {
+        // the aws-hub config that dropped `blocked`
+        assert_eq!(cols(&["todo", "doing", "tracking", "done"]), GENERIC);
+        // a config that omits `tracking`
+        assert_eq!(cols(&["todo", "doing", "blocked", "done"]), GENERIC);
+        // a config that names almost nothing
+        assert_eq!(cols(&["done"]), GENERIC);
+    }
+
+    #[test]
+    fn extras_are_kept_before_done_and_case_is_folded() {
+        assert_eq!(
+            cols(&["todo", "Review", "done"]),
+            ["todo", "doing", "blocked", "tracking", "review", "done"]
+        );
+    }
+
+    #[test]
+    fn a_complete_config_keeps_its_own_order() {
+        assert_eq!(
+            cols(&["todo", "doing", "review", "blocked", "tracking", "done"]),
+            ["todo", "doing", "review", "blocked", "tracking", "done"]
+        );
     }
 }
 

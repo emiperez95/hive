@@ -275,11 +275,15 @@ each reminder's notes start with a `key: value` header, and `status:` is the col
 ```toml
 [projects.thesis.tasks]
 list = "Thesis"                              # the Reminders list
-columns = ["todo", "blocked", "done"]        # default: todo, doing, blocked, done
+columns = ["review"]                         # optional EXTRAS; every board always has the generic five
 group_by = "epic"                            # swimlanes by a header field (optional)
 filter = { project = "symposium" }           # one list shared by several projects
 ```
 
+- **Every board has the same columns**: `todo doing blocked tracking done` (`CORE_TASK_COLUMNS`,
+  `projects.rs`). A board's `columns` can only add extras (kept before `done`) or reorder — a core
+  column it leaves out is put back (`with_core_columns`), because aws-hub once dropped `blocked`
+  with an explicit list. `tracking` = watching only, nothing owed; it is not for work in flight.
 - **`common/tasks.rs`** — `Notes` splits the header from the rest and edits ONE line,
   preserving every other key, the order and the `---` body (round-trip tests use both real
   dialects). `Task.column` = `status` if it is a configured column, else the first; a
@@ -305,7 +309,17 @@ filter = { project = "symposium" }           # one list shared by several projec
   the right-click menu, the sticky header, and the board switcher dropdown beside the logo).
   Each page keeps only its own data, card HTML and actions (`board.html` ~25KB, `tasks.html`
   ~14KB). Served at `/board-common.css|js` with `no-cache`; `--dev` reads them from disk. A
-  change to a shared piece reaches both pages — check both. The task page has a column strip with
+  change to a shared piece reaches both pages — check both.
+  **The Done column stacks** when it has more than one card (`.cell.stack` in the shared CSS): the
+  most recently finished card in front (tasks: Reminders' `completedAt`; conversations: when the
+  card moved to Done), the edges of the rest drawn as `box-shadow` layers so it doesn't depend on
+  card heights, the others hidden, `+N more` beneath. Hovering the column — or dragging a card
+  over it (`.over`) — fans it out. A page marks the cell and orders the cards; the CSS does the rest.
+  The fan-out is animated (~0.36s, staggered): back cards collapse by `max-height`/margin/padding
+  (`display` can't be transitioned) and the front card's edge shadows interpolate (same-shaped
+  shadow list in both states). Under macOS **Reduce Motion** it degrades to a 0.18s fade/collapse
+  with no sliding or stagger rather than switching off — the setting was ON in the browser this was
+  tested in, and "off" would have shown the user no animation at all. The task page has a column strip with
   counts, a `Lanes: None | <group_by>` toggle (default `area`), a Priority/Stalest sort, details
   on click, drag between columns, and ⚠ chips only once a board declares a schema (`schema_on`).
 - **Agents**: `/hive:tasks` (installed by `hive setup`) tells Claude how to read and write the

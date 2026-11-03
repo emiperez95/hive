@@ -34,6 +34,11 @@ hive task lint                 # tasks that already break the rules (read-only)
   plus whatever the board adds. `hive task schema` is the authority on names, values and which
   are required; don't rely on this list.
 
+**Statuses** are the same on every board: `todo` (not started) · `doing` (being worked on now) ·
+`blocked` (you want to move but something specific stands in the way — needs `blocked-by`) ·
+`tracking` (watching only: nothing is owed and it resolves by an outside event — not a place for
+work in flight) · `done`. A board may add columns of its own; `hive task schema` lists them.
+
 `untouched Nd` is the time since *anyone* last edited the reminder, phone included. Any write
 resets it — so don't edit a task just to look active, and don't write dates into the header
 (no `updated:`; Reminders tracks that itself).

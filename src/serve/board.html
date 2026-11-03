@@ -213,8 +213,11 @@ function cardHtml(c) {
   </div>`;
 }
 
+// Finished work stacks (see board-common.css): the card moved to Done most recently in front.
 function cellHtml(list, stageKey) {
-  return `<div class="cell" data-stage="${stageKey ?? ''}">
+  const stack = stageKey === 'done' && list.length > 1;
+  if (stack) list = [...list].sort((a, b) => (Date.parse(b.stage_at || 0) || 0) - (Date.parse(a.stage_at || 0) || 0));
+  return `<div class="cell ${stack ? 'stack' : ''}" data-stage="${stageKey ?? ''}" ${stack ? `data-hint="+${list.length - 1} more · hover"` : ''}>
     ${list.length ? list.map(c => cardHtml(c)).join('') : '<div class="empty">—</div>'}
   </div>`;
 }

@@ -188,6 +188,8 @@ pub struct Task {
     /// Reminders' own last-modified time (RFC 3339): the last edit by anyone,
     /// phone included. Not "last worked on" — any write, hive's own included, moves it.
     pub modified: Option<String>,
+    /// When the reminder was completed (RFC 3339), from Reminders itself.
+    pub completed_at: Option<String>,
     /// How this task breaks the board's schema (see `common/task_schema.rs`).
     pub issues: Vec<Issue>,
     #[serde(skip)]
@@ -229,6 +231,10 @@ impl Task {
             completed,
             modified: v
                 .get("modified")
+                .and_then(|d| d.as_str())
+                .map(str::to_string),
+            completed_at: v
+                .get("completedAt")
                 .and_then(|d| d.as_str())
                 .map(str::to_string),
             issues: task_schema::validate(cfg, &notes.fields(), completed),
@@ -860,19 +866,30 @@ mod tests {
         let t = |n: &str, done| Task::from_reminder(&reminder(n, done), &c).unwrap();
         assert_eq!(t("status: doing", false).column, "doing");
         assert_eq!(t("status: Blocked", false).column, "blocked");
-        assert_eq!(t("status: tracking", false).column, "todo");
+        assert_eq!(t("status: tracking", false).column, "tracking");
+        assert_eq!(
+            t("status: review", false).column,
+            "todo",
+            "unknown falls to the first column"
+        );
         assert_eq!(t("", false).column, "todo");
         assert_eq!(t("status: todo", true).column, "done");
     }
 
     #[test]
-    fn a_board_without_a_done_column_never_invents_one() {
+    fn every_board_has_the_generic_columns_even_when_it_names_fewer() {
         let c = TasksConfig {
             columns: vec!["todo".into(), "blocked".into()],
             ..cfg()
         };
-        let t = Task::from_reminder(&reminder("status: blocked", true), &c).unwrap();
-        assert_eq!(t.column, "blocked");
+        assert_eq!(
+            c.columns(),
+            ["todo", "doing", "blocked", "tracking", "done"]
+        );
+        let t = Task::from_reminder(&reminder("status: tracking", false), &c).unwrap();
+        assert_eq!(t.column, "tracking");
+        let done = Task::from_reminder(&reminder("status: blocked", true), &c).unwrap();
+        assert_eq!(done.column, "done", "completed always lands in done");
     }
 
     #[test]

@@ -9,7 +9,7 @@ reports. Edits made in the Reminders app are never blocked — lint is how drift
 
 | field | kind | meaning |
 |---|---|---|
-| `status` * | enum = board columns | column; `done` also completes the reminder |
+| `status` * | todo · doing · blocked · tracking · done (+ a board's extras) | board column. doing = being worked now; blocked = needs `blocked-by`; tracking = watching only, nothing owed; done completes the reminder |
 | `area` | text (narrowed per board) | coarse category of the work |
 | `epic` | text | named stream of related tasks |
 | `type` | chore · sync · review · research · feature · design | kind of work |
@@ -41,7 +41,7 @@ Cross-field rules: `blocked` ⇔ `blocked-by` present; `done` ⇔ reminder compl
 |---|---|
 | `project` (symposium, ops, roadmap, link) | **`area`** (closed set; also picks the title id `[SYMP-nnn]`) |
 | `area` (onboarding, skills-loader, …) | **`epic`** — same idea as Thesis's `epic` |
-| `type`, `size`, `status` | same (`tracking` stays an AWS column; `blocked` added) |
+| `type`, `size`, `status` | same (`tracking` and `blocked` are now generic columns on every board) |
 | `materials` | `files` |
 | `repo`, `links`, `worktree` | same (`repo: … (private)` → drop the suffix, it isn't a URL) |
 | `parent` (1×) | AWS-only field `parent` |

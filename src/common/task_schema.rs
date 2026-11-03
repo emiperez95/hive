@@ -53,7 +53,7 @@ const CORE: &[Core] = &[
         name: "status",
         kind: Kind::Enum,
         values: &[],
-        doc: "board column; `done` also completes the reminder",
+        doc: "board column. todo; doing = being worked now; blocked = needs `blocked-by`; tracking = watching only, nothing owed; done = finished, completes the reminder",
     },
     Core {
         name: "area",
@@ -609,9 +609,19 @@ mod tests {
     #[test]
     fn status_values_are_the_boards_columns() {
         let mut c = cfg();
-        c.columns = vec!["todo".into(), "tracking".into(), "done".into()];
-        assert!(msgs(&c, &[("status", "tracking")], false).is_empty());
-        assert!(!msgs(&c, &[("status", "doing")], false).is_empty());
+        c.columns = vec!["todo".into(), "review".into(), "done".into()];
+        // the generic set is always valid, and the board's own extra is too
+        for ok in ["todo", "doing", "blocked", "tracking", "done", "review"] {
+            let blocked = [("status", ok), ("blocked-by", "x")];
+            let hdr: &[(&str, &str)] = if ok == "blocked" {
+                &blocked
+            } else {
+                &[("status", ok)]
+            };
+            let m = msgs(&c, hdr, ok == "done");
+            assert!(m.is_empty(), "{ok}: {m:?}");
+        }
+        assert!(!msgs(&c, &[("status", "nope")], false).is_empty());
     }
 
     #[test]
