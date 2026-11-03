@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hive Tasks</title>
+<link rel="stylesheet" href="/board-common.css">
+<style>
+  /* Task-board only; the rest is in board-common.css. */
+  :root { --warn: #b38600; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --warn: #e2b203; } }
+  :root[data-theme="dark"] { --warn: #e2b203; }
+  .card.done { opacity: .72; }
+  .card .why { font-size: 12px; color: var(--s-blocked); background: color-mix(in srgb, var(--s-blocked) 10%, transparent);
+               border-radius: 4px; padding: 3px 6px; line-height: 1.35; }
+  .tag.late { color: var(--s-blocked); }
+  .tag.warn { color: var(--warn); cursor: help; }
+  .foot .age.stale { color: var(--warn); font-weight: 600; }
+  .dialog.wide { max-width: 560px; max-height: 86vh; overflow: auto; }
+  .dialog dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; font-size: 12px; }
+  .dialog dt { color: var(--faint); }
+  .dialog dd { word-break: break-word; }
+  .dialog pre { white-space: pre-wrap; font: 12px/1.5 inherit; color: var(--muted); margin: 0; }
+  .dialog .issues { font-size: 12px; color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐝 hive <span>tasks</span></h1>
+  <select class="board-sel" id="boardSel" title="Switch board"></select>
+  <div class="strip" id="strip"></div>
+  <span class="offline" id="offline" hidden>offline</span>
+  <div class="spacer"></div>
+  <input class="search" id="search" placeholder="Filter…" autocomplete="off">
+  <div>
+    <span class="seg-label">Sort</span>
+    <div class="seg" id="sorts">
+      <button data-v="priority">Priority</button>
+      <button data-v="stalest">Stalest</button>
+    </div>
+  </div>
+  <div>
+    <span class="seg-label">Lanes</span>
+    <div class="seg" id="lanes">
+      <button data-v="none">None</button>
+      <button data-v="on" id="laneBtn">Area</button>
+    </div>
+  </div>
+</header>
+<main>
+  <div class="board" id="board"></div>
+</main>
+
+<div class="scrim" id="scrim">
+  <form class="dialog" id="dialog">
+    <h2>Blocked on what?</h2>
+    <p id="dialogFor"></p>
+    <input id="reason" placeholder="e.g. waiting on staging creds" autocomplete="off">
+    <div class="row">
+      <button type="button" id="cancel">Cancel</button>
+      <button type="submit" class="primary">Move to Blocked</button>
+    </div>
+  </form>
+</div>
+<div class="scrim" id="detailScrim"><div class="dialog wide" id="detail"></div></div>
+<div class="menu" id="menu" role="menu"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/board-common.js"></script>
+<script>
+const { $, esc, post, toast } = Board;
+const store = Board.store('hiveTasks:');
+
+let project = '', data = null, tasks = [];
+let lastJson = '', query = '', pendingBlock = null, menuTask = null;
+let sortMode = store.get('sort', 'priority');
+let laneOn = true;
+let folded = new Set();
+
+// Board columns reuse the conversation board's stage colours.
+const KNOWN = ['todo', 'planning', 'in_progress', 'blocked', 'done'];
+const ALIAS = { doing: 'in_progress', tracking: 'planning' };
+const colVar = k => { const m = ALIAS[k] || k; return `var(--s-${KNOWN.includes(m) ? m : 'todo'})`; };
+const label = k => k.charAt(0).toUpperCase() + k.slice(1);
+const PRIO = {
+  high:   { label: 'high',   v: '--rt-needs' },
+  medium: { label: 'medium', v: '--rt-working' },
+  low:    { label: 'low',    v: '--rt-off' },
+};
+const prioRank = { high: 0, medium: 1, low: 2, none: 3 };
+
+const field = (t, k) => { const f = t.fields.find(f => f[0].toLowerCase() === k.toLowerCase()); return f ? f[1] : ''; };
+const laneField = () => ((data && data.group_by) || 'area').toLowerCase();
+const ageDays = t => t.modified ? Math.max(0, Math.floor((Date.now() - Date.parse(t.modified)) / 864e5)) : null;
+const isOpen = t => !t.completed && t.column !== 'done';
+const issuesOf = t => data.schema_on ? (t.issues || []).filter(i => i.level === 'error') : [];
+
+function sortTasks(a, b) {
+  if (sortMode === 'stalest') {
+    const x = ageDays(a), y = ageDays(b);
+    if (x !== y) return (y ?? -1) - (x ?? -1);
+  }
+  return (prioRank[a.priority] ?? 3) - (prioRank[b.priority] ?? 3)
+      || (a.due || '9').localeCompare(b.due || '9');
+}
+
+function matches(t) {
+  if (!query) return true;
+  const hay = [t.title, t.body, ...t.fields.map(f => f[1])].join(' ').toLowerCase();
+  return query.split(/\s+/).every(w => hay.includes(w));
+}
+
+function cardHtml(t) {
+  const lf = laneOn ? laneField() : '';
+  const place = ['area', 'epic'].filter(k => k !== lf).map(k => field(t, k)).filter(Boolean).join(' / ');
+  const p = PRIO[t.priority];
+  const age = ageDays(t);
+  const stale = age !== null && isOpen(t) && age >= (data.stale_days || 7);
+  const tags = [];
+  for (const k of ['type', 'size', 'est']) { const v = field(t, k); if (v) tags.push(`<span class="tag" title="${k}">${esc(v)}</span>`); }
+  if (t.due) {
+    const d = t.due.slice(0, 10);
+    tags.push(`<span class="tag ${isOpen(t) && d < new Date().toISOString().slice(0, 10) ? 'late' : ''}" title="due">⏰ ${d}</span>`);
+  }
+  if (t.conversation) tags.push(`<span class="tag" title="conversation ${esc(t.conversation)}">💬 ${esc(t.conversation.slice(0, 8))}</span>`);
+  const errs = issuesOf(t);
+  if (errs.length) tags.push(`<span class="tag warn" title="${esc(errs.map(i => i.msg).join('\n'))}">⚠ ${errs.length}</span>`);
+  const why = t.column === 'blocked' ? field(t, 'blocked-by') : '';
+  return `<div class="card ${isOpen(t) ? '' : 'done'}" draggable="true" data-id="${esc(t.id)}" style="--stage:${colVar(t.column)}">
+    <div class="top">
+      <span class="place" title="${esc(place)}">${esc(place)}</span>
+      ${p ? `<span class="rt" style="--rt:var(${p.v})"><i></i>${p.label}</span>` : ''}
+    </div>
+    <div class="title">${esc(t.title)}</div>
+    ${why ? `<div class="why">⛔ ${esc(why)}</div>` : ''}
+    <div class="foot">
+      ${tags.join('')}
+      ${age !== null && isOpen(t) ? `<span class="age ${stale ? 'stale' : ''}" title="last edited ${esc(t.modified.slice(0, 10))}">⏱ ${age === 0 ? 'today' : age + 'd'}</span>` : ''}
+    </div>
+  </div>`;
+}
+
+const cellHtml = (list, col) => `<div class="cell" data-col="${esc(col)}">
+  ${list.length ? list.map(cardHtml).join('') : '<div class="empty">—</div>'}</div>`;
+
+function render() {
+  if (!data) return;
+  const cols = data.columns;
+  const visible = tasks.filter(matches);
+  const count = c => visible.filter(t => t.column === c).length;
+  const by = (list, c) => list.filter(t => t.column === c).sort(sortTasks);
+  const lf = laneField();
+
+  $('#strip').innerHTML = cols.map(c =>
+    `<span class="pill"><i style="background:${colVar(c)}"></i>${label(c)} <b>${count(c)}</b></span>`).join('');
+  const heads = `<div class="cols">${cols.map(c =>
+    `<div class="colhead"><i style="background:${colVar(c)}"></i>${label(c)}<span class="n">${count(c)}</span></div>`).join('')}</div>`;
+
+  let body;
+  if (!laneOn) {
+    body = `<div class="lane-cells">${cols.map(c => cellHtml(by(visible, c), c)).join('')}</div>`;
+  } else {
+    const lanes = new Map();
+    for (const t of visible) {
+      const v = field(t, lf) || '(none)';
+      if (!lanes.has(v)) lanes.set(v, { key: v, cards: [] });
+      lanes.get(v).cards.push(t);
+    }
+    const open = l => l.cards.filter(isOpen).length;
+    const sorted = [...lanes.values()].sort((a, b) => open(b) - open(a) || b.cards.length - a.cards.length || a.key.localeCompare(b.key));
+    body = sorted.map(l => {
+      const mini = cols.map(c => {
+        const n = l.cards.filter(t => t.column === c).length;
+        return n ? `<span title="${label(c)}"><i style="background:${colVar(c)}"></i>${n}</span>` : '';
+      }).join('');
+      return `<section class="lane ${folded.has(l.key) ? 'folded' : ''}" data-lane="${esc(l.key)}">
+        <div class="lane-head"><span class="caret">▾</span>${esc(l.key)}<span class="n">${l.cards.length}</span><span class="mini">${mini}</span></div>
+        <div class="lane-cells">${cols.map(c => cellHtml(by(l.cards, c), c)).join('')}</div>
+      </section>`;
+    }).join('') || '<div style="padding:40px;text-align:center;color:var(--faint)">No tasks</div>';
+  }
+
+  const boardEl = $('#board');
+  boardEl.className = 'board ' + (laneOn ? '' : 'no-lanes');
+  boardEl.style.setProperty('--ncols', cols.length);
+  const scroll = $('main').scrollTop;
+  boardEl.innerHTML = heads + body;
+  $('main').scrollTop = scroll;
+  Board.syncStuck();
+
+  $('#laneBtn').textContent = label(lf);
+  Board.segMark('#lanes', v => (v === 'on') === laneOn);
+  Board.segMark('#sorts', v => v === sortMode);
+}
+
+const pathProject = () => { const m = location.pathname.match(/^\/tasks\/([^/]+)/); return m ? decodeURIComponent(m[1]) : ''; };
+
+async function load() {
+  if (!project) {
+    $('#board').innerHTML = '<div style="padding:60px;text-align:center;color:var(--faint)">No task boards yet.<br><br>Add <code>[projects.&lt;key&gt;.tasks]</code> with a <code>list = "…"</code> to <code>~/.hive/projects.toml</code>.</div>';
+    return;
+  }
+  try {
+    const text = await (await fetch('/api/tasks?project=' + encodeURIComponent(project))).text();
+    const r = JSON.parse(text);
+    if (r.error) { $('#offline').hidden = false; $('#offline').textContent = r.error; return; }
+    $('#offline').hidden = true;
+    if (text === lastJson || Board.dragging()) return;
+    lastJson = text;
+    if (data === null) laneOn = store.get('lanes:' + project, !!r.group_by);
+    data = r; tasks = r.tasks;
+    render();
+  } catch { $('#offline').hidden = false; $('#offline').textContent = 'offline'; }
+}
+
+async function moveTask(id, column, blockedBy) {
+  const t = tasks.find(t => t.id === id);
+  if (t) { t.column = column; render(); }   // optimistic; the next poll confirms
+  const res = await post('/api/task-move', { project, id, column, blocked_by: blockedBy });
+  if (!res.ok) toast(res.error || 'Could not move task');
+  lastJson = '';
+  load();
+}
+
+// ---- blocked reason dialog ----
+function askReason(t) {
+  pendingBlock = t.id;
+  $('#dialogFor').textContent = t.title;
+  $('#reason').value = field(t, 'blocked-by');
+  $('#scrim').classList.add('open');
+  $('#reason').focus();
+}
+function closeDialog() { pendingBlock = null; $('#scrim').classList.remove('open'); }
+$('#dialog').addEventListener('submit', e => {
+  e.preventDefault();
+  const id = pendingBlock, why = $('#reason').value.trim();
+  closeDialog();
+  if (id) moveTask(id, 'blocked', why);
+});
+$('#cancel').addEventListener('click', closeDialog);
+$('#scrim').addEventListener('mousedown', e => { if (e.target.id === 'scrim') closeDialog(); });
+
+// ---- details ----
+function showDetail(t) {
+  const rows = [['column', label(t.column)], ['priority', t.priority], t.due ? ['due', t.due.slice(0, 10)] : null,
+    t.modified ? ['last edited', t.modified.slice(0, 10) + ' (' + ageDays(t) + 'd ago)'] : null, ...t.fields].filter(Boolean);
+  const errs = issuesOf(t);
+  $('#detail').innerHTML = `<h2>${esc(t.title)}</h2>
+    <dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
+    ${errs.length ? `<div class="issues">⚠ ${errs.map(i => esc(i.msg)).join('<br>⚠ ')}</div>` : ''}
+    ${t.body ? `<pre>${esc(t.body)}</pre>` : ''}
+    <div class="row"><button type="button" id="detailClose">Close</button></div>`;
+  $('#detailScrim').classList.add('open');
+  $('#detailClose').onclick = () => $('#detailScrim').classList.remove('open');
+}
+$('#detailScrim').addEventListener('mousedown', e => { if (e.target.id === 'detailScrim') e.target.classList.remove('open'); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeDialog(); $('#detailScrim').classList.remove('open'); } });
+
+// ---- board: drag between columns (shared), fold lanes, open details ----
+const board = $('#board');
+Board.wireDnD(board, (id, cell) => {
+  const col = cell.dataset.col;
+  const t = tasks.find(t => t.id === id);
+  if (!t || t.column === col) return;
+  if (col === 'blocked') askReason(t); else moveTask(id, col);
+});
+board.addEventListener('click', e => {
+  const lane = e.target.closest('.lane-head');
+  if (lane) { Board.toggleLane(lane, folded, () => store.set('folded:' + project, [...folded])); return; }
+  const el = e.target.closest('.card');
+  const t = el && tasks.find(t => t.id === el.dataset.id);
+  if (t) showDetail(t);
+});
+
+// ---- toolbar ----
+Board.seg('#lanes', v => { laneOn = v === 'on'; store.set('lanes:' + project, laneOn); render(); });
+Board.seg('#sorts', v => { sortMode = v; store.set('sort', v); render(); });
+$('#search').addEventListener('input', e => { query = e.target.value.trim().toLowerCase(); render(); });
+
+// ---- right-click menu (shared) ----
+Board.menu.onClose = () => { menuTask = null; };
+board.addEventListener('contextmenu', e => {
+  const el = e.target.closest('.card');
+  const t = el && tasks.find(t => t.id === el.dataset.id);
+  if (!t) return;
+  e.preventDefault();
+  menuTask = t;
+  Board.menu.open(`<div class="who">${esc(t.title)}</div>
+    <button role="menuitem" data-act="detail"><span class="ic">ⓘ</span>Details</button>
+    <hr><div class="sec">Move to</div>` +
+    data.columns.map(c => `<button role="menuitem" data-act="move" data-col="${esc(c)}" class="${t.column === c ? 'cur' : ''}">
+      <span class="dot" style="background:${colVar(c)}"></span>${label(c)}${t.column === c ? '<span class="check">✓</span>' : ''}</button>`).join(''),
+    e.clientX, e.clientY);
+});
+Board.menu.el.addEventListener('click', e => {
+  const btn = e.target.closest('button[data-act]');
+  const t = menuTask;
+  if (!btn || !t) return;
+  Board.menu.close();
+  if (btn.dataset.act === 'detail') showDetail(t);
+  else if (btn.dataset.col !== t.column) { if (btn.dataset.col === 'blocked') askReason(t); else moveTask(t.id, btn.dataset.col); }
+});
+
+(async () => {
+  const boards = await Board.switcher();
+  project = pathProject() || (boards[0] && boards[0].key) || '';
+  Board.pick('/tasks/' + encodeURIComponent(project));
+  folded = new Set(store.get('folded:' + project, []));
+  await load();
+  setInterval(load, 3000);
+})();
+</script>
+</body>
+</html>

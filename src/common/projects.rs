@@ -56,6 +56,84 @@ impl FilePatterns {
     }
 }
 
+/// A project's task board (`[projects.<key>.tasks]`): a Reminders list whose
+/// reminders carry a `key: value` header in their notes. `status` picks the column.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksConfig {
+    /// Where tasks live. Only `reminders` exists today.
+    #[serde(default = "default_tasks_source")]
+    pub source: String,
+    /// Reminders list name.
+    pub list: String,
+    /// Board columns, in order. Default: todo, doing, blocked, done. A column named
+    /// `done` is the one that completes the reminder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// Header field the board groups into swimlanes (e.g. `epic`, `area`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
+    /// For a list shared by several projects: only reminders whose header has all of
+    /// these `key = value` pairs belong here (new tasks get them stamped on).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub filter: std::collections::BTreeMap<String, String>,
+    /// Enforce the task schema on writes (`add`, `set`, `move`). Off until a board's
+    /// schema has been reviewed; `hive task lint` reports drift either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
+    /// Header fields this board adds to the core, or narrows (`values`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fields: std::collections::BTreeMap<String, FieldDef>,
+    /// Fields every task here must have (besides `status`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+    /// Legacy field names mapped to the core ones they became (`artefact = "files"`).
+    /// Applied together, so a swap (`area = "epic"`, `project = "area"`) is fine.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub renames: std::collections::BTreeMap<String, String>,
+    /// Title ids: value of `id_field` (default `area`) -> prefix, so a new task in
+    /// area `ops` is titled `[OPS-007] …`, numbered after the highest existing.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub id_prefix: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_field: Option<String>,
+    /// Days without any edit after which an open task is flagged stale (default 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_days: Option<u32>,
+}
+
+/// One extension (or narrowing) of the task schema — see `common/task_schema.rs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FieldDef {
+    /// text | enum | bool | duration | url | urls | paths | uuid
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Allowed values (makes it an enum).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+}
+
+fn default_tasks_source() -> String {
+    "reminders".into()
+}
+
+pub const DEFAULT_TASK_COLUMNS: [&str; 4] = ["todo", "doing", "blocked", "done"];
+
+impl TasksConfig {
+    pub fn stale_days(&self) -> u32 {
+        self.stale_days.unwrap_or(7)
+    }
+
+    pub fn columns(&self) -> Vec<String> {
+        if self.columns.is_empty() {
+            DEFAULT_TASK_COLUMNS.iter().map(|s| s.to_string()).collect()
+        } else {
+            self.columns.iter().map(|c| c.to_lowercase()).collect()
+        }
+    }
+}
+
 /// A single project configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -99,6 +177,9 @@ pub struct ProjectConfig {
     /// Archived: hidden from the picker and default `project list`
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// This project's own task board (see `common/tasks.rs`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<TasksConfig>,
 }
 
 impl ProjectConfig {
@@ -362,6 +443,7 @@ mod tests {
             hooks_dir: None,
             auth_profile: None,
             archived: false,
+            tasks: None,
         };
         assert_eq!(ProjectRegistry::session_name("hive", &config), "🐝 hive");
     }
@@ -383,6 +465,7 @@ mod tests {
             hooks_dir: None,
             auth_profile: None,
             archived: false,
+            tasks: None,
         };
         assert_eq!(
             ProjectRegistry::session_name("my-app", &config),
@@ -574,6 +657,7 @@ base_port = 3000
             hooks_dir: None,
             auth_profile: None,
             archived: false,
+            tasks: None,
         };
         registry.add_project("test".to_string(), config);
         assert_eq!(registry.projects.len(), 1);
@@ -598,6 +682,7 @@ base_port = 3000
             hooks_dir: None,
             auth_profile: None,
             archived: false,
+            tasks: None,
         };
         registry.add_project("test".to_string(), config);
         assert!(registry.remove_project("test"));

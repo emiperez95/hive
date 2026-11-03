@@ -86,6 +86,7 @@ fn main() -> Result<()> {
             ProjectCommand::List { all } => cli::project::run_project_list(all),
         },
         Some(Command::Todo { command }) => cli::todo::run_todo(command),
+        Some(Command::Task { command }) => cli::task::run_task(command),
         Some(Command::Spread { count }) => cli::session::run_spread(count),
         Some(Command::Collapse) => cli::session::run_collapse(),
         Some(Command::Stats { days }) => cli::stats::run_stats(days),

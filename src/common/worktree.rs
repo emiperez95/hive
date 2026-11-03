@@ -887,6 +887,7 @@ mod tests {
             hooks_dir: None,
             auth_profile: None,
             archived: false,
+            tasks: None,
         }
     }
 

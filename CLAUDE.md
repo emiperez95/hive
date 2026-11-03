@@ -90,6 +90,9 @@ hive wt delete <project> <branch>  # delete worktree + session + branch
 hive wt list [project]  # list registered worktrees with tmux status
 hive wt prune [project] # remove leftover Workflow agent worktrees + worktree-wf_* / wf/* branches (plan, then y/N)
 hive wt prune --branches 'review-*' --dry-run  # extra branch globs; show the plan only
+hive task list|show|add|move|set|done|link [-p <project>]  # the project's task board (Apple Reminders); project defaults to the cwd's
+hive task schema|lint [-p <project>]        # the board's header rules / tasks that break them (read-only)
+hive task boards                            # which projects have a board
 hive todo list [--session <name>] [--done]  # list active (or completed) todos
 hive todo list --all                        # every session's todos, grouped by project
 hive todo next [--session <name>]           # print first active todo (exit 1 if none)
@@ -262,6 +265,94 @@ waiter starts is only believed after 5s — the waiter is launched mid-turn, so 
 first reading is `busy`. A vanished process or the 30-min timeout exits non-zero, and the
 `&&` means nothing is killed — the safe direction.
 
+## Task boards — a board per project, over Apple Reminders (`/tasks/<project>`)
+
+Not the conversation board. A **task** is a reminder in the project's Reminders list; the
+conversation working on it is optional (`conversation:` in its header), and a conversation
+may touch no task at all. Built for the lists already kept by hand (Thesis, AWS Projects):
+each reminder's notes start with a `key: value` header, and `status:` is the column.
+
+```toml
+[projects.thesis.tasks]
+list = "Thesis"                              # the Reminders list
+columns = ["todo", "blocked", "done"]        # default: todo, doing, blocked, done
+group_by = "epic"                            # swimlanes by a header field (optional)
+filter = { project = "symposium" }           # one list shared by several projects
+```
+
+- **`common/tasks.rs`** — `Notes` splits the header from the rest and edits ONE line,
+  preserving every other key, the order and the `---` body (round-trip tests use both real
+  dialects). `Task.column` = `status` if it is a configured column, else the first; a
+  completed reminder is in `done` when the board has one. A column named `done` is the one
+  that completes the reminder (moving out re-opens it). `filter` both selects and **stamps**
+  (`add` writes the filter pairs into the header so a new task stays on its board).
+- **Backend** shells out to the apple-reminders skill's EventKit CLI
+  (`~/.claude/skills/apple-reminders/bin/reminders`, `HIVE_REMINDERS_CMD` overrides) with a 30s
+  bound — a first run can sit on a macOS permission prompt and a web request must not. It is
+  NOT bundled; a native helper is the follow-up. Only `source = "reminders"` exists.
+- **Default board = the cwd's project**, worktrees included (`project_for_cwd` →
+  `resolve_parent` → `project_of`), so a conversation in any checkout of a project sees its
+  own cards without `--project`.
+- **Every write re-reads the reminder first** (`get_owned`) and refuses one outside the
+  project's list or filter, so a LAN-reachable `/api/task-move` can't touch an arbitrary
+  reminder, and a phone edit made in between survives.
+- **Web**: `GET /tasks/<key>` (`tasks.html`), `/api/task-boards` (config only), `/api/tasks?project=`,
+  `POST /api/task-move`, `/api/task-add`. Reads are cached 4s (`fetch_cached`; a fetch is two
+  process spawns) and the cache is dropped on every write.
+- **`/board` and `/tasks/*` share their code**, not a copy: `board-common.css` (theme, header,
+  status strip, toggles, columns, lanes, cards, dialogs, menu, toast) and `board-common.js`
+  (`window.Board`: storage, toast, POST, card drag-and-drop, lane folding, segmented toggles,
+  the right-click menu, the sticky header, and the board switcher dropdown beside the logo).
+  Each page keeps only its own data, card HTML and actions (`board.html` ~25KB, `tasks.html`
+  ~14KB). Served at `/board-common.css|js` with `no-cache`; `--dev` reads them from disk. A
+  change to a shared piece reaches both pages — check both. The task page has a column strip with
+  counts, a `Lanes: None | <group_by>` toggle (default `area`), a Priority/Stalest sort, details
+  on click, drag between columns, and ⚠ chips only once a board declares a schema (`schema_on`).
+- **Agents**: `/hive:tasks` (installed by `hive setup`) tells Claude how to read and write the
+  board. Only the completed tasks within the latest 15 are loaded; older ones aren't addressable.
+
+### The schema — one core, extended per board (`common/task_schema.rs`)
+
+hive's CLI is the only writer that can enforce anything, so the rules live in it. A shared
+**core** is defined in code (`status area epic type size est blocked-by files links repo
+worktree conversation`, in that canonical order); a board's `[projects.<k>.tasks]` extends it:
+`fields.<name>` (new field, or `values` to narrow a core one — `area` is free on most boards, a
+closed set on Thesis), `required`, `renames` (legacy name → core name), `id_prefix` (`area`
+value → `[PREFIX-nnn]` title id, numbered after the highest existing, completed included).
+`strict = true` turns enforcement on for `add` / `set` / `move`; it is **off by default** so a
+schema can be reviewed with `hive task lint` first (draft + migration table:
+`docs/task-schemas.md`).
+
+- **Enforced on what is written, not on the whole task** (`validate_write`): a legacy-dirty task
+  can still be moved without being cleaned first. `validate` (every rule, whole header) feeds
+  `lint` and each card's `issues` (the ⚠ chip on the page).
+- Cross-field rules: `blocked` ⇔ `blocked-by` present (moving to `blocked` needs `--by`,
+  leaving it drops the reason and says so); `done` ⇔ reminder completed. Placeholders (`none`,
+  `-`, empty) are errors — absence is the "no value" — and enum case is canonicalised (`s` → `S`).
+- A renamed field is reported as `legacy field X — now Y`, plus whether its value would survive
+  the rename (a URL in `artefact` is flagged "put it in `links`" — the split case).
+- **`renames` may swap** (`area → epic`, `project → area` on aws-hub) because they are applied
+  together; remove the table once the reminders are migrated, or it will misread the new `area`.
+- **`hive task set` edits Reminders' own fields too**: `priority=` (none|low|medium|high),
+  `due=` (ISO date or datetime; empty clears) and `title=` (`tasks::edit_native`). Those three
+  names are reserved — never written to the header. A title edit may not lose or change a
+  leading `[PREFIX-nnn]` id (ids are cited in notes and PRs).
+- **Custom metadata, two ways.** A board *declares* a field (`fields.<name>` in `projects.toml`,
+  optionally typed / restricted — Thesis `log`, AWS `parent`), or a task carries a one-off
+  **`x-` field** (`--field x-reviewer=niko`) that no schema needs to know about: free text,
+  optional, any board, still no placeholders. Anything else undeclared is refused on a strict board.
+- Edits made in the Reminders app are never blocked; lint is how that drift shows. Migrating
+  existing reminders is a separate, explicit step — nothing rewrites them implicitly.
+
+- **Staleness is Reminders' own `modified` date**, not a header field: it covers phone edits and
+  can't drift. The apple-reminders CLI was patched to return `modified` / `completedAt`
+  (`reminders.swift`, beside `created`). Cards show `⏱ Nd` for open tasks, amber at `stale_days`
+  (default 7, per board); the page can sort stalest-first; `hive task list` appends `untouched Nd`.
+  It means *last edited by anyone* — any write, hive's own included, resets it.
+
+> **Gotcha — `-f` is taken.** `hive --filter` is a global flag, so a subcommand can't claim `-f`
+> (clap panics at parse time, only when that subcommand runs).
+
 ## Janus WT Portal
 
 The **janus-wt-portal** agent (`.claude/agents/janus-wt-portal.md`) ships with hive and is installed by `hive setup`. It's the primary way to manage worktrees interactively — detects ticket mentions, extracts branch names, resolves the project from git remote, and runs `hive wt` commands.
@@ -285,6 +376,7 @@ src/
 │   ├── setup.rs            run_setup(), run_uninstall(), is_hive_hook_command()
 │   ├── worktree.rs         run_wt_new/delete/list/import(): full worktree lifecycle
 │   ├── project.rs          run_project_add/remove/list/import()
+│   ├── task.rs             run_task(): `hive task` — a project's task board (see Task boards)
 │   ├── todo.rs             run_todo*(), resolve_session()
 │   ├── session.rs          run_cycle/spread/collapse/connect/start()
 │   ├── stats.rs            run_stats(): usage summary from the activity log
@@ -307,6 +399,8 @@ src/
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml)
 │   ├── todos.rs            every session's todos regrouped by owning project (TUI `t`, `todo list --all`)
+│   ├── task_schema.rs      the task schema: shared core + per-board extensions, validate/lint
+│   ├── tasks.rs            per-project task boards over Apple Reminders: notes header parser, Reminders backend, cache
 │   ├── prune.rs            leftover Workflow agent worktrees/branches + the keep/remove rules (`hive wt prune`)
 │   ├── worktree.rs         worktree lifecycle (types, state, git ops, file ops, hooks, memory seed)
 │   ├── worktree_health.rs  git state of ONE working tree (dirty/ahead/behind/merged), mtime-cached
@@ -323,6 +417,9 @@ src/
 │   ├── dispatch.rs         todo → work: branch naming (ticket / Haiku / slug), worktree jobs
 │   ├── metrics.rs          Prometheus text exposition for GET /metrics (scraped by OTel)
 │   ├── web.rs              HTTP web server (tiny_http), API endpoints, TTS proxy
+│   ├── board-common.css    styles shared by /board and /tasks/* (theme, header, columns, lanes, cards, dialogs)
+│   ├── board-common.js     `window.Board`: the behavior they share (drag-and-drop, menu, toggles, switcher)
+│   ├── tasks.html          per-project task board page (`/tasks/<key>`)
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
 └── tests/

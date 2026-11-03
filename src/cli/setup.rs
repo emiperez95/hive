@@ -28,6 +28,10 @@ const BUNDLED_COMMANDS: &[(&str, &str)] = &[
         "close.md",
         include_str!("../../.claude/commands/hive/close.md"),
     ),
+    (
+        "tasks.md",
+        include_str!("../../.claude/commands/hive/tasks.md"),
+    ),
 ];
 
 fn commands_dir(home: &std::path::Path) -> std::path::PathBuf {

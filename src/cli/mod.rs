@@ -12,6 +12,7 @@ pub mod setup;
 pub mod sidebar;
 pub mod stage;
 pub mod stats;
+pub mod task;
 pub mod todo;
 pub mod update;
 pub mod worktree;
@@ -122,6 +123,12 @@ pub enum Command {
     Todo {
         #[command(subcommand)]
         command: TodoCommand,
+    },
+    /// A project's task board (Apple Reminders): list, add, move, complete. The
+    /// project defaults to the one this directory belongs to (worktrees included).
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
     },
     /// Spread tmux sessions into N side-by-side terminal panes (iTerm2 or Ghostty)
     Spread {
@@ -406,6 +413,104 @@ pub enum WtCommand {
         /// Skip the confirmation prompt
         #[arg(short, long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TaskCommand {
+    /// Projects that have a task board
+    Boards,
+    /// The board, by column
+    List {
+        /// Project key (default: the project of the current directory)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Only this column
+        #[arg(short, long)]
+        column: Option<String>,
+        /// Full JSON (id, status, header fields, body, linked conversation)
+        #[arg(long)]
+        json: bool,
+    },
+    /// One task in full: header fields and body
+    Show {
+        /// Task id — the 8 characters `list` prints are enough
+        id: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Add a task (to the first column unless --column)
+    Add {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        column: Option<String>,
+        /// Header field, repeatable: --field area=infra
+        #[arg(long, value_name = "KEY=VALUE")]
+        field: Vec<String>,
+        /// Markdown body under the header
+        #[arg(long)]
+        body: Option<String>,
+        /// ISO date or datetime
+        #[arg(long)]
+        due: Option<String>,
+        /// none | low | medium | high
+        #[arg(long)]
+        priority: Option<String>,
+        /// The task title
+        #[arg(required = true, trailing_var_arg = true)]
+        title: Vec<String>,
+    },
+    /// Move a task to a column (rewrites its `status:`; `done` completes it)
+    Move {
+        id: String,
+        column: String,
+        #[arg(short, long)]
+        project: Option<String>,
+        /// What a task moved to `blocked` waits on (required there on a strict board)
+        #[arg(long, value_name = "REASON")]
+        by: Option<String>,
+    },
+    /// Set header fields (`key=value`; `key=` removes) and the Reminders fields
+    /// `priority=` (none|low|medium|high), `due=` (ISO date; empty clears) and `title=`
+    Set {
+        id: String,
+        #[arg(required = true, value_name = "KEY=VALUE")]
+        fields: Vec<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// The board's schema: every header field, its type, allowed values, what is required
+    Schema {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report tasks that break the board's schema (read-only)
+    Lint {
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Include cosmetic issues (field order)
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Complete a task (move it to `done`)
+    Done {
+        id: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Record that a conversation is working on a task (`conversation:` in its header)
+    Link {
+        id: String,
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Conversation (default: the Claude conversation running this command)
+        #[arg(long)]
+        conv: Option<String>,
     },
 }
 

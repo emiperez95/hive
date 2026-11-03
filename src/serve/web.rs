@@ -154,6 +154,9 @@ const WEB_HTML: &str = include_str!("web.html");
 /// The board (`/board`) — its own page rather than a mode of `web.html`, which is
 /// built mobile-first for the phone and the 280px sidebar; a board is wide.
 const BOARD_HTML: &str = include_str!("board.html");
+const TASKS_HTML: &str = include_str!("tasks.html");
+const BOARD_COMMON_CSS: &str = include_str!("board-common.css");
+const BOARD_COMMON_JS: &str = include_str!("board-common.js");
 
 /// In dev mode, re-read web.html from disk on every request.
 /// Falls back to the embedded version if the file isn't found.
@@ -330,6 +333,31 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let _ = request.respond(response);
             }
 
+            // The styles and script /board and /tasks/* share. `no-cache` so a new build's
+            // version is never masked by a stale copy in the browser.
+            (Method::Get, _) if path == "/board-common.css" || path == "/board-common.js" => {
+                let (file, embedded, mime) = if path.ends_with(".css") {
+                    (
+                        "board-common.css",
+                        BOARD_COMMON_CSS,
+                        "text/css; charset=utf-8",
+                    )
+                } else {
+                    (
+                        "board-common.js",
+                        BOARD_COMMON_JS,
+                        "application/javascript; charset=utf-8",
+                    )
+                };
+                let dev = dev_path.as_ref().map(|p| p.with_file_name(file));
+                let body = get_page(&dev, embedded);
+                let _ = request.respond(
+                    Response::from_string(body)
+                        .with_header(Header::from_bytes("Content-Type", mime).unwrap())
+                        .with_header(Header::from_bytes("Cache-Control", "no-cache").unwrap()),
+                );
+            }
+
             (Method::Get, _) if path == "/board" => {
                 let dev_board = dev_path.as_ref().map(|p| p.with_file_name("board.html"));
                 let html = get_page(&dev_board, BOARD_HTML);
@@ -351,6 +379,128 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let json = serde_json::to_string(&cards).unwrap_or_else(|_| "[]".to_string());
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            // ---- per-project task boards (Apple Reminders) — see `common::tasks` ----
+            (Method::Get, _) if path == "/tasks" || path.starts_with("/tasks/") => {
+                let dev_tasks = dev_path.as_ref().map(|p| p.with_file_name("tasks.html"));
+                let html = get_page(&dev_tasks, TASKS_HTML);
+                let header =
+                    Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
+                let _ = request.respond(Response::from_string(html).with_header(header));
+            }
+
+            // Which projects have a task board (no Reminders call — config only).
+            (Method::Get, "/api/task-boards") => {
+                let reg = crate::common::projects::ProjectRegistry::load();
+                let boards: Vec<serde_json::Value> = crate::common::tasks::boards(&reg)
+                    .into_iter()
+                    .map(|(k, c)| {
+                        let p = reg.projects.get(&k);
+                        serde_json::json!({
+                            "key": k,
+                            "emoji": p.map(|p| p.emoji.clone()).unwrap_or_default(),
+                            "name": p.and_then(|p| p.display_name.clone()).unwrap_or_else(|| k.clone()),
+                            "list": c.list,
+                        })
+                    })
+                    .collect();
+                let json = serde_json::to_string(&boards).unwrap_or_else(|_| "[]".into());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
+            }
+
+            (Method::Get, url) if path == "/api/tasks" => {
+                let json = (|| -> serde_json::Value {
+                    let key = query_param(url, "project").unwrap_or_default();
+                    let reg = crate::common::projects::ProjectRegistry::load();
+                    let Some(cfg) = reg
+                        .projects
+                        .get(crate::common::tasks::project_of(&key))
+                        .and_then(|p| p.tasks.clone())
+                    else {
+                        return serde_json::json!({"error": "no task board for that project"});
+                    };
+                    match crate::common::tasks::fetch_cached(&cfg) {
+                        Ok(tasks) => serde_json::json!({
+                            "project": key,
+                            "list": cfg.list,
+                            "columns": cfg.columns(),
+                            "group_by": cfg.group_by,
+                            "stale_days": cfg.stale_days(),
+                            // Warnings mean nothing until the board has rules to break.
+                            "schema_on": cfg.strict
+                                || !cfg.fields.is_empty()
+                                || !cfg.required.is_empty()
+                                || !cfg.renames.is_empty(),
+                            "tasks": tasks,
+                        }),
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    }
+                })();
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ =
+                    request.respond(Response::from_string(json.to_string()).with_header(header));
+            }
+
+            // Move a task: `{"project","id","column"}`. The id is checked against the
+            // project's own list before anything is written.
+            (Method::Post, "/api/task-move") | (Method::Post, "/api/task-add") => {
+                let adding = path == "/api/task-add";
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let json = (|| -> serde_json::Value {
+                    let Ok(req) = serde_json::from_str::<serde_json::Value>(&body) else {
+                        return serde_json::json!({"error": "invalid request"});
+                    };
+                    let text = |k: &str| req.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                    let reg = crate::common::projects::ProjectRegistry::load();
+                    let Some(cfg) = text("project")
+                        .and_then(|k| {
+                            reg.projects
+                                .get(crate::common::tasks::project_of(&k))
+                                .cloned()
+                        })
+                        .and_then(|p| p.tasks)
+                    else {
+                        return serde_json::json!({"error": "no task board for that project"});
+                    };
+                    let res = if adding {
+                        let Some(title) = text("title").filter(|t| !t.trim().is_empty()) else {
+                            return serde_json::json!({"error": "title required"});
+                        };
+                        crate::common::tasks::add_task(
+                            &cfg,
+                            crate::common::tasks::NewTask {
+                                title: title.trim().to_string(),
+                                column: text("column"),
+                                fields: Vec::new(),
+                                body: None,
+                                due: None,
+                                priority: None,
+                            },
+                        )
+                        .map(|_| ())
+                    } else {
+                        let (Some(id), Some(col)) = (text("id"), text("column")) else {
+                            return serde_json::json!({"error": "id and column required"});
+                        };
+                        crate::common::tasks::move_task(
+                            &cfg,
+                            &id,
+                            &col,
+                            text("blocked_by").as_deref(),
+                        )
+                        .map(|_| ())
+                    };
+                    match res {
+                        Ok(()) => serde_json::json!({"ok": true}),
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    }
+                })();
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ =
+                    request.respond(Response::from_string(json.to_string()).with_header(header));
             }
 
             // Move a card: `{"id", "stage": "todo"|…|null, "note"?}`. `null` puts it

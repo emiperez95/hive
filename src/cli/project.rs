@@ -87,6 +87,7 @@ pub fn run_project_add(cmd: ProjectCommand) -> Result<()> {
         hooks_dir,
         auth_profile,
         archived: false,
+        tasks: None,
     };
 
     let session_name = ProjectRegistry::session_name(&key, &config);

@@ -31,6 +31,8 @@ pub mod registry;
 // The terminal emulator around tmux (iTerm2 or Ghostty): panes, focus.
 pub mod terminal;
 // Every session's todos regrouped by the project that owns the session.
+pub mod task_schema;
+pub mod tasks;
 pub mod tmux;
 pub mod todos;
 pub mod types;
