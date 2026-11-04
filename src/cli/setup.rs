@@ -1,5 +1,6 @@
 //! Setup and uninstall commands.
 
+use crate::common::ghostty;
 use anyhow::{bail, Result};
 
 /// Bundled janus-wt-portal agent definition, embedded at compile time.
@@ -441,6 +442,29 @@ pub fn run_setup(yes: bool) -> Result<()> {
         println!("  [missing] tmux Ctrl+g keybinding (cycle free)");
     }
 
+    // Ghostty: read, never written (see common::ghostty). The sidebar workflow is optional, so
+    // an unset line is a `[hint]` and never keeps setup from finishing.
+    let ghostty_report = if ghostty::installed(&home) {
+        let (config, path) = ghostty::read_config(&home);
+        let inspection = ghostty::inspect(&config, &ghostty::hive_root_keys(&tmux_keys));
+        for (ok, what) in [
+            (
+                inspection.launches_sidebar,
+                "first window opens tmux + the sidebar (initial-command)",
+            ),
+            (
+                inspection.sidebar_undimmed,
+                "sidebar split stays undimmed (unfocused-split-opacity = 1)",
+            ),
+        ] {
+            let tag = if ok { "[ok]      " } else { "[hint]    " };
+            println!("  {tag}Ghostty: {what}");
+        }
+        Some((inspection, path))
+    } else {
+        None
+    };
+
     // Check janus-wt-portal agent
     let agent_dest = home
         .join(".claude")
@@ -483,6 +507,25 @@ pub fn run_setup(yes: bool) -> Result<()> {
             continue;
         }
         cmds_to_install.push((file, content));
+    }
+
+    // Before the "already set up" early return, so the lines show on every run that needs them.
+    if let Some((inspection, path)) = &ghostty_report {
+        if !inspection.essentials_ok() {
+            println!();
+            println!(
+                "Ghostty config: hive reads it and never writes it. Add this to {}:",
+                path.display()
+            );
+            println!();
+            for line in ghostty::snippet(&binary_str, inspection).lines() {
+                if line.is_empty() {
+                    println!();
+                } else {
+                    println!("  {line}");
+                }
+            }
+        }
     }
 
     let needs_hook_changes = !hooks_missing.is_empty() || !hooks_stale.is_empty();

@@ -138,6 +138,11 @@ hive collapse           # close all panes except the current one
 hive sidebar --split    # open the sidebar in a split on the right of this tab
 ```
 
+The sidebar workflow needs two lines in your Ghostty config: `initial-command = hive start --sidebar`
+(the first window opens tmux with the sidebar beside it) and `unfocused-split-opacity = 1` (Ghostty
+dims the split without focus, which is usually the sidebar). `hive setup` checks for them and prints
+what is missing; it never edits your terminal config.
+
 ### Project Registry
 
 ```bash

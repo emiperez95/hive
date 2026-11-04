@@ -30,6 +30,8 @@ pub mod prune;
 pub mod registry;
 // The terminal emulator around tmux (Ghostty): panes, the sidebar split.
 pub mod terminal;
+// What hive wants from a Ghostty config (read, never written): the sidebar launch setup.
+pub mod ghostty;
 // Every session's todos regrouped by the project that owns the session.
 pub mod task_schema;
 pub mod tasks;

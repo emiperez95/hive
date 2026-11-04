@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 541 tests (509 unit + 32 CLI smoke)
+cargo test                # 559 tests (527 unit + 32 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 906 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 509 unit + 32 smoke.
+> `cargo test` prints 942 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 527 unit + 32 smoke.
 
 ## The TUI (conversation-first)
 
@@ -448,6 +448,7 @@ src/
 │   ├── ports.rs            listening port detection via libproc (macOS only, #[cfg] guarded)
 │   ├── chrome.rs           Chrome tab detection via AppleScript (macOS only, #[cfg] guarded)
 │   ├── terminal.rs         the emulator around tmux — Ghostty (detect, spread/collapse, sidebar split)
+│   ├── ghostty.rs          what hive wants from a Ghostty config — read by `hive setup`, never written
 │   ├── jsonl.rs            JSONL parsing + transcript scan (all auth profiles), mtime-keyed scan cache
 │   ├── persistence.rs      file persistence for all txt-based state (favorites, todos, muted, etc.)
 │   ├── projects.rs         project registry (projects.toml)
@@ -1808,6 +1809,23 @@ Things that shaped it:
   tmux + sidebar; later windows, tabs and splits stay plain shells (`command` would apply to
   every split too). `open_split_on_start` retries briefly, since the first window isn't yet
   AppleScript's "front window" when the command starts.
+- **`hive setup` reads the Ghostty config and never writes it** (`common/ghostty.rs`). That file is
+  the user's, hand-curated and outside the repo, but two lines in it are hive's: `initial-command`
+  (the launch above) and `unfocused-split-opacity = 1` (the sidebar is usually the unfocused
+  split, which Ghostty dims to 0.7). Each shows as `[ok]` or `[hint]` — a hint, because the sidebar
+  workflow is optional, so it never keeps setup from finishing — and what is missing is printed as
+  a paste-ready snippet *before* the "already set up" early return, or that path would hide it.
+  Ghostty applies settings in order and the last wins, so the check does too (`initial-command`
+  may carry a path, a `direct:`/`shell:` prefix or an `env … hive start --sidebar` wrapper).
+  - **The ⌘⇧ chords are optional, and derived.** `Ctrl+n/p/g/\` reach tmux as typed, so a
+    `keybind = cmd+shift+…=text:\x0e` is a convenience (the author's iTerm2 map carried them over),
+    never a requirement: they appear only inside the snippet, and only when an essential line is
+    missing. The control byte comes from the keys tmux *actually has* in its root table
+    (`tmux list-keys -T root`, `C-n` → 0x0e, `C-\` → 0x1c), not from a second list, so it cannot
+    drift; a chord is skipped when some `keybind` already sends that byte. Only the suggested
+    trigger names (`chord_for`) are a fixed table — a new root key with no entry just gets none.
+  - Not Ghostty-config-aware elsewhere: `terminal::detect` still finds the emulator through
+    `$TERM_PROGRAM` / the tmux client, never by reading this file.
 
 > **Gotcha — a terminal-launched hive gets a bare environment.** Ghostty runs commands with
 > launchd's PATH (no Homebrew) and possibly no locale. Most tmux call sites spawn a bare
@@ -1912,13 +1930,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-541 distinct tests. Run with `cargo test`.
+559 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 906 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 365 · bin 509 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 942 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 383 · bin 527 (the superset — adds cli/daemon/serve)
 > · smoke 32.
 
-**Unit tests (509)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (527)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs
@@ -1928,6 +1946,11 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   conv-stats wire shape), and TestBackend draws of the whole app — panes, the click map
   matching the screen, the dialog owning its clicks, done todos newest-first with the server's
   index, no panic down to 4×3
+- `common/ghostty.rs`: the launch command in its usual forms (path, `direct:`/`shell:`, `env` wrapper)
+  and what it is not (`hive start` without `--sidebar`, `nothive`, a commented line); the last setting
+  wins; opacity < 1 or unset still dims; `C-n` → 0x0e / `C-\` → 0x1c; only root keys bound to hive
+  count (not prefix ones); a chord is offered only for a byte nothing sends yet, and never alongside a
+  config that already has the essentials; config files read in load order
 - `common/terminal.rs`: emulator detection — `$TERM_PROGRAM`, a tmux client's
   `client_termtype`/`termname` (Ghostty by either; an unrecognised terminal is `None`, never mistaken
   for Ghostty), and the most recent non-control client wins even over an older attached Ghostty one
