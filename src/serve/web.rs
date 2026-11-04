@@ -433,6 +433,11 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                                 || !cfg.fields.is_empty()
                                 || !cfg.required.is_empty()
                                 || !cfg.renames.is_empty(),
+                            // What the add dialog must ask for besides a title.
+                            "required": crate::common::tasks::required_for_add(&cfg)
+                                .into_iter()
+                                .map(|(name, values)| serde_json::json!({"name": name, "values": values}))
+                                .collect::<Vec<_>>(),
                             "tasks": tasks,
                         }),
                         Err(e) => serde_json::json!({"error": e.to_string()}),
@@ -443,8 +448,12 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     request.respond(Response::from_string(json.to_string()).with_header(header));
             }
 
-            // Move a task: `{"project","id","column"}`. The id is checked against the
-            // project's own list before anything is written.
+            // Move a task: `{"project","id","column"}` (the id is checked against the
+            // project's own list before anything is written), or add one:
+            // `{"project","title","column"?,"fields"?}` — the tasks page's per-column "+".
+            // `fields` is only for what a strict board requires (`web_fields` guards it);
+            // the board's `filter` is stamped by `add_task`, and anything else is set
+            // afterwards (`hive task set`).
             (Method::Post, "/api/task-move") | (Method::Post, "/api/task-add") => {
                 let adding = path == "/api/task-add";
                 let mut body = String::new();
@@ -469,12 +478,23 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         let Some(title) = text("title").filter(|t| !t.trim().is_empty()) else {
                             return serde_json::json!({"error": "title required"});
                         };
+                        let fields = match req.get("fields") {
+                            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+                            Some(serde_json::Value::Object(m)) => {
+                                crate::common::tasks::web_fields(&cfg, m)
+                            }
+                            Some(_) => Err(anyhow::anyhow!("fields must be an object")),
+                        };
+                        let fields = match fields {
+                            Ok(f) => f,
+                            Err(e) => return serde_json::json!({"error": e.to_string()}),
+                        };
                         crate::common::tasks::add_task(
                             &cfg,
                             crate::common::tasks::NewTask {
                                 title: title.trim().to_string(),
                                 column: text("column"),
-                                fields: Vec::new(),
+                                fields,
                                 body: None,
                                 due: None,
                                 priority: None,

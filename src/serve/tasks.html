@@ -22,6 +22,25 @@
   .dialog dd { word-break: break-word; }
   .dialog pre { white-space: pre-wrap; font: 12px/1.5 inherit; color: var(--muted); margin: 0; }
   .dialog .issues { font-size: 12px; color: var(--warn); }
+  .dialog .err { color: var(--s-blocked); }
+  /* A strict board's required fields: one labelled control each, under the title. */
+  .dialog .fields { display: flex; flex-direction: column; gap: 10px; }
+  .dialog .fields:empty { display: none; }
+  .dialog label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  .dialog select {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 10px; outline: none;
+  }
+  .dialog select:focus { border-color: var(--accent); }
+  /* The per-column "+": quiet until you reach for it, but never hidden (no hover on a phone). */
+  .colhead .add {
+    margin-left: auto; width: 22px; height: 22px; padding: 0; border-radius: 5px;
+    border: 1px solid transparent; background: none; color: var(--faint);
+    font: inherit; font-size: 16px; line-height: 1; cursor: pointer;
+  }
+  .colhead .add:hover, .colhead .add:focus-visible {
+    color: var(--text); background: var(--col); border-color: var(--line); outline: none;
+  }
 </style>
 </head>
 <body>
@@ -56,6 +75,19 @@
     <div class="row">
       <button type="button" id="cancel">Cancel</button>
       <button type="submit" class="primary">Move to Blocked</button>
+    </div>
+  </form>
+</div>
+<div class="scrim" id="addScrim">
+  <form class="dialog" id="addForm">
+    <h2>New task</h2>
+    <p id="addFor"></p>
+    <input id="addTitle" placeholder="What needs doing?" autocomplete="off" maxlength="300">
+    <div class="fields" id="addFields"></div>
+    <p class="err" id="addErr" hidden></p>
+    <div class="row">
+      <button type="button" id="addCancel">Cancel</button>
+      <button type="submit" class="primary calm" id="addGo">Add</button>
     </div>
   </form>
 </div>
@@ -171,7 +203,10 @@ function render() {
   $('#strip').innerHTML = cols.map(c =>
     `<span class="pill"><i style="background:${colVar(c)}"></i>${label(c)} <b>${count(c)}</b></span>`).join('');
   const heads = `<div class="cols">${cols.map(c =>
-    `<div class="colhead"><i style="background:${colVar(c)}"></i>${label(c)}<span class="n">${count(c)}</span></div>`).join('')}</div>`;
+    `<div class="colhead"><i style="background:${colVar(c)}"></i>${label(c)}<span class="n">${count(c)}</span>${
+      // Not on Done: a task created there would be born completed.
+      c === 'done' ? '' : `<button type="button" class="add" data-col="${esc(c)}" title="Add a task to ${esc(label(c))}" aria-label="Add a task to ${esc(label(c))}">+</button>`
+    }</div>`).join('')}</div>`;
 
   let body;
   if (!laneBy) {
@@ -270,6 +305,55 @@ $('#dialog').addEventListener('submit', e => {
 $('#cancel').addEventListener('click', closeDialog);
 $('#scrim').addEventListener('mousedown', e => { if (e.target.id === 'scrim') closeDialog(); });
 
+// ---- add a task ----
+// A title and the column it was opened from. The board's `filter` is stamped by the server,
+// and a strict board's required fields (`data.required`) are asked for here; anything else
+// (size, epic…) is set afterwards with `hive task set`. With lanes on, a card with no value for
+// the lane field yet sits under "(none)", which the dialog says up front.
+let addCol = '', adding = false;
+function openAdd(col) {
+  addCol = col;
+  const req = (data && data.required) || [];
+  $('#addFields').innerHTML = req.map(f => {
+    const name = esc(f.name);
+    return `<label>${name}` + (f.values && f.values.length
+      ? `<select data-f="${name}" required><option value="">choose…</option>${f.values.map(v => `<option>${esc(v)}</option>`).join('')}</select>`
+      : `<input data-f="${name}" required autocomplete="off" maxlength="200">`) + '</label>';
+  }).join('');
+  const asked = req.some(f => f.name.toLowerCase() === laneBy);
+  $('#addFor').textContent = 'in ' + label(col) +
+    (laneBy && !asked ? ` · no ${laneBy} yet, so it sits under (none) until you set one` : '');
+  $('#addErr').hidden = true;
+  $('#addTitle').value = '';
+  $('#addScrim').classList.add('open');
+  $('#addTitle').focus();
+}
+function closeAdd() { $('#addScrim').classList.remove('open'); }
+// Failures stay in the dialog (the toast would sit under the overlay) so the title isn't lost.
+function addFailed(msg) {
+  if ($('#addScrim').classList.contains('open')) { $('#addErr').textContent = msg; $('#addErr').hidden = false; }
+  else toast(msg);
+}
+$('#addForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const title = $('#addTitle').value.trim();
+  if (!title) { $('#addTitle').focus(); return; }
+  if (adding) return;   // a double Enter must not create the reminder twice
+  adding = true;
+  const go = $('#addGo');
+  go.disabled = true; go.textContent = 'Adding…';
+  try {
+    const fields = {};
+    for (const el of $('#addFields').querySelectorAll('[data-f]')) fields[el.dataset.f] = el.value;
+    const res = await post('/api/task-add', { project, title, column: addCol, fields });
+    if (res.ok) { closeAdd(); toast('Added to ' + label(addCol)); lastJson = ''; load(); }
+    else addFailed(res.error || 'Could not add task');
+  } catch { addFailed('offline'); }
+  finally { adding = false; go.disabled = false; go.textContent = 'Add'; }
+});
+$('#addCancel').addEventListener('click', closeAdd);
+$('#addScrim').addEventListener('mousedown', e => { if (e.target.id === 'addScrim') closeAdd(); });
+
 // ---- details ----
 function showDetail(t) {
   const rows = [['column', label(t.column)], ['priority', t.priority], t.due ? ['due', t.due.slice(0, 10)] : null,
@@ -284,7 +368,7 @@ function showDetail(t) {
   $('#detailClose').onclick = () => $('#detailScrim').classList.remove('open');
 }
 $('#detailScrim').addEventListener('mousedown', e => { if (e.target.id === 'detailScrim') e.target.classList.remove('open'); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeDialog(); $('#detailScrim').classList.remove('open'); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeDialog(); closeAdd(); $('#detailScrim').classList.remove('open'); } });
 
 // ---- board: drag between columns (shared), fold lanes, open details ----
 const board = $('#board');
@@ -295,6 +379,8 @@ Board.wireDnD(board, (id, cell) => {
   if (col === 'blocked') askReason(t); else moveTask(id, col);
 });
 board.addEventListener('click', e => {
+  const add = e.target.closest('.colhead .add');
+  if (add) { openAdd(add.dataset.col); return; }
   const lane = e.target.closest('.lane-head');
   if (lane) { Board.toggleLane(lane, folded, () => store.set(foldKey(), [...folded])); return; }
   const el = e.target.closest('.card');

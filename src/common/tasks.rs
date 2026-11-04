@@ -788,6 +788,68 @@ pub fn add_task(cfg: &TasksConfig, new: NewTask) -> Result<String> {
     Ok(title)
 }
 
+/// What the tasks page's add dialog must ask for besides a title, as
+/// `(field, allowed values)` — no values means free text. Only a strict board enforces
+/// `required` on an add, so any other board needs nothing. `status` is the column the
+/// dialog was opened from, and a field the board's `filter` stamps is supplied by
+/// `add_task` itself, so neither is asked.
+pub fn required_for_add(cfg: &TasksConfig) -> Vec<(String, Vec<String>)> {
+    if !cfg.strict {
+        return Vec::new();
+    }
+    task_schema::fields(cfg)
+        .into_iter()
+        .filter(|f| f.required && f.name != "status" && !is_filter_key(cfg, &f.name))
+        .map(|f| (f.name, f.values))
+        .collect()
+}
+
+fn is_filter_key(cfg: &TasksConfig, key: &str) -> bool {
+    cfg.filter.keys().any(|k| k.eq_ignore_ascii_case(key))
+}
+
+/// The extra header fields an add from the web may carry (`/api/task-add`'s `fields`).
+/// Only a strict board takes any — its schema then checks every name and value — and a
+/// request cannot touch what the server owns: `status` (that is the column) or a pair the
+/// board's `filter` stamps, since a task moved out of the filter would vanish from the
+/// board it was added to. Names are plain, values one short line: this text is written
+/// into the reminder's header, where a newline would start another field.
+pub fn web_fields(
+    cfg: &TasksConfig,
+    raw: &serde_json::Map<String, Value>,
+) -> Result<Vec<(String, String)>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !cfg.strict {
+        bail!("fields can only be set from the web on a strict board — use `hive task set`");
+    }
+    let mut out = Vec::new();
+    for (k, v) in raw {
+        let key = k.trim().to_lowercase();
+        let plain = !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !plain {
+            bail!("'{k}' is not a field name");
+        }
+        if key == "status" || is_filter_key(cfg, &key) {
+            bail!("'{key}' is set by the board, not by the request");
+        }
+        let val = v
+            .as_str()
+            .ok_or_else(|| anyhow!("field '{key}' must be text"))?
+            .trim()
+            .to_string();
+        if val.chars().count() > 200 || val.chars().any(char::is_control) {
+            bail!("field '{key}' must be one short line");
+        }
+        out.push((key, val));
+    }
+    Ok(out)
+}
+
 // ----------------------------------------------------------------------- cache
 
 type CacheMap = HashMap<String, (Instant, Vec<Task>)>;
@@ -1164,5 +1226,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.conversation.as_deref(), Some("abc-123"));
+    }
+
+    fn strict() -> TasksConfig {
+        TasksConfig {
+            strict: true,
+            ..cfg()
+        }
+    }
+
+    fn obj(v: Value) -> serde_json::Map<String, Value> {
+        v.as_object().expect("an object").clone()
+    }
+
+    #[test]
+    fn an_add_asks_only_for_what_a_strict_board_requires() {
+        // Not strict: `required` is not enforced on an add, so nothing is asked.
+        let lax = TasksConfig {
+            required: vec!["area".into()],
+            ..cfg()
+        };
+        assert!(required_for_add(&lax).is_empty());
+
+        // Strict: the required field, but never `status` (the column) or a field the
+        // board's own filter stamps.
+        let mut c = TasksConfig {
+            required: vec!["area".into(), "epic".into()],
+            ..strict()
+        };
+        c.filter.insert("area".into(), "symposium".into());
+        let names: Vec<String> = required_for_add(&c).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["epic".to_string()]);
+    }
+
+    #[test]
+    fn web_fields_are_only_taken_by_a_strict_board() {
+        assert!(web_fields(&cfg(), &obj(serde_json::json!({})))
+            .unwrap()
+            .is_empty());
+        let err = web_fields(&cfg(), &obj(serde_json::json!({"area": "x"}))).unwrap_err();
+        assert!(err.to_string().contains("strict"), "{err}");
+        assert_eq!(
+            web_fields(&strict(), &obj(serde_json::json!({" Area ": "  writing "}))).unwrap(),
+            vec![("area".to_string(), "writing".to_string())],
+            "names are lowercased and values trimmed"
+        );
+    }
+
+    #[test]
+    fn web_fields_cannot_reach_what_the_server_owns() {
+        let mut c = strict();
+        c.filter.insert("area".into(), "symposium".into());
+        for key in ["status", "STATUS", "area", "Area"] {
+            let err = web_fields(&c, &obj(serde_json::json!({ key: "x" }))).unwrap_err();
+            assert!(err.to_string().contains("set by the board"), "{key}: {err}");
+        }
+        // A field the filter does not own is fine.
+        assert!(web_fields(&c, &obj(serde_json::json!({"epic": "x"}))).is_ok());
+    }
+
+    #[test]
+    fn web_fields_are_a_plain_name_and_one_short_line() {
+        let c = strict();
+        // The value is written into the header: a newline would start another field.
+        for bad in ["a\nstatus: done", "a\rb", "tab\there"] {
+            assert!(
+                web_fields(&c, &obj(serde_json::json!({"area": bad}))).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(web_fields(&c, &obj(serde_json::json!({"area": "x".repeat(201)}))).is_err());
+        assert!(web_fields(&c, &obj(serde_json::json!({"area": "x".repeat(200)}))).is_ok());
+        for bad in ["a\nstatus", "a b", "a:b", "", "  "] {
+            assert!(
+                web_fields(&c, &obj(serde_json::json!({ bad: "x" }))).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(web_fields(&c, &obj(serde_json::json!({"area": 3}))).is_err());
+        assert!(web_fields(&c, &obj(serde_json::json!({"area": null}))).is_err());
     }
 }

@@ -323,6 +323,22 @@ filter = { project = "symposium" }           # one list shared by several projec
   tested in, and "off" would have shown the user no animation at all. The task page has a column strip with
   counts, a `Lanes: None | Area | Type | …` toggle (see below), a Priority/Stalest sort, details
   on click, drag between columns, and ⚠ chips only once a board declares a schema (`schema_on`).
+- **Adding a task from the page** (`+` on every column head but Done). The dialog asks for a title
+  and posts `/api/task-add`; the column is the one whose `+` you clicked. Not on Done: a task
+  created there would be born completed. Only a **strict** board asks for more — `/api/tasks`
+  reports `required` (`tasks::required_for_add`: the schema's required fields, minus `status` and
+  any field the board's `filter` already stamps), and the dialog renders one input per field, a
+  select where the schema gives a closed set. Without that, the `+` could never succeed on a
+  board whose schema requires `area`. A lane field that is *not* asked for is the one surprise: with
+  lanes on, the new card has no value for it and sits under `(none)`, so the dialog says so up front.
+  - **`fields` is guarded server-side** (`tasks::web_fields`), because it is text written into the
+    reminder's header, where a newline would start another field. Strict boards only (the schema
+    then checks every name and value); plain names; one short line; and never `status` (that is the
+    column) or a `filter` key (a task stamped outside the filter would vanish from the board it was
+    added to). The rest — size, epic, links — is set afterwards, as before.
+  - Failures show **inside** the dialog and keep the title: a toast would sit under the overlay.
+    A second submit while one is in flight is ignored (a double Enter must not create the
+    reminder twice).
 - **Lanes group by one header field, switchable on the page.** `group_by` is the board's lead
   field (`area` when unset); `area`, `epic` and `type` are offered too, once at least one task
   carries them, so a board with no `type` never shows an empty Type button. The chosen field is
@@ -373,7 +389,7 @@ schema can be reviewed with `hive task lint` first (draft + migration table:
     `modified` is the staleness clock and any write resets it.
   - **The fence is always written.** A body with no `---` above it would be re-read as header
     fields if its first line looked like `Summary: …`. An existing fence is kept as written.
-  - Not in the web page: `tasks.html` shows the body but can't edit it.
+  - Not in the web page: `tasks.html` shows the body but can't edit it (it can only *create* a task, title-first).
 - **Custom metadata, two ways.** A board *declares* a field (`fields.<name>` in `projects.toml`,
   optionally typed / restricted — Thesis `log`, AWS `parent`), or a task carries a one-off
   **`x-` field** (`--field x-reviewer=niko`) that no schema needs to know about: free text,
