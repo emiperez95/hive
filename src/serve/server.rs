@@ -161,7 +161,6 @@ pub(crate) fn build_board(
                 auth_profile: c.auth_profile.clone(),
                 note: c.note.clone(),
                 frozen_note: c.frozen_note.clone(),
-                frozen_relative: c.frozen_relative.clone(),
             })
         })
         .collect();
@@ -676,13 +675,9 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
             .and_then(|b| b.strip_prefix(".claude-"))
             .map(|s| s.to_string())
     });
-    let (frozen, frozen_note, frozen_relative) = match &c.frozen {
-        Some(f) => (
-            true,
-            Some(f.note.clone()).filter(|s| !s.is_empty()),
-            Some(crate::common::frozen::relative_time(&f.frozen_at)),
-        ),
-        None => (false, None, None),
+    let (frozen, frozen_note) = match &c.frozen {
+        Some(f) => (true, Some(f.note.clone()).filter(|s| !s.is_empty())),
+        None => (false, None),
     };
     let placement = c.placement.as_ref().map(|p| PlacementView {
         session_name: p.session_name.clone(),
@@ -702,11 +697,6 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
         }
         .to_string(),
         status: c.status.as_ref().map(|s| s.status.clone()),
-        needs_attention: c
-            .status
-            .as_ref()
-            .map(|s| s.needs_attention)
-            .unwrap_or(false),
         last_activity: c.last_activity.clone(),
         placement,
         parent: c.parent.clone(),
@@ -714,7 +704,6 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
         emoji,
         frozen,
         frozen_note,
-        frozen_relative,
         note: c.note.clone(),
         pinned: c.pinned,
         archived: c.archived,
@@ -780,7 +769,6 @@ mod tests {
             cwd: None,
             lifecycle: lifecycle.into(),
             status: None,
-            needs_attention: false,
             last_activity: None,
             placement: None,
             parent: None,
@@ -788,7 +776,6 @@ mod tests {
             emoji: String::new(),
             frozen,
             frozen_note: None,
-            frozen_relative: None,
             note: String::new(),
             pinned: false,
             archived: false,

@@ -143,9 +143,6 @@ pub struct ConversationView {
     /// no recovered status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,
-    /// Whether the status is one requiring the user to act.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub needs_attention: bool,
     /// Last activity timestamp (ISO 8601).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
@@ -166,9 +163,6 @@ pub struct ConversationView {
     pub frozen: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_note: Option<String>,
-    /// Human "3h ago" relative to when it was frozen.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frozen_relative: Option<String>,
     /// Free-text overlay note (from conversations.json).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
@@ -246,8 +240,6 @@ pub struct BoardCard {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frozen_relative: Option<String>,
 }
 
 /// Where a live conversation currently runs, for routing send/switch/freeze.
