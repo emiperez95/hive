@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 471 tests (444 unit + 27 CLI smoke)
+cargo test                # 541 tests (509 unit + 32 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 775 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 444 unit + 27 smoke.
+> `cargo test` prints 906 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 509 unit + 32 smoke.
 
 ## The TUI (conversation-first)
 
@@ -460,7 +460,7 @@ src/
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
 └── tests/
-    └── cli_smoke.rs        24 integration tests: CLI arg parsing, read-only commands, todo roundtrip
+    └── cli_smoke.rs        32 integration tests: CLI arg parsing, read-only commands, todo roundtrip
 ```
 
 (The classic session-first TUI lived in `src/tui/` — removed in the cutover; see git history
@@ -1896,13 +1896,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-468 distinct tests. Run with `cargo test`.
+541 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 775 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 307 · bin 441 (the superset — adds cli/daemon/serve)
-> · smoke 27.
+> `cargo test` prints 906 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 365 · bin 509 (the superset — adds cli/daemon/serve)
+> · smoke 32.
 
-**Unit tests (441)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (509)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs
@@ -2011,7 +2011,7 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   blocked-vs-working split, closed convs contributing no status/resources, auth-profile
   defaulting, payload-free status labels)
 
-**Integration tests (27)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (32)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
@@ -2020,6 +2020,8 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 - `--auth-profile` persists to `projects.toml`, and is absent from the TOML when the flag is omitted
 - `wt new --help` still lists `--no-switch`
 - `fork --help` lists `--wt` / `--to` / `--id` / `--switch`; `fork` outside a conversation fails pointing at `--id`
+- `stage` / `freeze` / `close` help lists their flags; outside a conversation they point at `--id`; `stage` rejects an unknown stage before touching anything
+- `task set --help` lists `--append` / `--body`; `task set` with nothing to set fails, and `--body` excludes `--append`
 - `wt prune --dry-run` over an empty registry is a no-op (isolated `$HOME`)
 
 No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test

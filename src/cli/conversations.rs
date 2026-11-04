@@ -5131,6 +5131,14 @@ fn help_lines() -> Vec<Line<'static>> {
             "t",
             "Todos of every project — Enter start · x done · a add · → project · ^R archived",
         ),
+        key(
+            "F",
+            "Fork the conversation: same history, new window beside it, and land there",
+        ),
+        key(
+            "R",
+            "Recovery: reopen the windows that were open when hive last saw the machine",
+        ),
         key("L", "Spread sessions into terminal panes / collapse back"),
         key("N", "New-project wizard (key → emoji → path)"),
         key("w / x", "In a project detail: create / delete a worktree"),

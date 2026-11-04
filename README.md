@@ -215,7 +215,12 @@ Two views: **Active** (live conversations grouped by their tmux session) and **B
 | `Tab` | Browse: expand / collapse the project under the cursor |
 | `z` | Freeze a Claude window (prompts for a note) |
 | `v` `m` `s` `!` | Favorite · mute · skip from cycling · auto-approve (session-level) |
-| `M` / `P` | Global mute / pin the conversation |
+| `G` | Toggle global mute (silence all notifications) |
+| `M` | Mute override 🔔 — this conversation notifies even while muted |
+| `P` | Pin / unpin the conversation (sorts to top, survives age-bounding) |
+| `F` | Fork the conversation — same history, new window beside it, and land there |
+| `t` | Todos of every project in one list |
+| `R` | Recovery — reopen the windows that were open when hive last saw the machine |
 | `Del` | Close a live conversation (kills its window) · discard a frozen one |
 | `L` / `N` | Spread / collapse Ghostty panes · new-project wizard |
 | `Ctrl+R` | Browse: reveal / hide archived projects |
