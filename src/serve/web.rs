@@ -523,8 +523,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     request.respond(Response::from_string(json.to_string()).with_header(header));
             }
 
-            // Move a card: `{"id", "stage": "todo"|…|null, "note"?}`. `null` puts it
-            // back in Unsorted. The note is kept only for Blocked.
+            // Label a card: `{"id", "stage": "now"|"waiting"|"later"|"done"|null, "note"?}`.
+            // `null` clears it (reads as Now). The note is kept only for Waiting. Freezing
+            // or closing the window is the page's next call, after this one lands.
             (Method::Post, "/api/stage") => {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
@@ -548,7 +549,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     let ok = ConversationSidecar::edit(&id, |o| {
                         o.stage = stage;
                         o.stage_at = stage.map(|_| chrono::Utc::now().to_rfc3339());
-                        o.stage_note = note.filter(|_| stage == Some(Stage::Blocked));
+                        o.stage_note = note.filter(|_| stage == Some(Stage::Waiting));
                     })
                     .is_ok();
                     Some(format!(r#"{{"ok":{ok}}}"#))

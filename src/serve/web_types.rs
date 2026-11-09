@@ -201,13 +201,13 @@ pub struct BoardCard {
     pub short_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Never unset on the wire: a conversation nobody has placed is in Todo.
+    /// Never unset on the wire: a conversation nobody has placed is in Now.
     pub stage: crate::common::registry::Stage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_note: Option<String>,
-    /// `live` | `skipped` | `frozen`.
+    /// `live` | `skipped` | `frozen` | `closed` (only ever in Done).
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,

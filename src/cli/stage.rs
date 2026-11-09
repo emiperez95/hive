@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Result};
 use std::time::{Duration, Instant};
 
 use crate::common::claude_sessions::{self, ClaudeSessionStatus};
-use crate::common::frozen::{freeze_window, FreezeTarget};
+use crate::common::frozen::{discard_frozen, freeze_window, FreezeTarget};
 use crate::common::registry::{Conversation, ConversationSidecar, Stage};
 use crate::common::tmux::{exact_window, sh_quote};
 
@@ -26,12 +26,34 @@ const STALE_GRACE: Duration = Duration::from_secs(5);
 
 pub fn parse_stage(s: &str) -> Option<Stage> {
     match s.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
-        "todo" => Some(Stage::Todo),
-        "planning" | "plan" => Some(Stage::Planning),
-        "in-progress" | "progress" | "wip" | "doing" => Some(Stage::InProgress),
-        "blocked" => Some(Stage::Blocked),
+        "now" => Some(Stage::Now),
+        "waiting" | "wait" => Some(Stage::Waiting),
+        "later" => Some(Stage::Later),
         "done" => Some(Stage::Done),
         _ => None,
+    }
+}
+
+/// What moving to a column does to the conversation's window.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowAction {
+    Nothing,
+    Freeze,
+    Close,
+    DiscardFrozen,
+    Thaw,
+}
+
+/// Waiting and Later park the window; Done ends it; Now brings a parked one back. A
+/// frozen conversation has no window to freeze or close, so Done drops its frozen entry
+/// instead (the transcript stays).
+fn window_action(stage: Stage, has_window: bool, frozen: bool) -> WindowAction {
+    match (stage, has_window) {
+        (Stage::Waiting | Stage::Later, true) => WindowAction::Freeze,
+        (Stage::Done, true) => WindowAction::Close,
+        (Stage::Done, false) if frozen => WindowAction::DiscardFrozen,
+        (Stage::Now, false) if frozen => WindowAction::Thaw,
+        _ => WindowAction::Nothing,
     }
 }
 
@@ -76,46 +98,51 @@ fn subject(id: Option<String>) -> Result<Subject> {
     Ok(Subject { conv, mid_turn })
 }
 
-pub fn run_stage(
-    stage: &str,
-    reason: Option<String>,
-    freeze: bool,
-    id: Option<String>,
-    now: bool,
-) -> Result<()> {
-    let stage = parse_stage(stage).ok_or_else(|| {
-        anyhow!("unknown stage '{stage}' — todo, planning, in-progress, blocked or done")
-    })?;
+pub fn run_stage(stage: &str, reason: Option<String>, id: Option<String>, now: bool) -> Result<()> {
+    let stage = parse_stage(stage)
+        .ok_or_else(|| anyhow!("unknown stage '{stage}' — now, waiting, later or done"))?;
     let s = subject(id)?;
     let note = reason.filter(|r| !r.trim().is_empty());
     let id = s.conv.id.as_str().to_string();
     ConversationSidecar::edit(&id, |o| {
         o.stage = Some(stage);
         o.stage_at = Some(chrono::Utc::now().to_rfc3339());
-        o.stage_note = note.clone().filter(|_| stage == Stage::Blocked);
+        o.stage_note = note.clone().filter(|_| stage == Stage::Waiting);
     })?;
     let label = serde_json::to_value(stage)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
-        .replace('_', " ");
+        .unwrap_or_default();
     match (&note, stage) {
-        (Some(n), Stage::Blocked) => println!("{} → {label}: {n}", short(&id)),
+        (Some(n), Stage::Waiting) => println!("{} → {label}: {n}", short(&id)),
         (Some(_), _) => println!(
-            "{} → {label} (reason ignored — kept only for blocked)",
+            "{} → {label} (reason ignored — kept only for waiting)",
             short(&id)
         ),
         _ => println!("{} → {label}", short(&id)),
     }
-    if freeze {
-        let freeze_note = match (stage, note) {
-            (Stage::Blocked, Some(n)) => format!("Blocked: {n}"),
-            (Stage::Blocked, None) => "Blocked".to_string(),
-            (_, n) => n.unwrap_or_default(),
-        };
-        freeze_subject(&s, &freeze_note, now)?;
+    match window_action(stage, s.conv.placement.is_some(), s.conv.is_frozen()) {
+        WindowAction::Nothing => Ok(()),
+        WindowAction::Freeze => {
+            let freeze_note = match (stage, note) {
+                (Stage::Waiting, Some(n)) => format!("Waiting: {n}"),
+                (Stage::Waiting, None) => "Waiting".to_string(),
+                _ => String::new(),
+            };
+            freeze_subject(&s, &freeze_note, now)
+        }
+        WindowAction::Close => close_subject(&s, now),
+        WindowAction::DiscardFrozen => {
+            discard_frozen(&id)?;
+            println!("Closed {} — no longer frozen", short(&id));
+            Ok(())
+        }
+        WindowAction::Thaw => {
+            let session = crate::common::conversations::reopen_conversation(&s.conv, None)?;
+            println!("Thawed {} into {session}", short(&id));
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 pub fn run_freeze(note: Option<String>, id: Option<String>, now: bool) -> Result<()> {
@@ -124,7 +151,10 @@ pub fn run_freeze(note: Option<String>, id: Option<String>, now: bool) -> Result
 }
 
 pub fn run_close(id: Option<String>, now: bool) -> Result<()> {
-    let s = subject(id)?;
+    close_subject(&subject(id)?, now)
+}
+
+fn close_subject(s: &Subject, now: bool) -> Result<()> {
     let p = placement(&s.conv)?;
     if s.mid_turn && !now {
         defer(&["close", "--now", "--id", s.conv.id.as_str()])?;
@@ -266,14 +296,41 @@ mod tests {
 
     #[test]
     fn stages_parse_with_the_spellings_people_type() {
-        assert_eq!(parse_stage("todo"), Some(Stage::Todo));
-        assert_eq!(parse_stage("Plan"), Some(Stage::Planning));
-        for s in ["in-progress", "in_progress", "in progress", "wip"] {
-            assert_eq!(parse_stage(s), Some(Stage::InProgress), "{s}");
-        }
-        assert_eq!(parse_stage("blocked"), Some(Stage::Blocked));
+        assert_eq!(parse_stage("now"), Some(Stage::Now));
+        assert_eq!(parse_stage("Waiting"), Some(Stage::Waiting));
+        assert_eq!(parse_stage("later"), Some(Stage::Later));
         assert_eq!(parse_stage("DONE"), Some(Stage::Done));
         assert_eq!(parse_stage("unsorted"), None);
+    }
+
+    #[test]
+    fn each_column_does_the_right_thing_to_the_window() {
+        use WindowAction::*;
+        assert_eq!(window_action(Stage::Now, true, false), Nothing);
+        assert_eq!(window_action(Stage::Waiting, true, false), Freeze);
+        assert_eq!(window_action(Stage::Later, true, false), Freeze);
+        assert_eq!(window_action(Stage::Done, true, false), Close);
+        // Already frozen: nothing more to park, and Done has no window to close.
+        assert_eq!(window_action(Stage::Later, false, true), Nothing);
+        assert_eq!(window_action(Stage::Done, false, true), DiscardFrozen);
+        assert_eq!(window_action(Stage::Now, false, true), Thaw);
+        assert_eq!(window_action(Stage::Now, false, false), Nothing);
+        // Already closed.
+        assert_eq!(window_action(Stage::Done, false, false), Nothing);
+    }
+
+    #[test]
+    fn overlays_written_with_the_old_columns_still_read() {
+        for (old, new) in [
+            ("todo", Stage::Now),
+            ("in_progress", Stage::Now),
+            ("blocked", Stage::Waiting),
+            ("planning", Stage::Later),
+            ("done", Stage::Done),
+        ] {
+            let got: Stage = serde_json::from_value(serde_json::json!(old)).unwrap();
+            assert_eq!(got, new, "{old}");
+        }
     }
 
     #[test]

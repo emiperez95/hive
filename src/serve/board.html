@@ -20,24 +20,6 @@
     border-radius: 4px; padding: 2px 8px;
   }
   .card button.thaw:hover { border-color: var(--accent); color: var(--accent); }
-  .switch {
-    display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
-    font-size: 12px; font-weight: 600; color: var(--muted);
-  }
-  .switch[hidden] { display: none; }
-  .switch input { position: absolute; opacity: 0; pointer-events: none; }
-  .switch .track {
-    width: 30px; height: 18px; border-radius: 999px; background: var(--line);
-    position: relative; transition: background .15s; flex-shrink: 0;
-  }
-  .switch .track::after {
-    content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
-    border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform .15s;
-  }
-  .switch input:checked + .track { background: var(--accent); }
-  .switch input:checked + .track::after { transform: translateX(12px); }
-  .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .switch input:checked ~ .lbl { color: var(--text); }
   /* ---- project filter ---- */
   .filters {
     display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
@@ -83,15 +65,12 @@
 
 <div class="scrim" id="scrim">
   <form class="dialog" id="dialog">
-    <h2>Blocked on what?</h2>
+    <h2>Waiting on what?</h2>
     <p id="dialogFor"></p>
     <input id="reason" placeholder="e.g. waiting on staging creds" autocomplete="off">
-    <label class="switch" id="freezeSwitch" title="Close the window and keep the conversation to thaw later — the reason becomes its freeze note">
-      <input type="checkbox" id="freezeToggle"><span class="track"></span><span class="lbl">💤 Freeze the conversation until unblocked</span>
-    </label>
     <div class="row">
       <button type="button" id="cancel">Cancel</button>
-      <button type="submit" class="primary">Move to Blocked</button>
+      <button type="submit" class="primary">Move to Waiting</button>
     </div>
   </form>
 </div>
@@ -111,14 +90,14 @@
 
 <script src="/board-common.js"></script>
 <script>
+// `color` names a --s-* token in board-common.css, shared with the task boards.
 const STAGES = [
-  { key: 'todo',        label: 'Todo' },
-  { key: 'planning',    label: 'Planning' },
-  { key: 'in_progress', label: 'In progress' },
-  { key: 'blocked',     label: 'Blocked' },
-  { key: 'done',        label: 'Done' },
+  { key: 'now',     label: 'Now',     color: 'in_progress' },
+  { key: 'waiting', label: 'Waiting', color: 'blocked' },
+  { key: 'later',   label: 'Later',   color: 'planning' },
+  { key: 'done',    label: 'Done',    color: 'done' },
 ];
-const stageVar = k => `var(--s-${k || 'todo'})`;
+const stageVar = k => `var(--s-${(STAGES.find(s => s.key === k) || STAGES[0]).color})`;
 
 const { $, esc, post, toast } = Board;
 const store = Board.store('hiveBoard:');
@@ -136,6 +115,7 @@ let projectFilter = new Set(urlProjects != null ? urlProjects.split(',').filter(
 // What Claude is doing right now — separate from the stage you set.
 function runtime(c) {
   if (c.kind === 'frozen') return { label: 'frozen', v: '--rt-off' };
+  if (c.kind === 'closed') return { label: 'closed', v: '--rt-off' };
   const st = c.status;
   if (c.attention === 0) return { label: 'needs you', v: '--rt-needs' };
   if (st && st.RunningWorkflow) return { label: 'flow', v: '--rt-flow' };
@@ -190,10 +170,10 @@ function cardHtml(c) {
   if (c.kind === 'frozen') tags.push('<span class="tag">💤 frozen</span>');
   if (c.kind === 'skipped') tags.push('<span class="tag">skipped</span>');
   if (c.auth_profile) tags.push(`<span class="tag">${esc(c.auth_profile)}</span>`);
-  // A card frozen from the Blocked dialog carries `Blocked: <reason>` as its freeze
-  // note — the same words as the reason line above it, so don't print them twice.
-  const restates = n => c.stage === 'blocked' &&
-    n.replace(/^Blocked:?\s*/i, '').trim() === (c.stage_note || '').trim();
+  // A card frozen from the Waiting dialog carries `Waiting: <reason>` as its freeze
+  // note (`Blocked:` on older ones) — the same words as the reason line above it.
+  const restates = n => c.stage === 'waiting' &&
+    n.replace(/^(Waiting|Blocked):?\s*/i, '').trim() === (c.stage_note || '').trim();
   const note = [c.frozen_note, c.note].find(n => n && !restates(n));
   return `<div class="card ${c.kind === 'frozen' ? 'frozen' : ''}"
       draggable="true" data-id="${esc(c.id)}" style="--stage:${stageVar(c.stage)}">
@@ -202,12 +182,13 @@ function cardHtml(c) {
       <span class="rt ${c.unseen ? 'pulse' : ''}" style="--rt:var(${rt.v})"><i></i>${rt.label}</span>
     </div>
     <div class="title ${c.title ? '' : 'untitled'}">${esc(c.title || '(untitled)')}</div>
-    ${c.stage === 'blocked' && c.stage_note ? `<div class="reason">⛔ ${esc(c.stage_note)}</div>` : ''}
+    ${c.stage === 'waiting' && c.stage_note ? `<div class="reason">⏳ ${esc(c.stage_note)}</div>` : ''}
     ${note ? `<div class="note">📝 ${esc(note)}</div>` : ''}
     <div class="foot">
       ${tags.join('')}
       <span class="mono">${esc(c.short_id)}</span>
       ${c.kind === 'frozen' ? '<button class="thaw" data-thaw>Thaw</button>' : ''}
+      ${c.kind === 'closed' ? '<button class="thaw" data-resume>Resume</button>' : ''}
       <span class="age" title="${c.stage_at ? 'in this column since ' + esc(c.stage_at) : ''}">${stageAge}</span>
     </div>
   </div>`;
@@ -320,7 +301,7 @@ async function setStage(id, stage, note) {
   if (c) {
     c.stage = stage || undefined;
     c.stage_at = stage ? new Date().toISOString() : undefined;
-    c.stage_note = stage === 'blocked' ? note : undefined;
+    c.stage_note = stage === 'waiting' ? note : undefined;
     render();
   }
   const res = await post('/api/stage', { id, stage, note });
@@ -329,45 +310,80 @@ async function setStage(id, stage, note) {
   load();
 }
 
-// ---- blocked reason dialog ----
+// Moving a card is what acts on its window: Waiting and Later freeze it, Done closes it.
+const isBusy = c => c.status === 'Working' || !!(c.status && c.status.RunningWorkflow);
+
+async function moveCard(c, stage) {
+  if ((c.stage ?? null) === stage) return;
+  // A closed card has no window to park, and off Done it would leave the board.
+  if (c.kind === 'closed' && stage !== 'now') { toast('Closed — move it to Now to resume it'); return; }
+  if (stage === 'waiting') { askReason(c); return; }
+  const hasWindow = c.kind !== 'frozen' && c.kind !== 'closed' && !!c.placement;
+  // Later and Done act on the drop with no dialog, so don't let a stray drag end a running turn.
+  if (hasWindow && stage !== 'now' && isBusy(c)) {
+    const ok = await ask({ title: 'Claude is still working', input: false, danger: true,
+      ok: stage === 'done' ? 'Close anyway' : 'Freeze anyway',
+      sub: `${c.title || c.short_id} — this stops what it is doing now.` });
+    if (ok == null) return;
+  }
+  const wasClosed = c.kind === 'closed';
+  await setStage(c.id, stage);
+  if (wasClosed) await resumeCard(c);
+  else if (c.kind === 'frozen' && stage === 'now') await thawCard(c);
+  else if (stage === 'later' && hasWindow) await freezeCard(c, '');
+  else if (stage === 'done') await closeCard(c);
+}
+
+async function resumeCard(c) {
+  toast('Resuming…');
+  const res = await post('/api/resume', { id: c.id });
+  toast(res.ok ? `Resumed in ${res.session}` : (res.error || 'Resume failed'));
+  lastJson = '';
+  setTimeout(load, 800);
+}
+
+async function thawCard(c) {
+  toast('Thawing…');
+  const res = await post('/api/thaw', { key: c.id });
+  toast(res.ok ? `Thawed into ${res.session}` : (res.error || 'Thaw failed'));
+  lastJson = '';
+  setTimeout(load, 800);
+}
+
+async function closeCard(c) {
+  const res = c.kind === 'frozen'
+    ? await post('/api/discard-frozen', { key: c.id })
+    : await post('/api/close-window', { id: c.id });
+  toast(res.ok ? 'Closed — its history stays on disk' : (res.error || 'Close failed'));
+  lastJson = '';
+  setTimeout(load, 600);
+}
+
+// ---- waiting reason dialog ----
 let pendingBlock = null;
 function askReason(c) {
   pendingBlock = c.id;
   document.getElementById('dialogFor').textContent = c.title || c.short_id;
   const input = document.getElementById('reason');
   input.value = c.stage_note || '';
-  // Only a running window can be frozen; a frozen card already is.
-  const canFreeze = !!c.placement && c.kind !== 'frozen';
-  document.getElementById('freezeSwitch').hidden = !canFreeze;
-  document.getElementById('freezeToggle').checked = canFreeze && store.get('freezeOnBlock', false);
-  updateSubmit();
   document.getElementById('scrim').classList.add('open');
   input.focus();
 }
 function closeDialog() { pendingBlock = null; document.getElementById('scrim').classList.remove('open'); }
-function updateSubmit() {
-  const freeze = document.getElementById('freezeToggle').checked;
-  document.querySelector('#dialog button.primary').textContent = freeze ? 'Block & freeze' : 'Move to Blocked';
-}
-document.getElementById('freezeToggle').addEventListener('change', e => {
-  store.set('freezeOnBlock', e.target.checked);
-  updateSubmit();
-});
 document.getElementById('dialog').addEventListener('submit', async e => {
   e.preventDefault();
   const id = pendingBlock;
   const note = document.getElementById('reason').value.trim();
-  const freeze = !document.getElementById('freezeSwitch').hidden && document.getElementById('freezeToggle').checked;
   closeDialog();
   if (!id) return;
   const c = cards.find(c => c.id === id);
   // Stage first: the overlay is keyed by conversation id, so the card stays in
-  // Blocked when it comes back as a frozen card.
-  await setStage(id, 'blocked', note);
-  if (freeze && c && c.placement) await freezeCard(c, note);
+  // Waiting when it comes back as a frozen card.
+  await setStage(id, 'waiting', note);
+  if (c && c.placement && c.kind !== 'frozen') await freezeCard(c, note ? 'Waiting: ' + note : 'Waiting');
 });
 
-async function freezeCard(c, note, raw = false) {
+async function freezeCard(c, note) {
   const p = c.placement;
   const res = await post('/api/freeze', {
     session: p.session_name,
@@ -375,9 +391,9 @@ async function freezeCard(c, note, raw = false) {
     window_name: p.window_name,
     cwd: c.cwd || '',
     session_id: c.id,
-    note: raw ? note : (note ? 'Blocked: ' + note : 'Blocked'),
+    note,
   });
-  toast(res.ok ? '💤 Frozen — thaw it from the card when unblocked' : (res.error || 'Freeze failed'));
+  toast(res.ok ? '💤 Frozen — thaw it from the card' : (res.error || 'Freeze failed'));
   lastJson = '';
   setTimeout(load, 600);
 }
@@ -390,9 +406,7 @@ const board = document.getElementById('board');
 Board.wireDnD(board, (id, cell) => {
   const stage = cell.dataset.stage || null;
   const c = cards.find(c => c.id === id);
-  if (!c || (c.stage ?? null) === stage) return;
-  if (stage === 'blocked') askReason(c);
-  else setStage(id, stage);
+  if (c) moveCard(c, stage);
 });
 
 // ---- click: switch to the window, or thaw ----
@@ -406,15 +420,13 @@ board.addEventListener('click', async e => {
   if (!el) return;
   const c = cards.find(c => c.id === el.dataset.id);
   if (!c) return;
-  if (e.target.closest('[data-thaw]')) {
-    toast('Thawing…');
-    const res = await post('/api/thaw', { key: c.id });
-    toast(res.ok ? `Thawed into ${res.session}` : (res.error || 'Thaw failed'));
-    lastJson = '';
-    setTimeout(load, 800);
+  if (e.target.closest('[data-thaw]')) { thawCard(c); return; }
+  if (e.target.closest('[data-resume]')) { moveCard(c, 'now'); return; }
+  if (!c.placement) {
+    if (c.kind === 'frozen') toast('Frozen — use Thaw to reopen it');
+    if (c.kind === 'closed') toast('Closed — use Resume to reopen it');
     return;
   }
-  if (!c.placement) { if (c.kind === 'frozen') toast('Frozen — use Thaw to reopen it'); return; }
   const res = await post('/api/switch', { session: c.placement.session_name, window_index: c.placement.window_index });
   toast(res.ok ? `Switched to ${c.placement.session_name}` : (res.error || 'Switch failed'));
 });
@@ -495,6 +507,7 @@ function openMenu(c, x, y) {
     `<button role="menuitem" data-act="${act}" ${extra}><span class="ic">${ic}</span>${label}</button>`;
   const parts = [`<div class="who">${esc(c.title || c.short_id)}</div>`];
   if (live) parts.push(item('open', '↗', 'Open'));
+  else if (c.kind === 'closed') parts.push(item('resume', '▶', 'Resume'));
   else parts.push(item('thaw', '▶', 'Resume (thaw)'));
   parts.push('<hr><div class="sec">Move to</div>');
   for (const s of STAGES) {
@@ -507,7 +520,7 @@ function openMenu(c, x, y) {
     parts.push(item('skip', c.kind === 'skipped' ? '↩' : '⏭', c.kind === 'skipped' ? 'Unskip session' : 'Skip session'));
     parts.push('<hr>');
     parts.push(item('close', '✕', 'Close window…', 'class="danger"'));
-  } else {
+  } else if (c.kind === 'frozen') {
     parts.push(item('discard', '🗑', 'Discard…', 'class="danger"'));
   }
   menu.open(parts.join(''), x, y);
@@ -534,26 +547,15 @@ menu.el.addEventListener('click', async e => {
       toast(res.ok ? `Switched to ${c.placement.session_name}` : (res.error || 'Switch failed'));
       break;
     }
-    case 'thaw': {
-      toast('Thawing…');
-      const res = await post('/api/thaw', { key: c.id });
-      toast(res.ok ? `Thawed into ${res.session}` : (res.error || 'Thaw failed'));
-      refresh();
-      break;
-    }
-    case 'stage': {
-      const stage = btn.dataset.stage || null;
-      if ((c.stage ?? null) === stage) break;
-      if (stage === 'blocked') askReason(c);
-      else setStage(c.id, stage);
-      break;
-    }
+    case 'thaw': await thawCard(c); break;
+    case 'resume': moveCard(c, 'now'); break;
+    case 'stage': moveCard(c, btn.dataset.stage || null); break;
     case 'freeze': {
       const note = await ask({ title: 'Freeze this conversation?', sub: label,
-        placeholder: 'Why are you parking it? (optional)', value: c.stage === 'blocked' && c.stage_note ? 'Blocked: ' + c.stage_note : '',
+        placeholder: 'Why are you parking it? (optional)', value: c.stage === 'waiting' && c.stage_note ? 'Waiting: ' + c.stage_note : '',
         ok: '💤 Freeze' });
       if (note == null) break;
-      await freezeCard(c, note, true);
+      await freezeCard(c, note);
       break;
     }
     case 'skip': {

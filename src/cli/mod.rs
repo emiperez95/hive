@@ -176,22 +176,19 @@ pub enum Command {
         #[arg(trailing_var_arg = true)]
         directive: Vec<String>,
     },
-    /// Move a conversation on the board (`/board`): todo, planning, in-progress,
-    /// blocked or done. Run from inside Claude (`/hive:stage`) it moves the
-    /// conversation running it.
+    /// Move a conversation on the board (`/board`): now, waiting, later or done.
+    /// Waiting and later freeze its window, done closes it — at the end of the turn
+    /// when run from inside it (`/hive:stage`).
     Stage {
-        /// todo | planning | in-progress | blocked | done
+        /// now | waiting | later | done
         stage: String,
-        /// Also freeze the window — at the end of this turn when run from inside it
-        #[arg(long)]
-        freeze: bool,
         /// Conversation to move (default: the Claude conversation running this command)
         #[arg(long)]
         id: Option<String>,
-        /// Freeze right away instead of at the end of the turn
-        #[arg(long, requires = "freeze")]
+        /// Freeze or close right away instead of at the end of the turn
+        #[arg(long)]
         now: bool,
-        /// What it's blocked on (kept only for `blocked`)
+        /// What it's waiting on (kept only for `waiting`)
         #[arg(trailing_var_arg = true)]
         reason: Vec<String>,
     },

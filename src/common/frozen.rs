@@ -349,6 +349,13 @@ pub fn thaw_window(key: &str) -> Result<String> {
     state.save()?;
     if let Some(sid) = &entry.claude_session_id {
         crate::common::activity::log_window_thaw(sid, &session_name);
+        // The window is already back, so a failed overlay write must not read as a failed thaw.
+        if let Err(e) = crate::common::registry::ConversationSidecar::edit(
+            sid,
+            crate::common::registry::ConversationOverlay::return_to_now,
+        ) {
+            crate::common::debug::debug_log(&format!("thaw: board stage not reset: {e}"));
+        }
     }
     Ok(session_name)
 }

@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 559 tests (527 unit + 32 CLI smoke)
+cargo test                # 562 tests (530 unit + 32 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 942 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 527 unit + 32 smoke.
+> `cargo test` prints 945 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 530 unit + 32 smoke.
 
 ## The TUI (conversation-first)
 
@@ -83,7 +83,7 @@ hive wt new <project> <branch> --no-switch  # …and stay where you are
 hive fork [-- <directive>]                  # split the conversation running this in two: fork in a new window beside it
 hive fork --wt <branch> [-- <directive>]    # …into a NEW worktree branched off the source's checked-out branch
 hive fork --to <project|project/branch>     # …into a registered project / worktree   (--switch: land in the fork)
-hive stage <todo|planning|in-progress|blocked|done> [--freeze] [-- reason]  # move the conversation running this on the board
+hive stage <now|waiting|later|done> [-- reason]  # move the conversation running this on the board (waiting/later freeze it, done closes it)
 hive freeze [-- note]                       # freeze the conversation running this — once its turn ends
 hive close                                  # close the conversation running this — once its turn ends (all three take --id / --now)
 hive wt delete <project> <branch>  # delete worktree + session + branch
@@ -247,7 +247,9 @@ The board's actions, from inside the conversation (or on another with `--id`, wh
 takes the 8-char short id). The conversation is found the way `hive fork` finds it
 (`running_conversation_id`: `$CLAUDE_PID`'s record, which follows `/clear`). `stage`
 writes the overlay directly, so none of this needs the web server. Claude runs these when
-you ask — moving cards stays a human decision (see **Board**).
+you ask — moving cards stays a human decision (see **Board**). `stage` does to the window what
+a drop on the board does (`window_action`): `waiting` and `later` freeze it, `done` closes it,
+deferred like the two below; `now --id` thaws a frozen one.
 
 **Freeze and close are deferred when they target the conversation running them.** An
 immediate kill cuts the reply off and leaves the transcript ending on an unfinished
@@ -1349,7 +1351,7 @@ into explicitly.
 | GET | `/board` | The board page (`board.html`, its own page — see **Board**) |
 | GET | `/api/board` | Board cards: live + skipped + frozen conversations, each with its hand-set `stage` |
 | POST | `/api/close-window` | Close a live conversation's tmux window by id (board menu; the window is looked up server-side) |
-| POST | `/api/stage` | Move a card: `{"id", "stage": "todo"\|"planning"\|"in_progress"\|"blocked"\|"done"\|null, "note"?}` — note kept only for blocked |
+| POST | `/api/stage` | Move a card: `{"id", "stage": "now"\|"waiting"\|"later"\|"done"\|null, "note"?}` — note kept only for waiting |
 | GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
 | GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
 
@@ -1414,27 +1416,41 @@ into explicitly.
 ## Board — project management over conversations (`/board`)
 
 A Jira/Trello-style board at `http://localhost:8375/board`: one card per **conversation**
-(live, skipped and frozen — plain closed ones are not on it), in five columns: Todo ·
-Planning · In progress · Blocked · Done. Swimlanes toggle between none, **project**
-and **env** (= auth profile); `?lanes=project` bookmarks one. Drag a card to move it;
-dropping on Blocked asks what it's blocked on, with a **💤 Freeze** switch under the
-reason (remembered per browser): the stage is set first, then `/api/freeze` closes the
-window with `Blocked: <reason>` as its note — the overlay is keyed by conversation id,
-so the card stays in Blocked as a frozen card to thaw later, and the card hides a note
+(live, skipped and frozen, plus closed ones marked Done), in four columns: Now · Waiting ·
+Later · Done. Swimlanes toggle between none, **project** and **env** (= auth profile);
+`?lanes=project` bookmarks one.
+
+**A drop acts on the window** (`moveCard`). The stage is set first, so the overlay, keyed by
+conversation id, keeps the card in its column when it comes back frozen or closed:
+
+| Column | Asks | Window |
+|---|---|---|
+| Now | — | a frozen card is thawed, a closed one resumed; a live one is left as it is |
+| Waiting | what it's waiting on | frozen, note `Waiting: <reason>` |
+| Later | nothing | frozen, no note |
+| Done | nothing | closed; a frozen card's entry is discarded |
+
+**Thawing moves the card back to Now**, from any surface (`frozen::thaw_window` →
+`ConversationOverlay::return_to_now`), and drops the Waiting reason: those columns describe
+parked work, and a thawed conversation is running again.
+
+A running turn gets one confirmation on Later and Done, which otherwise have no dialog to
+stop a stray drag. A closed card only moves to Now, which resumes it: off Done it would
+leave the board. The card hides a note
 that only restates its reason. Project chips filter the board (click adds, ⌘-click
 shows just one, `?projects=a,b` bookmarks); they scroll away while the column names
 stay pinned. **Right-click a card** for its menu: Open / Resume (thaw), Move to any
 stage, Freeze… (asks a note), Skip/Unskip session, and Close window… (live) or
 Discard… (frozen), both confirmed in-page. Click switches the tmux client to it; a
-frozen card has a Thaw button instead.
+frozen card has a Thaw button instead, a closed one Resume.
 
 **The stage is set by hand, never inferred.** It lives in the conversation's overlay
 (`stage` / `stage_at` / `stage_note` in `conversations.json`, `registry::Stage`); unset
-reads as **Todo** (`Stage::default`), so a new conversation lands there with no write and
+reads as **Now** (`Stage::default`), so a new conversation lands there with no write and
 `/api/board` never sends an unset stage. (An Unsorted column for unset was tried and
-removed — every new conversation needed filing before the board said anything.) It is deliberately separate from the runtime status: each card also shows what
+removed — every new conversation needed filing before the board said anything.) Serde aliases read the older column names (`todo`/`in_progress` → Now, `blocked` → Waiting, `planning` → Later). It is deliberately separate from the runtime status: each card also shows what
 Claude is doing *now* (needs you · review · idle · working · flow · frozen), because a card
-in In progress whose Claude is waiting on a permission is exactly what the board must not
+in Now whose Claude is waiting on a permission is exactly what the board must not
 hide. Within a column cards keep the attention order — `build_board` emits them in
 `Ctrl+g`'s order, frozen last. (A highlighted "next" card was tried and removed: it
 read as a stage of its own.)
@@ -1447,7 +1463,7 @@ read as a stage of its own.)
   rather than after the next gather.
 - `/api/stage` only accepts an id that is on the board — a LAN-reachable endpoint must
   not mint overlay records (same rule as `/api/conv-notes`). Any move other than to
-  Blocked clears the note, so a stale reason never follows a card.
+  Waiting clears the note, so a stale reason never follows a card.
 
 ## Sidebar — `hive sidebar`, a terminal UI in a Ghostty split
 
@@ -1664,6 +1680,15 @@ the resolved git dir so the hit path costs two stats and no subprocess; a linked
 worktree's `.git` is a file, and `--absolute-git-dir` is what points at the real
 per-worktree `index`. That cache is what would make a fleet-wide consumer — an
 attention-ordered cycle key over every live conversation — affordable.
+
+### Where the conversation sits on the board
+
+Details carries a `Column` line (the board stage, how long it has been there, the Waiting
+reason). Under it, the **Project** pane lists every board card in the focused conversation's
+project, worktrees included, grouped by column in board order, each with its live state
+(`frozen` / `closed` for a card with no process). Both read one `/api/board` poll (3s, skipped
+while both panes are folded), so the sidebar never derives a column itself, and a closed
+conversation appears only when it was marked Done, as on the board.
 
 ### The notes pane — a scratchpad per conversation
 
@@ -1930,13 +1955,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-559 distinct tests. Run with `cargo test`.
+562 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 942 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 383 · bin 527 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 945 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 383 · bin 530 (the superset — adds cli/daemon/serve)
 > · smoke 32.
 
-**Unit tests (527)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (530)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs

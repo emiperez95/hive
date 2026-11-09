@@ -9,8 +9,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::api::{FrozenItem, ProjectItem};
+use crate::common::registry::Stage;
 use crate::ipc::messages::SessionStatus;
-use crate::serve::web_types::SessionView;
+use crate::serve::web_types::{BoardCard, SessionView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -250,6 +251,55 @@ pub fn state_word(st: &Option<SessionStatus>) -> &'static str {
         Some(SessionStatus::RunningWorkflow { .. }) => "flow",
         Some(SessionStatus::NeedsInput { .. }) => "needs",
     }
+}
+
+pub fn stage_name(s: Stage) -> &'static str {
+    match s {
+        Stage::Now => "Now",
+        Stage::Waiting => "Waiting",
+        Stage::Later => "Later",
+        Stage::Done => "Done",
+    }
+}
+
+/// What a card's conversation is doing: its word and the status that colours it.
+/// A frozen or closed card has no process, so whatever status the transcript last
+/// showed says nothing about it.
+pub fn card_state(c: &BoardCard) -> (&str, Option<SessionStatus>) {
+    match c.kind.as_str() {
+        k @ ("frozen" | "closed") => (k, None),
+        _ => (state_word(&c.status), c.status.clone()),
+    }
+}
+
+/// A card's project. A conversation in an unregistered project has no
+/// `project_key`, so its parent's project half stands in.
+fn card_project(c: &BoardCard) -> Option<&str> {
+    c.project_key.as_deref().or_else(|| {
+        c.parent
+            .as_deref()
+            .map(|p| p.split('/').next().unwrap_or(p))
+    })
+}
+
+/// Every card in the project of conversation `id`, worktrees included, by board
+/// column in board order. Within a column the server's attention order holds.
+/// Columns with no card are left out.
+pub fn project_board<'a>(cards: &'a [BoardCard], id: &str) -> Vec<(Stage, Vec<&'a BoardCard>)> {
+    let Some(project) = cards.iter().find(|c| c.id == id).and_then(card_project) else {
+        return Vec::new();
+    };
+    [Stage::Now, Stage::Waiting, Stage::Later, Stage::Done]
+        .into_iter()
+        .map(|stage| {
+            let col = cards
+                .iter()
+                .filter(|c| c.stage == stage && card_project(c) == Some(project))
+                .collect();
+            (stage, col)
+        })
+        .filter(|(_, col): &(Stage, Vec<&BoardCard>)| !col.is_empty())
+        .collect()
 }
 
 /// The two folded sections below every list view.
@@ -676,6 +726,53 @@ pub fn short_model(m: &str) -> &str {
 mod tests {
     use super::*;
     use crate::serve::web_types::WindowView;
+
+    fn card(id: &str, stage: &str, kind: &str, project: Option<&str>, parent: &str) -> BoardCard {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "short_id": id, "stage": stage, "kind": kind, "attention": 2,
+            "status": "Working", "project_key": project, "parent": parent,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn project_board_rolls_worktrees_up_and_orders_by_column() {
+        let cards = vec![
+            card("later", "later", "frozen", Some("a"), "a"),
+            card("wt", "now", "live", Some("a"), "a/feature"),
+            card("other", "now", "live", Some("b"), "b"),
+            card("me", "now", "live", Some("a"), "a"),
+        ];
+        let got: Vec<(Stage, Vec<&str>)> = project_board(&cards, "me")
+            .into_iter()
+            .map(|(s, col)| (s, col.iter().map(|c| c.id.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Stage::Now, vec!["wt", "me"]),
+                (Stage::Later, vec!["later"])
+            ]
+        );
+    }
+
+    #[test]
+    fn project_board_falls_back_to_the_parent_and_is_empty_off_the_board() {
+        let cards = vec![
+            card("me", "now", "live", None, "x/branch"),
+            card("sib", "done", "closed", None, "x"),
+        ];
+        assert_eq!(project_board(&cards, "me").len(), 2);
+        assert!(project_board(&cards, "nobody").is_empty());
+    }
+
+    #[test]
+    fn a_parked_card_ignores_its_last_known_status() {
+        let frozen = card("f", "later", "frozen", None, "x");
+        assert_eq!(card_state(&frozen), ("frozen", None));
+        let live = card("l", "now", "live", None, "x");
+        assert_eq!(card_state(&live), ("work", Some(SessionStatus::Working)));
+    }
 
     fn win(
         idx: &str,

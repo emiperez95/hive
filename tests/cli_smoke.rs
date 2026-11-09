@@ -187,7 +187,7 @@ fn fork_outside_a_conversation_says_how_to_name_one() {
 #[test]
 fn stage_freeze_close_help_list_their_flags() {
     for (cmd, flags) in [
-        ("stage", &["--freeze", "--id", "--now"][..]),
+        ("stage", &["--id", "--now"][..]),
         ("freeze", &["--id", "--now"][..]),
         ("close", &["--id", "--now"][..]),
     ] {

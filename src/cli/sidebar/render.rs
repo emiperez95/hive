@@ -8,11 +8,13 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::model::{self, Item, Sect, View};
+use super::model::{self, Conv, Item, Sect, View};
 use super::theme::Theme;
 use super::{App, Ctl, DlgHit, Hit, KeyFocus, Pane, TodoBtn, TodoLine};
 use crate::cli::conversations::fit_cells;
+use crate::common::registry::Stage;
 use crate::ipc::messages::SessionStatus;
+use crate::serve::web_types::BoardCard;
 
 /// The list never shrinks below this many rows: it is the reason the panel
 /// exists, and a pane dragged over it would hide the thing you switch with.
@@ -93,6 +95,7 @@ impl App {
         let has_conv = self.focused_conv().is_some();
         let mut panes = vec![(Pane::Details, self.prefs.details_collapsed || !has_conv)];
         if has_conv {
+            panes.push((Pane::Project, self.prefs.project_collapsed));
             panes.push((Pane::Notes, self.prefs.notes_collapsed));
         }
         if self.todos_session.is_some() {
@@ -119,6 +122,7 @@ impl App {
             if body.height > 0 {
                 match pane {
                     Pane::Details => self.draw_details(f, body),
+                    Pane::Project => self.draw_project(f, body),
                     Pane::Notes => self.draw_notes(f, body),
                     Pane::Todos => self.draw_todos(f, body),
                 }
@@ -533,6 +537,17 @@ impl App {
                     "no conversation here".into()
                 },
             ),
+            Pane::Project => {
+                let label = self
+                    .focused_conv()
+                    .map(|c| c.place.label.clone())
+                    .unwrap_or_default();
+                let n: usize = self.project_groups().iter().map(|(_, col)| col.len()).sum();
+                (
+                    format!("Project · {label}"),
+                    if n > 0 { n.to_string() } else { String::new() },
+                )
+            }
             Pane::Notes => ("Notes".to_string(), self.notes_state.clone()),
             Pane::Todos => {
                 let place = self
@@ -572,6 +587,96 @@ impl App {
         self.place_hits(r.y, vec![vec![(0, r.width, Hit::PaneHead(pane))]]);
     }
 
+    /// The cards of the focused conversation's project, by board column.
+    fn project_groups(&self) -> Vec<(Stage, Vec<&BoardCard>)> {
+        match (&self.board, self.focused_conv()) {
+            (
+                Some(cards),
+                Some(Conv {
+                    session_id: Some(id),
+                    ..
+                }),
+            ) => model::project_board(cards, id),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The conversation's board column, how long it has sat there, and what it is
+    /// waiting on. Nothing until the board has loaded: a default of Now would claim
+    /// a column the card may not be in.
+    fn column_lines(&self, id: Option<&str>, w: usize) -> Vec<Line<'static>> {
+        let Some(card) = self
+            .board
+            .iter()
+            .flatten()
+            .find(|c| Some(c.id.as_str()) == id)
+        else {
+            return Vec::new();
+        };
+        let dim = self.theme.dim();
+        let mut column = vec![
+            Span::styled(" Column ", dim),
+            Span::styled(
+                model::stage_name(card.stage),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ];
+        let held = card
+            .stage_at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds());
+        // `dur` reads "now" under a minute, which beside the column Now says nothing.
+        if let Some(secs) = held.filter(|s| *s >= 60) {
+            column.push(Span::styled(format!(" · {}", model::dur(secs as u64)), dim));
+        }
+        let mut lines = vec![Line::from(column)];
+        if let Some(note) = &card.stage_note {
+            lines.push(Line::styled(fit_cells(&format!(" ⏳ {note}"), w), dim));
+        }
+        lines
+    }
+
+    fn draw_project(&mut self, f: &mut Frame, r: Rect) {
+        let w = r.width as usize;
+        let t = self.theme;
+        let id = self.focused_conv().and_then(|c| c.session_id.clone());
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (stage, col) in self.project_groups() {
+            let head = format!(" {} {}", model::stage_name(stage).to_uppercase(), col.len());
+            lines.push(Line::styled(head, t.label()));
+            for c in col {
+                let (word, status) = model::card_state(c);
+                let colour = Style::new().fg(t.state(&status));
+                let title = c.title.as_deref().unwrap_or(&c.short_id);
+                let title_style = if Some(&c.id) == id.as_ref() {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(" ● ", colour),
+                    Span::styled(fit_cells(title, w.saturating_sub(3 + 7)), title_style),
+                    Span::styled(format!("{word:>6} "), colour),
+                ]));
+            }
+        }
+        if lines.is_empty() {
+            let text = if self.board.is_some() {
+                " Not on the board yet."
+            } else {
+                " Reading the board…"
+            };
+            lines.push(Line::styled(text, t.dim()));
+        }
+        let rows = r.height as usize;
+        self.project_scroll = self.project_scroll.min(lines.len().saturating_sub(rows));
+        f.render_widget(
+            Paragraph::new(lines).scroll((self.project_scroll as u16, 0)),
+            r,
+        );
+    }
+
     fn draw_details(&mut self, f: &mut Frame, r: Rect) {
         let w = r.width as usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -586,6 +691,7 @@ impl App {
             fit_cells(&format!(" {}", conv.place.line()), w),
             self.theme.dim(),
         ));
+        lines.extend(self.column_lines(conv.session_id.as_deref(), w));
         match &self.stats {
             None => lines.push(Line::styled(" Reading transcript…", self.theme.dim())),
             Some(s) if s.error.is_some() => lines.push(Line::styled(

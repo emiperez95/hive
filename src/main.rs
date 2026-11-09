@@ -60,14 +60,12 @@ fn main() -> Result<()> {
         }),
         Some(Command::Stage {
             stage,
-            freeze,
             id,
             now,
             reason,
         }) => cli::stage::run_stage(
             &stage,
             (!reason.is_empty()).then(|| reason.join(" ")),
-            freeze,
             id,
             now,
         ),

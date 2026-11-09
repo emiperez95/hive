@@ -245,22 +245,40 @@ pub struct ConversationOverlay {
     /// When `stage` was last set (RFC3339) — the card's "in this column for 3d".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_at: Option<String>,
-    /// What it's blocked on. Asked for when a card moves to Blocked, cleared on
+    /// What it's waiting on. Asked for when a card moves to Waiting, cleared on
     /// any other move so a stale reason never follows the card around.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_note: Option<String>,
 }
 
-/// A board column. Unset (`None` on the overlay) reads as `Todo` — so a new
+impl ConversationOverlay {
+    /// The conversation is running again, so its card belongs in Now: Waiting and
+    /// Later describe parked work. A card already in Now keeps its `stage_at`, the
+    /// card's "in this column since".
+    pub fn return_to_now(&mut self) {
+        if matches!(self.stage, None | Some(Stage::Now)) {
+            return;
+        }
+        self.stage = Some(Stage::Now);
+        self.stage_at = Some(chrono::Utc::now().to_rfc3339());
+        self.stage_note = None;
+    }
+}
+
+/// A board column. Unset (`None` on the overlay) reads as `Now` — so a new
 /// conversation lands there with no write, and placing one is the only write.
+/// The aliases read overlays written when the columns were Todo / Planning /
+/// In progress / Blocked; the next save rewrites them under the new names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     #[default]
-    Todo,
-    Planning,
-    InProgress,
-    Blocked,
+    #[serde(alias = "todo", alias = "in_progress")]
+    Now,
+    #[serde(alias = "blocked")]
+    Waiting,
+    #[serde(alias = "planning")]
+    Later,
     Done,
 }
 
@@ -684,6 +702,38 @@ pub fn should_surface_closed(
 mod tests {
     use super::*;
     use crate::ipc::messages::{HookState, SessionState, SessionStatus};
+
+    #[test]
+    fn return_to_now_moves_a_parked_card_and_drops_its_reason() {
+        for parked in [Stage::Waiting, Stage::Later, Stage::Done] {
+            let mut o = ConversationOverlay {
+                stage: Some(parked),
+                stage_at: Some("2026-01-01T00:00:00+00:00".into()),
+                stage_note: Some("creds".into()),
+                ..Default::default()
+            };
+            o.return_to_now();
+            assert_eq!(o.stage, Some(Stage::Now));
+            assert_ne!(o.stage_at.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+            assert_eq!(o.stage_note, None);
+        }
+    }
+
+    #[test]
+    fn return_to_now_leaves_a_card_already_in_now_untouched() {
+        let mut unset = ConversationOverlay::default();
+        unset.return_to_now();
+        assert_eq!(unset, ConversationOverlay::default());
+
+        let in_now = ConversationOverlay {
+            stage: Some(Stage::Now),
+            stage_at: Some("2026-01-01T00:00:00+00:00".into()),
+            ..Default::default()
+        };
+        let mut o = in_now.clone();
+        o.return_to_now();
+        assert_eq!(o, in_now);
+    }
 
     /// The launch dir wins over whatever the latest hook reported; the hook cwd only fills in
     /// for a transcript that has no cwd yet.

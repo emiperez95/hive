@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use crate::serve::web_types::SessionView;
+use crate::serve::web_types::{BoardCard, SessionView};
 
 /// Where the tmux client is, plus the mute flags, from `/api/ambient`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -138,6 +138,7 @@ pub enum Msg {
     Frozen(Vec<FrozenItem>),
     Projects(Vec<ProjectItem>),
     Stats(String, Box<Stats>),
+    Board(Vec<BoardCard>),
     Notes(String, String),
     NotesSaved(String, bool),
     Todos(String, Todos),
@@ -227,6 +228,14 @@ impl Api {
         self.spawn(move |p| {
             let body = get(p, &format!("/api/conv-stats?id={}", enc(&id)), 15)?;
             Some(Msg::Stats(id, Box::new(serde_json::from_str(&body).ok()?)))
+        });
+    }
+
+    pub fn fetch_board(&self) {
+        self.spawn(|p| {
+            Some(Msg::Board(
+                serde_json::from_str(&get(p, "/api/board", 5)?).ok()?,
+            ))
         });
     }
 

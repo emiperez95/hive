@@ -10,8 +10,9 @@
 //!
 //! Layout, top to bottom: header (counts + view / archived / mute toggles), the
 //! list (Live · Attention · Projects, with Skipped and Frozen folded below), then
-//! three panes — Details (spend + git), Notes, Todos — each collapsible and
-//! resizable by dragging its header.
+//! four panes — Details (board column, spend, git), Project (every conversation in
+//! this one's project, by column), Notes, Todos — each collapsible and resizable
+//! by dragging its header.
 
 mod api;
 mod editor;
@@ -32,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::config::HiveConfig;
 use crate::common::terminal::{self, SIDEBAR_TITLE};
 use crate::common::tmux;
-use crate::serve::web_types::SessionView;
+use crate::serve::web_types::{BoardCard, SessionView};
 use api::{Api, Focus, FrozenItem, Msg, Stats, Todos};
 use editor::Editor;
 use model::{Conv, Item, ListState, Projects, Sect, View};
@@ -48,6 +49,7 @@ const CLICK_THROUGH: Duration = Duration::from_millis(1500);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Pane {
     Details,
+    Project,
     Notes,
     Todos,
 }
@@ -71,11 +73,13 @@ struct Prefs {
     frozen_open: bool,
     show_archived: bool,
     details_collapsed: bool,
+    project_collapsed: bool,
     notes_collapsed: bool,
     todos_collapsed: bool,
     done_open: bool,
     /// Body height per pane, in rows; set by dragging a pane header.
     details_h: u16,
+    project_h: u16,
     notes_h: u16,
     todos_h: u16,
 }
@@ -88,10 +92,12 @@ impl Default for Prefs {
             frozen_open: false,
             show_archived: false,
             details_collapsed: false,
+            project_collapsed: false,
             notes_collapsed: false,
             todos_collapsed: false,
             done_open: false,
             details_h: 9,
+            project_h: 6,
             notes_h: 5,
             todos_h: 7,
         }
@@ -122,6 +128,7 @@ impl Prefs {
     fn collapsed(&self, p: Pane) -> bool {
         match p {
             Pane::Details => self.details_collapsed,
+            Pane::Project => self.project_collapsed,
             Pane::Notes => self.notes_collapsed,
             Pane::Todos => self.todos_collapsed,
         }
@@ -130,6 +137,7 @@ impl Prefs {
     fn toggle(&mut self, p: Pane) {
         match p {
             Pane::Details => self.details_collapsed ^= true,
+            Pane::Project => self.project_collapsed ^= true,
             Pane::Notes => self.notes_collapsed ^= true,
             Pane::Todos => self.todos_collapsed ^= true,
         }
@@ -138,6 +146,7 @@ impl Prefs {
     fn height(&self, p: Pane) -> u16 {
         match p {
             Pane::Details => self.details_h,
+            Pane::Project => self.project_h,
             Pane::Notes => self.notes_h,
             Pane::Todos => self.todos_h,
         }
@@ -146,6 +155,7 @@ impl Prefs {
     fn set_height(&mut self, p: Pane, h: u16) {
         match p {
             Pane::Details => self.details_h = h,
+            Pane::Project => self.project_h = h,
             Pane::Notes => self.notes_h = h,
             Pane::Todos => self.todos_h = h,
         }
@@ -252,6 +262,11 @@ pub(crate) struct App {
     stats_at: Option<Instant>,
     stats_inflight: bool,
     details_scroll: usize,
+
+    /// `/api/board`: the Details column line and the Project pane.
+    board: Option<Vec<BoardCard>>,
+    board_at: Option<Instant>,
+    project_scroll: usize,
 
     notes: Editor,
     notes_id: Option<String>,
@@ -447,6 +462,9 @@ impl App {
             stats_at: None,
             stats_inflight: false,
             details_scroll: 0,
+            board: None,
+            board_at: None,
+            project_scroll: 0,
             notes: Editor::default(),
             notes_id: None,
             notes_loading: false,
@@ -563,6 +581,7 @@ impl App {
                     self.stats_at = Some(Instant::now());
                 }
             }
+            Msg::Board(v) => self.board = Some(v),
             Msg::Notes(id, text) => {
                 if Some(&id) == self.notes_id.as_ref() {
                     self.notes.set(&text);
@@ -727,6 +746,7 @@ impl App {
             self.stats = None;
             self.stats_at = None;
             self.details_scroll = 0;
+            self.project_scroll = 0;
             changed = true;
         }
         if let Some(id) = &self.stats_id {
@@ -735,6 +755,15 @@ impl App {
                 self.stats_at = Some(Instant::now());
                 self.api.fetch_stats(id.clone());
             }
+        }
+
+        // Covers every conversation, so a focus change needs no fetch of its own.
+        if conv_id.is_some()
+            && !(self.prefs.details_collapsed && self.prefs.project_collapsed)
+            && stale(self.board_at, 3)
+        {
+            self.board_at = Some(Instant::now());
+            self.api.fetch_board();
         }
 
         // Notes follow the conversation; the previous one's edits flush first.
@@ -1085,6 +1114,7 @@ impl App {
                     };
                     match self.pane_at(m.row) {
                         Some(Pane::Details) => step(&mut self.details_scroll),
+                        Some(Pane::Project) => step(&mut self.project_scroll),
                         Some(Pane::Notes) => step(&mut self.notes_scroll),
                         Some(Pane::Todos) => step(&mut self.todos_scroll),
                         None => step(&mut self.list_scroll),
@@ -1449,6 +1479,7 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use serde_json::Value;
 
     fn app() -> App {
         let (tx, _rx) = mpsc::channel();
@@ -1494,6 +1525,46 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn details_shows_the_column_and_project_lists_its_conversations() {
+        let mut a = app();
+        let card = |id: &str, title: &str, stage: &str, kind: &str, project: &str, note: Value| {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "short_id": id, "title": title, "stage": stage, "kind": kind,
+                "status": "Waiting", "attention": 2, "project_key": project,
+                "stage_note": note,
+            }))
+            .unwrap()
+        };
+        a.board = Some(vec![
+            card(
+                "abc",
+                "this one",
+                "waiting",
+                "live",
+                "hive",
+                "the creds".into(),
+            ),
+            card(
+                "def",
+                "parked sibling",
+                "later",
+                "frozen",
+                "hive",
+                Value::Null,
+            ),
+            card("zzz", "elsewhere", "now", "live", "other", Value::Null),
+        ]);
+        let s = screen(&mut a, 40, 40);
+        assert!(s.contains("Column Waiting"), "{s}");
+        assert!(s.contains("the creds"), "{s}");
+        assert!(s.contains("Project · hive"), "{s}");
+        assert!(s.contains("LATER 1"), "{s}");
+        assert!(s.contains("parked sibling"), "{s}");
+        assert!(s.contains("frozen"), "{s}");
+        assert!(!s.contains("elsewhere"), "{s}");
     }
 
     #[test]

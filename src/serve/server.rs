@@ -10,7 +10,7 @@
 use crate::common::persistence::{load_session_todos, load_skipped_sessions};
 use crate::common::process::get_process_info;
 use crate::common::projects::ProjectRegistry;
-use crate::common::registry::{Conversation, ConversationRegistry};
+use crate::common::registry::{Conversation, ConversationRegistry, Stage};
 use crate::common::tmux::{get_other_client_sessions, get_tmux_sessions};
 use crate::ipc::messages::SessionStatus;
 use crate::serve::web_types::{
@@ -102,7 +102,8 @@ pub(crate) fn build_conversation_views(reg: &ConversationRegistry) -> Vec<Conver
 }
 
 /// The board (`/api/board`): every live, skipped and frozen conversation as a card,
-/// joined with the stage set on it by hand. Pure over the two projections the data
+/// plus the closed ones marked Done (moving a card to Done closes it, so without them
+/// that column would always be empty), joined with the stage set on it by hand. Pure over the two projections the data
 /// thread already publishes plus the overlay, which the caller loads per request so
 /// a card moved a moment ago is already in its new column.
 ///
@@ -125,6 +126,7 @@ pub(crate) fn build_board(
         .iter()
         .filter_map(|c| {
             let win = windows.get(c.id.as_str()).copied();
+            let overlay = sidecar.conversations.get(&c.id);
             let kind = if c.lifecycle == "live" {
                 if win.is_some_and(|(_, skipped)| skipped) {
                     "skipped"
@@ -133,10 +135,11 @@ pub(crate) fn build_board(
                 }
             } else if c.frozen {
                 "frozen"
+            } else if overlay.and_then(|o| o.stage) == Some(Stage::Done) {
+                "closed"
             } else {
                 return None;
             };
-            let overlay = sidecar.conversations.get(&c.id);
             Some(BoardCard {
                 id: c.id.clone(),
                 short_id: c.short_id.clone(),
@@ -812,8 +815,31 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_conversation_is_on_the_board_only_when_done() {
+        use crate::common::registry::{ConversationOverlay, ConversationSidecar};
+        let convs = vec![
+            conv("finished", "closed", false),
+            conv("left", "closed", false),
+        ];
+        let mut sc = ConversationSidecar::default();
+        for (id, stage) in [("finished", Stage::Done), ("left", Stage::Later)] {
+            sc.conversations.insert(
+                id.into(),
+                ConversationOverlay {
+                    stage: Some(stage),
+                    ..Default::default()
+                },
+            );
+        }
+        let cards = build_board(&convs, &[], &sc);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, "finished");
+        assert_eq!(cards[0].kind, "closed");
+    }
+
+    #[test]
     fn board_takes_stage_from_the_overlay_and_orders_by_attention() {
-        use crate::common::registry::{ConversationOverlay, ConversationSidecar, Stage};
+        use crate::common::registry::{ConversationOverlay, ConversationSidecar};
         let convs = vec![conv("x", "live", false), conv("y", "live", false)];
         let mut wx = win("x", None, "");
         wx.attention_rank = Some(1);
@@ -824,16 +850,16 @@ mod tests {
         sc.conversations.insert(
             "x".into(),
             ConversationOverlay {
-                stage: Some(Stage::Blocked),
+                stage: Some(Stage::Waiting),
                 stage_note: Some("creds".into()),
                 ..Default::default()
             },
         );
         let cards = build_board(&convs, &active, &sc);
         assert_eq!(cards[0].id, "y");
-        // Never placed → Todo; there is no Unsorted column.
-        assert_eq!(cards[0].stage, Stage::Todo);
-        assert_eq!(cards[1].stage, Stage::Blocked);
+        // Never placed → Now; there is no Unsorted column.
+        assert_eq!(cards[0].stage, Stage::Now);
+        assert_eq!(cards[1].stage, Stage::Waiting);
         assert_eq!(cards[1].stage_note.as_deref(), Some("creds"));
     }
 
