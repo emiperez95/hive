@@ -964,6 +964,25 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
         Ok(())
     })?;
 
+    // `wt new` pre-trusts the worktrees it makes; a box lands one without it, and a resumed
+    // conversation would sit at "Do you trust this folder?" until someone attached. Linked
+    // worktrees only: a project's own checkout is one the user already set up. Best effort —
+    // a failure costs a prompt, not the unpack.
+    if !m.main_checkout {
+        let cfg = if m.profile == ".claude" {
+            home.join(".claude.json")
+        } else {
+            home.join(&m.profile).join(".claude.json")
+        };
+        for dir in [Path::new(&m.root), Path::new(&m.cwd)] {
+            if dir.starts_with(&m.root) {
+                if let Err(e) = crate::common::worktree::pretrust_in(&cfg, dir) {
+                    eprintln!("warning: could not pre-trust {}: {e}", dir.display());
+                }
+            }
+        }
+    }
+
     fs::create_dir_all(&slug_dir)?;
     fs::copy(&box_transcript, &target_transcript)?;
     if src.join("memory").is_dir() {

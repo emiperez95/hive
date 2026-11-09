@@ -677,10 +677,16 @@ fn path_to_claude_dir_name(path: &Path) -> String {
 /// dialog is skipped when Claude starts in the new session.
 pub fn pretrust_claude_project(worktree_path: &Path) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-    let claude_json = home.join(".claude.json");
+    pretrust_in(&home.join(".claude.json"), worktree_path)
+}
 
+/// [`pretrust_claude_project`] against an explicit Claude config file: the default profile's
+/// is `~/.claude.json`, any other profile keeps its own inside its config dir
+/// (`~/.claude-work/.claude.json`). Written via a temp file + rename, since a running Claude
+/// rewrites this file too and a half-written one would log everyone out of their projects.
+pub fn pretrust_in(claude_json: &Path, worktree_path: &Path) -> Result<()> {
     let mut config: serde_json::Value = if claude_json.exists() {
-        let content = std::fs::read_to_string(&claude_json)?;
+        let content = std::fs::read_to_string(claude_json)?;
         serde_json::from_str(&content)?
     } else {
         serde_json::json!({})
@@ -707,7 +713,9 @@ pub fn pretrust_claude_project(worktree_path: &Path) -> Result<()> {
     }
 
     let content = serde_json::to_string_pretty(&config)?;
-    std::fs::write(&claude_json, content)?;
+    let tmp = claude_json.with_extension("json.hive-tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, claude_json)?;
 
     Ok(())
 }
@@ -1359,5 +1367,37 @@ mod tests {
             "unpushed work must survive"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pretrust_in_sets_the_flag_and_keeps_everything_else() {
+        let dir = std::env::temp_dir().join(format!("hive-pretrust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(".claude.json");
+        std::fs::write(
+            &file,
+            r#"{"theme":"dark","projects":{"/a":{"allowedTools":["x"]}}}"#,
+        )
+        .unwrap();
+        pretrust_in(&file, Path::new("/a")).unwrap();
+        pretrust_in(&file, Path::new("/b")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(
+            v["projects"]["/a"]["allowedTools"][0], "x",
+            "existing keys survive"
+        );
+        assert_eq!(v["projects"]["/a"]["hasTrustDialogAccepted"], true);
+        assert_eq!(v["projects"]["/b"]["hasTrustDialogAccepted"], true);
+        assert!(
+            !file.with_extension("json.hive-tmp").exists(),
+            "no temp file left"
+        );
+        // A machine that has never run Claude has no file yet.
+        let fresh = dir.join("fresh.json");
+        pretrust_in(&fresh, Path::new("/c")).unwrap();
+        assert!(fresh.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

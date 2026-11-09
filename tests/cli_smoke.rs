@@ -751,6 +751,13 @@ fn box_pack_unpack_thaw_roundtrip() {
         "ignored"
     );
     assert_eq!(std::fs::read(&transcript).unwrap(), transcript_bytes);
+    // The unpacked worktree is pre-trusted, so the resumed Claude doesn't stop at the trust prompt.
+    let claude_json = std::fs::read_to_string(home.join(".claude.json")).unwrap();
+    assert!(
+        claude_json.contains(wt.to_str().unwrap())
+            && claude_json.contains("hasTrustDialogAccepted"),
+        "worktree pre-trusted: {claude_json}"
+    );
     assert!(slug_dir.join("memory/MEMORY.md").is_file());
     let wts = std::fs::read_to_string(home.join(".hive/cache/worktrees.json")).unwrap();
     assert!(wts.contains("proj/feat"), "worktree re-registered: {wts}");
