@@ -35,9 +35,19 @@ pub fn ssh_output(r: &RemoteConfig, cmd: &str) -> Result<Output> {
         .map_err(|e| anyhow!("failed to run ssh: {e}"))
 }
 
+/// Where a POSIX remote keeps the tools hive needs. A command sent over ssh runs in a
+/// non-login, non-interactive shell, whose PATH on macOS lacks Homebrew (`tmux`, `node`) and
+/// `~/.local/bin` (`hive`, `claude`): `ssh -t host tmux attach` answers "command not found"
+/// on a machine where `tmux` works fine at its own prompt. Prefixed to every command hive
+/// runs there; `$PATH` and `$HOME` are expanded by the REMOTE shell, so the string must reach
+/// it unexpanded. (Windows' cmd.exe has neither syntax — not a supported remote.)
+pub const REMOTE_PATH: &str =
+    "PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH";
+
 /// Run a `hive …` subcommand on the remote; errors carry its stderr.
 pub fn remote_hive_run(r: &RemoteConfig, args: &[&str]) -> Result<String> {
-    let cmd = std::iter::once(sh_quote(&remote_hive(r)))
+    let cmd = std::iter::once(REMOTE_PATH.to_string())
+        .chain(std::iter::once(sh_quote(&remote_hive(r))))
         .chain(args.iter().map(|a| sh_quote(a)))
         .collect::<Vec<_>>()
         .join(" ");
@@ -111,6 +121,15 @@ pub fn attach_window_name(host: &str, window_name: &str, window_index: &str) -> 
     format!("@{host}:{label}")
 }
 
+/// What the REMOTE shell runs to attach: tmux, found via [`REMOTE_PATH`], on the exact window
+/// (`=` so a longer session name can't be prefix-matched).
+fn attach_shell(session: &str, window_index: &str) -> String {
+    format!(
+        "{REMOTE_PATH} tmux attach-session -t {}",
+        sh_quote(&format!("={session}:{window_index}"))
+    )
+}
+
 /// The shell command a local window runs to land in the remote conversation's window:
 /// `ssh -t [-L p:localhost:p …] <target> tmux attach -t '=<session>:<window>'`.
 ///
@@ -128,10 +147,7 @@ pub fn attach_command(
         parts.push(sh_quote(&format!("{p}:localhost:{p}")));
     }
     parts.push(sh_quote(&r.ssh));
-    parts.push(sh_quote(&format!(
-        "tmux attach-session -t {}",
-        sh_quote(&format!("={session}:{window_index}"))
-    )));
+    parts.push(sh_quote(&attach_shell(session, window_index)));
     parts.join(" ")
 }
 
@@ -260,5 +276,44 @@ mod tests {
     fn attach_window_names_are_recognisable_plumbing() {
         assert_eq!(attach_window_name("mini", "server", "2"), "@mini:server");
         assert_eq!(attach_window_name("mini", "", "2"), "@mini:2");
+    }
+
+    /// The reason for `REMOTE_PATH`: on a macOS remote `tmux` lives in Homebrew, which a
+    /// non-interactive ssh shell does not have on PATH. Run the prefix the way the remote
+    /// shell receives it, from a bare PATH, and ask where `tmux` resolves.
+    #[test]
+    fn the_remote_path_prefix_reaches_tools_a_bare_path_misses() {
+        let home = std::env::temp_dir().join(format!("hive-remote-path-{}", std::process::id()));
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("only-in-local-bin"), "#!/bin/sh\n").unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(bin.join("only-in-local-bin"))
+            .output()
+            .unwrap();
+        let resolve = |prefix: &str| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{prefix} command -v only-in-local-bin"))
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(resolve(""), "", "a bare ssh PATH cannot see ~/.local/bin");
+        assert_eq!(
+            resolve(&format!("{REMOTE_PATH};")),
+            bin.join("only-in-local-bin").to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_attach_command_the_remote_receives_is_path_prefixed_and_exact() {
+        let c = attach_shell("🛰 Argus", "2");
+        assert!(c.starts_with("PATH="), "{c}");
+        assert!(c.ends_with("tmux attach-session -t '=🛰 Argus:2'"), "{c}");
     }
 }

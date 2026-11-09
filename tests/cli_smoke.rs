@@ -1296,6 +1296,18 @@ fn sandboxed_thaw_confines_writes_to_the_boxs_path_set() {
         .join("target")
         .join(format!("sbx-outside-{}", std::process::id()));
     let _ = std::fs::remove_file(&outside);
+    // A stand-in for "another program's database": readable by anyone, denied by config.
+    let secret_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("sbx-secret-{}", std::process::id()));
+    std::fs::create_dir_all(&secret_dir).unwrap();
+    std::fs::write(secret_dir.join("wa.sqlite"), "TOPSECRET").unwrap();
+    std::fs::create_dir_all(home.join(".hive")).unwrap();
+    std::fs::write(
+        home.join(".hive/config.toml"),
+        format!("[sandbox]\ndeny_read = [\"{}\"]\n", secret_dir.display()),
+    )
+    .unwrap();
     let proj = home.join("proj");
     let marker = root.join("marker");
     // `srt` may be a version-manager shim that needs the REAL home; hive runs under an
@@ -1328,10 +1340,12 @@ fn sandboxed_thaw_confines_writes_to_the_boxs_path_set() {
         format!(
             "#!/bin/sh\necho in > '{}/inside.txt' 2>/dev/null && echo inside-ok >> '{m}'\n\
              echo out > '{o}' 2>/dev/null && echo outside-WROTE >> '{m}' || echo outside-denied >> '{m}'\n\
+             cat '{sec}/wa.sqlite' >/dev/null 2>&1 && echo secret-READ >> '{m}' || echo secret-denied >> '{m}'\n\
              echo done >> '{m}'\nsleep 30\n",
             proj.display(),
             m = marker.display(),
-            o = outside.display()
+            o = outside.display(),
+            sec = secret_dir.display()
         ),
     )
     .unwrap();
@@ -1414,6 +1428,11 @@ fn sandboxed_thaw_confines_writes_to_the_boxs_path_set() {
     );
     assert!(log.contains("outside-denied"), "write outside it: {log}");
     assert!(!outside.exists(), "the kernel refused it");
+    assert!(
+        log.contains("secret-denied") && !log.contains("secret-READ"),
+        "a configured deny_read path is unreadable from inside: {log}"
+    );
+    let _ = std::fs::remove_dir_all(&secret_dir);
 
     Command::new("tmux")
         .arg("kill-server")

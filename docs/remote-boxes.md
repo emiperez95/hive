@@ -298,6 +298,17 @@ and is "complete by construction"; `extra_write` entries are reported as complet
 Verified with the real `srt`: a write outside the set is refused by the kernel, and a real
 `claude -p` runs under exactly the derived write set and domains.
 
+**Added for the homeserver (Argus).**
+- **Remote PATH.** Every command hive runs over ssh is prefixed with `remote::REMOTE_PATH`
+  (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`): a non-interactive ssh
+  shell on macOS has none of them, so `ssh -t host tmux attach` said "command not found" on a
+  machine where tmux works at its own prompt. `$PATH`/`$HOME` expand on the remote shell.
+- **`[sandbox] deny_read`.** Paths the conversation may not read (`~` expanded) — another
+  program's database, other projects' credentials. Enforced by `srt` in the kernel (`cat`, `ls`
+  and a read-only `sqlite3` open all refused; verified), unlike a `Read(...)` deny rule, which stops
+  the Read tool but not `cat` through Bash. Emitted with an `allowRead` of the box's own paths so a
+  deny over a parent can't lock the session out of its tree. Empty by default.
+
 **Not done / not verified**
 - Everything ssh was exercised through a shim (a second `$HOME`), not a real second machine or
   `localhost` sshd (key auth to localhost isn't set up here). Key-based ssh, a PATH where

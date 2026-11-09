@@ -1976,7 +1976,8 @@ Full design, evidence and **as-built deviations / unverified parts** are in
   are `"<session> @<host>"` everywhere a name is a key.
 - Actions on a remote row go to that remote's own API (`federation::proxy_post`, web
   `remote_post`); `Enter` opens an `@host:<window>` ssh window (`remote::attach_remote`).
-- `[sandbox]` / `--sandbox` run the conversation under `srt` with a write set derived from the box.
+- `[sandbox]` / `--sandbox` run the conversation under `srt` with a write set derived from the box; `deny_read` adds paths it must not even read (kernel-enforced).
+- Commands run over ssh get `remote::REMOTE_PATH` prefixed: a non-interactive macOS shell has no Homebrew or `~/.local/bin` on PATH.
 
 ## Tmux Integration
 

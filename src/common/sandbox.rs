@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common::boxes::Manifest;
 use crate::common::persistence::cache_dir;
+use crate::common::projects::expand_tilde;
 use crate::common::tmux::sh_quote;
 
 /// The `[sandbox]` block of `config.toml`.
@@ -33,6 +34,14 @@ pub struct SandboxConfig {
     /// NOT carry, so `pack` reports it as a completeness gap.
     #[serde(default)]
     pub extra_write: Vec<String>,
+    /// Paths the conversation must not even READ (`~` is expanded): another program's
+    /// database, other projects' credentials. `srt` enforces it in the kernel — `cat`, `ls`
+    /// and a read-only `sqlite3` open are all refused — which a `Read(...)` deny rule in
+    /// Claude's settings is not: that stops the Read tool, not `cat` through Bash.
+    /// Empty by default: reads stay open everywhere, since a default set would be a guess
+    /// about what is secret on a machine hive knows nothing about.
+    #[serde(default)]
+    pub deny_read: Vec<String>,
 }
 
 /// Reachable even with an empty `allowed_domains`: Claude itself needs these.
@@ -53,6 +62,8 @@ pub struct SandboxPlan {
     /// User-granted writes (`extra_write`) the box does not carry.
     pub extra: Vec<String>,
     pub domains: Vec<String>,
+    /// `deny_read`, `~` expanded.
+    pub deny_read: Vec<String>,
 }
 
 impl SandboxPlan {
@@ -100,18 +111,41 @@ pub fn plan(m: &Manifest, home: &Path, repo: &Path, cfg: &SandboxConfig) -> Sand
     let mut domains: Vec<String> = BASE_DOMAINS.iter().map(|d| d.to_string()).collect();
     domains.extend(cfg.allowed_domains.iter().cloned());
     domains.dedup();
+    // A deny over a parent of something the session needs (deny `~/Projects`, work in a
+    // worktree under it) would lock the conversation out of its own tree; `allowRead` wins
+    // over `denyRead` in srt, so what it must read is re-allowed explicitly.
+    let deny_read = cfg
+        .deny_read
+        .iter()
+        .map(|p| expand_tilde(p).to_string_lossy().to_string())
+        .collect();
     SandboxPlan {
         carried,
         infrastructure,
         extra: cfg.extra_write.clone(),
         domains,
+        deny_read,
     }
 }
 
 /// `srt`'s settings document. `deniedDomains` is required by srt even when empty.
 pub fn settings_json(plan: &SandboxPlan) -> serde_json::Value {
+    let mut fs = serde_json::json!({
+        "denyRead": plan.deny_read,
+        "allowWrite": plan.write_set(),
+        "denyWrite": [],
+    });
+    // Only alongside a deny: the default document is the one verified against real `srt`
+    // and `claude`, and an empty allow list means nothing.
+    if !plan.deny_read.is_empty() {
+        fs["allowRead"] = serde_json::json!(plan
+            .carried
+            .iter()
+            .chain(&plan.infrastructure)
+            .collect::<Vec<_>>());
+    }
     serde_json::json!({
-        "filesystem": { "denyRead": [], "allowWrite": plan.write_set(), "denyWrite": [] },
+        "filesystem": fs,
         "network": { "allowedDomains": plan.domains, "deniedDomains": [] },
     })
 }
@@ -249,5 +283,40 @@ mod tests {
             c,
             "srt --settings '/h/it'\\''s.json' -c 'claude --resume abc'"
         );
+    }
+
+    #[test]
+    fn deny_read_is_tilde_expanded_and_re_allows_what_the_session_needs() {
+        let c = SandboxConfig {
+            deny_read: vec!["~/Library/Group Containers/x".into(), "/etc/secret".into()],
+            ..Default::default()
+        };
+        let p = plan(&manifest(true), Path::new("/h"), Path::new("/w/p"), &c);
+        let v = settings_json(&p);
+        let deny: Vec<&str> = v["filesystem"]["denyRead"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap())
+            .collect();
+        assert!(deny.contains(&"/etc/secret"));
+        assert!(
+            deny.iter().all(|d| !d.starts_with('~')),
+            "tilde left for srt to guess at: {deny:?}"
+        );
+        let allow = v["filesystem"]["allowRead"].as_array().unwrap();
+        assert!(
+            allow.iter().any(|a| a == "/w/p-feat"),
+            "the box's own tree stays readable"
+        );
+        assert!(allow.iter().any(|a| a == "/h/.claude-work"));
+    }
+
+    #[test]
+    fn without_deny_read_the_verified_default_document_is_unchanged() {
+        let p = plan(&manifest(true), Path::new("/h"), Path::new("/w/p"), &cfg());
+        let v = settings_json(&p);
+        assert_eq!(v["filesystem"]["denyRead"], serde_json::json!([]));
+        assert!(v["filesystem"].get("allowRead").is_none());
     }
 }
