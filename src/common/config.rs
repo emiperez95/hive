@@ -39,6 +39,11 @@ pub struct WebConfig {
     /// additionally refuses any path outside a registered project or its worktrees dir.
     #[serde(default)]
     pub accept_boxes: bool,
+    /// Address the dashboard binds to. Default `0.0.0.0` (the phone reaches it over the LAN);
+    /// set `127.0.0.1` on a machine that must not be reachable from the network — a server
+    /// holding other programs' credentials — and reach it through an ssh forward instead.
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -48,6 +53,7 @@ impl Default for WebConfig {
             port: default_web_port(),
             tts_host: None,
             accept_boxes: false,
+            bind: None,
         }
     }
 }

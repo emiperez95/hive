@@ -114,6 +114,7 @@ hive web                                    # start web dashboard on port 8375
 hive web --dev                              # dev mode: serve HTML from disk (live reload)
 hive web --tts-host <url>                   # enable TTS read-aloud via TTSQwen service
 hive web --port <N>                         # custom port (default: 8375)
+hive web --bind 127.0.0.1                   # off the network (or `[web] bind`); reach it through an ssh forward
 ```
 
 ## Auth Profiles

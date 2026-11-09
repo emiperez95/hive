@@ -116,7 +116,8 @@ fn main() -> Result<()> {
             port,
             dev,
             tts_host,
-        }) => crate::serve::web::run_web_server(port, dev, tts_host),
+            bind,
+        }) => crate::serve::web::run_web_server(port, dev, tts_host, bind),
         Some(Command::Sidebar { split, fit }) => cli::sidebar::run_sidebar(split, fit),
         Some(Command::Start { sidebar }) => {
             if sidebar {

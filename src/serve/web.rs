@@ -194,8 +194,17 @@ struct SendRequest {
 /// Run the HTTP web server on the given port.
 /// When `dev` is true, serves web.html from disk (re-read per request) for live editing.
 /// When `tts_host` is set, enables TTS proxy endpoints.
-pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<()> {
-    let bind_addr = format!("0.0.0.0:{}", port);
+pub fn run_web_server(
+    port: u16,
+    dev: bool,
+    tts_host: Option<String>,
+    bind: Option<String>,
+) -> Result<()> {
+    let host = bind
+        .or_else(|| crate::common::config::HiveConfig::load().web.bind)
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let lan = host == "0.0.0.0";
+    let bind_addr = format!("{host}:{port}");
     let server = Server::http(&bind_addr)
         .map_err(|e| anyhow::anyhow!("Failed to bind {}: {}", bind_addr, e))?;
 
@@ -205,13 +214,13 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             .join("src/serve/web.html");
         if path.exists() {
             eprintln!(
-                "Hive web dashboard running at http://0.0.0.0:{} (dev mode)",
-                port
+                "Hive web dashboard running at http://{}:{} (dev mode)",
+                host, port
             );
             eprintln!("  Serving HTML from: {}", path.display());
             Some(path)
         } else {
-            eprintln!("Hive web dashboard running at http://0.0.0.0:{}", port);
+            eprintln!("Hive web dashboard running at http://{}:{}", host, port);
             eprintln!(
                 "  warn: --dev but {} not found, using embedded HTML",
                 path.display()
@@ -219,16 +228,20 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             None
         }
     } else {
-        eprintln!("Hive web dashboard running at http://0.0.0.0:{}", port);
+        eprintln!("Hive web dashboard running at http://{}:{}", host, port);
         None
     };
 
-    // Print access URLs
-    if let Some(hostname) = get_local_hostname() {
-        eprintln!("  Local: http://{}:{}", hostname, port);
-    }
-    for (label, ip) in get_all_ips(port) {
-        eprintln!("  {}: http://{}:{}", label, ip, port);
+    // Print access URLs — only the ones that actually reach it.
+    if lan {
+        if let Some(hostname) = get_local_hostname() {
+            eprintln!("  Local: http://{}:{}", hostname, port);
+        }
+        for (label, ip) in get_all_ips(port) {
+            eprintln!("  {}: http://{}:{}", label, ip, port);
+        }
+    } else {
+        eprintln!("  Bound to {host} only — not reachable from the network");
     }
 
     // Shared data between the data thread and request handlers. `shared_active` is

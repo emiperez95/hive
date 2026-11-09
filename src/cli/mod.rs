@@ -269,6 +269,10 @@ pub enum Command {
         /// TTS service URL (e.g. http://10.18.1.2:9800)
         #[arg(long)]
         tts_host: Option<String>,
+        /// Address to bind (default 0.0.0.0, or `[web] bind`). `127.0.0.1` keeps the
+        /// dashboard off the network; reach it through an ssh forward.
+        #[arg(long)]
+        bind: Option<String>,
     },
 }
 

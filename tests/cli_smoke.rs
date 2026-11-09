@@ -1686,3 +1686,51 @@ fn box_transfer_over_http_is_opt_in_and_path_checked() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// `--bind 127.0.0.1` keeps the dashboard off the network: the server on a machine that holds
+/// other programs' credentials is reached through an ssh forward, not a LAN port.
+#[test]
+fn web_bind_loopback_is_not_reachable_on_the_lan_address() {
+    // This machine's outward-facing address (a UDP "connect" sends nothing).
+    let lan = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("8.8.8.8:80").map(|_| s))
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip());
+    let Ok(lan) = lan else {
+        eprintln!("skipped: no outward route to learn a LAN address from");
+        return;
+    };
+    if lan.is_loopback() {
+        eprintln!("skipped: no non-loopback address");
+        return;
+    }
+    let home = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("hive-smoke-bind-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let port = free_port();
+    let child = hive_cmd()
+        .args(["web", "--port", &port.to_string(), "--bind", "127.0.0.1"])
+        .env("HOME", &home)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let server = Server(child);
+    let mut up = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(up, "reachable on loopback");
+    let on_lan = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(lan, port),
+        std::time::Duration::from_secs(2),
+    );
+    assert!(on_lan.is_err(), "must not answer on {lan}:{port}");
+    drop(server);
+    std::fs::remove_dir_all(&home).ok();
+}

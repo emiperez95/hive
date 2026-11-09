@@ -309,6 +309,11 @@ Verified with the real `srt`: a write outside the set is refused by the kernel, 
   the Read tool but not `cat` through Bash. Emitted with an `allowRead` of the box's own paths so a
   deny over a parent can't lock the session out of its tree. Empty by default.
 
+- **`hive web --bind` / `[web] bind`.** The dashboard binds `0.0.0.0` by default (the phone uses
+  it); on a server holding other programs' credentials set `127.0.0.1` and reach it through
+  `ssh -fN -L <local>:127.0.0.1:8375 <host>`, so the only way in is the ssh key. Verified: with
+  `--bind 127.0.0.1` the machine's LAN address refuses the connection.
+
 **Not done / not verified**
 - Everything ssh was exercised through a shim (a second `$HOME`), not a real second machine or
   `localhost` sshd (key auth to localhost isn't set up here). Key-based ssh, a PATH where
