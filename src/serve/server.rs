@@ -916,6 +916,7 @@ mod tests {
     fn conv(id: &str, lifecycle: &str, frozen: bool) -> ConversationView {
         ConversationView {
             id: id.into(),
+            host: None,
             short_id: id.chars().take(8).collect(),
             title: None,
             cwd: None,

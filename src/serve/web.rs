@@ -614,13 +614,27 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let id = req.get("id")?.as_str()?;
-                    let placement = shared_conversations
+                    let conv = shared_conversations
                         .lock()
                         .ok()?
                         .iter()
                         .find(|c| c.id == id && c.lifecycle == "live")?
-                        .placement
-                        .clone()?;
+                        .clone();
+                    // A federated remote's window is on THAT machine: the placement here
+                    // names its tmux session and index, which a local kill-window would
+                    // apply to whatever local window shares them. Its own API closes it.
+                    if let Some(host) = &conv.host {
+                        let out = crate::common::federation::proxy_post(
+                            host,
+                            "/api/close-window",
+                            &serde_json::json!({ "id": id }),
+                        );
+                        return Some(match out {
+                            Ok(v) => v.to_string(),
+                            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+                        });
+                    }
+                    let placement = conv.placement.clone()?;
                     let target = crate::common::tmux::exact_window(
                         &placement.session_name,
                         &placement.window_index,

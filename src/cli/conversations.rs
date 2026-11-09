@@ -5915,6 +5915,13 @@ fn reopen(c: &Conversation) -> Result<String> {
 /// project / worktree is registered under, else the caller's.
 fn fork_beside(c: &Conversation) -> Result<crate::common::fork::Forked> {
     use crate::common::fork::{fork, ForkSource, ForkTarget};
+    if let Some(host) = &c.host {
+        // Its transcript is on `host`; a stale local copy (left by a push) would fork old state.
+        return Err(anyhow!(
+            "{} lives on {host}; fork it there",
+            short_id(c.id.as_str())
+        ));
+    }
     let src = ForkSource::locate(c.id.as_str())?;
     let session = c
         .placement
