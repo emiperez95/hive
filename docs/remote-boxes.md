@@ -314,6 +314,21 @@ Verified with the real `srt`: a write outside the set is refused by the kernel, 
   `ssh -fN -L <local>:127.0.0.1:8375 <host>`, so the only way in is the ssh key. Verified: with
   `--bind 127.0.0.1` the machine's LAN address refuses the connection.
 
+**Verified against the homeserver (Mac mini, macOS 15.5) with a throwaway public project**:
+`box send` over an ssh forward (0.3 s), identical tree and all 9 unpushed commits, the resumed
+Claude in a tmux window with its history, the transcript read back through the proxy, the row
+ranked in the merged attention order, `tmux` found only with the PATH prefix, and `box pull
+--remove-remote` back (0.6 s). Things that only a real second machine showed:
+- **An unpacked worktree must be pre-trusted.** `wt new` does it; a box landing on a machine that
+  never saw the path left Claude at "Do you trust this folder?" until someone attached. Unpack now
+  pre-trusts linked worktrees in the box's profile's `.claude.json` (`worktree::pretrust_in`,
+  atomic write; best effort).
+- **Never overwrite an executable in place on macOS.** `scp` over an existing binary rewrites the
+  same inode, the kernel's cached code signature no longer matches, and every run is `Killed: 9`
+  (the remote shell reports it as an ssh exit of 255 with no output). Copy to `name.new` and `mv -f`.
+- **The remote's Claude must be logged in** (here its OAuth session had expired). Nothing in hive
+  can or should copy credentials; `claude` on that machine, once.
+
 **Not done / not verified**
 - Everything ssh was exercised through a shim (a second `$HOME`), not a real second machine or
   `localhost` sshd (key auth to localhost isn't set up here). Key-based ssh, a PATH where
