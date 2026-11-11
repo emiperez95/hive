@@ -853,6 +853,7 @@ HOME='{hb}' TMUX_TMPDIR='{tb}' exec sh -c "$*"
             .env("SHELL", "/bin/sh")
             .env("TMUX_TMPDIR", tmux)
             .env("HIVE_SSH", &shim)
+            .env("HIVE_BOX_SHARED_PATHS", "1")
             .env_remove("TMUX")
             .output()
             .unwrap();
@@ -992,7 +993,25 @@ HOME='{hb}' TMUX_TMPDIR='{tb}' exec sh -c "$*"
     let sidecar = std::fs::read_to_string(ha.join(".hive/cache/conversations.json")).unwrap();
     assert!(sidecar.contains("\"location\""), "{sidecar}");
 
-    // pull
+    // pull. Without the shared-filesystem escape the copy still sitting at the worktree path
+    // (here: the remote's own, the rig being one disk) must stop the pull BEFORE the remote
+    // is asked to pack or release anything.
+    let refused = hive_cmd()
+        .args(["box", "pull", &id[..8], "--remove-remote"])
+        .env("HOME", &ha)
+        .env("PATH", &path)
+        .env("SHELL", "/bin/sh")
+        .env("TMUX_TMPDIR", &ta)
+        .env("HIVE_SSH", &shim)
+        .env_remove("TMUX")
+        .env_remove("HIVE_BOX_SHARED_PATHS")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(!refused.status.success(), "{err}");
+    assert!(err.contains("nothing was changed on"), "{err}");
+    assert!(wt.join("c1.txt").exists(), "the remote copy must survive");
+
     std::fs::remove_file(&argv_log).unwrap();
     let out = a(&["box", "pull", &id[..8], "--remove-remote"]);
     assert!(out.contains("back on this machine"), "{out}");
@@ -1495,6 +1514,7 @@ fn box_transfer_over_http_is_opt_in_and_path_checked() {
             .env("SHELL", "/bin/sh")
             .env("TMUX_TMPDIR", tmux)
             .env("HIVE_NO_NOTIFY", "1")
+            .env("HIVE_BOX_SHARED_PATHS", "1")
             .env_remove("TMUX")
             .output()
             .unwrap()

@@ -287,27 +287,41 @@ pub fn pack_worktree(root: &Path, dest: &Path, with_ignored: bool) -> Result<Pac
     })
 }
 
-/// Restore the git state from `src` (a box dir) onto `root`.
-///
-/// `repo` is the project's own checkout: where the bundle is fetched into and, for a
-/// linked worktree, where `git worktree add` runs. For a main-checkout box `repo == root`.
-///
-/// `after_checkout` runs for a linked worktree right after `git worktree add` and BEFORE the
-/// tree is overlaid: project hooks (ports, env files) get a fresh worktree to act on, and
-/// anything they write is then overwritten by the box, which is the truth.
-pub fn unpack_worktree(
-    src: &Path,
-    m: &Manifest,
-    repo: &Path,
-    root: &Path,
-    after_checkout: &mut dyn FnMut() -> Result<()>,
-) -> Result<()> {
-    if !git_ok(repo, &["rev-parse", "--git-dir"]) {
-        bail!("{} is not a git checkout", repo.display());
+/// Is `dir` the top of its OWN git checkout? `rev-parse --git-dir` alone also succeeds in an
+/// empty directory nested inside someone else's repository.
+pub fn is_own_checkout(dir: &Path) -> bool {
+    let Ok(top) = git(dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    match (fs::canonicalize(top), fs::canonicalize(dir)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
+}
 
-    // Preconditions first — refuse before anything is touched.
+fn dir_has_entries(dir: &Path) -> bool {
+    dir.exists()
+        && fs::read_dir(dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(true)
+}
+
+/// Everything `unpack_worktree` refuses on, with nothing touched. Public so `box pull` can
+/// ask BEFORE it releases the remote copy: a pull that fails here must leave the other
+/// machine exactly as it was.
+pub fn check_target(m: &Manifest, root: &Path) -> Result<()> {
     if m.main_checkout {
+        if !is_own_checkout(root) {
+            // Not a checkout yet: fine when there is nothing there (it gets initialised),
+            // never when there are files we would be writing a repository over.
+            if dir_has_entries(root) {
+                bail!(
+                    "{} exists, is not a git checkout and is not empty",
+                    root.display()
+                );
+            }
+            return Ok(());
+        }
         let cur = git(root, &["symbolic-ref", "--short", "-q", "HEAD"])
             .map_err(|_| anyhow!("{} is on a detached HEAD", root.display()))?;
         if cur != m.branch {
@@ -324,12 +338,38 @@ pub fn unpack_worktree(
                 root.display()
             );
         }
-    } else if root.exists()
-        && fs::read_dir(root)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(true)
-    {
+    } else if dir_has_entries(root) {
         bail!("{} already exists and is not empty", root.display());
+    }
+    Ok(())
+}
+
+/// Restore the git state from `src` (a box dir) onto `root`.
+///
+/// `repo` is the project's own checkout: where the bundle is fetched into and, for a
+/// linked worktree, where `git worktree add` runs. For a main-checkout box `repo == root`.
+///
+/// `after_checkout` runs for a linked worktree right after `git worktree add` and BEFORE the
+/// tree is overlaid: project hooks (ports, env files) get a fresh worktree to act on, and
+/// anything they write is then overwritten by the box, which is the truth.
+pub fn unpack_worktree(
+    src: &Path,
+    m: &Manifest,
+    repo: &Path,
+    root: &Path,
+    after_checkout: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    // Preconditions first — refuse before anything is touched.
+    check_target(m, root)?;
+
+    // A project that exists only on the machine the box came from: no remote to clone, so
+    // the box's bundle is the whole history and the checkout starts here, empty.
+    if m.main_checkout && !is_own_checkout(repo) {
+        fs::create_dir_all(repo)?;
+        git(repo, &["init", "-q", "-b", &m.branch])?;
+    }
+    if !git_ok(repo, &["rev-parse", "--git-dir"]) {
+        bail!("{} is not a git checkout", repo.display());
     }
 
     // 1. Make the tip commit available as a ref. Fetch into a scratch ref so a branch that
@@ -382,7 +422,9 @@ pub fn unpack_worktree(
         )
         .ok();
         if m.main_checkout {
-            if !git_ok(root, &["merge-base", "--is-ancestor", "HEAD", &m.head]) {
+            // An unborn branch (a checkout initialised above) has nothing to rewind.
+            let born = git_ok(root, &["rev-parse", "--verify", "-q", "HEAD"]);
+            if born && !git_ok(root, &["merge-base", "--is-ancestor", "HEAD", &m.head]) {
                 bail!(
                     "{} has commits that are not ancestors of the box tip; refusing to move it",
                     root.display()
@@ -941,6 +983,9 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
         .unwrap_or(&m.branch)
         .to_string();
     let mut session_name = m.session_name.clone();
+    // Asked before the unpack creates it: a checkout we initialise is as new to Claude as a
+    // worktree is.
+    let fresh_main = m.main_checkout && !is_own_checkout(&repo);
     unpack_worktree(src, &m, &repo, &root, &mut || {
         if m.worktree_key.is_none() {
             return Ok(());
@@ -966,9 +1011,10 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
 
     // `wt new` pre-trusts the worktrees it makes; a box lands one without it, and a resumed
     // conversation would sit at "Do you trust this folder?" until someone attached. Linked
-    // worktrees only: a project's own checkout is one the user already set up. Best effort —
-    // a failure costs a prompt, not the unpack.
-    if !m.main_checkout {
+    // worktrees, and a main checkout this unpack created: a project's own checkout that was
+    // already here is one the user set up. Best effort — a failure costs a prompt, not the
+    // unpack.
+    if !m.main_checkout || fresh_main {
         let cfg = if m.profile == ".claude" {
             home.join(".claude.json")
         } else {
@@ -1325,6 +1371,50 @@ mod tests {
             fs::read_to_string(main.join("a.txt")).unwrap(),
             "local only"
         );
+    }
+
+    #[test]
+    fn main_checkout_unpacks_onto_a_machine_that_has_no_repo_at_all() {
+        // A project with no remote: the bundle is the whole history, the target path is empty.
+        let tmp = tempdir("norepo");
+        let src = tmp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        sh(&src, &["init", "-q", "-b", "main"]);
+        sh(&src, &["config", "user.email", "t@t"]);
+        sh(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("a.txt"), "one").unwrap();
+        sh(&src, &["add", "a.txt"]);
+        sh(&src, &["commit", "-q", "-m", "first"]);
+        fs::write(src.join("b.txt"), "untracked").unwrap();
+        let box_dir = tmp.join("box");
+        let p = pack_worktree(&src, &box_dir, true).unwrap();
+        assert!(p.has_bundle && p.main_checkout);
+        let m = manifest_for(&src, &p, "id1");
+
+        let dst = tmp.join("elsewhere").join("proj");
+        assert!(!is_own_checkout(&dst));
+        unpack_worktree(&box_dir, &m, &dst, &dst, &mut || Ok(())).unwrap();
+        assert!(is_own_checkout(&dst));
+        assert_eq!(sh(&dst, &["rev-parse", "HEAD"]), p.head);
+        assert_eq!(sh(&dst, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "one");
+        assert_eq!(sh(&dst, &["status", "--porcelain"]), "?? b.txt");
+    }
+
+    #[test]
+    fn main_checkout_unpack_refuses_a_non_empty_directory_that_is_not_a_repo() {
+        let tmp = tempdir("notrepo");
+        let (_o, main) = init_repo(&tmp);
+        let box_dir = tmp.join("box");
+        let p = pack_worktree(&main, &box_dir, true).unwrap();
+        let m = manifest_for(&main, &p, "id1");
+        let dst = tmp.join("plain");
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("keep.txt"), "mine").unwrap();
+        let err = check_target(&m, &dst).unwrap_err();
+        assert!(err.to_string().contains("not a git checkout"), "{err}");
+        assert!(unpack_worktree(&box_dir, &m, &dst, &dst, &mut || Ok(())).is_err());
+        assert!(!dst.join(".git").exists());
     }
 
     #[test]

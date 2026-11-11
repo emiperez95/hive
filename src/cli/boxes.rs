@@ -333,9 +333,39 @@ pub fn run_box_pull(
     };
     let r = remote::find_remote(from.unwrap_or(&loc))?;
     let v = via(&r, via_ssh);
-    remote_op(&r, &v, "pack", &id, &[("force", force)], None)?;
     let local_box = boxes::boxes_dir()?.join(&id);
+    // Ask whether this machine can take it BEFORE the remote is touched. The box left here
+    // by the push names the same path the one coming back will, so a leftover working copy
+    // is caught while the conversation is still running over there.
+    //
+    // `HIVE_BOX_SHARED_PATHS` is for a rig where both "machines" are one filesystem (the
+    // smoke tests' second `$HOME`): there the copy at that path IS the remote's, and it
+    // only goes away once the remote releases it.
+    let shared = std::env::var_os("HIVE_BOX_SHARED_PATHS").is_some();
+    if let (false, Ok(m)) = (shared, boxes::read_manifest(&local_box)) {
+        boxes::check_target(&m, std::path::Path::new(&m.root)).map_err(|e| {
+            anyhow!(
+                "{e}\nnothing was changed on {}; clear that and pull again",
+                r.name
+            )
+        })?;
+    }
+    remote_op(&r, &v, "pack", &id, &[("force", force)], None)?;
     fetch_box(&r, &v, &id, &local_box)?;
+    // And again on what actually arrived, still before the remote copy is released.
+    let m = boxes::read_manifest(&local_box)?;
+    let fits = if shared {
+        Ok(())
+    } else {
+        boxes::check_target(&m, std::path::Path::new(&m.root))
+    };
+    fits.map_err(|e| {
+        anyhow!(
+            "{e}\nthe conversation is packed and still on {} (frozen there); \
+             clear that and pull again",
+            r.name
+        )
+    })?;
 
     // The box is on this disk now, so the remote copy is safe to release before unpacking
     // (and must be, when both sides share paths).
