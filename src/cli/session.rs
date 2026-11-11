@@ -131,8 +131,7 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     let mut windows: Vec<(String, String, bool, u32)> = Vec::new(); // (session, window, free, rank)
                                                                     // A remote window has no local window to select; what stands in for it is the ssh
                                                                     // window attached to it. Keyed by the (session, window) pair used above.
-    let mut remote: std::collections::HashMap<(String, String), (String, String)> =
-        Default::default(); // → (host, remote window name)
+    let mut remote: std::collections::HashMap<(String, String), String> = Default::default(); // → host
     for sv in &session_data {
         let session_blocked = skipped.contains(&sv.name) || other_clients.contains(&sv.name);
         for w in &sv.windows {
@@ -147,10 +146,7 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
             let rank = w.attention_rank.unwrap_or(u32::MAX);
             if let Some(host) = &sv.host {
                 // `sv.name` is `"<session> @<host>"`: unique among local names.
-                remote.insert(
-                    (sv.name.clone(), win.clone()),
-                    (host.clone(), w.window_name.clone()),
-                );
+                remote.insert((sv.name.clone(), win.clone()), host.clone());
                 windows.push((sv.name.clone(), win, !busy, rank));
                 continue;
             }
@@ -175,14 +171,12 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
         None => None,
     };
     let on_remote = |ws: &String, ww: &String| {
-        remote
-            .get(&(ws.clone(), ww.clone()))
-            .is_some_and(|(host, wname)| {
-                cur_name.as_deref()
-                    == Some(crate::common::remote::attach_window_name(host, wname, ww).as_str())
-                    && cur_session.as_deref()
-                        == Some(crate::common::federation::real_session(ws, host).as_str())
-            })
+        remote.get(&(ws.clone(), ww.clone())).is_some_and(|host| {
+            let real = crate::common::federation::real_session(ws, host);
+            cur_session.as_deref() == Some(crate::common::config::REMOTE_SESSION)
+                && cur_name.as_deref()
+                    == Some(crate::common::remote::attach_window_name(host, &real, ww).as_str())
+        })
     };
     let cur_idx = match (&cur_session, &cur_window) {
         (Some(s), Some(w)) => windows
@@ -198,12 +192,10 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
         .find(|(_, _, free, _)| *free);
 
     if let Some((s, w, _, _)) = target {
-        if let Some((host, wname)) = remote.get(&(s.clone(), w.clone())) {
+        if let Some(host) = remote.get(&(s.clone(), w.clone())) {
             if !on_remote(s, w) {
-                let local = crate::common::federation::real_session(s, host);
-                if let Ok((ls, idx)) =
-                    crate::common::remote::attach_window(host, &local, w, wname, &local, &[])
-                {
+                let real = crate::common::federation::real_session(s, host);
+                if let Ok((ls, idx)) = crate::common::remote::attach_window(host, &real, w, &[]) {
                     switch_to_session(&ls);
                     select_window(&ls, &idx);
                 }
@@ -356,6 +348,7 @@ pub fn run_connect(key: &str) -> Result<()> {
         .get(key)
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found in registry", key))?;
 
+    crate::common::projects::require_local(key)?;
     let session_name = ProjectRegistry::session_name(key, config);
     if !connect_project(&session_name) {
         anyhow::bail!("Failed to create/connect session for '{}'", key);

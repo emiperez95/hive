@@ -14,6 +14,17 @@ use crate::common::persistence::hive_home;
 /// up as a switch/cycle target in the TUI, the web dashboard, or `hive start`.
 pub const WEB_SESSION: &str = "__hive_web";
 
+/// The reserved tmux session holding the ssh windows attached to conversations on OTHER
+/// machines. Hidden like [`WEB_SESSION`]: a conversation that lives elsewhere has exactly one
+/// row (`"<session> @<host>"`), and a local session named after its project would be a
+/// second one for work that is not here.
+pub const REMOTE_SESSION: &str = "__hive_remote";
+
+/// Sessions that are hive's own plumbing, never a place work happens.
+pub fn is_hidden_session(name: &str) -> bool {
+    name == WEB_SESSION || name == REMOTE_SESSION
+}
+
 fn default_web_port() -> u16 {
     8375
 }

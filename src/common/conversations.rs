@@ -440,6 +440,7 @@ pub fn start_task_in_session(session: &str, prompt: &str) -> Result<String> {
     let startup = format!("claude {}", crate::common::tmux::sh_quote(prompt));
     let target = resolve_session_target(session);
     if let Some(t) = &target {
+        crate::common::projects::require_local(&t.project)?;
         activate_project(&t.project);
     }
     let tmux_target = crate::common::tmux::exact(session);

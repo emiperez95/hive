@@ -906,20 +906,10 @@ impl App {
         // is nothing local to switch to, so open the ssh window attached to it and go there.
         if let Some((remote_session, host)) = session.rsplit_once(" @") {
             if crate::common::remote::find_remote(host).is_ok() {
-                // The same name the list and `Ctrl+g` give it, so all three land in ONE
-                // attach window instead of opening one each.
-                let window_name = self
-                    .convs
-                    .iter()
-                    .find(|c| c.session == session && c.window_index.as_deref() == window)
-                    .map(|c| c.window_name.clone())
-                    .unwrap_or_default();
                 let attached = crate::common::remote::attach_window(
                     host,
                     remote_session,
                     window.unwrap_or("0"),
-                    &window_name,
-                    remote_session,
                     &[],
                 );
                 crate::common::debug::debug_log(&format!(

@@ -412,6 +412,66 @@ pub fn activate_project(key: &str) {
     }
 }
 
+// ─── Where a project lives ───────────────────────────────────────────────────
+//
+// A project lives on ONE machine at a time. When its own checkout is shipped in a box
+// (`hive box push` of a conversation in the main checkout), the copy left here is stale by
+// construction, and work started in it would fork the project across two machines with no
+// remote to reconcile them. `project-hosts.json` records where it went; every way of
+// starting work here asks `require_local` first, and pulling it back clears the record.
+
+fn hosts_file() -> Option<PathBuf> {
+    crate::common::persistence::cache_dir().map(|c| c.join("project-hosts.json"))
+}
+
+fn load_hosts() -> HashMap<String, String> {
+    hosts_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// The machine `key`'s project lives on, when that is not this one. Accepts a worktree
+/// key (`project/branch`) too.
+pub fn lives_on(key: &str) -> Option<String> {
+    let project = key.split('/').next().unwrap_or(key);
+    load_hosts().get(project).cloned()
+}
+
+/// Record that a project moved to `host` (`None` ⇒ it is here again).
+pub fn set_lives_on(project: &str, host: Option<&str>) -> anyhow::Result<()> {
+    let Some(path) = hosts_file() else {
+        anyhow::bail!("cannot determine cache directory");
+    };
+    let mut hosts = load_hosts();
+    let changed = match host {
+        Some(h) => hosts.insert(project.to_string(), h.to_string()).as_deref() != Some(h),
+        None => hosts.remove(project).is_some(),
+    };
+    if !changed {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&hosts)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Refuse to start work on a project that lives on another machine.
+pub fn require_local(key: &str) -> anyhow::Result<()> {
+    match lives_on(key) {
+        Some(host) => anyhow::bail!(
+            "project '{}' lives on {host}: open its @{host} conversation, or bring it back \
+             with `hive box pull`",
+            key.split('/').next().unwrap_or(key)
+        ),
+        None => Ok(()),
+    }
+}
+
 /// Ensure a tmux session exists, creating it at the given path if needed.
 /// Optionally runs a startup command in the new session.
 /// `env` is passed via `tmux new-session -e KEY=VAL` so the initial shell inherits it.

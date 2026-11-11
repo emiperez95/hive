@@ -110,15 +110,11 @@ pub fn local_name() -> String {
 
 // ─── Attaching to a remote conversation ──────────────────────────────────────
 
-/// The local window's name for a remote conversation's window: `@mini:server`. The `@`
-/// prefix is how the Active view recognises (and hides) these as ssh plumbing.
-pub fn attach_window_name(host: &str, window_name: &str, window_index: &str) -> String {
-    let label = if window_name.is_empty() {
-        window_index
-    } else {
-        window_name
-    };
-    format!("@{host}:{label}")
+/// The local window's name for a remote conversation's window: `🛰 Argus @mini:2` — the
+/// remote session as every listing names it, plus the window's index there (unique and
+/// stable, which its name is not).
+pub fn attach_window_name(host: &str, remote_session: &str, window_index: &str) -> String {
+    format!("{remote_session} @{host}:{window_index}")
 }
 
 /// What the REMOTE shell runs to attach: tmux, found via [`REMOTE_PATH`], on the exact window
@@ -163,16 +159,7 @@ pub fn attach_remote(c: &crate::common::registry::Conversation) -> Result<(Strin
         .placement
         .as_ref()
         .ok_or_else(|| anyhow!("remote conversation has no window to attach to"))?;
-    let local_session =
-        crate::common::conversations::target_session(c).unwrap_or_else(|| format!("@{host}"));
-    attach_window(
-        host,
-        &p.session_name,
-        &p.window_index,
-        &p.window_name,
-        &local_session,
-        &c.ports,
-    )
+    attach_window(host, &p.session_name, &p.window_index, &c.ports)
 }
 
 /// [`attach_remote`] for a caller that holds only names (the sidebar, which sees the
@@ -182,14 +169,14 @@ pub fn attach_window(
     host: &str,
     remote_session: &str,
     window_index: &str,
-    window_name: &str,
-    local_session: &str,
     ports: &[u16],
 ) -> Result<(String, String)> {
     use crate::common::tmux::exact;
     let r = find_remote(host)?;
-    let local_session = local_session.to_string();
-    let name = attach_window_name(host, window_name, window_index);
+    // Always the hidden session: the conversation lives on `host`, so nothing named after
+    // its project may appear here as if it ran on this machine too.
+    let local_session = crate::common::config::REMOTE_SESSION.to_string();
+    let name = attach_window_name(host, remote_session, window_index);
     let cmd = attach_command(&r, remote_session, window_index, ports);
 
     let tmux = |args: &[&str]| Command::new("tmux").args(args).output();
@@ -296,8 +283,10 @@ mod tests {
 
     #[test]
     fn attach_window_names_are_recognisable_plumbing() {
-        assert_eq!(attach_window_name("mini", "server", "2"), "@mini:server");
-        assert_eq!(attach_window_name("mini", "", "2"), "@mini:2");
+        assert_eq!(
+            attach_window_name("mini", "🛰 Argus", "2"),
+            "🛰 Argus @mini:2"
+        );
     }
 
     /// The reason for `REMOTE_PATH`: on a macOS remote `tmux` lives in Homebrew, which a

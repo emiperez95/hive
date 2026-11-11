@@ -403,6 +403,40 @@ fn todo_add_and_done_roundtrip() {
 
 // --- Project archive roundtrip (isolated HOME so the real registry is untouched) ---
 
+/// A project lives on one machine: once its checkout has shipped, nothing starts work on the
+/// stale copy left here. Both refusals happen before tmux or git is touched.
+#[test]
+fn a_project_that_lives_on_another_machine_refuses_local_work() {
+    let home = std::env::temp_dir().join(format!("hive-smoke-liveson-{}", std::process::id()));
+    std::fs::create_dir_all(home.join(".hive/cache")).unwrap();
+    let run = |args: &[&str]| hive_cmd().args(args).env("HOME", &home).output().unwrap();
+    assert!(run(&[
+        "project",
+        "add",
+        "demo",
+        "--emoji",
+        "🧪",
+        "--path",
+        "/tmp/demo"
+    ])
+    .status
+    .success());
+    std::fs::write(
+        home.join(".hive/cache/project-hosts.json"),
+        r#"{"demo":"mini"}"#,
+    )
+    .unwrap();
+    for args in [
+        vec!["connect", "demo"],
+        vec!["wt", "new", "demo", "feat", "--no-switch"],
+    ] {
+        let o = run(&args);
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        assert!(!o.status.success(), "{args:?} should be refused");
+        assert!(err.contains("lives on mini"), "{args:?}: {err}");
+    }
+}
+
 #[test]
 fn project_archive_roundtrip() {
     // Isolate ~/.hive by pointing HOME at a temp dir; dirs::home_dir() honors $HOME.

@@ -306,6 +306,10 @@ fn ship(
     )?;
     print!("{out}");
     ship_mark(id, Some(r.name.clone()), remove_local.then_some(m))?;
+    // The project's own checkout went with it: the project lives there now.
+    if m.main_checkout {
+        crate::common::projects::set_lives_on(&m.project_key, Some(&r.name))?;
+    }
     println!("{id} now lives on {}", r.name);
     Ok(())
 }
@@ -424,6 +428,10 @@ pub fn run_box_unpack(target: &str, thaw: bool, force: bool, sandbox: bool) -> R
     }
     let id = boxes::unpack(&dir, &UnpackOptions { force })?;
     println!("unpacked {} onto {}", id, m.root);
+    // Its own checkout just landed here, so here is where the project lives.
+    if m.main_checkout {
+        crate::common::projects::set_lives_on(&m.project_key, None)?;
+    }
     let settings = if sandboxed {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
         let plan = crate::common::sandbox::plan(&m, &home, &boxes::repo_for(&m)?, &cfg.sandbox);

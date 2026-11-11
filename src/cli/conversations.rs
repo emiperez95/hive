@@ -5942,6 +5942,7 @@ fn new_conversation(key: &str) -> Result<String> {
         .projects
         .get(key)
         .ok_or_else(|| anyhow!("unknown project '{key}'"))?;
+    crate::common::projects::require_local(key)?;
     // Starting a conversation here means the project is active again.
     activate_project(key);
     let session = ProjectRegistry::session_name(key, config);
@@ -5965,6 +5966,7 @@ fn new_conversation_in_worktree(project: &str, branch: &str) -> Result<String> {
         .get(project)
         .map(|c| c.tmux_env())
         .unwrap_or_default();
+    crate::common::projects::require_local(project)?;
     activate_project(project);
     open_new_conversation(&entry.session_name, &entry.path, &env)
 }
@@ -6015,6 +6017,7 @@ fn open_new_conversation(session: &str, cwd: &str, env: &[(String, String)]) -> 
 /// hooks are untouched — this only (re)creates the session you jump into, which is
 /// what makes a worktree with no live conversation a usable Browse row.
 fn connect_worktree(project: &str, branch: &str) -> Result<String> {
+    crate::common::projects::require_local(project)?;
     let wts = WorktreeState::load();
     let entry = wts
         .get(project, branch)
