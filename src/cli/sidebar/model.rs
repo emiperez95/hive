@@ -53,6 +53,9 @@ pub struct Conv {
     pub session: String,
     /// `None` for a session with no windows — switching goes to the session.
     pub window_index: Option<String>,
+    /// The tmux window's own name, as its machine reports it (empty for a windowless
+    /// session). `title` is what is shown; this is what names a remote attach window.
+    pub window_name: String,
     pub session_id: Option<String>,
     pub pane_id: Option<String>,
     pub title: String,
@@ -190,6 +193,7 @@ pub fn conv_rows(
             out.push(Conv {
                 session: s.name.clone(),
                 window_index: None,
+                window_name: String::new(),
                 session_id: None,
                 pane_id: None,
                 title: split_emoji(&s.name).1.to_string(),
@@ -216,6 +220,7 @@ pub fn conv_rows(
             out.push(Conv {
                 session: s.name.clone(),
                 window_index: Some(w.window_index.clone()),
+                window_name: w.window_name.clone(),
                 session_id: w.session_id.clone(),
                 pane_id: Some(w.pane_id.clone()),
                 title: if named {
