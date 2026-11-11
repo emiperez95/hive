@@ -902,6 +902,30 @@ impl App {
 
     /// Move the tmux client, then give the keyboard back to the work split.
     fn switch_to(&mut self, session: &str, window: Option<&str>) {
+        // A federated row names a session on ANOTHER machine (`"<session> @<host>"`): there
+        // is nothing local to switch to, so open the ssh window attached to it and go there.
+        if let Some((remote_session, host)) = session.rsplit_once(" @") {
+            if crate::common::remote::find_remote(host).is_ok() {
+                let attached = crate::common::remote::attach_window(
+                    host,
+                    remote_session,
+                    window.unwrap_or("0"),
+                    "",
+                    remote_session,
+                    &[],
+                );
+                if let Ok((local, idx)) = attached {
+                    let clients = tmux::list_clients();
+                    if let Some(c) = tmux::pick_client(&clients) {
+                        tmux::switch_client_to(&c.tty, &local, Some(&idx));
+                    }
+                }
+                self.focus.session = Some(session.to_string());
+                self.focus.window_index = window.map(str::to_string);
+                terminal::focus_work_split();
+                return;
+            }
+        }
         let clients = tmux::list_clients();
         if let Some(c) = tmux::pick_client(&clients) {
             if tmux::switch_client_to(&c.tty, session, window) {

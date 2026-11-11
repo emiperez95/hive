@@ -155,7 +155,6 @@ pub fn attach_command(
 /// that owns the conversation's project here. Returns `(local session, window index)`
 /// for the caller to switch to; a second call finds the same window.
 pub fn attach_remote(c: &crate::common::registry::Conversation) -> Result<(String, String)> {
-    use crate::common::tmux::exact;
     let host = c
         .host
         .as_deref()
@@ -164,11 +163,34 @@ pub fn attach_remote(c: &crate::common::registry::Conversation) -> Result<(Strin
         .placement
         .as_ref()
         .ok_or_else(|| anyhow!("remote conversation has no window to attach to"))?;
-    let r = find_remote(host)?;
     let local_session =
         crate::common::conversations::target_session(c).unwrap_or_else(|| format!("@{host}"));
-    let name = attach_window_name(host, &p.window_name, &p.window_index);
-    let cmd = attach_command(&r, &p.session_name, &p.window_index, &c.ports);
+    attach_window(
+        host,
+        &p.session_name,
+        &p.window_index,
+        &p.window_name,
+        &local_session,
+        &c.ports,
+    )
+}
+
+/// [`attach_remote`] for a caller that holds only names (the sidebar, which sees the
+/// dashboard's rows and not the registry): open — or find — the local window attached to
+/// `remote_session:window_index` on `host`, inside `local_session`.
+pub fn attach_window(
+    host: &str,
+    remote_session: &str,
+    window_index: &str,
+    window_name: &str,
+    local_session: &str,
+    ports: &[u16],
+) -> Result<(String, String)> {
+    use crate::common::tmux::exact;
+    let r = find_remote(host)?;
+    let local_session = local_session.to_string();
+    let name = attach_window_name(host, window_name, window_index);
+    let cmd = attach_command(&r, remote_session, window_index, ports);
 
     let tmux = |args: &[&str]| Command::new("tmux").args(args).output();
     let session_alive = tmux(&["has-session", "-t", &exact(&local_session)])
