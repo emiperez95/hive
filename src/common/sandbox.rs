@@ -106,6 +106,9 @@ pub fn plan(m: &Manifest, home: &Path, repo: &Path, cfg: &SandboxConfig) -> Sand
     infrastructure.push("/tmp".to_string());
     infrastructure.push("/private/tmp".to_string());
     if let Ok(t) = std::fs::canonicalize(std::env::temp_dir()) {
+        if let Some(mds) = keychain_cache_dir(&t) {
+            infrastructure.push(s(&mds));
+        }
         infrastructure.push(s(&t));
     }
     let mut domains: Vec<String> = BASE_DOMAINS.iter().map(|d| d.to_string()).collect();
@@ -126,6 +129,19 @@ pub fn plan(m: &Manifest, home: &Path, repo: &Path, cfg: &SandboxConfig) -> Sand
         domains,
         deny_read,
     }
+}
+
+/// macOS only: the Security framework's per-user module database, `<user cache dir>/mds`,
+/// beside the per-user temp dir (`…/T` → `…/C/mds`). Every keychain call opens it read-write;
+/// without it they fail with "A Module Directory Service error has occurred", and since
+/// Claude keeps its login in the keychain, a sandboxed Claude starts as "Not logged in".
+/// Measured on the homeserver: unreadable under the default settings, readable with this
+/// one path added.
+fn keychain_cache_dir(temp_dir: &Path) -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") || temp_dir.file_name()? != "T" {
+        return None;
+    }
+    Some(temp_dir.parent()?.join("C").join("mds"))
 }
 
 /// `srt`'s settings document. `deniedDomains` is required by srt even when empty.
@@ -206,6 +222,21 @@ pub fn require_srt() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_keychain_module_cache_sits_beside_the_user_temp_dir() {
+        let got = keychain_cache_dir(Path::new("/private/var/folders/81/abc/T"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                got,
+                Some(PathBuf::from("/private/var/folders/81/abc/C/mds"))
+            );
+        } else {
+            assert_eq!(got, None);
+        }
+        // A temp dir that is not the per-user one (`TMPDIR=/tmp`) names no cache dir.
+        assert_eq!(keychain_cache_dir(Path::new("/tmp")), None);
+    }
 
     fn manifest(main: bool) -> Manifest {
         serde_json::from_value(serde_json::json!({
