@@ -861,6 +861,24 @@ pub fn set_location(id: &str, location: Option<String>) -> Result<()> {
 /// box stay. Callers do this once the box is safely on another disk.
 pub fn remove_worktree_copy(m: &Manifest) -> Result<()> {
     if m.main_checkout {
+        // A project's own checkout is never removed, but what the box just carried away is
+        // still lying in it — and a main checkout must be clean to take the box back, so
+        // left alone it refuses its own conversation's return. Set it aside in a stash:
+        // nothing is discarded, and the tree is clean for the round trip.
+        let root = Path::new(&m.root);
+        if is_own_checkout(root) && !git(root, &["status", "--porcelain"])?.is_empty() {
+            git(
+                root,
+                &[
+                    "stash",
+                    "push",
+                    "-u",
+                    "-q",
+                    "-m",
+                    &format!("hive box {}: shipped to another machine", m.id),
+                ],
+            )?;
+        }
         return Ok(());
     }
     let projects = ProjectRegistry::load();
@@ -1415,6 +1433,25 @@ mod tests {
         assert!(err.to_string().contains("not a git checkout"), "{err}");
         assert!(unpack_worktree(&box_dir, &m, &dst, &dst, &mut || Ok(())).is_err());
         assert!(!dst.join(".git").exists());
+    }
+
+    #[test]
+    fn releasing_a_main_checkout_stashes_what_the_box_carried_and_keeps_the_checkout() {
+        let tmp = tempdir("release-main");
+        let (_o, main) = init_repo(&tmp);
+        fs::write(main.join("a.txt"), "edited").unwrap();
+        fs::write(main.join("new.txt"), "untracked").unwrap();
+        let box_dir = tmp.join("box");
+        let p = pack_worktree(&main, &box_dir, true).unwrap();
+        let m = manifest_for(&main, &p, "id1");
+        remove_worktree_copy(&m).unwrap();
+        assert!(main.join(".git").exists());
+        assert_eq!(sh(&main, &["status", "--porcelain"]), "");
+        assert!(sh(&main, &["stash", "list"]).contains("hive box id1"));
+        // Clean now, so the same box comes back, dirty state and all.
+        unpack_worktree(&box_dir, &m, &main, &main, &mut || Ok(())).unwrap();
+        assert_eq!(fs::read_to_string(main.join("a.txt")).unwrap(), "edited");
+        assert!(main.join("new.txt").exists());
     }
 
     #[test]
