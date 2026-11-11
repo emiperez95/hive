@@ -307,6 +307,23 @@ pub fn down_remotes() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// [`merge_into`] for a one-shot (a keypress handler): no poller has run in this process, so
+/// ask each remote once, now. Bounded by the fetch timeouts (300ms connect, 800ms read) and
+/// run in parallel, so a remote that is down costs one connect timeout, not one per remote.
+pub fn merge_now(reg: &mut crate::common::registry::ConversationRegistry) {
+    let handles: Vec<_> = HiveConfig::load()
+        .remotes
+        .into_iter()
+        .filter_map(|r| r.api.map(|api| (r.name, api)))
+        .map(|(name, api)| std::thread::spawn(move || (name, fetch_registry(&api))))
+        .collect();
+    for h in handles {
+        if let Ok((name, Ok(conversations))) = h.join() {
+            reg.merge_remote(&name, conversations);
+        }
+    }
+}
+
 /// Fold every reachable remote into `reg`. A down remote contributes nothing.
 pub fn merge_into(reg: &mut crate::common::registry::ConversationRegistry) {
     for s in snapshots() {

@@ -94,7 +94,10 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     // cycle (full process scan), but it's a one-shot keypress.
     let mut sys = System::new_all();
     sys.refresh_all();
-    let reg = crate::common::conversations::gather_conversations_stats(&mut sys);
+    let mut reg = crate::common::conversations::gather_conversations_stats(&mut sys);
+    // Other machines' conversations are in the panel's order too, so they are in this one:
+    // a one-shot has no poller, so ask each remote once.
+    crate::common::federation::merge_now(&mut reg);
     let mut session_data = crate::serve::server::gather_active_views(&reg, &sys);
     // `gather_active_views` leaves `attention_rank` unset — the ranking is a separate
     // pass because it does I/O (the git probe) and needs a clock. The web data thread
@@ -126,6 +129,10 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     // before leaving it. That was a consequence of tmux ordering, never the goal:
     // priority doesn't stop at a session boundary.
     let mut windows: Vec<(String, String, bool, u32)> = Vec::new(); // (session, window, free, rank)
+                                                                    // A remote window has no local window to select; what stands in for it is the ssh
+                                                                    // window attached to it. Keyed by the (session, window) pair used above.
+    let mut remote: std::collections::HashMap<(String, String), (String, String)> =
+        Default::default(); // → (host, remote window name)
     for sv in &session_data {
         let session_blocked = skipped.contains(&sv.name) || other_clients.contains(&sv.name);
         for w in &sv.windows {
@@ -138,6 +145,15 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
             );
             // Unranked (skipped session) sorts last; it is never `free` anyway.
             let rank = w.attention_rank.unwrap_or(u32::MAX);
+            if let Some(host) = &sv.host {
+                // `sv.name` is `"<session> @<host>"`: unique among local names.
+                remote.insert(
+                    (sv.name.clone(), win.clone()),
+                    (host.clone(), w.window_name.clone()),
+                );
+                windows.push((sv.name.clone(), win, !busy, rank));
+                continue;
+            }
             windows.push((s, win, !busy && !session_blocked, rank));
         }
     }
@@ -152,8 +168,26 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     // last — so the keypress always moves if anywhere else is free.
     let cur_session = current_session(pane);
     let cur_window = current_window(pane);
+    // Sitting in an attach window IS being on that remote conversation: without this the
+    // scan starts from the top each time and can land on the window you are already in.
+    let cur_name = match pane {
+        Some(p) => display_message_for_pane(p, "#{window_name}"),
+        None => None,
+    };
+    let on_remote = |ws: &String, ww: &String| {
+        remote
+            .get(&(ws.clone(), ww.clone()))
+            .is_some_and(|(host, wname)| {
+                cur_name.as_deref()
+                    == Some(crate::common::remote::attach_window_name(host, wname, ww).as_str())
+                    && cur_session.as_deref()
+                        == Some(crate::common::federation::real_session(ws, host).as_str())
+            })
+    };
     let cur_idx = match (&cur_session, &cur_window) {
-        (Some(s), Some(w)) => windows.iter().position(|(ws, ww, _, _)| ws == s && ww == w),
+        (Some(s), Some(w)) => windows
+            .iter()
+            .position(|(ws, ww, _, _)| (ws == s && ww == w) || on_remote(ws, ww)),
         _ => None,
     };
 
@@ -164,6 +198,18 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
         .find(|(_, _, free, _)| *free);
 
     if let Some((s, w, _, _)) = target {
+        if let Some((host, wname)) = remote.get(&(s.clone(), w.clone())) {
+            if !on_remote(s, w) {
+                let local = crate::common::federation::real_session(s, host);
+                if let Ok((ls, idx)) =
+                    crate::common::remote::attach_window(host, &local, w, wname, &local, &[])
+                {
+                    switch_to_session(&ls);
+                    select_window(&ls, &idx);
+                }
+            }
+            return Ok(());
+        }
         // Avoid a no-op switch when the only free window is the current one.
         if Some(s) != cur_session.as_ref() || Some(w) != cur_window.as_ref() {
             switch_to_session(s);
