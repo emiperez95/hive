@@ -344,6 +344,33 @@ ranked in the merged attention order, `tmux` found only with the PATH prefix, an
 - `srt` network defaults are Anthropic-only; a sandboxed session that needs git/npm needs
   `allowed_domains`.
 
+### Running on the homeserver for real (2026-11-11)
+
+What it took to run a real project (Argus) there, beyond the throwaway runs above:
+
+- **The server must live in the desktop session.** Over ssh the login keychain is locked
+  ("User interaction is not allowed"), and Claude keeps its login there, so a tmux server
+  started from ssh gives every Claude in it "Not logged in". The homeserver runs `hive web` as
+  a LaunchAgent (`~/Library/LaunchAgents/com.hive.boxes.plist`, `gui/<uid>` domain); the tmux
+  server it spawns inherits the unlocked keychain. Measured: the credential item reads 0 bytes
+  from ssh and in full from a job in that domain. Never start tmux there from a plain ssh
+  shell while no server is running. One `/login` inside such a session was enough for every
+  later one.
+- **Under `srt`, the keychain also needs `<user cache dir>/mds` writable** (`sandbox.rs`,
+  `keychain_cache_dir`); without it Security calls fail with "A Module Directory Service
+  error" and the sandboxed Claude is not logged in.
+- **NOT working: typing into a Claude running under `srt` in tmux.** It starts, logs in and
+  draws, but keys sent to the pane are echoed raw and never submitted (terminal query replies
+  also land in its input box). The `node` parent appears to share the tty with it. Until that
+  is solved a sandboxed conversation can be watched but not driven, so Argus runs unsandboxed.
+- **A project with no remote and no checkout on the target** unpacks: the bundle is the whole
+  history, the checkout is `git init`-ed at the registered path and pre-trusted.
+- **`box pull` asks `check_target` before the remote packs and before it releases its copy**;
+  it used to release first and then fail on a leftover local worktree.
+- **A main checkout is stashed, not left dirty, when its box ships away** (`--remove-local`,
+  `pull --remove-remote`): it must be clean to take the box back.
+- The API is bound to the LAN (`0.0.0.0`, no auth) by the owner's choice; the ssh forward is gone.
+
 ## Open questions
 
 - Ignored artifacts: rsync (default on same OS/arch, measured cheap) vs rebuild via hooks.
