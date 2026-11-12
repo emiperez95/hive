@@ -900,8 +900,35 @@ impl App {
         }
     }
 
+    /// Always-on trace of clicks and switches (`~/.hive/cache/sidebar-trace.log`): the one
+    /// part of the sidebar that only a real terminal can exercise, so it has to be readable
+    /// after the fact without restarting under `--debug`. A few lines per click.
+    fn trace(msg: &str) {
+        use std::io::Write;
+        let Some(path) =
+            crate::common::persistence::cache_dir().map(|c| c.join("sidebar-trace.log"))
+        else {
+            return;
+        };
+        // Bounded: start over once it passes 256KB.
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > 256 * 1024)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{} {msg}", chrono::Local::now().format("%H:%M:%S%.3f"));
+        }
+    }
+
     /// Move the tmux client, then give the keyboard back to the work split.
     fn switch_to(&mut self, session: &str, window: Option<&str>) {
+        Self::trace(&format!("switch_to {session:?} {window:?}"));
         // A federated row names a session on ANOTHER machine (`"<session> @<host>"`): there
         // is nothing local to switch to, so open the ssh window attached to it and go there.
         if let Some((remote_session, host)) = session.rsplit_once(" @") {
@@ -912,14 +939,19 @@ impl App {
                     window.unwrap_or("0"),
                     &[],
                 );
-                crate::common::debug::debug_log(&format!(
-                    "sidebar: remote switch {session:?} window {window:?} → {attached:?}"
+                Self::trace(&format!(
+                    "remote switch {session:?} window {window:?} → {attached:?}"
                 ));
                 if let Ok((local, idx)) = attached {
                     let clients = tmux::list_clients();
-                    if let Some(c) = tmux::pick_client(&clients) {
-                        tmux::switch_client_to(&c.tty, &local, Some(&idx));
-                    }
+                    let picked = tmux::pick_client(&clients).map(|c| c.tty.clone());
+                    let moved = picked
+                        .as_deref()
+                        .map(|tty| tmux::switch_client_to(tty, &local, Some(&idx)));
+                    Self::trace(&format!(
+                        "  clients {} picked {picked:?} switched {moved:?}",
+                        clients.len()
+                    ));
                 }
                 self.focus.session = Some(session.to_string());
                 self.focus.window_index = window.map(str::to_string);
@@ -1166,6 +1198,11 @@ impl App {
     /// pointer parked over it, from clicking anything.
     fn on_focus_gained(&mut self) {
         crate::common::debug::debug_log(&format!("sidebar: focus gained, hover {:?}", self.hover));
+        Self::trace(&format!(
+            "focus gained, hover {:?}",
+            self.hover
+                .map(|(x, y, at)| (x, y, at.elapsed().as_millis()))
+        ));
         if let Some((x, y, at)) = self.hover {
             if at.elapsed() < CLICK_THROUGH {
                 self.click(x, y);
@@ -1197,7 +1234,7 @@ impl App {
 
     fn click(&mut self, x: u16, y: u16) {
         let hit = self.hit_at(x, y);
-        crate::common::debug::debug_log(&format!("sidebar: click {x},{y} → {hit:?}"));
+        Self::trace(&format!("click {x},{y} → {hit:?}"));
         if self.dialog.is_some() {
             match hit {
                 Some(Hit::Dlg(DlgHit::Branch)) => {}
