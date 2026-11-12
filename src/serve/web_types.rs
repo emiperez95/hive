@@ -74,6 +74,10 @@ pub struct WindowView {
     pub window_index: String,
     /// tmux window name.
     pub window_name: String,
+    /// The conversation's own title, for a window whose tmux name says nothing (a
+    /// machine with a stock tmux leaves it as the process name, `2.1.322`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Resolved Claude session id (jsonl basename), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,

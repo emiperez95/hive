@@ -215,6 +215,9 @@ pub fn attach_window(
         .unwrap_or(false);
 
     if session_alive {
+        // Every time, not only at creation: a session made by an older build has no
+        // override yet, and a theme change is picked up on the next click.
+        name_status_after_window(&local_session);
         // An existing attach window for this conversation: just switch to it.
         let listing = tmux(&[
             "list-windows",
@@ -268,10 +271,62 @@ pub fn attach_window(
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        name_status_after_window(&local_session);
         Ok((
             local_session,
             String::from_utf8_lossy(&out.stdout).trim().to_string(),
         ))
+    }
+}
+
+/// `#S` → `#W`, and the long form. `None` when the value names no session.
+fn session_name_to_window_name(value: &str) -> Option<String> {
+    let out = value
+        .replace("#{session_name}", "#{window_name}")
+        .replace("#S", "#W");
+    (out != value).then_some(out)
+}
+
+/// Make the status line of the hidden attach session show the WINDOW's name wherever the
+/// user's theme shows the session's: the session is `__hive_remote`, an implementation
+/// detail, while each window is named after the conversation it is attached to
+/// (`🛰 Argus @mini:0`).
+///
+/// Themes reach `#S` through their own options (catppuccin: `@catppuccin_session_text`),
+/// so every scalar global option naming the session gets a session-level override — the
+/// user's config is read, never written. Best effort: a failure leaves the plain name.
+fn name_status_after_window(session: &str) {
+    let tmux = |args: &[&str]| {
+        Command::new("tmux")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(listing) = tmux(&["show-options", "-g"]) else {
+        return;
+    };
+    for line in listing.lines() {
+        let Some((name, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        // Arrays (`status-format[2]`) iterate sessions themselves; the terminal title is
+        // not the status line.
+        let wanted = name == "status-left" || name == "status-right" || name.starts_with('@');
+        if !wanted || !(rest.contains("#S") || rest.contains("#{session_name}")) {
+            continue;
+        }
+        // `-v` gives the value unquoted; the listing above escapes it.
+        let Some(value) = tmux(&["show-options", "-gv", name]) else {
+            continue;
+        };
+        if let Some(new) = session_name_to_window_name(value.trim_end_matches('\n')) {
+            // `=name:` — set-option takes a window-form target and rejects a bare `=name`
+            // ("no such session").
+            let target = format!("{}:", crate::common::tmux::exact(session));
+            let _ = tmux(&["set-option", "-t", &target, name, &new]);
+        }
     }
 }
 
@@ -286,6 +341,16 @@ mod tests {
             api: None,
             hive_path: None,
         }
+    }
+
+    #[test]
+    fn a_status_format_naming_the_session_names_the_window_instead() {
+        assert_eq!(session_name_to_window_name(" #S").as_deref(), Some(" #W"));
+        assert_eq!(
+            session_name_to_window_name("[#{session_name}]").as_deref(),
+            Some("[#{window_name}]")
+        );
+        assert_eq!(session_name_to_window_name("%H:%M #W"), None);
     }
 
     #[test]

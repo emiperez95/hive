@@ -225,6 +225,8 @@ pub fn conv_rows(
                 pane_id: Some(w.pane_id.clone()),
                 title: if named {
                     w.window_name.clone()
+                } else if let Some(t) = &w.title {
+                    t.clone()
                 } else {
                     format!("Window {}", w.window_index)
                 },
@@ -1065,6 +1067,15 @@ mod tests {
             now(),
         );
         assert_eq!(convs[0].title, "Window 3");
+    }
+
+    #[test]
+    fn a_window_tmux_never_named_shows_the_conversations_own_title() {
+        // A machine with a stock tmux leaves the window named after the process.
+        let mut w = win("0", "2.1.322", 2, Some(0), SessionStatus::Waiting);
+        w.title = Some("Argus build".into());
+        let convs = conv_rows(&[session("s", false, vec![w])], &Projects::default(), now());
+        assert_eq!(convs[0].title, "Argus build");
     }
 
     #[test]
