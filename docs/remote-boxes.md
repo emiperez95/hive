@@ -371,6 +371,21 @@ What it took to run a real project (Argus) there, beyond the throwaway runs abov
   `pull --remove-remote`): it must be clean to take the box back.
 - The API is bound to the LAN (`0.0.0.0`, no auth) by the owner's choice; the ssh forward is gone.
 
+### One row, one machine (2026-11-11)
+
+- Attach windows moved out of a local session named after the project (which listed the
+  project twice, once as if it ran here) into the hidden `__hive_remote` session. Window name
+  `"<session> @<host>:<index>"`; `remote::attached_target` reads it back.
+- The sidebar used to `switch-client` to `"<session> @<host>"`, a session that does not exist
+  locally, so a click did nothing. It now opens the attach window. `Ctrl+g` asks each remote
+  once per keypress (`federation::merge_now`); `Ctrl+n/p` cycle through attach windows that
+  are already open.
+- `project-hosts.json` marks a project whose own checkout was shipped; hive's entry points
+  refuse to start work on the stale copy. Not enforced for a hand-started `claude`, and not
+  applied when only a linked worktree ships.
+- Known: `/api/send` delivered a long kickoff prompt truncated (the remote Claude reported
+  the end missing). Not yet traced.
+
 ## Open questions
 
 - Ignored artifacts: rsync (default on same OS/arch, measured cheap) vs rebuild via hooks.

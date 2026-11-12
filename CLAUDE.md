@@ -1978,6 +1978,11 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 - Actions on a remote row go to that remote's own API (`federation::proxy_post`, web
   `remote_post`); `Enter` opens an `@host:<window>` ssh window (`remote::attach_remote`).
 - `[sandbox]` / `--sandbox` run the conversation under `srt` with a write set derived from the box; `deny_read` adds paths it must not even read (kernel-enforced).
+- **A remote conversation has ONE row here, `"<session> @<host>"`.** The ssh window attached to it lives in the hidden `__hive_remote` session (`config::REMOTE_SESSION`, filtered like `__hive_web`), named `"<session> @<host>:<index>"`. The sidebar click, the list's `Enter` and `Ctrl+g` all go through `remote::attach_window`, so they share that window; `/api/ambient` maps a client sitting in it back to the remote row (the sidebar's "you are here"), and `Ctrl+n/p` cycle through open attach windows (`remote::attach_windows`, no network on a keypress).
+- **A project lives on one machine.** Shipping a project's own checkout records the host in `cache/project-hosts.json` (`projects::set_lives_on`); `connect`, new conversation, `wt new` and todo dispatch call `projects::require_local` and refuse until the box is unpacked back here. A bare `claude` started by hand is not stopped. Linked worktrees can still ship on their own.
+- A main-checkout box unpacks onto a machine with no repo (it is `git init`-ed: no remote to clone), and a released main checkout is stashed, not left dirty. `box pull` runs `boxes::check_target` before the remote packs and before it releases its copy.
+- On macOS the remote's `hive web` must run in the desktop session (a LaunchAgent), or Claude there cannot read its login from the keychain; under `srt` the keychain also needs `<user cache dir>/mds` writable. A Claude under `srt` in tmux does not accept typed input yet — see `docs/remote-boxes.md`.
+- The sidebar appends every click and switch to `cache/sidebar-trace.log` (always on, 256KB cap): real Ghostty clicks cannot be reproduced from a test.
 - Commands run over ssh get `remote::REMOTE_PATH` prefixed: a non-interactive macOS shell has no Homebrew or `~/.local/bin` on PATH.
 
 ## Tmux Integration
