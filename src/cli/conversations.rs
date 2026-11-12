@@ -20,7 +20,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::common::activity::OpenWindowsState;
 use crate::common::chrome::{
@@ -1615,12 +1615,396 @@ impl ConvDetailState {
     }
 }
 
+// ── Action menu (`Space` in the detail screens) ─────────────────────────────
+
+/// What a menu entry does: replay one of the screen's own keys — so the menu can never
+/// drift from what the key does — or move the conversation's box between machines.
+#[derive(Clone, Debug, PartialEq)]
+enum MenuAct {
+    Key(KeyCode),
+    /// `hive box push <id> <remote>`.
+    Push(String, String),
+    /// `hive box pull <id>`.
+    Pull(String),
+}
+
+struct MenuItem {
+    label: String,
+    /// The key that does the same thing directly ("" when only the menu does it).
+    hint: &'static str,
+    act: MenuAct,
+}
+
+fn menu_item(label: impl Into<String>, hint: &'static str, act: MenuAct) -> MenuItem {
+    MenuItem {
+        label: label.into(),
+        hint,
+        act,
+    }
+}
+
+struct ActionMenu {
+    title: String,
+    items: Vec<MenuItem>,
+    sel: usize,
+}
+
+enum MenuOutcome {
+    /// No menu open: the key is the screen's.
+    Pass(KeyCode),
+    Consumed,
+    Act(MenuAct),
+}
+
+/// Feed a key to the open menu, if any. Any key that isn't navigation closes it.
+fn menu_key(menu: &mut Option<ActionMenu>, code: KeyCode) -> MenuOutcome {
+    let Some(m) = menu.as_mut() else {
+        return MenuOutcome::Pass(code);
+    };
+    let pick = match code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            m.sel = (m.sel + 1).min(m.items.len().saturating_sub(1));
+            return MenuOutcome::Consumed;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            m.sel = m.sel.saturating_sub(1);
+            return MenuOutcome::Consumed;
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Some(m.sel),
+        KeyCode::Char(d @ '1'..='9') => Some(d as usize - '1' as usize),
+        _ => None,
+    };
+    let act = pick.and_then(|i| m.items.get(i)).map(|i| i.act.clone());
+    *menu = None;
+    act.map(MenuOutcome::Act).unwrap_or(MenuOutcome::Consumed)
+}
+
+/// Names of the machines a conversation can be moved to.
+fn remote_names() -> Vec<String> {
+    crate::common::config::HiveConfig::load()
+        .remotes
+        .into_iter()
+        .map(|r| r.name)
+        .collect()
+}
+
+/// The move entries for one conversation: back here when another machine holds it, else
+/// one entry per configured remote. `what` names it in the label ("it", or a short id
+/// where the menu belongs to a list).
+fn box_items(conv: &Conversation, what: &str, remotes: &[String]) -> Vec<MenuItem> {
+    let id = conv.id.as_str().to_string();
+    // A synthetic frozen row (`session#window`) has no transcript to pack.
+    if id.contains('#') {
+        return Vec::new();
+    }
+    match conv.host.as_ref().or(conv.location.as_ref()) {
+        Some(host) => vec![menu_item(
+            format!("Bring {what} back to this machine (from {host})"),
+            "",
+            MenuAct::Pull(id),
+        )],
+        None => remotes
+            .iter()
+            .map(|r| {
+                menu_item(
+                    format!("Move {what} to {r}"),
+                    "",
+                    MenuAct::Push(id.clone(), r.clone()),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The conversation detail's menu.
+fn conv_menu(conv: &Conversation, remotes: &[String]) -> ActionMenu {
+    let key =
+        |label: &str, hint: &'static str, code: KeyCode| menu_item(label, hint, MenuAct::Key(code));
+    let live = conv.lifecycle.is_actionable_here();
+    let remote = conv.is_remote();
+    // Shipped from here and not (currently) reported back by that machine: this copy
+    // must not be resumed or forked — the conversation is running somewhere else.
+    let shipped = !remote && conv.location.is_some();
+    let mut items = Vec::new();
+    if !shipped {
+        items.push(key(
+            match (remote, live) {
+                (true, _) => "Open it (attach to the other machine)",
+                (false, true) => "Switch to it",
+                (false, false) => "Resume it",
+            },
+            "Enter",
+            KeyCode::Enter,
+        ));
+    }
+    items.extend(box_items(conv, "it", remotes));
+    if !remote && !shipped {
+        items.push(key("Fork", "f", KeyCode::Char('f')));
+        if live {
+            items.push(key("Freeze", "z", KeyCode::Char('z')));
+        }
+    }
+    items.push(key(
+        if conv.pinned { "Unpin" } else { "Pin" },
+        "P",
+        KeyCode::Char('P'),
+    ));
+    items.push(key("Edit note", "e", KeyCode::Char('e')));
+    items.push(key(
+        if conv.notify_override {
+            "Stop ringing through mute"
+        } else {
+            "Ring even when muted"
+        },
+        "M",
+        KeyCode::Char('M'),
+    ));
+    items.push(key("Open its project", "p", KeyCode::Char('p')));
+    if !remote && (live || conv.is_frozen()) {
+        items.push(key(
+            if conv.is_frozen() {
+                "Discard (frozen)"
+            } else {
+                "Close window"
+            },
+            "Del",
+            KeyCode::Delete,
+        ));
+    }
+    ActionMenu {
+        title: conv
+            .title
+            .clone()
+            .unwrap_or_else(|| short_id(conv.id.as_str())),
+        items,
+        sel: 0,
+    }
+}
+
+/// The project (or worktree) detail's menu: what the selected row can do, then the
+/// project-level actions.
+fn project_menu(d: &ProjectDetailState, remotes: &[String]) -> ActionMenu {
+    let key =
+        |label: &str, hint: &'static str, code: KeyCode| menu_item(label, hint, MenuAct::Key(code));
+    let mut items = Vec::new();
+    if let Some(c) = d.selected_conv() {
+        let what = short_id(c.id.as_str());
+        items.push(key(&format!("Open {what}"), "Enter", KeyCode::Enter));
+        items.extend(box_items(c, &what, remotes));
+        items.push(key(
+            &format!(
+                "{} {what}",
+                if c.archived { "Unarchive" } else { "Archive" }
+            ),
+            "A",
+            KeyCode::Char('A'),
+        ));
+        items.push(key(
+            &format!("Ring for {what} even when muted (toggle)"),
+            "M",
+            KeyCode::Char('M'),
+        ));
+    } else if d.num_items() > 0 {
+        items.push(key("Open the selected row", "Enter", KeyCode::Enter));
+    }
+    if !d.bucket {
+        items.push(key("New conversation", "n", KeyCode::Char('n')));
+        items.push(key(
+            "Resume the latest conversation",
+            "r",
+            KeyCode::Char('r'),
+        ));
+        if d.wt_info.is_none() {
+            items.push(key("New worktree", "w", KeyCode::Char('w')));
+        }
+        items.push(key("Delete worktree", "x", KeyCode::Char('x')));
+        if d.wt_info.is_none() {
+            items.push(key("Mute / unmute project", "m", KeyCode::Char('m')));
+            items.push(key("Archive / unarchive project", "a", KeyCode::Char('a')));
+        }
+    }
+    items.push(key(
+        if d.show_all {
+            "Show only the latest"
+        } else {
+            "Show everything"
+        },
+        "Tab",
+        KeyCode::Tab,
+    ));
+    ActionMenu {
+        title: d.key.clone(),
+        items,
+        sel: 0,
+    }
+}
+
+/// A box move running in the background: `hive box push|pull` as a subprocess, so its
+/// progress lines are captured instead of being printed over the TUI.
+struct BoxJob {
+    title: String,
+    /// `Some((succeeded, output))` once it has finished.
+    done: Arc<Mutex<Option<(bool, String)>>>,
+}
+
+fn start_box_job(act: &MenuAct) -> Option<BoxJob> {
+    let (title, args): (String, Vec<String>) = match act {
+        MenuAct::Push(id, remote) => (
+            format!("Moving {} to {remote}", short_id(id)),
+            vec!["box".into(), "push".into(), id.clone(), remote.clone()],
+        ),
+        MenuAct::Pull(id) => (
+            format!("Bringing {} back to this machine", short_id(id)),
+            vec!["box".into(), "pull".into(), id.clone()],
+        ),
+        MenuAct::Key(_) => return None,
+    };
+    let done = Arc::new(Mutex::new(None));
+    let sink = done.clone();
+    std::thread::spawn(move || {
+        let result = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| {
+                Ok(Command::new(exe)
+                    .args(&args)
+                    .stdin(std::process::Stdio::null())
+                    .output()?)
+            });
+        let finished = match result {
+            Ok(o) => {
+                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&o.stderr));
+                (o.status.success(), text)
+            }
+            Err(e) => (false, e.to_string()),
+        };
+        if let Ok(mut g) = sink.lock() {
+            *g = Some(finished);
+        }
+    });
+    Some(BoxJob { title, done })
+}
+
+/// A centered box of at most `w`×`h`, cleared for a popup.
+fn popup_area(frame: &mut ratatui::Frame, w: u16, h: u16) -> ratatui::layout::Rect {
+    let area = frame.area();
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let rect = ratatui::layout::Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    rect
+}
+
+/// Draw the open menu or the running job over whatever detail screen is underneath.
+fn draw_overlays(frame: &mut ratatui::Frame, menu: Option<&ActionMenu>, job: Option<&BoxJob>) {
+    use unicode_width::UnicodeWidthStr;
+    if let Some(j) = job {
+        let done = j.done.lock().ok().and_then(|g| g.clone());
+        let width = frame.area().width.saturating_sub(4).clamp(20, 90);
+        let mut lines: Vec<Line> = Vec::new();
+        let (border, footer) = match &done {
+            None => {
+                lines.push(Line::raw(
+                    " working — packing, copying and unpacking can take a minute…",
+                ));
+                (Color::Yellow, String::new())
+            }
+            Some((ok, text)) => {
+                let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let room = frame.area().height.saturating_sub(6) as usize;
+                for l in all.iter().skip(all.len().saturating_sub(room.max(1))) {
+                    lines.push(Line::raw(format!(" {l}")));
+                }
+                if *ok {
+                    (Color::Green, " done — press any key ".to_string())
+                } else {
+                    (Color::Red, " failed — press any key ".to_string())
+                }
+            }
+        };
+        let rect = popup_area(frame, width, lines.len() as u16 + 2);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(format!(" {} ", j.title))
+            .title_bottom(footer);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(block),
+            rect,
+        );
+        return;
+    }
+    let Some(m) = menu else { return };
+    let inner = m
+        .items
+        .iter()
+        .map(|i| i.label.width() + i.hint.width() + 9)
+        .max()
+        .unwrap_or(20)
+        .max(m.title.width() + 4)
+        .max(38);
+    let rect = popup_area(frame, inner as u16 + 2, m.items.len() as u16 + 2);
+    let row_w = rect.width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = m
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            let num = if i < 9 {
+                format!(" {} ", i + 1)
+            } else {
+                "   ".to_string()
+            };
+            let pad = row_w.saturating_sub(num.width() + it.label.width() + it.hint.width() + 1);
+            let text = format!("{num}{}{}{} ", it.label, " ".repeat(pad), it.hint);
+            if i == m.sel {
+                Line::styled(text, Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                Line::raw(text)
+            }
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" {} ", m.title))
+        .title_bottom(" ↑↓ · Enter / 1-9 · Esc ");
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 /// The live conversation running in the caller's current tmux window (for `--detail`).
 /// Prefers an exact session+window match; falls back to any live conversation in the
 /// current session (mirroring classic's session-level `--detail`) when the window index
 /// can't be read or doesn't line up — e.g. a popup reporting its own window.
 fn current_window_conv(reg: &ConversationRegistry) -> Option<Conversation> {
     let session = get_current_tmux_session()?;
+    // An attach window: the conversation is the remote row its name stands for.
+    if session == crate::common::config::REMOTE_SESSION {
+        let out = Command::new("tmux")
+            .args(["display-message", "-p", "#{window_name}"])
+            .output()
+            .ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (listed, index) = crate::common::remote::attached_target(&name)?;
+        return reg
+            .conversations
+            .values()
+            .find(|c| {
+                c.is_remote()
+                    && c.flag_session().as_deref() == Some(listed.as_str())
+                    && c.placement
+                        .as_ref()
+                        .is_some_and(|p| p.window_index == index)
+            })
+            .cloned();
+    }
     let in_session: Vec<&Conversation> = reg
         .conversations
         .values()
@@ -1697,9 +2081,71 @@ fn spawn_conv_detail(c: &Conversation) -> ConvDetailState {
     }
 }
 
+/// The detail of a conversation another machine holds: its processes, tree and transcript
+/// are there, so nothing local is probed (the checkout left here is stale by design).
+/// CPU and memory come with the federated row; the transcript tail is asked of the
+/// remote's own dashboard.
+fn gather_remote_resources(conv: &Conversation, host: &str) -> ConvResources {
+    let preview = conv
+        .placement
+        .as_ref()
+        .and_then(|p| {
+            let path = format!(
+                "/api/messages?session={}",
+                crate::common::federation::enc(&p.session_name)
+            );
+            crate::common::federation::proxy_get(host, &path).ok()
+        })
+        .map(|body| remote_preview(&body))
+        .unwrap_or_default();
+    ConvResources {
+        running: true,
+        cpu: conv.cpu,
+        mem_kb: conv.mem_kb,
+        processes: Vec::new(),
+        ports: Vec::new(),
+        chrome: Vec::new(),
+        commits: Vec::new(),
+        preview,
+    }
+}
+
+/// The last few messages out of a remote's `/api/messages` answer (a bare array, or an
+/// object carrying one under `messages`). Tool cards are dropped: the tail shows text.
+fn remote_preview(body: &str) -> Vec<jsonl::ConversationMessage> {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let list = v
+        .as_array()
+        .or_else(|| v.get("messages").and_then(|m| m.as_array()))
+        .cloned()
+        .unwrap_or_default();
+    let mut out: Vec<jsonl::ConversationMessage> = list
+        .iter()
+        .filter_map(|m| {
+            let text = m.get("text")?.as_str()?.to_string();
+            let role = m.get("role")?.as_str()?.to_string();
+            (!text.is_empty() && (role == "user" || role == "assistant")).then(|| {
+                jsonl::ConversationMessage {
+                    role,
+                    text,
+                    tools: Vec::new(),
+                    task: None,
+                }
+            })
+        })
+        .collect();
+    if out.len() > 6 {
+        out.drain(0..out.len() - 6);
+    }
+    out
+}
+
 /// Gather the slow bits. Live conversations get a CPU/mem/process/port sample;
 /// commits and the transcript tail come from disk for live AND closed ones.
 fn gather_conv_resources(conv: &Conversation) -> ConvResources {
+    if let Some(host) = &conv.host {
+        return gather_remote_resources(conv, host);
+    }
     let (running, cpu, mem_kb, processes, ports) = if conv.lifecycle.is_actionable_here() {
         gather_live_resources(conv)
     } else {
@@ -2089,6 +2535,13 @@ fn conversations_loop(
     // startup. Independent of `--detail` — the conversation detail draws on top of
     // this one, so passing both lands on the conversation with its project
     // underneath, and Esc pops to the project rather than out to the list.
+    // From an attach window the conversation is a remote row, and the pollers that feed
+    // those have only just started: fetch once, now, so there is something to resolve.
+    if (opts.detail || opts.project_detail)
+        && get_current_tmux_session().as_deref() == Some(crate::common::config::REMOTE_SESSION)
+    {
+        crate::common::federation::merge_now(&mut reg);
+    }
     if opts.project_detail {
         if let Some(key) = current_window_project(&reg, &projects) {
             detail = Some(build_group_detail(&key, &reg));
@@ -2102,6 +2555,9 @@ fn conversations_loop(
             conv_detail = Some(spawn_conv_detail(&c));
         }
     }
+    // The detail screens' action menu (`Space`), and the box move it may have started.
+    let mut menu: Option<ActionMenu> = None;
+    let mut job: Option<BoxJob> = None;
     // Some(conv) while awaiting y/n to close (kill the window of) a live conversation.
     let mut confirm: Option<Conversation> = None;
     // Some((project, branch)) while awaiting y/n to DELETE a worktree.
@@ -2192,7 +2648,10 @@ fn conversations_loop(
         if conv_detail.is_some() {
             {
                 let cd = conv_detail.as_ref().unwrap();
-                terminal.draw(|frame| draw_conv_detail(frame, cd, &flags))?;
+                terminal.draw(|frame| {
+                    draw_conv_detail(frame, cd, &flags);
+                    draw_overlays(frame, menu.as_ref(), job.as_ref());
+                })?;
             }
             if !event::poll(Duration::from_millis(250))? {
                 continue;
@@ -2203,6 +2662,31 @@ fn conversations_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // A box move owns the screen until it finishes and a key dismisses it. The
+            // conversation changed machines, so a success goes back to a fresh list.
+            if let Some(j) = &job {
+                let done = j.done.lock().ok().and_then(|g| g.clone());
+                if let Some((ok, _)) = done {
+                    job = None;
+                    if ok {
+                        conv_detail = None;
+                        reg = gather_conversations_stats(&mut sys);
+                        flags = Flags::load();
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                        sel = 0;
+                    }
+                }
+                continue;
+            }
+            let code = match menu_key(&mut menu, key.code) {
+                MenuOutcome::Pass(c) => c,
+                MenuOutcome::Consumed => continue,
+                MenuOutcome::Act(MenuAct::Key(k)) => k,
+                MenuOutcome::Act(act) => {
+                    job = start_box_job(&act);
+                    continue;
+                }
+            };
             // Add-todo input mode takes every key while active.
             if conv_detail.as_ref().unwrap().adding {
                 let cd = conv_detail.as_mut().unwrap();
@@ -2275,9 +2759,15 @@ fn conversations_loop(
                 continue;
             }
 
-            match key.code {
+            match code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                     conv_detail = None
+                }
+                // The action menu: everything this screen can do, plus moving the
+                // conversation to another machine or back.
+                KeyCode::Char(' ') => {
+                    let c = &conv_detail.as_ref().unwrap().conv;
+                    menu = Some(conv_menu(c, &remote_names()));
                 }
                 KeyCode::Enter => {
                     let c = conv_detail.as_ref().unwrap().conv.clone();
@@ -2361,7 +2851,7 @@ fn conversations_loop(
                     if let Some(session) =
                         conv_detail.as_ref().unwrap().session().map(str::to_string)
                     {
-                        let flag = match key.code {
+                        let flag = match code {
                             KeyCode::Char('v') => Flag::Favorite,
                             KeyCode::Char('m') => Flag::Mute,
                             KeyCode::Char('!') => Flag::AutoApprove,
@@ -2545,7 +3035,10 @@ fn conversations_loop(
         if detail.is_some() {
             {
                 let d = detail.as_mut().unwrap();
-                terminal.draw(|frame| draw_project_detail(frame, d, &projects, &flags))?;
+                terminal.draw(|frame| {
+                    draw_project_detail(frame, d, &projects, &flags);
+                    draw_overlays(frame, menu.as_ref(), job.as_ref());
+                })?;
             }
             if !event::poll(Duration::from_millis(250))? {
                 continue;
@@ -2556,6 +3049,35 @@ fn conversations_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // A box move started from the menu: see the conversation detail. Here a
+            // success rebuilds this screen, since the project is still the subject.
+            if let Some(j) = &job {
+                let done = j.done.lock().ok().and_then(|g| g.clone());
+                if let Some((ok, _)) = done {
+                    job = None;
+                    if ok {
+                        reg = gather_conversations_stats(&mut sys);
+                        flags = Flags::load();
+                        let (key, show_all) = {
+                            let d = detail.as_ref().unwrap();
+                            (d.key.clone(), d.show_all)
+                        };
+                        detail = Some(build_group_detail(&key, &reg));
+                        detail.as_mut().unwrap().show_all = show_all;
+                        (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);
+                    }
+                }
+                continue;
+            }
+            let code = match menu_key(&mut menu, key.code) {
+                MenuOutcome::Pass(c) => c,
+                MenuOutcome::Consumed => continue,
+                MenuOutcome::Act(MenuAct::Key(k)) => k,
+                MenuOutcome::Act(act) => {
+                    job = start_box_job(&act);
+                    continue;
+                }
+            };
             // Branch-name input for a new worktree (`w`). Enter creates it; Esc cancels.
             if detail.as_ref().unwrap().wt_input.is_some() {
                 let d = detail.as_mut().unwrap();
@@ -2619,10 +3141,15 @@ fn conversations_loop(
                 }
                 continue;
             }
-            match key.code {
+            match code {
                 // Esc pops one level (worktree → its project → the list); q/Q leaves
                 // the detail screens outright.
                 KeyCode::Esc => detail = detail_stack.pop(),
+                // The options menu: the selected row's actions (moving a conversation
+                // between machines among them), then the project's own.
+                KeyCode::Char(' ') => {
+                    menu = Some(project_menu(detail.as_ref().unwrap(), &remote_names()));
+                }
                 KeyCode::Char('q') | KeyCode::Char('Q') => {
                     detail_stack.clear();
                     detail = None;
@@ -4600,14 +5127,14 @@ fn draw_project_detail(
     } else if let Some(w) = &state.wt_info {
         Line::from(Span::styled(
             format!(
-                " Enter switch / start-todo · → detail · Tab show-all · Del close · n new in {} · r resume · x delete-wt · M ring · A archive-conv · Esc back",
+                " Space options · Enter switch / start-todo · → detail · Tab show-all · Del close · n new in {} · r resume · x delete-wt · M ring · A archive-conv · Esc back",
                 w.branch
             ),
             Style::default().fg(Color::DarkGray),
         ))
     } else {
         Line::from(Span::styled(
-            " Enter open wt / switch conv / start-todo · → detail · Tab show-all · Del close-conv / delete-wt · n new · r resume · w worktree · x delete-wt · m mute · M ring · a archive-project · A archive-conv · Esc back",
+            " Space options · Enter open wt / switch conv / start-todo · → detail · Tab show-all · Del close-conv / delete-wt · n new · r resume · w worktree · x delete-wt · m mute · M ring · a archive-project · A archive-conv · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -4965,7 +5492,7 @@ fn draw_conv_detail(frame: &mut ratatui::Frame, cd: &ConvDetailState, flags: &Fl
         ))
     } else {
         Line::from(Span::styled(
-            " Enter switch · v★ m ! s · z freeze · P pin · f fork · M ring · e note · a/1-9/d todo · o chrome · Del close · Esc back",
+            " Space actions · Enter switch · v★ m ! s · z freeze · P pin · f fork · M ring · e note · a/1-9/d todo · o chrome · Del close · Esc back",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -7188,6 +7715,117 @@ mod tests {
     }
 
     /// `mk` + the freeze overlay, for the frozen-section tests.
+    #[test]
+    fn a_local_conversation_can_move_to_each_remote_and_a_held_one_only_comes_back() {
+        let remotes = vec!["mini".to_string(), "pc".to_string()];
+        let local = mk("aaaa1111-0000", Lifecycle::Closed, Some("p"), None);
+        let acts: Vec<MenuAct> = box_items(&local, "it", &remotes)
+            .into_iter()
+            .map(|i| i.act)
+            .collect();
+        assert_eq!(
+            acts,
+            [
+                MenuAct::Push("aaaa1111-0000".into(), "mini".into()),
+                MenuAct::Push("aaaa1111-0000".into(), "pc".into()),
+            ]
+        );
+
+        // Held by another machine — a federated row, or one shipped from here whose
+        // remote is not answering right now: the only move is back.
+        let mut remote = local.clone();
+        remote.host = Some("mini".into());
+        let mut shipped = local.clone();
+        shipped.location = Some("mini".into());
+        for c in [&remote, &shipped] {
+            let items = box_items(c, "it", &remotes);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].act, MenuAct::Pull("aaaa1111-0000".into()));
+            assert!(items[0].label.contains("mini"), "{}", items[0].label);
+        }
+
+        // A synthetic frozen row has no transcript to pack.
+        let synthetic = mk("sess#1", Lifecycle::Closed, None, None);
+        assert!(box_items(&synthetic, "it", &remotes).is_empty());
+    }
+
+    #[test]
+    fn the_menu_replays_keys_and_any_other_key_closes_it() {
+        let c = mk("aaaa1111-0000", Lifecycle::Closed, Some("p"), None);
+        let open = || Some(conv_menu(&c, &["mini".to_string()]));
+
+        // No menu: the key belongs to the screen.
+        let mut none = None;
+        assert!(matches!(
+            menu_key(&mut none, KeyCode::Char('z')),
+            MenuOutcome::Pass(KeyCode::Char('z'))
+        ));
+
+        // First entry is Enter's own action; picking it hands the key back.
+        let mut m = open();
+        assert!(matches!(
+            menu_key(&mut m, KeyCode::Enter),
+            MenuOutcome::Act(MenuAct::Key(KeyCode::Enter))
+        ));
+        assert!(m.is_none());
+
+        // Down then Enter reaches the move, and a digit picks by position.
+        let mut m = open();
+        assert!(matches!(
+            menu_key(&mut m, KeyCode::Down),
+            MenuOutcome::Consumed
+        ));
+        assert!(matches!(
+            menu_key(&mut m, KeyCode::Enter),
+            MenuOutcome::Act(MenuAct::Push(_, _))
+        ));
+        let mut m = open();
+        assert!(matches!(
+            menu_key(&mut m, KeyCode::Char('2')),
+            MenuOutcome::Act(MenuAct::Push(_, _))
+        ));
+
+        // A letter is NOT run as the screen's key while the menu is up: it closes it.
+        let mut m = open();
+        assert!(matches!(
+            menu_key(&mut m, KeyCode::Char('z')),
+            MenuOutcome::Consumed
+        ));
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn a_remote_conversations_menu_offers_no_local_window_actions() {
+        let mut c = mk("aaaa1111-0000", Lifecycle::Live, Some("p"), None);
+        c.host = Some("mini".into());
+        let acts: Vec<MenuAct> = conv_menu(&c, &["mini".to_string()])
+            .items
+            .into_iter()
+            .map(|i| i.act)
+            .collect();
+        assert!(acts.contains(&MenuAct::Pull("aaaa1111-0000".into())));
+        for k in [KeyCode::Char('f'), KeyCode::Char('z'), KeyCode::Delete] {
+            assert!(!acts.contains(&MenuAct::Key(k)), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn a_remote_transcript_tail_keeps_the_last_text_messages() {
+        let msgs: Vec<serde_json::Value> = (0..9)
+            .map(|i| serde_json::json!({"role": if i % 2 == 0 {"user"} else {"assistant"}, "text": format!("m{i}")}))
+            .chain([serde_json::json!({"role": "assistant", "tools": [{"name": "Bash"}]})])
+            .collect();
+        for body in [
+            serde_json::json!(msgs).to_string(),
+            serde_json::json!({ "messages": msgs }).to_string(),
+        ] {
+            let out = remote_preview(&body);
+            assert_eq!(out.len(), 6);
+            assert_eq!(out.last().unwrap().text, "m8");
+        }
+        assert!(remote_preview("not json").is_empty());
+    }
+
     fn mk_frozen(id: &str, parent: Option<&str>, last: Option<&str>) -> Conversation {
         let mut c = mk(id, Lifecycle::Closed, parent, last);
         c.frozen = Some(crate::common::registry::FrozenInfo {

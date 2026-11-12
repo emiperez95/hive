@@ -324,9 +324,14 @@ pub fn check_target(m: &Manifest, root: &Path) -> Result<()> {
         }
         let cur = git(root, &["symbolic-ref", "--short", "-q", "HEAD"])
             .map_err(|_| anyhow!("{} is on a detached HEAD", root.display()))?;
-        if cur != m.branch {
+        // Another branch is fine when the box's branch is new to this machine: the unpack
+        // creates it from here (it still refuses unless HEAD is an ancestor of the box's
+        // tip). A branch of that name that exists but isn't checked out may hold its own
+        // commits, so that stays a refusal.
+        if cur != m.branch && local_branch_exists(root, &m.branch) {
             bail!(
-                "{} has '{}' checked out, the box is for '{}'",
+                "{} has '{}' checked out, the box is for '{}' (which exists here too); \
+                 check it out first",
                 root.display(),
                 cur,
                 m.branch
@@ -342,6 +347,18 @@ pub fn check_target(m: &Manifest, root: &Path) -> Result<()> {
         bail!("{} already exists and is not empty", root.display());
     }
     Ok(())
+}
+
+fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+    git_ok(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
 }
 
 /// Restore the git state from `src` (a box dir) onto `root`.
@@ -429,6 +446,13 @@ pub fn unpack_worktree(
                     "{} has commits that are not ancestors of the box tip; refusing to move it",
                     root.display()
                 );
+            }
+            // The conversation moved to a branch this machine never had (it was made
+            // over there): start it here, at HEAD. The tree is clean (`check_target`),
+            // and step 4 moves the new branch to the box's tip.
+            let cur = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]).unwrap_or_default();
+            if born && cur != m.branch {
+                git(root, &["checkout", "-q", "-b", &m.branch])?;
             }
         } else {
             match have {
@@ -1417,6 +1441,49 @@ mod tests {
         assert_eq!(sh(&dst, &["symbolic-ref", "--short", "HEAD"]), "main");
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "one");
         assert_eq!(sh(&dst, &["status", "--porcelain"]), "?? b.txt");
+    }
+
+    #[test]
+    fn main_checkout_unpack_follows_the_box_onto_a_branch_made_elsewhere() {
+        // Shipped on `main`, the conversation branched and committed on the other machine.
+        // Coming back, this checkout is still on `main` and has never seen that branch.
+        let tmp = tempdir("newbranch");
+        let src = tmp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        sh(&src, &["init", "-q", "-b", "main"]);
+        sh(&src, &["config", "user.email", "t@t"]);
+        sh(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("a.txt"), "one").unwrap();
+        sh(&src, &["add", "a.txt"]);
+        sh(&src, &["commit", "-q", "-m", "first"]);
+        let dst = tmp.join("dst");
+        sh(&tmp, &["clone", "-q", "src", "dst"]);
+
+        sh(&src, &["checkout", "-q", "-b", "step-1"]);
+        fs::write(src.join("a.txt"), "second version").unwrap();
+        sh(&src, &["commit", "-q", "-am", "second"]);
+        let box_dir = tmp.join("box");
+        let p = pack_worktree(&src, &box_dir, true).unwrap();
+        let m = manifest_for(&src, &p, "id1");
+
+        check_target(&m, &dst).unwrap();
+        unpack_worktree(&box_dir, &m, &dst, &dst, &mut || Ok(())).unwrap();
+        assert_eq!(sh(&dst, &["symbolic-ref", "--short", "HEAD"]), "step-1");
+        assert_eq!(sh(&dst, &["rev-parse", "HEAD"]), p.head);
+        assert_eq!(
+            fs::read_to_string(dst.join("a.txt")).unwrap(),
+            "second version"
+        );
+        assert_eq!(sh(&dst, &["status", "--porcelain"]), "");
+        // `main` stays where it was: nothing here was rewound or moved.
+        assert_ne!(sh(&dst, &["rev-parse", "main"]), p.head);
+
+        // A branch of that name that already exists here, not checked out, is refused.
+        let other = tmp.join("other");
+        sh(&tmp, &["clone", "-q", "src", "other"]);
+        sh(&other, &["checkout", "-q", "-b", "main2"]);
+        let err = check_target(&m, &other).unwrap_err();
+        assert!(err.to_string().contains("exists here too"), "{err}");
     }
 
     #[test]
