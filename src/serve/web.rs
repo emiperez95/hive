@@ -80,9 +80,22 @@ fn ambient_json(gen: u64) -> String {
         .collect();
     muted_projects.sort();
     let client = crate::common::tmux::pick_client(&clients);
+    // A client sitting in an attach window is ON that remote conversation: report the row
+    // the panel draws for it, not the hidden session that holds the ssh window.
+    let mut at = client.map(|c| (c.session.clone(), c.window_index.clone()));
+    if let Some((session, window)) = &at {
+        if session == crate::common::config::REMOTE_SESSION {
+            if let Some((_, listed, remote_idx)) = crate::common::remote::attach_windows()
+                .into_iter()
+                .find(|(idx, _, _)| idx == window)
+            {
+                at = Some((listed, remote_idx));
+            }
+        }
+    }
     serde_json::json!({
-        "session": client.map(|c| c.session.clone()),
-        "window_index": client.map(|c| c.window_index.clone()),
+        "session": at.as_ref().map(|a| a.0.clone()),
+        "window_index": at.as_ref().map(|a| a.1.clone()),
         "tty": client.map(|c| c.tty.clone()),
         "global_mute": muted,
         "muted_projects": muted_projects,

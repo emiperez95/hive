@@ -117,6 +117,36 @@ pub fn attach_window_name(host: &str, remote_session: &str, window_index: &str) 
     format!("{remote_session} @{host}:{window_index}")
 }
 
+/// The inverse of [`attach_window_name`]: `"🛰 Argus @mini:2"` → (`"🛰 Argus @mini"` — the
+/// name every listing gives that session — and `"2"`, its window there).
+pub fn attached_target(window_name: &str) -> Option<(String, String)> {
+    let (session, index) = window_name.rsplit_once(':')?;
+    (session.contains(" @") && !index.is_empty()).then(|| (session.to_string(), index.to_string()))
+}
+
+/// The attach windows open on this machine: (local window index, listed session name,
+/// remote window index). No network — it is what `__hive_remote` holds right now.
+pub fn attach_windows() -> Vec<(String, String, String)> {
+    let out = Command::new("tmux")
+        .args([
+            "list-windows",
+            "-t",
+            &crate::common::tmux::exact(crate::common::config::REMOTE_SESSION),
+            "-F",
+            "#{window_index}\t#{window_name}",
+        ])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (idx, name) = l.split_once('\t')?;
+            let (session, remote_idx) = attached_target(name)?;
+            Some((idx.to_string(), session, remote_idx))
+        })
+        .collect()
+}
+
 /// What the REMOTE shell runs to attach: tmux, found via [`REMOTE_PATH`], on the exact window
 /// (`=` so a longer session name can't be prefix-matched).
 fn attach_shell(session: &str, window_index: &str) -> String {
@@ -279,6 +309,18 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "4");
+    }
+
+    #[test]
+    fn an_attach_window_name_reads_back_as_the_listed_session_and_window() {
+        let name = attach_window_name("mini", "🌳 [cs] CSD-1", "3");
+        assert_eq!(
+            attached_target(&name),
+            Some(("🌳 [cs] CSD-1 @mini".to_string(), "3".to_string()))
+        );
+        // A window someone else put there is not an attach window.
+        assert_eq!(attached_target("zsh"), None);
+        assert_eq!(attached_target("notes:1"), None);
     }
 
     #[test]

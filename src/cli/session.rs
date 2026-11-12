@@ -68,7 +68,17 @@ fn sidebar_order(mut sessions: Vec<String>, projects: &ProjectRegistry) -> Vec<S
 pub fn run_cycle(forward: bool, pane: Option<&str>) -> Result<()> {
     let skipped = load_skipped_sessions();
     let other_clients = get_other_client_sessions();
-    let current = current_session(pane);
+    let mut current = current_session(pane);
+    // In an attach window the "session" you are on is the remote one it shows.
+    if current.as_deref() == Some(crate::common::config::REMOTE_SESSION) {
+        let name = pane.and_then(|p| display_message_for_pane(p, "#{window_name}"));
+        if let Some((listed, _)) = name
+            .as_deref()
+            .and_then(crate::common::remote::attached_target)
+        {
+            current = Some(listed);
+        }
+    }
     cycle_among(forward, current, |name| {
         !skipped.contains(name) && !other_clients.contains(name)
     })
@@ -221,7 +231,17 @@ fn cycle_among(
     current: Option<String>,
     eligible: impl Fn(&String) -> bool,
 ) -> Result<()> {
-    let all_sessions = sidebar_order(get_current_tmux_session_names(), &ProjectRegistry::load());
+    // Conversations on other machines are stops too, through the attach window each one has
+    // here (no network on a keypress: only those already opened). They cycle under the name
+    // the panel lists them by, `"<session> @<host>"`.
+    let attached: std::collections::HashMap<String, String> =
+        crate::common::remote::attach_windows()
+            .into_iter()
+            .map(|(idx, listed, _)| (listed, idx))
+            .collect();
+    let mut names = get_current_tmux_session_names();
+    names.extend(attached.keys().cloned());
+    let all_sessions = sidebar_order(names, &ProjectRegistry::load());
 
     let filtered: Vec<&String> = all_sessions.iter().filter(|name| eligible(name)).collect();
 
@@ -277,7 +297,13 @@ fn cycle_among(
         }
     };
 
-    switch_to_session(target);
+    match attached.get(target) {
+        Some(idx) => {
+            switch_to_session(crate::common::config::REMOTE_SESSION);
+            select_window(crate::common::config::REMOTE_SESSION, idx);
+        }
+        None => switch_to_session(target),
+    }
     Ok(())
 }
 
