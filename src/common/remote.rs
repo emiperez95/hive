@@ -407,7 +407,8 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "4");
+        // ssh, -t, two `-o <keepalive>` pairs, the target, the remote command.
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "8");
     }
 
     #[test]
