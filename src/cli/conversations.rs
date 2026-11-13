@@ -1626,6 +1626,8 @@ enum MenuAct {
     Push(String, String),
     /// `hive box pull <id>`.
     Pull(String),
+    /// Close this machine's attach window to a remote conversation and open a fresh one.
+    Reconnect,
 }
 
 struct MenuItem {
@@ -1735,6 +1737,13 @@ fn conv_menu(conv: &Conversation, remotes: &[String]) -> ActionMenu {
             },
             "Enter",
             KeyCode::Enter,
+        ));
+    }
+    if remote {
+        items.push(menu_item(
+            "Reconnect (close the ssh window and open a fresh one)",
+            "",
+            MenuAct::Reconnect,
         ));
     }
     items.extend(box_items(conv, "it", remotes));
@@ -1857,7 +1866,7 @@ fn start_box_job(act: &MenuAct) -> Option<BoxJob> {
             format!("Bringing {} back to this machine", short_id(id)),
             vec!["box".into(), "pull".into(), id.clone()],
         ),
-        MenuAct::Key(_) => return None,
+        MenuAct::Key(_) | MenuAct::Reconnect => return None,
     };
     let done = Arc::new(Mutex::new(None));
     let sink = done.clone();
@@ -2682,6 +2691,19 @@ fn conversations_loop(
                 MenuOutcome::Pass(c) => c,
                 MenuOutcome::Consumed => continue,
                 MenuOutcome::Act(MenuAct::Key(k)) => k,
+                // A hung ssh connection: drop the local window, then open it as Enter
+                // would. The conversation over there is not touched.
+                MenuOutcome::Act(MenuAct::Reconnect) => {
+                    let c = conv_detail.as_ref().unwrap().conv.clone();
+                    if let (Some(host), Some(p)) = (&c.host, &c.placement) {
+                        crate::common::remote::close_attach_window(
+                            host,
+                            &p.session_name,
+                            &p.window_index,
+                        );
+                    }
+                    return Ok(activate(&c));
+                }
                 MenuOutcome::Act(act) => {
                     job = start_box_job(&act);
                     continue;

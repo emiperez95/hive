@@ -168,6 +168,13 @@ pub fn attach_command(
     ports: &[u16],
 ) -> String {
     let mut parts = vec![sh_quote(&ssh_program()), "-t".to_string()];
+    // A connection that died silently (sleep, a network change) otherwise leaves the
+    // window frozen forever: nothing is sent, so nothing fails. With keepalives ssh exits
+    // after ~45s of silence, the window closes, and the next click opens a fresh one.
+    for opt in ["ServerAliveInterval=15", "ServerAliveCountMax=3"] {
+        parts.push("-o".to_string());
+        parts.push(opt.to_string());
+    }
     for p in ports {
         parts.push("-L".to_string());
         parts.push(sh_quote(&format!("{p}:localhost:{p}")));
@@ -190,6 +197,28 @@ pub fn attach_remote(c: &crate::common::registry::Conversation) -> Result<(Strin
         .as_ref()
         .ok_or_else(|| anyhow!("remote conversation has no window to attach to"))?;
     attach_window(host, &p.session_name, &p.window_index, &c.ports)
+}
+
+/// Close the local attach window for a remote conversation, if one is open — the way out
+/// of a hung ssh connection. Only the window on THIS machine goes: the conversation and
+/// its tmux window on `host` are untouched. Returns whether there was one.
+pub fn close_attach_window(host: &str, remote_session: &str, window_index: &str) -> bool {
+    let name = attach_window_name(host, remote_session, window_index);
+    let listed = format!("{remote_session} @{host}");
+    let mut closed = false;
+    for (idx, session, remote_idx) in attach_windows() {
+        if session == listed && remote_idx == window_index {
+            debug_assert_eq!(attach_window_name(host, remote_session, &remote_idx), name);
+            let target =
+                crate::common::tmux::exact_window(crate::common::config::REMOTE_SESSION, &idx);
+            closed |= Command::new("tmux")
+                .args(["kill-window", "-t", &target])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        }
+    }
+    closed
 }
 
 /// [`attach_remote`] for a caller that holds only names (the sidebar, which sees the
@@ -358,6 +387,11 @@ mod tests {
         let c = attach_command(&remote(), "📊 Avateen", "3", &[3000, 5432]);
         assert!(c.contains("-L '3000:localhost:3000'") && c.contains("-L '5432:localhost:5432'"));
         assert!(c.contains("'me@mini.local'"));
+        // A silently dead connection must end on its own rather than freeze the window.
+        assert!(
+            c.contains("-o ServerAliveInterval=15 -o ServerAliveCountMax=3"),
+            "{c}"
+        );
         // `=` keeps tmux from prefix-matching a longer session name on the remote.
         assert!(c.contains("=📊 Avateen:3"), "{c}");
         assert!(c.contains("-t"), "{c}");
