@@ -287,6 +287,14 @@ fn gather_conversations_inner(stats: Option<&mut System>, federate: bool) -> Con
         c.lifecycle.is_actionable_here() || registry::should_surface_closed(c, now, &cfg)
     });
 
+    // Each live conversation's process tree — always, not only when sampling resources:
+    // `box pack`'s gate is a one-shot and checks Claude's status record against it.
+    for (id, pids) in &id_pids {
+        if let Some(c) = reg.conversations.get_mut(id) {
+            c.pids = pids.clone();
+        }
+    }
+
     // Optional live-resource sample: sum each live conversation's window process
     // tree. `refresh_all` gives cpu_percent as a delta since the caller's last call.
     if let Some(sys) = stats {
@@ -302,7 +310,6 @@ fn gather_conversations_inner(stats: Option<&mut System>, federate: bool) -> Con
                 }
                 c.cpu = cpu;
                 c.mem_kb = mem;
-                c.pids = pids.clone();
                 c.ports = get_listening_ports_for_pids(pids, sys)
                     .into_iter()
                     .map(|lp| lp.port)

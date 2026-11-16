@@ -1,6 +1,7 @@
-//! `hive box pack|unpack|list` — move a conversation as a directory of files.
-//! The mechanics live in `common/boxes.rs`; this resolves the conversation and
-//! sequences gate → freeze → write.
+//! `hive box pack|unpack|push|pull|send|mark|list` and `hive remote add|list` — move a
+//! conversation as a directory of files. The mechanics live in `common/boxes.rs`; this
+//! resolves the conversation, sequences gate → freeze → write, and picks the transport
+//! (HTTP when the remote has an `api`, else ssh + rsync).
 
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
@@ -33,18 +34,25 @@ fn resolve_conversation_id(
 }
 
 pub fn run_box_pack(conv: &str, force: bool, with_ignored: bool) -> Result<()> {
-    let (id, dir, _) = pack_conversation(conv, force, with_ignored)?;
+    let (id, dir, _) = pack_conversation(conv, force, with_ignored, false)?;
     println!("packed {} → {}", id, dir.display());
     Ok(())
 }
 
 /// Gate → freeze → write. Returns the conversation id, the box dir and its manifest.
+///
+/// `exact` refuses an id prefix: a request from another machine must name the whole
+/// conversation, or `/api/box/a/pack` would freeze whichever one happens to start with `a`.
 pub(crate) fn pack_conversation(
     conv: &str,
     force: bool,
     with_ignored: bool,
+    exact: bool,
 ) -> Result<(String, PathBuf, boxes::Manifest)> {
     let reg = crate::common::conversations::gather_conversations();
+    if exact && !reg.conversations.contains_key(conv) {
+        bail!("no conversation with id '{conv}' (the full id is required)");
+    }
     let id = resolve_conversation_id(&reg, conv)?;
     let c = &reg.conversations[&id];
     let placement = c.placement.as_ref().map(|p| {
@@ -65,6 +73,7 @@ pub(crate) fn pack_conversation(
             cwd: &c.cwd,
             note,
             placement,
+            pids: &c.pids,
         },
         &PackOptions {
             force,
@@ -207,8 +216,7 @@ fn remote_op(
     match v {
         Via::Ssh => {
             let mut args: Vec<String> = vec!["box".into(), op.into(), id.into()];
-            for (k, on) in flags.iter().filter(|(_, on)| *on) {
-                let _ = on;
+            for (k, _) in flags.iter().filter(|(_, on)| *on) {
                 args.push(format!("--{}", k.replace('_', "-")));
             }
             if let Some(l) = location {
@@ -251,7 +259,7 @@ pub fn run_box_push(
     via_ssh: bool,
 ) -> Result<()> {
     let r = remote::find_remote(remote)?;
-    let (id, dir, m) = pack_conversation(conv, force, with_ignored)?;
+    let (id, dir, m) = pack_conversation(conv, force, with_ignored, false)?;
     ship(&r, &id, &dir, &m, thaw, remove_local, sandbox, via_ssh)
 }
 
@@ -268,16 +276,7 @@ pub fn run_box_send(
     let r = remote::find_remote(remote)?;
     let dir = resolve_box(target)?;
     let m = boxes::read_manifest(&dir)?;
-    ship(
-        &r,
-        &m.id.clone(),
-        &dir,
-        &m,
-        thaw,
-        remove_local,
-        sandbox,
-        via_ssh,
-    )
+    ship(&r, &m.id, &dir, &m, thaw, remove_local, sandbox, via_ssh)
 }
 
 /// Copy a packed box to the remote, unpack (and thaw) it there, then record that it now
@@ -371,10 +370,17 @@ pub fn run_box_pull(
         )
     })?;
 
-    // The box is on this disk now, so the remote copy is safe to release before unpacking
-    // (and must be, when both sides share paths).
+    // Order matters: once the files are restored here, this machine owns the conversation,
+    // whatever happens next. So: restore, record that it is here, tell the remote, and only
+    // then resume — a resume that fails must not leave the overlay saying "lives there"
+    // (nothing could open it) while the files sit here (a second pull would be refused).
+    //
+    // The remote's copy is released only after the restore, so a failed restore leaves it
+    // intact. The one exception is the shared-paths rig, where that copy occupies the very
+    // path we restore onto and has to go first.
     let local = remote::local_name();
-    if remove_remote {
+    let release_first = shared && remove_remote;
+    if release_first {
         remote_op(
             &r,
             &v,
@@ -384,12 +390,31 @@ pub fn run_box_pull(
             Some(&local),
         )?;
     }
-    run_box_unpack(&id, true, false, false)?;
-    if !remove_remote {
-        remote_op(&r, &v, "mark", &id, &[], Some(&local))?;
-    }
+    let (m, settings) = restore_box(&id, false, false).map_err(|e| {
+        anyhow!(
+            "{e:#}\nthe conversation was not restored here; it is packed and frozen on {}",
+            r.name
+        )
+    })?;
     boxes::set_location(&id, None)?;
+    if !release_first {
+        if let Err(e) = remote_op(
+            &r,
+            &v,
+            "mark",
+            &id,
+            &[("remove_worktree", remove_remote)],
+            Some(&local),
+        ) {
+            eprintln!(
+                "warning: the conversation is restored here, but {} could not be told ({e:#}); \
+                 it still lists a frozen copy — discard that one there",
+                r.name
+            );
+        }
+    }
     println!("{id} is back on this machine");
+    thaw_box(&m, settings);
     Ok(())
 }
 
@@ -402,10 +427,33 @@ pub fn run_box_mark(id: &str, location: Option<&str>, remove_worktree: bool) -> 
         &m.id,
         location.map(String::from),
         remove_worktree.then_some(&m),
-    )
+    )?;
+    // The project's own checkout went with the box: this machine must stop offering to
+    // start work in it, the same as the machine that runs `push` records for itself.
+    if m.main_checkout {
+        crate::common::projects::set_lives_on(&m.project_key, location)?;
+    }
+    Ok(())
+}
+
+/// Whether `id` names a complete box here by its WHOLE id. Requests from another machine
+/// go through this: the CLI's unique-prefix convenience must not be reachable over HTTP.
+pub(crate) fn box_exists_exactly(id: &str) -> bool {
+    boxes::valid_id(id)
+        && boxes::boxes_dir()
+            .map(|d| d.join(id).join("manifest.json").is_file())
+            .unwrap_or(false)
 }
 
 fn ship_mark(id: &str, location: Option<String>, remove: Option<&boxes::Manifest>) -> Result<()> {
+    // Before anything is recorded: removing a working copy the box no longer describes
+    // would destroy work, and this is reachable from another machine (`/api/box/<id>/mark`).
+    if let Some(m) = remove {
+        if location.is_none() {
+            bail!("refusing to remove the working copy of a conversation that lives here");
+        }
+        boxes::check_unchanged_since_pack(m, &boxes::boxes_dir()?.join(&m.id))?;
+    }
     // A frozen entry here would offer a local thaw of something that now lives elsewhere.
     if location.is_some() {
         let _ = frozen::discard_frozen(id);
@@ -418,6 +466,20 @@ fn ship_mark(id: &str, location: Option<String>, remove: Option<&boxes::Manifest
 }
 
 pub fn run_box_unpack(target: &str, thaw: bool, force: bool, sandbox: bool) -> Result<()> {
+    let (m, settings) = restore_box(target, force, sandbox)?;
+    if thaw {
+        thaw_box(&m, settings);
+    }
+    Ok(())
+}
+
+/// Restore a box's files onto this machine without starting anything. Returns its manifest
+/// and, when sandboxed, the `srt` settings file the resumed conversation must run under.
+fn restore_box(
+    target: &str,
+    force: bool,
+    sandbox: bool,
+) -> Result<(boxes::Manifest, Option<String>)> {
     let dir = resolve_box(target)?;
     let m = boxes::read_manifest(&dir)?;
     let cfg = crate::common::config::HiveConfig::load();
@@ -448,17 +510,32 @@ pub fn run_box_unpack(target: &str, thaw: bool, force: bool, sandbox: bool) -> R
     } else {
         None
     };
-    if thaw {
+    Ok((m, settings))
+}
+
+/// Resume a restored box. Never an error: by now the files are here and this machine owns
+/// the conversation, so a window that would not start is something to report, not a reason
+/// to tell the caller the move failed (it would retry onto a tree that is no longer empty).
+/// The frozen entry is written first and survives a failed thaw, so the conversation — and
+/// its sandbox settings — can be resumed from the 💤 bucket.
+fn thaw_box(m: &boxes::Manifest, settings: Option<String>) {
+    let resumed = (|| -> Result<String> {
         let mut state = FrozenState::load();
-        let mut entry = boxes::frozen_entry_for(&m);
+        let mut entry = boxes::frozen_entry_for(m);
         entry.sandbox = settings;
         let key = entry.key();
         state.frozen.insert(key.clone(), entry);
         state.save()?;
-        let session = frozen::thaw_window(&key)?;
-        println!("resumed in session '{session}'");
+        frozen::thaw_window(&key)
+    })();
+    match resumed {
+        Ok(session) => println!("resumed in session '{session}'"),
+        Err(e) => eprintln!(
+            "warning: {} is restored here but could not be resumed ({e:#}); \
+             thaw it from the 💤 bucket",
+            m.id
+        ),
     }
-    Ok(())
 }
 
 pub fn run_box_list() -> Result<()> {

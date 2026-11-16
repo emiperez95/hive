@@ -6,6 +6,11 @@
 //! registered project, a box id/profile/slug is a plain name, and nothing local that exists
 //! only here is overwritten.
 //!
+//! `mark` with `remove_worktree` and `pack` are the two requests that take something away
+//! (a working copy; a running window). Both require the WHOLE id — never the CLI's unique
+//! prefix — and the removal is refused unless the request also says where the conversation
+//! went and this machine's copy is still what the box holds (`check_unchanged_since_pack`).
+//!
 //! Each request runs on its own thread: the web server's request loop is serial, and a
 //! transfer or an unpack (git, rsync, project hooks) would otherwise freeze the dashboard.
 
@@ -79,8 +84,12 @@ pub fn handle(mut request: Request) {
                         &id,
                         flag("force"),
                         !flag("without_ignored"),
+                        true,
                     )?;
                     Ok(serde_json::json!({ "ok": true, "id": cid }))
+                }
+                "unpack" | "mark" if !crate::cli::boxes::box_exists_exactly(&id) => {
+                    anyhow::bail!("no box with id '{id}' (the full id is required)")
                 }
                 "unpack" => {
                     crate::cli::boxes::run_box_unpack(

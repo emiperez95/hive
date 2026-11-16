@@ -6,9 +6,11 @@
 //! that is down, slow or unreachable simply contributes nothing and reads as `✗` in the
 //! title bar — it can never stall the 1 s tick.
 //!
-//! Only long-running loops (TUI, web data thread) federate. A one-shot command such as
-//! `hive box pack` uses the plain gather, which also means it can never pick a remote
-//! conversation by accident.
+//! The long-running loops (TUI, web data thread) federate through the pollers. Two one-shots
+//! federate once, synchronously, through [`merge_now`]: `hive cycle-free` (`Ctrl+g` visits
+//! remote windows) and the TUI's `--detail` / `--project-detail` start-up. Every other
+//! one-shot, `hive box pack` among them, uses the plain gather, so it can never pick a
+//! remote conversation by accident.
 //!
 //! The wire is the registry's own [`Conversation`] (serde), not the web views: the views are
 //! lossy projections (no parent, no placement) and the peer needs the same model to merge.

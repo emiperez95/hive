@@ -672,7 +672,6 @@ fn unskip_session(name: &str) {
     }
 }
 
-/// Build a freeze target from a live conversation (its window placement + id).
 /// Discard a frozen conversation: here, or on the remote that holds it.
 fn discard_conv(c: &Conversation) -> anyhow::Result<bool> {
     match &c.host {
@@ -688,6 +687,7 @@ fn discard_conv(c: &Conversation) -> anyhow::Result<bool> {
     }
 }
 
+/// Build a freeze target from a live conversation (its window placement + id).
 fn freeze_target_of(c: &Conversation) -> Option<FreezeTarget> {
     let p = c.placement.as_ref()?;
     Some(FreezeTarget {

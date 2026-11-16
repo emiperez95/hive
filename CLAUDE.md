@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 562 tests (530 unit + 32 CLI smoke)
+cargo test                # 641 tests (601 unit + 40 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 945 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 530 unit + 32 smoke.
+> `cargo test` prints 1074 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 601 unit + 40 smoke.
 
 ## The TUI (conversation-first)
 
@@ -493,7 +493,7 @@ src/
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
 └── tests/
-    └── cli_smoke.rs        32 integration tests: CLI arg parsing, read-only commands, todo roundtrip
+    └── cli_smoke.rs        40 integration tests: CLI arg parsing, read-only commands, todo roundtrip, box/federation round trips
 ```
 
 (The classic session-first TUI lived in `src/tui/` — removed in the cutover; see git history
@@ -1971,7 +1971,7 @@ Full design, evidence and **as-built deviations / unverified parts** are in
   conversation lives; `reopen_conversation` refuses it.
 - **Federation:** the web server exports `GET /api/registry` (local rows only); each configured
   `[[remotes]]` with an `api` gets a poller thread; `gather_conversations_stats` (the TUI and the
-  web data thread, not one-shots) merges the rows in with `Conversation.host = Some(name)`. A
+  web data thread; `cycle-free` and the detail start-up merge once via `merge_now`, other one-shots never) merges the rows in with `Conversation.host = Some(name)`. A
   remote row is `Live` but **not local**: every action that trusts a placement must go through
   `is_remote()` / `flag_session()`, or it will hit a same-named local session. Remote sessions
   are `"<session> @<host>"` everywhere a name is a key.
@@ -1986,6 +1986,22 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 - **The detail of a remote conversation is asked of that machine** (`gather_remote_resources`: CPU/mem from the federated row, the transcript tail from its `/api/messages`); nothing local is probed, the checkout left here being stale. `prefix + d` / `prefix + a` from an attach window resolve through the window's name (`current_window_conv`), after one `federation::merge_now`.
 - A main-checkout box whose branch was created on the other machine unpacks onto a clean checkout by creating that branch here (HEAD must be an ancestor of the box's tip); a same-named branch that exists but is not checked out is refused.
 - The sidebar appends every click and switch to `cache/sidebar-trace.log` (always on, 256KB cap): real Ghostty clicks cannot be reproduced from a test.
+- **What a request from another machine may do is narrower than the CLI.** `/api/box/*` takes
+  the WHOLE id only (no unique prefix); a received tar is refused if it holds a symbolic link
+  outside `tree/` (`boxes::validate_received` — unpack copies the transcript and memory with
+  calls that follow links); `mark --remove-worktree` is refused unless it names where the
+  conversation went and this machine's copy is still what the box holds
+  (`check_unchanged_since_pack`: HEAD unmoved, transcript not grown). In `remote_post` a body's
+  `host` field routes only `/api/thaw` and `/api/discard-frozen` (`host_field_routes`); on any
+  other path it is ignored, or it would forward `kill-session` past its refusal.
+- **Restored ≠ resumed.** Once a box's files are on a machine, that machine owns the
+  conversation: `pull` restores, clears `location`, tells the remote (releasing its copy only
+  now), and then thaws. A thaw that fails is a warning (`thaw_box`), the frozen entry stays for
+  the 💤 bucket; it is never an error that would have the caller retry onto a non-empty tree.
+- **The pack gate believes a status record only under a pid in the window's own process tree**
+  (`confirmed_status`, the `index_confirmed` rule), and a running window with no readable status
+  blocks the pack. The gather therefore sets `Conversation.pids` on every run, not only when
+  sampling resources.
 - Commands run over ssh get `remote::REMOTE_PATH` prefixed: a non-interactive macOS shell has no Homebrew or `~/.local/bin` on PATH.
 
 ## Tmux Integration
@@ -2001,13 +2017,13 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 
 ## Testing
 
-562 distinct tests. Run with `cargo test`.
+641 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 945 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 383 · bin 530 (the superset — adds cli/daemon/serve)
-> · smoke 32.
+> `cargo test` prints 1074 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 433 · bin 601 (the superset — adds cli/daemon/serve)
+> · smoke 40.
 
-**Unit tests (530)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (601)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs
@@ -2128,7 +2144,7 @@ Full design, evidence and **as-built deviations / unverified parts** are in
   blocked-vs-working split, closed convs contributing no status/resources, auth-profile
   defaulting, payload-free status labels)
 
-**Integration tests (32)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (40)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
@@ -2140,6 +2156,13 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 - `stage` / `freeze` / `close` help lists their flags; outside a conversation they point at `--id`; `stage` rejects an unknown stage before touching anything
 - `task set --help` lists `--append` / `--body`; `task set` with nothing to set fails, and `--body` excludes `--append`
 - `wt prune --dry-run` over an empty registry is a no-op (isolated `$HOME`)
+- Boxes and federation, each in isolated `$HOME`s with a private tmux server and a fake `claude`
+  (which writes its own `sessions/<pid>.json`, as the pack gate requires of a running window):
+  pack → unpack → thaw round trip, incl. the refusal to overwrite a longer local transcript and
+  `--force`; push/pull between two homes over a fake ssh; the same over HTTP (opt-in, path-checked);
+  a project that lives elsewhere refuses local work; project export/import; a remote's parked
+  conversation listed and thawed there; a sandboxed thaw confined to the box's path set;
+  `web --bind` loopback
 
 No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test
 infrastructure) — hence the pure `build_active`/`build_browse` functions take their tmux/flag

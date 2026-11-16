@@ -184,9 +184,10 @@ pub fn attach_command(
     parts.join(" ")
 }
 
-/// Find or create the local window attached to a remote conversation, in the session
-/// that owns the conversation's project here. Returns `(local session, window index)`
-/// for the caller to switch to; a second call finds the same window.
+/// Find or create the local window attached to a remote conversation. It always lives in
+/// the hidden `config::REMOTE_SESSION` (`__hive_remote`), named
+/// `"<session> @<host>:<index>"`. Returns `(that session, window index)` for the caller to
+/// switch to; a second call finds the same window.
 pub fn attach_remote(c: &crate::common::registry::Conversation) -> Result<(String, String)> {
     let host = c
         .host
@@ -203,12 +204,10 @@ pub fn attach_remote(c: &crate::common::registry::Conversation) -> Result<(Strin
 /// of a hung ssh connection. Only the window on THIS machine goes: the conversation and
 /// its tmux window on `host` are untouched. Returns whether there was one.
 pub fn close_attach_window(host: &str, remote_session: &str, window_index: &str) -> bool {
-    let name = attach_window_name(host, remote_session, window_index);
     let listed = format!("{remote_session} @{host}");
     let mut closed = false;
     for (idx, session, remote_idx) in attach_windows() {
         if session == listed && remote_idx == window_index {
-            debug_assert_eq!(attach_window_name(host, remote_session, &remote_idx), name);
             let target =
                 crate::common::tmux::exact_window(crate::common::config::REMOTE_SESSION, &idx);
             closed |= Command::new("tmux")
@@ -223,7 +222,7 @@ pub fn close_attach_window(host: &str, remote_session: &str, window_index: &str)
 
 /// [`attach_remote`] for a caller that holds only names (the sidebar, which sees the
 /// dashboard's rows and not the registry): open — or find — the local window attached to
-/// `remote_session:window_index` on `host`, inside `local_session`.
+/// `remote_session:window_index` on `host`, in the hidden `config::REMOTE_SESSION`.
 pub fn attach_window(
     host: &str,
     remote_session: &str,

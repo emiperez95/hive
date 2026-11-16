@@ -116,13 +116,23 @@ pub fn gate_blockers(status: Option<ClaudeSessionStatus>, background: Option<&st
 }
 
 /// Claude's own status for a LIVE conversation. The session files have no heartbeat, so a
-/// record only counts when its pid is alive (`kill(pid, 0)`), which also guards a recycled
-/// pid being believed.
-fn live_status(id: &str) -> Option<ClaudeSessionStatus> {
-    claude_sessions::load_all()
+/// record only counts when its pid is in the process tree the gather resolved for this
+/// conversation's window (`pids`) — the rule `claude_sessions::index_confirmed` applies. A
+/// live-pid check alone is not enough: a recycled pid is alive too, and the stale record a
+/// dead Claude left under it would be believed.
+fn live_status(id: &str, pids: &[u32]) -> Option<ClaudeSessionStatus> {
+    confirmed_status(claude_sessions::load_all(), id, pids)
+}
+
+fn confirmed_status(
+    sessions: Vec<claude_sessions::ClaudeSession>,
+    id: &str,
+    pids: &[u32],
+) -> Option<ClaudeSessionStatus> {
+    sessions
         .into_iter()
         .filter(|s| s.session_id.as_deref() == Some(id))
-        .filter(|s| unsafe { libc::kill(s.pid as i32, 0) } == 0)
+        .filter(|s| pids.contains(&s.pid))
         .find_map(|s| s.status)
 }
 
@@ -261,7 +271,19 @@ pub fn pack_worktree(root: &Path, dest: &Path, with_ignored: bool) -> Result<Pac
 
     fs::write(
         dest.join("staged.patch"),
-        git_raw(root, &["diff", "--cached", "--binary"])?,
+        // Porcelain `git diff` honours the user's `diff.external`, textconv drivers and
+        // `color.diff=always`; any of them turns this into something `git apply` rejects.
+        git_raw(
+            root,
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+            ],
+        )?,
     )?;
 
     let src = format!("{}/", root.display());
@@ -556,6 +578,9 @@ pub struct PackSource<'a> {
     pub note: &'a str,
     /// Live tmux placement (session, window index, window name) when running.
     pub placement: Option<(&'a str, &'a str, &'a str)>,
+    /// The process tree of its window, when running: what a status record's pid is
+    /// checked against.
+    pub pids: &'a [u32],
 }
 
 pub struct PackOptions {
@@ -578,9 +603,18 @@ pub fn plan_pack(src: &PackSource, opts: &PackOptions) -> Result<PackPlan> {
     let (profile, slug) = profile_and_slug(&transcript)?;
 
     let live = src.placement.is_some();
-    let status = if live { live_status(src.id) } else { None };
+    let status = if live {
+        live_status(src.id, src.pids)
+    } else {
+        None
+    };
     let background = crate::common::jsonl::background_running_summary(src.cwd, Some(src.id));
-    let blockers = gate_blockers(status, background.as_deref());
+    let mut blockers = gate_blockers(status, background.as_deref());
+    // A running window whose status we cannot read is not known to be idle. The gate must
+    // not read "no answer" as "safe": that is the direction that loses a turn.
+    if live && status.is_none() {
+        blockers.push("it is running and Claude's status for it could not be read".to_string());
+    }
     if !blockers.is_empty() && !opts.force {
         bail!(
             "not safe to pack {}:\n  - {}\nwait for it to go idle, or pass --force to pack anyway \
@@ -622,7 +656,7 @@ pub fn plan_pack(src: &PackSource, opts: &PackOptions) -> Result<PackPlan> {
         .map(|a| {
             a.iter()
                 .filter_map(|v| v.as_u64())
-                .map(|v| v as u16)
+                .filter_map(|v| u16::try_from(v).ok())
                 .collect()
         })
         .unwrap_or_default();
@@ -741,7 +775,8 @@ pub fn write_box(plan: &PackPlan) -> Result<PathBuf> {
     }
 }
 
-/// A box id becomes a directory name and a URL segment: hex digits and dashes only.
+/// A box id becomes a directory name and a URL segment: ASCII letters, digits and dashes
+/// only, at most 64 characters.
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
@@ -828,16 +863,81 @@ pub fn untar_box(input: &mut dyn std::io::Read, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Move a freshly extracted box into `~/.hive/boxes/<id>` once its manifest checks out
-/// (right id, supported version). A re-send replaces the earlier copy.
-pub fn install_received_box(scratch: &Path, id: &str) -> Result<PathBuf> {
+/// Check a box that arrived from another machine before it is trusted: the id it claims,
+/// a readable manifest, and no symbolic link anywhere outside `tree/`.
+///
+/// The link rule is what matters. Unpack copies `transcript.jsonl` and `memory/` into the
+/// Claude profile with calls that follow links, so a box whose transcript is a link to
+/// `~/.ssh/id_rsa` would copy that file to where the dashboard serves transcripts from.
+/// Inside `tree/` links are ordinary repository content and rsync restores them as links.
+pub fn validate_received(scratch: &Path, id: &str) -> Result<Manifest> {
     if !valid_id(id) {
         bail!("invalid box id");
     }
+    fn no_links(dir: &Path, top: bool) -> Result<()> {
+        for e in fs::read_dir(dir)? {
+            let e = e?;
+            let ft = e.file_type()?;
+            if ft.is_symlink() {
+                bail!(
+                    "box contains a symbolic link outside its tree ({}); refusing",
+                    e.file_name().to_string_lossy()
+                );
+            }
+            if ft.is_dir() && !(top && e.file_name() == "tree") {
+                no_links(&e.path(), false)?;
+            }
+        }
+        Ok(())
+    }
+    no_links(scratch, true)?;
     let m = read_manifest(scratch)?;
     if m.id != id {
         bail!("box says it is {} but was sent as {id}", m.id);
     }
+    Ok(m)
+}
+
+/// Whether this machine's copy of a packed conversation is still what the box holds: the
+/// checkout's HEAD has not moved and the transcript has not grown. Removing the working
+/// copy is only safe while that is true — a box stays in `~/.hive/boxes` after the
+/// conversation comes back, and by then the tree has work the box never saw.
+pub fn check_unchanged_since_pack(m: &Manifest, box_dir: &Path) -> Result<()> {
+    let root = Path::new(&m.root);
+    if is_own_checkout(root) {
+        let head = git(root, &["rev-parse", "HEAD"])?;
+        if head != m.head {
+            bail!(
+                "{} has moved since the box was packed (HEAD {head}, box {}); not removing it",
+                root.display(),
+                m.head
+            );
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let here = home
+            .join(&m.profile)
+            .join("projects")
+            .join(&m.slug)
+            .join(format!("{}.jsonl", m.id));
+        let have = fs::metadata(here).map(|md| md.len()).unwrap_or(0);
+        let boxed = fs::metadata(box_dir.join("transcript.jsonl"))
+            .map(|md| md.len())
+            .unwrap_or(0);
+        if have > boxed {
+            bail!(
+                "the conversation has turns the box does not ({have} > {boxed} bytes); \
+                 not removing its working copy"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Move a freshly extracted box into `~/.hive/boxes/<id>` once its manifest checks out
+/// (right id, supported version). A re-send replaces the earlier copy.
+pub fn install_received_box(scratch: &Path, id: &str) -> Result<PathBuf> {
+    validate_received(scratch, id)?;
     let dir = boxes_dir()?;
     fs::create_dir_all(&dir)?;
     let final_dir = dir.join(id);
@@ -1086,13 +1186,9 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
     if let Some(key) = &m.worktree_key {
         let mut state = WorktreeState::load();
         if !state.worktrees.contains_key(key) {
-            let branch = key
-                .strip_prefix(&format!("{}/", m.project_key))
-                .unwrap_or(&m.branch)
-                .to_string();
             state.add(WorktreeEntry {
                 project_key: m.project_key.clone(),
-                branch,
+                branch: registered_branch.clone(),
                 worktree_type: "worktree".to_string(),
                 path: m.root.clone(),
                 session_name: session_name.clone(),
@@ -1626,5 +1722,139 @@ mod tests {
         let names = raw_tar_names(&out);
         assert!(names.iter().any(|n| n.ends_with("a.txt")), "{names:?}");
         assert!(!names.iter().any(|n| n.contains("._")), "{names:?}");
+    }
+
+    fn session(pid: u32, id: &str, status: &str) -> claude_sessions::ClaudeSession {
+        serde_json::from_value(serde_json::json!({
+            "pid": pid, "sessionId": id, "status": status
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_status_record_under_a_pid_outside_the_windows_tree_is_not_believed() {
+        // pid 999 is alive (recycled) and carries a dead Claude's stale "idle" for this id.
+        let stale = vec![session(999, "c1", "idle")];
+        assert_eq!(confirmed_status(stale, "c1", &[100, 101]), None);
+        let real = vec![session(999, "c1", "idle"), session(101, "c1", "busy")];
+        assert_eq!(
+            confirmed_status(real, "c1", &[100, 101]),
+            Some(ClaudeSessionStatus::Busy)
+        );
+        // Another conversation's record in the same tree is not ours either.
+        assert_eq!(
+            confirmed_status(vec![session(101, "other", "idle")], "c1", &[101]),
+            None
+        );
+    }
+
+    fn received_box(tag: &str, id: &str) -> (PathBuf, PathBuf) {
+        let tmp = tempdir(tag);
+        let scratch = tmp.join("incoming");
+        fs::create_dir_all(scratch.join("tree")).unwrap();
+        fs::create_dir_all(scratch.join("memory")).unwrap();
+        let p = PackedTree {
+            branch: "feat".into(),
+            head: "0".repeat(40),
+            base: None,
+            main_checkout: false,
+            has_bundle: false,
+        };
+        let m = manifest_for(&tmp.join("wt"), &p, id);
+        fs::write(
+            scratch.join("manifest.json"),
+            serde_json::to_string(&m).unwrap(),
+        )
+        .unwrap();
+        fs::write(scratch.join("transcript.jsonl"), "{}\n").unwrap();
+        (tmp, scratch)
+    }
+
+    #[test]
+    fn a_received_box_is_checked_for_its_id_and_for_links_outside_the_tree() {
+        use std::os::unix::fs::symlink;
+        let (tmp, scratch) = received_box("recv-ok", "abc-1");
+        // A link inside the tree is repository content.
+        symlink("a.txt", scratch.join("tree/link")).unwrap();
+        assert_eq!(validate_received(&scratch, "abc-1").unwrap().id, "abc-1");
+        // Sent under another id.
+        assert!(validate_received(&scratch, "abc-2").is_err());
+        assert!(validate_received(&scratch, "../abc-1").is_err());
+
+        // The transcript as a link to a file of ours: unpack would copy the target.
+        let secret = tmp.join("secret");
+        fs::write(&secret, "key").unwrap();
+        fs::remove_file(scratch.join("transcript.jsonl")).unwrap();
+        symlink(&secret, scratch.join("transcript.jsonl")).unwrap();
+        let e = validate_received(&scratch, "abc-1")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("symbolic link"), "{e}");
+
+        // Same through memory/, and with `tree` itself replaced by a link.
+        let (tmp2, scratch2) = received_box("recv-mem", "abc-1");
+        symlink(&secret, scratch2.join("memory/MEMORY.md")).unwrap();
+        assert!(validate_received(&scratch2, "abc-1").is_err());
+        let (tmp3, scratch3) = received_box("recv-tree", "abc-1");
+        fs::remove_dir_all(scratch3.join("tree")).unwrap();
+        symlink(&tmp, scratch3.join("tree")).unwrap();
+        assert!(validate_received(&scratch3, "abc-1").is_err());
+        for t in [tmp, tmp2, tmp3] {
+            let _ = fs::remove_dir_all(t);
+        }
+    }
+
+    /// One ustar entry (header + data, padded) for a regular file.
+    fn tar_entry(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        h[100..108].copy_from_slice(b"0000644\0");
+        h[108..116].copy_from_slice(b"0000000\0");
+        h[116..124].copy_from_slice(b"0000000\0");
+        h[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+        h[136..148].copy_from_slice(b"00000000000\0");
+        h[148..156].copy_from_slice(b"        ");
+        h[156] = b'0';
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        let sum: u32 = h.iter().map(|b| *b as u32).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let mut out = h.to_vec();
+        out.extend_from_slice(data);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out
+    }
+
+    #[test]
+    fn a_tar_entry_that_climbs_out_of_the_scratch_dir_writes_nothing_outside_it() {
+        let tmp = tempdir("tar-escape");
+        let dest = tmp.join("a/b/scratch");
+        let mut tar = tar_entry("ok.txt", b"fine");
+        tar.extend(tar_entry("../escape.txt", b"out"));
+        tar.extend(tar_entry("../../escape2.txt", b"out"));
+        tar.extend(vec![0u8; 1024]);
+        // tar may refuse the archive or skip the entries; either way nothing lands outside.
+        let _ = untar_box(&mut tar.as_slice(), &dest);
+        assert!(!tmp.join("a/b/escape.txt").exists());
+        assert!(!tmp.join("a/escape2.txt").exists());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_working_copy_that_moved_since_the_pack_is_not_the_boxs_to_remove() {
+        let tmp = tempdir("unchanged");
+        let (_origin, main) = init_repo(&tmp);
+        let dest = tmp.join("box");
+        let p = pack_worktree(&main, &dest, true).unwrap();
+        let m = manifest_for(&main, &p, "abc-1");
+        fs::write(dest.join("transcript.jsonl"), "{}\n").unwrap();
+        check_unchanged_since_pack(&m, &dest).unwrap();
+        fs::write(main.join("a.txt"), "later\n").unwrap();
+        sh(&main, &["commit", "-qam", "work after the box came back"]);
+        let e = check_unchanged_since_pack(&m, &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("has moved since the box was packed"), "{e}");
+        let _ = fs::remove_dir_all(tmp);
     }
 }

@@ -267,7 +267,8 @@ send` is the transfer half of `push`, for retrying without re-freezing.
 `/api/conversations` — those are lossy projections (no parent, no placement) and the peer needs
 the model to merge. One poller thread per remote with an `api` (300 ms connect, 800 ms read,
 1 s cadence); the gather only reads the cache, so a down remote contributes nothing and shows
-`@mini ✗`. Only the long-running loops federate (`gather_conversations_stats`); one-shots such as
+`@mini ✗`. The long-running loops federate through the pollers (`gather_conversations_stats`);
+`cycle-free` and the detail start-up federate once through `merge_now`; other one-shots such as
 `box pack` use the plain gather and so can never pick a remote row.
 - A remote conversation is `Live` with `Conversation.host = Some(name)`. Every local action that
   takes a placement at face value is guarded: `Conversation::is_remote()` / `flag_session()`.
@@ -337,8 +338,7 @@ ranked in the merged attention order, `tmux` found only with the PATH prefix, an
 - Packing a *running* window (gate against live status, then freeze) is covered by unit tests
   of the gate and by the code path, but no test can produce a detectable live Claude (detection
   keys off the real binary's version-string process name).
-- `Ctrl+g` (`cycle-free`) does not visit remote windows; the sidebar/web attention order is
-  merged. Pings on remote rows clear when the conversation goes busy, not when you land on its
+- Pings on remote rows clear when the conversation goes busy, not when you land on its
   ssh window. Remote todos are web-proxied only; the TUI detail disables them for remote rows.
   `todo-dispatch`, `conv-notes` and `conv-stats` are not proxied.
 - `srt` network defaults are Anthropic-only; a sandboxed session that needs git/npm needs

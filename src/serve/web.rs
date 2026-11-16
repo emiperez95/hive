@@ -216,7 +216,7 @@ pub fn run_web_server(
     let host = bind
         .or_else(|| crate::common::config::HiveConfig::load().web.bind)
         .unwrap_or_else(|| "0.0.0.0".to_string());
-    let lan = host == "0.0.0.0";
+    let lan = bind_is_exposed(&host);
     let bind_addr = format!("{host}:{port}");
     let server = Server::http(&bind_addr)
         .map_err(|e| anyhow::anyhow!("Failed to bind {}: {}", bind_addr, e))?;
@@ -1777,8 +1777,6 @@ pub fn run_web_server(
     Ok(())
 }
 
-/// Percent-decoding for URL query parameters (handles multi-byte UTF-8).
-/// Extract and URL-decode a query-string parameter from a request URL.
 /// Read the request body once. The federation pre-dispatch may already have consumed it
 /// (to look for a remote session), in which case the local handler gets that copy.
 fn read_body(request: &mut tiny_http::Request, prebody: &mut Option<String>) -> String {
@@ -1803,6 +1801,22 @@ const REMOTE_POST_PATHS: &[&str] = &[
 
 /// GET endpoints keyed by `?session=`.
 const REMOTE_GET_PATHS: &[&str] = &["/api/messages", "/api/session-info", "/api/todos"];
+
+/// Whether a request's own `host` field may choose where it is forwarded. True only for
+/// the endpoints keyed by conversation id, which have no session name to resolve a host from.
+fn host_field_routes(path: &str) -> bool {
+    matches!(path, "/api/thaw" | "/api/discard-frozen")
+}
+
+/// Whether a bind address is reachable from other machines. Anything that is not a
+/// loopback address counts: `0.0.0.0`, `::`, a LAN address, or a name we cannot parse.
+fn bind_is_exposed(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => bare != "localhost",
+    }
+}
 
 /// `(host, remote's own session name)` when `session` is a federated remote's view name.
 fn remote_of(shared_active: &Mutex<Vec<SessionView>>, session: &str) -> Option<(String, String)> {
@@ -1842,8 +1856,15 @@ fn remote_post(
 ) -> Option<(u16, String)> {
     let mut req: serde_json::Value = serde_json::from_str(body).ok()?;
     let err = |m: String| (400, serde_json::json!({ "error": m }).to_string());
-    // Thaw / discard are keyed by conversation id and name their host explicitly.
-    if let Some(host) = req.get("host").and_then(|h| h.as_str()).map(String::from) {
+    // Thaw / discard are keyed by conversation id and name their host explicitly. Only
+    // those two: a `host` on any other path would forward it past the per-path rules below
+    // (kill-session is refused for a remote session; a `host` field must not un-refuse it).
+    let named_host = req
+        .get("host")
+        .and_then(|h| h.as_str())
+        .map(String::from)
+        .filter(|_| host_field_routes(path));
+    if let Some(host) = named_host {
         // The remote must see its own request, not one that names a host to forward to.
         if let Some(o) = req.as_object_mut() {
             o.remove("host");
@@ -1900,6 +1921,7 @@ fn remote_post(
     }
 }
 
+/// Extract and URL-decode a query-string parameter from a request URL.
 fn query_param(url: &str, key: &str) -> Option<String> {
     url.split('?').nth(1).and_then(|qs| {
         qs.split('&').find_map(|param| {
@@ -1913,6 +1935,7 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Percent-decoding for URL query parameters (handles multi-byte UTF-8).
 fn urldecode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.bytes();
@@ -2019,5 +2042,35 @@ mod tests {
         f.bump();
         assert_eq!(waiter.join().unwrap(), 1);
         assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_host_field_only_routes_the_endpoints_keyed_by_conversation_id() {
+        assert!(host_field_routes("/api/thaw"));
+        assert!(host_field_routes("/api/discard-frozen"));
+        for p in REMOTE_POST_PATHS {
+            let by_id = matches!(*p, "/api/thaw" | "/api/discard-frozen");
+            assert_eq!(host_field_routes(p), by_id, "{p}");
+        }
+    }
+
+    #[test]
+    fn kill_session_naming_a_host_is_not_forwarded() {
+        // No such session in the views, so it is not a remote one: the request must fall
+        // through to the local handler (None), never be proxied to the host it names.
+        let views = Mutex::new(Vec::new());
+        let body = r#"{"session":"anything","host":"mini"}"#;
+        assert!(remote_post(&views, "/api/kill-session", body).is_none());
+        assert!(remote_post(&views, "/api/send", body).is_none());
+    }
+
+    #[test]
+    fn only_a_loopback_bind_is_off_the_network() {
+        for h in ["127.0.0.1", "::1", "[::1]", "localhost"] {
+            assert!(!bind_is_exposed(h), "{h}");
+        }
+        for h in ["0.0.0.0", "::", "[::]", "10.0.0.5", "mini.local", "0"] {
+            assert!(bind_is_exposed(h), "{h}");
+        }
     }
 }

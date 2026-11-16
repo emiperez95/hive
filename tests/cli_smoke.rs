@@ -811,6 +811,26 @@ fn box_pack_unpack_thaw_roundtrip() {
     let again = run(&["box", "unpack", id]);
     assert!(!again.status.success());
 
+    // Turns that exist only here are never overwritten: with the worktree gone (so that
+    // guard cannot be the one refusing) and a transcript longer than the box's, unpack
+    // refuses, touches nothing, and `--force` is what replaces it.
+    git_in(
+        &proj,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    let mut longer = transcript_bytes.clone();
+    longer.extend_from_slice(b"{\"type\":\"user\",\"message\":\"a turn the box never saw\"}\n");
+    std::fs::write(&transcript, &longer).unwrap();
+    let refused = run(&["box", "unpack", id]);
+    assert!(!refused.status.success());
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(why.contains("longer transcript"), "{why}");
+    assert_eq!(std::fs::read(&transcript).unwrap(), longer);
+    assert!(!wt.exists(), "nothing restored by a refused unpack");
+    ok(&["box", "unpack", id, "--force"]);
+    assert_eq!(std::fs::read(&transcript).unwrap(), transcript_bytes);
+    assert!(wt.join("a.txt").exists() || wt.join(".git").exists());
+
     // Tear down only the private tmux server (TMUX_TMPDIR is ours).
     Command::new("tmux")
         .arg("kill-server")
@@ -843,7 +863,12 @@ fn box_push_pull_between_two_homes() {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\necho \"$HOME $@\" > '{}'\nsleep 30\n",
+            // Like a real Claude it writes its own status record, which the pack gate
+            // requires of a running window (`$2` is the id after `--resume`).
+            "#!/bin/sh\necho \"$HOME $@\" > '{}'\n\
+             mkdir -p \"$HOME/.claude/sessions\"\n\
+             printf '{{\"pid\":%s,\"sessionId\":\"%s\",\"status\":\"idle\"}}' $$ \"$2\" \
+             > \"$HOME/.claude/sessions/$$.json\"\nsleep 30\n",
             argv_log.display()
         ),
     )
@@ -1212,7 +1237,12 @@ fn federation_lists_a_remote_parked_conversation_and_thaws_it_there() {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\necho \"$HOME $@\" > '{}'\nsleep 30\n",
+            // Like a real Claude it writes its own status record, which the pack gate
+            // requires of a running window (`$2` is the id after `--resume`).
+            "#!/bin/sh\necho \"$HOME $@\" > '{}'\n\
+             mkdir -p \"$HOME/.claude/sessions\"\n\
+             printf '{{\"pid\":%s,\"sessionId\":\"%s\",\"status\":\"idle\"}}' $$ \"$2\" \
+             > \"$HOME/.claude/sessions/$$.json\"\nsleep 30\n",
             argv_log.display()
         ),
     )
@@ -1526,7 +1556,12 @@ fn box_transfer_over_http_is_opt_in_and_path_checked() {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\necho \"$HOME $@\" > '{}'\nsleep 30\n",
+            // Like a real Claude it writes its own status record, which the pack gate
+            // requires of a running window (`$2` is the id after `--resume`).
+            "#!/bin/sh\necho \"$HOME $@\" > '{}'\n\
+             mkdir -p \"$HOME/.claude/sessions\"\n\
+             printf '{{\"pid\":%s,\"sessionId\":\"%s\",\"status\":\"idle\"}}' $$ \"$2\" \
+             > \"$HOME/.claude/sessions/$$.json\"\nsleep 30\n",
             argv_log.display()
         ),
     )
