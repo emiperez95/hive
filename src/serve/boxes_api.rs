@@ -10,6 +10,8 @@
 //! (a working copy; a running window). Both require the WHOLE id — never the CLI's unique
 //! prefix — and the removal is refused unless the request also says where the conversation
 //! went and this machine's copy is still what the box holds (`check_unchanged_since_pack`).
+//! `unpack` never honours `force` from the network, so it cannot replace a transcript that
+//! has turns the box lacks.
 //!
 //! Each request runs on its own thread: the web server's request loop is serial, and a
 //! transfer or an unpack (git, rsync, project hooks) would otherwise freeze the dashboard.
@@ -92,13 +94,16 @@ pub fn handle(mut request: Request) {
                     anyhow::bail!("no box with id '{id}' (the full id is required)")
                 }
                 "unpack" => {
-                    crate::cli::boxes::run_box_unpack(
-                        &id,
-                        flag("thaw"),
-                        flag("force"),
-                        flag("sandbox"),
-                    )?;
-                    Ok(serde_json::json!({ "ok": true }))
+                    // No `force` from another machine: it is what lets an unpack replace a
+                    // transcript longer than the box's, i.e. turns that exist only here.
+                    let warning =
+                        crate::cli::boxes::unpack_box(&id, flag("thaw"), false, flag("sandbox"))?;
+                    Ok(match warning {
+                        Some(w) => {
+                            serde_json::json!({ "ok": true, "resumed": false, "warning": w })
+                        }
+                        None => serde_json::json!({ "ok": true }),
+                    })
                 }
                 "mark" => {
                     let loc = req.get("location").and_then(|v| v.as_str());
@@ -119,16 +124,7 @@ pub fn handle(mut request: Request) {
 
 /// PUT: extract into scratch, validate, install.
 fn receive(id: &str, request: &mut Request) -> anyhow::Result<serde_json::Value> {
-    let scratch = boxes::boxes_dir()?.join(format!("{id}.incoming-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    let r = (|| {
-        boxes::untar_box(request.as_reader(), &scratch)?;
-        boxes::install_received_box(&scratch, id)
-    })();
-    if r.is_err() {
-        let _ = std::fs::remove_dir_all(&scratch);
-    }
-    r?;
+    boxes::receive_box(request.as_reader(), id)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -136,7 +132,8 @@ fn receive(id: &str, request: &mut Request) -> anyhow::Result<serde_json::Value>
 fn tar_for_download(id: &str) -> anyhow::Result<std::fs::File> {
     let dir = boxes::boxes_dir()?.join(id);
     boxes::read_manifest(&dir)?;
-    let tmp = std::env::temp_dir().join(format!("hive-box-{id}-{}.tar", std::process::id()));
+    // Unique per request (see `scratch_path`): two downloads of one box must not share it.
+    let tmp = boxes::scratch_path(id, "outgoing")?.with_extension("tar");
     boxes::tar_box(&dir, &tmp)?;
     let f = std::fs::File::open(&tmp)?;
     let _ = std::fs::remove_file(&tmp); // the open handle keeps the data

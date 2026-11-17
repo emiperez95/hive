@@ -138,10 +138,11 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
     // The cost is the old property that a forward scan exhausted the current session
     // before leaving it. That was a consequence of tmux ordering, never the goal:
     // priority doesn't stop at a session boundary.
-    let mut windows: Vec<(String, String, bool, u32)> = Vec::new(); // (session, window, free, rank)
-                                                                    // A remote window has no local window to select; what stands in for it is the ssh
-                                                                    // window attached to it. Keyed by the (session, window) pair used above.
-    let mut remote: std::collections::HashMap<(String, String), String> = Default::default(); // → host
+    // (session, window, free, rank)
+    let mut windows: Vec<(String, String, bool, u32)> = Vec::new();
+    // A remote window has no local window to select; what stands in for it is the ssh
+    // window attached to it. Keyed by the (session, window) pair used above → its host.
+    let mut remote: std::collections::HashMap<(String, String), String> = Default::default();
     for sv in &session_data {
         let session_blocked = skipped.contains(&sv.name) || other_clients.contains(&sv.name);
         for w in &sv.windows {
@@ -157,7 +158,10 @@ pub fn run_cycle_free(pane: Option<&str>) -> Result<()> {
             if let Some(host) = &sv.host {
                 // `sv.name` is `"<session> @<host>"`: unique among local names.
                 remote.insert((sv.name.clone(), win.clone()), host.clone());
-                windows.push((sv.name.clone(), win, !busy, rank));
+                // Skipping works on a remote session too (the flag is kept here, under
+                // this same name); "another client is on it" has no meaning for one.
+                let skipped_here = skipped.contains(&sv.name);
+                windows.push((sv.name.clone(), win, !busy && !skipped_here, rank));
                 continue;
             }
             windows.push((s, win, !busy && !session_blocked, rank));

@@ -1753,6 +1753,36 @@ fn box_transfer_over_http_is_opt_in_and_path_checked() {
     }
     assert_eq!(resumed.trim(), format!("{} --resume {id}", hb.display()));
 
+    // What another machine may ask of B is narrower than B's own CLI. An id prefix — fine
+    // on the command line — is refused on all three actions, and a removal that does not
+    // say where the conversation went is refused even with the whole id. Nothing changes.
+    for action in ["pack", "unpack", "mark"] {
+        let r = http(
+            pb,
+            "POST",
+            &format!("/api/box/{}/{action}", &id[..8]),
+            r#"{"force":true,"remove_worktree":true,"location":"a"}"#,
+        );
+        assert!(r.contains("full id is required"), "{action}: {r}");
+    }
+    let r = http(
+        pb,
+        "POST",
+        &format!("/api/box/{id}/mark"),
+        r#"{"remove_worktree":true}"#,
+    );
+    assert!(r.contains("refusing to remove"), "{r}");
+    assert_eq!(
+        git_in(&wt, &["status", "--short"]),
+        status,
+        "B's tree is untouched by the refused requests"
+    );
+    assert!(hb
+        .join(".hive/boxes")
+        .join(id)
+        .join("manifest.json")
+        .is_file());
+
     // Pull it home over HTTP.
     std::fs::remove_file(&argv_log).unwrap();
     let out = a_ok(&["box", "pull", &id[..8], "--remove-remote"]);

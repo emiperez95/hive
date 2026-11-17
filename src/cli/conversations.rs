@@ -1141,9 +1141,9 @@ fn build_active(
                 .collect();
             g.windows = wins
                 .iter()
-                // `@host:…` windows are the ssh attach windows of remote conversations —
-                // those conversations already have a row, a second one would double it.
-                .filter(|(idx, name)| !covered.contains(idx) && !name.starts_with('@'))
+                // (The ssh attach windows of remote conversations are not here to filter:
+                // they live in the hidden `__hive_remote` session.)
+                .filter(|(idx, _)| !covered.contains(idx))
                 .map(|(index, name)| WinRow {
                     index: index.clone(),
                     name: name.clone(),
@@ -2099,10 +2099,15 @@ fn gather_remote_resources(conv: &Conversation, host: &str) -> ConvResources {
         .placement
         .as_ref()
         .and_then(|p| {
-            let path = format!(
+            // Name the window too: a session can host several conversations, and without
+            // it the remote answers with its first window's transcript.
+            let mut path = format!(
                 "/api/messages?session={}",
                 crate::common::federation::enc(&p.session_name)
             );
+            if let Some(pane) = &p.pane_id {
+                path.push_str(&format!("&window={}", crate::common::federation::enc(pane)));
+            }
             crate::common::federation::proxy_get(host, &path).ok()
         })
         .map(|body| remote_preview(&body))
@@ -6952,15 +6957,12 @@ mod tests {
             c
         };
         let reg = registry_of(vec![mk("here", None), mk("there", Some("mini"))]);
-        // The local session has windows 1 (the conversation) and 2 (a server), plus the
-        // ssh plumbing window for the remote conversation.
+        // The local session has windows 1 (the conversation) and 2 (a server). The ssh
+        // window for the remote conversation is in `__hive_remote`, not here.
         let (groups, _) = build_active(
             &reg,
             &HashSet::new(),
-            &win_map(&[(
-                "📊 Avateen",
-                &[("1", "w"), ("2", "server"), ("3", "@mini:w")],
-            )]),
+            &win_map(&[("📊 Avateen", &[("1", "w"), ("2", "server")])]),
         );
         let keys: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
         assert!(
@@ -6968,7 +6970,7 @@ mod tests {
             "{keys:?}"
         );
         let local = groups.iter().find(|g| g.key == "📊 Avateen").unwrap();
-        // The remote's window index 1 did not hide anything, and the ssh window isn't a row.
+        // The remote's window index 1 did not hide the local server window.
         let names: Vec<&str> = local.windows.iter().map(|w| w.name.as_str()).collect();
         assert_eq!(names, vec!["server"], "{names:?}");
     }
@@ -7736,7 +7738,6 @@ mod tests {
         );
     }
 
-    /// `mk` + the freeze overlay, for the frozen-section tests.
     #[test]
     fn a_local_conversation_can_move_to_each_remote_and_a_held_one_only_comes_back() {
         let remotes = vec!["mini".to_string(), "pc".to_string()];
@@ -7848,6 +7849,7 @@ mod tests {
         assert!(remote_preview("not json").is_empty());
     }
 
+    /// `mk` + the freeze overlay, for the frozen-section tests.
     fn mk_frozen(id: &str, parent: Option<&str>, last: Option<&str>) -> Conversation {
         let mut c = mk(id, Lifecycle::Closed, parent, last);
         c.frozen = Some(crate::common::registry::FrozenInfo {

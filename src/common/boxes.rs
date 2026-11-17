@@ -216,9 +216,21 @@ fn ignored_excludes(root: &Path) -> Result<String> {
 /// Commits on `branch` that exist on no remote.
 fn unpushed_count(root: &Path, branch: &str) -> Result<usize> {
     Ok(
-        git(root, &["rev-list", "--count", branch, "--not", "--remotes"])?
-            .parse()
-            .unwrap_or(0),
+        // The full ref: a branch named like a top-level path (`docs`, `src`) is otherwise
+        // "ambiguous argument: both revision and filename", and the pack fails after the
+        // window was already frozen.
+        git(
+            root,
+            &[
+                "rev-list",
+                "--count",
+                &format!("refs/heads/{branch}"),
+                "--not",
+                "--remotes",
+            ],
+        )?
+        .parse()
+        .unwrap_or(0),
     )
 }
 
@@ -835,9 +847,41 @@ pub fn tar_box(dir: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract a tar stream into `dest` (created; must be empty or new). The stream may come
-/// from another machine, so extraction is into a scratch directory the caller validates
-/// before moving it into place — never straight into `~/.hive/boxes`.
+/// A scratch path next to the boxes for something arriving or leaving: unique per request,
+/// not per process — the web server handles box requests on concurrent threads, and a
+/// client that retries after a timeout would otherwise share (and delete) the first
+/// request's directory.
+pub fn scratch_path(id: &str, tag: &str) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    Ok(boxes_dir()?.join(format!(
+        "{id}.{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )))
+}
+
+/// Receive a box sent by another machine: extract `input` into a scratch directory,
+/// validate it there ([`validate_received`]) and only then move it to `~/.hive/boxes/<id>`.
+/// Both directions of the HTTP transport come through here — a `PUT` to this machine and
+/// the answer to this machine's own `pull` — so neither can skip the checks, and a
+/// transfer that fails halfway leaves the box that was already here untouched.
+pub fn receive_box(input: &mut dyn std::io::Read, id: &str) -> Result<PathBuf> {
+    if !valid_id(id) {
+        bail!("invalid box id");
+    }
+    fs::create_dir_all(boxes_dir()?)?;
+    let scratch = scratch_path(id, "incoming")?;
+    let _ = fs::remove_dir_all(&scratch);
+    let r = untar_box(input, &scratch).and_then(|_| install_received_box(&scratch, id));
+    if r.is_err() {
+        let _ = fs::remove_dir_all(&scratch);
+    }
+    r
+}
+
+/// Extract a tar stream into `dest` (created; must be empty or new). Low level: nothing is
+/// validated here. A stream from another machine goes through [`receive_box`] instead.
 pub fn untar_box(input: &mut dyn std::io::Read, dest: &Path) -> Result<()> {
     use std::process::Stdio;
     fs::create_dir_all(dest)?;
@@ -898,8 +942,46 @@ pub fn validate_received(scratch: &Path, id: &str) -> Result<Manifest> {
     Ok(m)
 }
 
+/// Files under `root` that differ from the box's `tree/` (changed, added or deleted since
+/// the pack), by rsync's own size + mtime comparison — the pack copied with `-a`, so an
+/// untouched file matches. Ignored files are left out when the box was packed without them.
+fn tree_differences(root: &Path, tree: &Path, with_ignored: bool) -> Result<Vec<String>> {
+    let mut cmd = Command::new("rsync");
+    cmd.args(["-a", "-n", "-i", "--delete", "--exclude", "/.git"]);
+    let excl = std::env::temp_dir().join(format!(
+        "hive-excl-{}-{}",
+        std::process::id(),
+        tree.to_string_lossy().len()
+    ));
+    if !with_ignored {
+        fs::write(&excl, ignored_excludes(root)?)?;
+        cmd.arg("--exclude-from").arg(&excl);
+    }
+    let out = cmd
+        .arg(format!("{}/", root.display()))
+        .arg(format!("{}/", tree.display()))
+        .output()
+        .context("failed to run rsync");
+    let _ = fs::remove_file(&excl);
+    let out = out?;
+    if !out.status.success() {
+        bail!(
+            "rsync failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // An itemized line starting with `.` is an attribute-only difference (a directory's
+    // mtime, say); anything else is content that would be transferred or deleted.
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('.'))
+        .map(|l| l.split_once(' ').map_or(l, |(_, n)| n).to_string())
+        .collect())
+}
+
 /// Whether this machine's copy of a packed conversation is still what the box holds: the
-/// checkout's HEAD has not moved and the transcript has not grown. Removing the working
+/// checkout's HEAD has not moved, a linked worktree's files are the ones in the box, and
+/// the transcript has not grown. Removing the working
 /// copy is only safe while that is true — a box stays in `~/.hive/boxes` after the
 /// conversation comes back, and by then the tree has work the box never saw.
 pub fn check_unchanged_since_pack(m: &Manifest, box_dir: &Path) -> Result<()> {
@@ -911,6 +993,20 @@ pub fn check_unchanged_since_pack(m: &Manifest, box_dir: &Path) -> Result<()> {
                 "{} has moved since the box was packed (HEAD {head}, box {}); not removing it",
                 root.display(),
                 m.head
+            );
+        }
+    }
+    // A linked worktree is removed with `--force`, which discards uncommitted and
+    // untracked files: they must all be in the box. (A main checkout is stashed instead,
+    // so nothing there is lost.)
+    if !m.main_checkout && root.is_dir() {
+        let changed = tree_differences(root, &box_dir.join("tree"), m.with_ignored)?;
+        if let Some(first) = changed.first() {
+            bail!(
+                "{} has {} file(s) the box does not hold as they are now (e.g. {first}); \
+                 not removing it",
+                root.display(),
+                changed.len()
             );
         }
     }
@@ -1205,7 +1301,9 @@ pub fn unpack(src: &Path, opts: &UnpackOptions) -> Result<String> {
 
     if let Ok(raw) = fs::read_to_string(src.join("todos.json")) {
         if let Ok(t) = serde_json::from_str::<BoxTodos>(&raw) {
-            merge_todos(&m.session_name, t);
+            // Under the session the worktree was registered as here: a `post-copy` hook may
+            // have renamed it, and todos filed under the source machine's name are orphans.
+            merge_todos(&session_name, t);
         }
     }
 
@@ -1849,7 +1947,20 @@ mod tests {
         let m = manifest_for(&main, &p, "abc-1");
         fs::write(dest.join("transcript.jsonl"), "{}\n").unwrap();
         check_unchanged_since_pack(&m, &dest).unwrap();
+        assert_eq!(
+            tree_differences(&main, &dest.join("tree"), true).unwrap(),
+            Vec::<String>::new()
+        );
         fs::write(main.join("a.txt"), "later\n").unwrap();
+        // An uncommitted edit (just made) and a new file: HEAD is where the box left it,
+        // and both would be discarded by `worktree remove --force`.
+        let diff = tree_differences(&main, &dest.join("tree"), true).unwrap();
+        assert_eq!(diff, vec!["a.txt".to_string()]);
+        fs::write(main.join("new.txt"), "made after the pack\n").unwrap();
+        let mut diff = tree_differences(&main, &dest.join("tree"), true).unwrap();
+        diff.sort();
+        assert_eq!(diff, vec!["a.txt".to_string(), "new.txt".to_string()]);
+        fs::remove_file(main.join("new.txt")).unwrap();
         sh(&main, &["commit", "-qam", "work after the box came back"]);
         let e = check_unchanged_since_pack(&m, &dest)
             .unwrap_err()

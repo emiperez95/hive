@@ -192,13 +192,16 @@ fn fetch_box(
         Via::Http(api) => {
             let tmp =
                 std::env::temp_dir().join(format!("hive-fetch-{id}-{}.tar", std::process::id()));
+            // Through the same scratch → validate → install path as a box PUT to us: what
+            // comes back from another machine is no more trusted than what it sends.
             let res = crate::common::federation::get_to_file(api, &format!("/api/box/{id}"), &tmp)
-                .and_then(|_| {
-                    let _ = std::fs::remove_dir_all(dir);
-                    boxes::untar_box(&mut std::fs::File::open(&tmp)?, dir)
-                });
+                .and_then(|_| boxes::receive_box(&mut std::fs::File::open(&tmp)?, id));
             let _ = std::fs::remove_file(&tmp);
-            res
+            let installed = res?;
+            if installed != dir {
+                bail!("box {id} was installed at {}", installed.display());
+            }
+            Ok(())
         }
     }
 }
@@ -234,14 +237,20 @@ fn remote_op(
             if let Some(l) = location {
                 body.insert("location".into(), l.into());
             }
-            crate::common::federation::http_request(
+            let answer = crate::common::federation::http_request(
                 api,
                 "POST",
                 &format!("/api/box/{id}/{op}"),
                 Some(&serde_json::Value::Object(body).to_string()),
             )
             .map_err(|e| anyhow!("{}: {e}", r.name))?;
-            Ok(String::new())
+            // The one thing a successful answer can still have to say (ssh carries the
+            // same line on stdout): the box is there but did not start.
+            Ok(serde_json::from_str::<serde_json::Value>(&answer)
+                .ok()
+                .and_then(|v| v.get("warning").and_then(|w| w.as_str()).map(String::from))
+                .map(|w| format!("warning: {w}\n"))
+                .unwrap_or_default())
         }
     }
 }
@@ -304,12 +313,20 @@ fn ship(
         None,
     )?;
     print!("{out}");
+    let not_running = out.lines().any(|l| l.starts_with("warning: "));
     ship_mark(id, Some(r.name.clone()), remove_local.then_some(m))?;
     // The project's own checkout went with it: the project lives there now.
     if m.main_checkout {
         crate::common::projects::set_lives_on(&m.project_key, Some(&r.name))?;
     }
-    println!("{id} now lives on {}", r.name);
+    if not_running {
+        println!(
+            "{id} now lives on {} but is NOT running there (see the warning above)",
+            r.name
+        );
+    } else {
+        println!("{id} now lives on {}", r.name);
+    }
     Ok(())
 }
 
@@ -418,8 +435,10 @@ pub fn run_box_pull(
     Ok(())
 }
 
-/// `hive box mark`: record that a conversation was shipped (or came back). Run locally by
-/// `push`, and over ssh by `pull` so each side stops offering what the other now owns.
+/// `hive box mark`: record that a conversation was shipped (or came back). This is the
+/// remote half of `pull` — run over ssh, or as `/api/box/<id>/mark` over HTTP — so the
+/// machine that gave the conversation up stops offering it. `push` records its own side
+/// through `ship_mark` directly.
 pub fn run_box_mark(id: &str, location: Option<&str>, remove_worktree: bool) -> Result<()> {
     let dir = resolve_box(id)?;
     let m = boxes::read_manifest(&dir)?;
@@ -466,11 +485,19 @@ fn ship_mark(id: &str, location: Option<String>, remove: Option<&boxes::Manifest
 }
 
 pub fn run_box_unpack(target: &str, thaw: bool, force: bool, sandbox: bool) -> Result<()> {
+    unpack_box(target, thaw, force, sandbox).map(|_| ())
+}
+
+/// [`run_box_unpack`], returning why the conversation is not running when it was restored
+/// but would not start — for a caller that has to pass that on (the HTTP endpoint).
+pub(crate) fn unpack_box(
+    target: &str,
+    thaw: bool,
+    force: bool,
+    sandbox: bool,
+) -> Result<Option<String>> {
     let (m, settings) = restore_box(target, force, sandbox)?;
-    if thaw {
-        thaw_box(&m, settings);
-    }
-    Ok(())
+    Ok(if thaw { thaw_box(&m, settings) } else { None })
 }
 
 /// Restore a box's files onto this machine without starting anything. Returns its manifest
@@ -518,7 +545,11 @@ fn restore_box(
 /// to tell the caller the move failed (it would retry onto a tree that is no longer empty).
 /// The frozen entry is written first and survives a failed thaw, so the conversation — and
 /// its sandbox settings — can be resumed from the 💤 bucket.
-fn thaw_box(m: &boxes::Manifest, settings: Option<String>) {
+///
+/// Returns the warning when it did not start. It is also printed on STDOUT, not stderr:
+/// over ssh the pushing machine reads only this command's stdout, and a push that ends
+/// "now lives on <remote>" with nothing running there must say so.
+fn thaw_box(m: &boxes::Manifest, settings: Option<String>) -> Option<String> {
     let resumed = (|| -> Result<String> {
         let mut state = FrozenState::load();
         let mut entry = boxes::frozen_entry_for(m);
@@ -529,12 +560,20 @@ fn thaw_box(m: &boxes::Manifest, settings: Option<String>) {
         frozen::thaw_window(&key)
     })();
     match resumed {
-        Ok(session) => println!("resumed in session '{session}'"),
-        Err(e) => eprintln!(
-            "warning: {} is restored here but could not be resumed ({e:#}); \
-             thaw it from the 💤 bucket",
-            m.id
-        ),
+        Ok(session) => {
+            println!("resumed in session '{session}'");
+            None
+        }
+        Err(e) => {
+            let w = format!(
+                "{} is restored on {} but could not be resumed ({e:#}); \
+                 thaw it from the 💤 bucket there",
+                m.id,
+                remote::local_name()
+            );
+            println!("warning: {w}");
+            Some(w)
+        }
     }
 }
 

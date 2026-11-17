@@ -1991,13 +1991,17 @@ Full design, evidence and **as-built deviations / unverified parts** are in
   outside `tree/` (`boxes::validate_received` — unpack copies the transcript and memory with
   calls that follow links); `mark --remove-worktree` is refused unless it names where the
   conversation went and this machine's copy is still what the box holds
-  (`check_unchanged_since_pack`: HEAD unmoved, transcript not grown). In `remote_post` a body's
+  (`check_unchanged_since_pack`: HEAD unmoved, a linked worktree's files identical to the box's
+  by an rsync dry run, transcript not grown). Both directions of the HTTP transport go through
+  `boxes::receive_box` (scratch → validate → install), `pull`'s download included, and `unpack`
+  never honours `force` from the network. In `remote_post` a body's
   `host` field routes only `/api/thaw` and `/api/discard-frozen` (`host_field_routes`); on any
   other path it is ignored, or it would forward `kill-session` past its refusal.
 - **Restored ≠ resumed.** Once a box's files are on a machine, that machine owns the
   conversation: `pull` restores, clears `location`, tells the remote (releasing its copy only
-  now), and then thaws. A thaw that fails is a warning (`thaw_box`), the frozen entry stays for
-  the 💤 bucket; it is never an error that would have the caller retry onto a non-empty tree.
+  now), and then thaws. A thaw that fails is a warning (`thaw_box`) — printed on stdout and returned in the
+  unpack reply, so `push` says "lives on <remote> but is NOT running there" — the frozen entry
+  stays for the 💤 bucket; it is never an error that would have the caller retry onto a non-empty tree.
 - **The pack gate believes a status record only under a pid in the window's own process tree**
   (`confirmed_status`, the `index_confirmed` rule), and a running window with no readable status
   blocks the pack. The gather therefore sets `Conversation.pids` on every run, not only when

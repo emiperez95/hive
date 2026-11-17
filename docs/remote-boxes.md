@@ -240,9 +240,12 @@ overrides the program, which is how the tests stand a second `$HOME` in for a se
   (overlay `location = <remote>`, local frozen entry discarded). `pull` is the reverse and
   marks the remote through `hive box mark` over ssh.
 - Nothing that exists only on a side is removed: the sender's linked worktree is kept unless
-  `push --remove-local` / `pull --remove-remote`. `pull --remove-remote` releases the remote
-  copy once the box is on *this* disk and before unpacking (the box is the backup; and it is
-  what lets two machines sharing paths in a test work).
+  `push --remove-local` / `pull --remove-remote`. `pull` restores here, clears `location`, and only then
+  tells the remote — which is when `--remove-remote` releases its copy — and resumes last; a
+  failed restore leaves the remote intact, a failed resume is a warning. `check_target` runs
+  before the remote packs and again before anything is released. The one exception is the
+  shared-paths test rig (`HIVE_BOX_SHARED_PATHS`), where the remote's copy occupies the very
+  path being restored onto and is released first.
 - `reopen_conversation` refuses a conversation whose overlay has a `location`: resuming a
   shipped conversation locally would fork its transcript.
 
@@ -274,9 +277,10 @@ the model to merge. One poller thread per remote with an `api` (300 ms connect, 
   takes a placement at face value is guarded: `Conversation::is_remote()` / `flag_session()`.
 - Remote sessions are named `"<session> @<host>"` in `SessionView`, build_active groups and
   every local flag set, so they cannot collide with a same-named local session.
-- `Enter` → `remote::attach_remote`: a window `@mini:<name>` in the conversation's parent
-  session (else a session `@mini`) running `ssh -t [-L p:localhost:p …] host tmux attach …`.
-  A second `Enter` finds it. The Active view hides these windows (the `@` prefix).
+- `Enter` → `remote::attach_remote`: a window named `"<session> @<host>:<index>"` in the
+  hidden `__hive_remote` session, running `ssh -t [-L p:localhost:p …] host tmux attach …`.
+  A second `Enter` finds it. (Originally these lived in the project's own session under an
+  `@mini:` name; see *One row, one machine* for why they moved.)
 - The recovery frame, `/metrics` and the attention git probe ignore remote rows.
 
 **Phase 4 — actions.** Web: a request naming a remote session (`/api/send`, `freeze`, `todos`,

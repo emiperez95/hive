@@ -311,7 +311,7 @@ pub(crate) fn gather_active_views(reg: &ConversationRegistry, sys: &System) -> V
         });
     }
 
-    results.extend(remote_session_views(&remote_convs));
+    results.extend(remote_session_views(&remote_convs, &skipped_sessions));
     results
 }
 
@@ -330,7 +330,10 @@ pub(crate) fn local_registry_json(reg: &ConversationRegistry) -> String {
 /// collide with a local session of the same name (every lookup in the API is by name).
 /// There is no local tmux session behind these, hence no processes, todos, attach flag or
 /// skip state — those belong to the machine that runs them.
-fn remote_session_views(convs: &[&Conversation]) -> Vec<SessionView> {
+fn remote_session_views(
+    convs: &[&Conversation],
+    skipped: &std::collections::HashSet<String>,
+) -> Vec<SessionView> {
     let mut by_session: std::collections::BTreeMap<(String, String), Vec<&Conversation>> =
         Default::default();
     for c in convs {
@@ -350,8 +353,12 @@ fn remote_session_views(convs: &[&Conversation]) -> Vec<SessionView> {
             let mut ports: Vec<u16> = windows.iter().flat_map(|w| w.ports.clone()).collect();
             ports.sort_unstable();
             ports.dedup();
+            let name = format!("{session} @{host}");
             SessionView {
-                name: format!("{session} @{host}"),
+                // Skip is a local preference kept under the listed name, so it applies to
+                // a remote session like any other: unranked, never a `Ctrl+g` target.
+                skipped: skipped.contains(&name),
+                name,
                 status: aggregate_status(&windows),
                 cpu: windows.iter().map(|w| w.cpu).sum(),
                 mem_kb: windows.iter().map(|w| w.mem_kb).sum(),
@@ -362,7 +369,6 @@ fn remote_session_views(convs: &[&Conversation]) -> Vec<SessionView> {
                 attached: false,
                 pane: windows.first().and_then(|w| w.pane.clone()),
                 claude_continue_failed: false,
-                skipped: false,
                 todo_count: 0,
                 messages: Vec::new(),
                 host: Some(host),
@@ -1439,8 +1445,11 @@ mod tests {
     fn remote_sessions_are_named_with_their_host_and_keep_remote_coordinates() {
         let a = wire("a", "📊 Avateen", "2", "mini");
         let b = wire("b", "📊 Avateen", "1", "mini");
-        let views = remote_session_views(&[&a, &b]);
+        let views = remote_session_views(&[&a, &b], &Default::default());
         assert_eq!(views.len(), 1);
+        assert!(!views[0].skipped);
+        let skipped = std::collections::HashSet::from(["📊 Avateen @mini".to_string()]);
+        assert!(remote_session_views(&[&a, &b], &skipped)[0].skipped);
         let v = &views[0];
         assert_eq!(
             v.name, "📊 Avateen @mini",
@@ -1457,7 +1466,10 @@ mod tests {
     fn two_hosts_with_the_same_session_name_stay_apart() {
         let a = wire("a", "s", "1", "mini");
         let b = wire("b", "s", "1", "nuc");
-        assert_eq!(remote_session_views(&[&a, &b]).len(), 2);
+        assert_eq!(
+            remote_session_views(&[&a, &b], &Default::default()).len(),
+            2
+        );
     }
 
     #[test]
