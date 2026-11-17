@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 562 tests (530 unit + 32 CLI smoke)
+cargo test                # 650 tests (610 unit + 40 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 945 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 530 unit + 32 smoke.
+> `cargo test` prints 1089 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 610 unit + 40 smoke.
 
 ## The TUI (conversation-first)
 
@@ -94,6 +94,14 @@ hive task list|show|add|move|set|done|link [-p <project>]  # the project's task 
 hive task set <id> --append '…'|-           # add to a task's body (`-` = stdin); --body rewrites it, '' clears
 hive task schema|lint [-p <project>]        # the board's header rules / tasks that break them (read-only)
 hive task boards                            # which projects have a board
+hive box pack <conv> [--force] [--without-ignored]  # pack a conversation + its tree into ~/.hive/boxes/<id>
+hive box unpack <id|path> [--thaw] [--sandbox]      # restore a box here (runs project hooks, optionally resumes)
+hive box push <conv> <remote> / pull <conv>         # move it to / back from another machine (HTTP if the remote has an api, else ssh)
+hive box send <id> <remote>                         # transfer an already-packed box (push minus the pack)
+hive box list                                       # boxes here, and where each shipped conversation lives
+hive remote add <name> --ssh user@host [--api URL]  # register another machine running hive
+hive remote list
+hive project export [key] / import <file|->         # carry the project registry to another machine
 hive todo list [--session <name>] [--done]  # list active (or completed) todos
 hive todo list --all                        # every session's todos, grouped by project
 hive todo next [--session <name>]           # print first active todo (exit 1 if none)
@@ -106,6 +114,7 @@ hive web                                    # start web dashboard on port 8375
 hive web --dev                              # dev mode: serve HTML from disk (live reload)
 hive web --tts-host <url>                   # enable TTS read-aloud via TTSQwen service
 hive web --port <N>                         # custom port (default: 8375)
+hive web --bind 127.0.0.1                   # off the network (or `[web] bind`); reach it through an ssh forward
 ```
 
 ## Auth Profiles
@@ -434,6 +443,7 @@ src/
 │   ├── task.rs             run_task(): `hive task` — a project's task board (see Task boards)
 │   ├── todo.rs             run_todo*(), resolve_session()
 │   ├── session.rs          run_cycle/spread/collapse/connect/start()
+│   ├── boxes.rs            hive box pack/unpack/push/pull/mark/list + hive remote add/list
 │   ├── stats.rs            run_stats(): usage summary from the activity log
 │   └── update.rs           run_update(): self-update from GitHub
 ├── common/
@@ -443,6 +453,10 @@ src/
 │   ├── instances.rs        ★ per-WINDOW Claude detection (a session may host many); HookIndex pane→id resolve
 │   ├── fork.rs             split a conversation: ForkSource/ForkTarget, plan (pure), launch, forked_from
 │   ├── frozen.rs           freeze/thaw one Claude window (FrozenState/FrozenEntry, frozen.json)
+│   ├── boxes.rs            ★ conversation boxes: manifest, gate, git bundle + rsync pack/unpack (docs/remote-boxes.md)
+│   ├── federation.rs       other machines' conversations: pollers, /api/registry client, merge, proxy_post/get
+│   ├── remote.rs           ssh + rsync to a remote, attach_remote (the local ssh window + port tunnels)
+│   ├── sandbox.rs          srt settings derived from a box's path set (`[sandbox]`, `box unpack --sandbox`)
 │   ├── activity.rs         append-only activity log + open-windows snapshot; compute_stats()
 │   ├── machine.rs          machine sleep/wake intervals from `pmset -g log` (macOS), for accurate usage time
 │   ├── tmux.rs             tmux helpers (list-sessions/windows, switch, send-keys, kill, get_all_windows, layout)
@@ -479,7 +493,7 @@ src/
 │   ├── web.html            embedded mobile-first SPA (HTML/CSS/JS)
 │   └── web_types.rs        SessionView, ProcessView, ConversationMessage, ToolSummary (web JSON)
 └── tests/
-    └── cli_smoke.rs        32 integration tests: CLI arg parsing, read-only commands, todo roundtrip
+    └── cli_smoke.rs        40 integration tests: CLI arg parsing, read-only commands, todo roundtrip, box/federation round trips
 ```
 
 (The classic session-first TUI lived in `src/tui/` — removed in the cutover; see git history
@@ -550,7 +564,13 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 │   ├── skipped.txt            # skipped-from-cycling session names
 │   ├── restore.txt            # sessions to restore
 │   ├── muted-global           # global mute flag (empty file)
+│   ├── project-hosts.json     # projects whose own checkout was shipped: key → remote (gates `require_local`)
+│   ├── sandbox/<id>.json      # srt settings for a sandboxed conversation (read back by thaw and by pack)
+│   ├── sidebar-trace.log      # every sidebar click and switch (always on, 256KB cap)
 │   └── debug.log              # debug log (--debug)
+├── boxes/                     # packed conversations, one dir per conversation id (see Remote boxes)
+│   └── <uuid>/                #   manifest.json, commits.bundle, staged.patch, tree/, transcript.jsonl, memory/, …
+│                              #   (`<uuid>.tmp-*` / `.incoming-*` / `.outgoing-*` are in-flight scratch)
 └── projects/                  # per-project config
     └── {project_key}/
         ├── hooks/             # lifecycle hook scripts
@@ -1352,8 +1372,16 @@ into explicitly.
 | GET | `/api/board` | Board cards: live + skipped + frozen conversations, each with its hand-set `stage` |
 | POST | `/api/close-window` | Close a live conversation's tmux window by id (board menu; the window is looked up server-side) |
 | POST | `/api/stage` | Move a card: `{"id", "stage": "now"\|"waiting"\|"later"\|"done"\|null, "note"?}` — note kept only for waiting |
+| GET | `/api/registry` | Federation wire: this machine's own conversations (never a remote's) as `Conversation` rows, polled by other hives |
+| PUT / GET | `/api/box/<id>` | Receive / hand out a box as a tar. Off unless `[web] accept_boxes = true`; whole id only |
+| POST | `/api/box/<id>/pack\|unpack\|mark` | The remote half of `hive box push\|pull` — see **Remote boxes** for what a network request may not do |
 | GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
 | GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
+
+`/api/send`, `/api/freeze`, `/api/todos`, `/api/switch`, `/api/thaw`, `/api/discard-frozen` and
+the `?session=` reads (`/api/messages`, `/api/session-info`, `/api/todos`) are **proxied to the
+machine that runs the session** when it is a federated `"<session> @<host>"` row (`remote_post` /
+`remote_get`); `/api/kill-session` on one is refused.
 
 **Frontend features (web.html):**
 
@@ -1942,6 +1970,78 @@ carry unbounded free text and would explode series cardinality.
 
 The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
+## Remote boxes — moving a conversation between machines
+
+Full design, evidence and **as-built deviations / unverified parts** are in
+`docs/remote-boxes.md`; read its *As built* section before changing anything here. The shape:
+
+- A conversation is files, the process is disposable. `hive box pack` writes
+  `~/.hive/boxes/<uuid>/` (bundle of commits on no remote, `git diff --cached --binary`, an rsync
+  of the tree incl. ignored files, transcript + memory, overlay, todos); `unpack` is the inverse
+  and refuses anything that would overwrite state existing only on the target. Pack is gated on
+  Claude's own status being `idle` with no orphaned background launch (`--force` overrides).
+- `push`/`pull` move a box over HTTP when the remote has an `api` (`serve/boxes_api.rs`; the server must set `[web] accept_boxes = true`; no auth — trusted LAN — but unpack refuses any path outside a registered project) or over ssh (`HIVE_SSH` overrides the program — tests use a fake that
+  runs the command under a second `$HOME`). The overlay's `location` records where a shipped
+  conversation lives; `reopen_conversation` refuses it.
+- **A conversation has a HOME machine, and its home is not its process.** Home changes only by
+  `box push` / `pull`; a reboot or a closed window there changes its state, never where it is.
+  Three rules implement that, and every surface reads the one merged list they produce:
+  - *Export*: `/api/registry` is every conversation homed on that machine — running, frozen
+    or closed — and never one it shipped away (`location` set) or another machine's.
+  - *Merge* (`registry::merge_remote`): running and frozen rows are always taken; a CLOSED one
+    only when this machine has a reason to track it — it was shipped there from here (the local
+    overlay's `location`), or its project's checkout lives there (`project-hosts.json`).
+  - *Settle* (`settle_homes`, after the merges): a shipped conversation the remote did not
+    report still becomes a `host` row — closed, `home_unreachable` when that machine did not
+    answer. It never falls back to looking like a local closed conversation.
+
+  A row with `host` set and no live placement is "not running on its home": the sidebar lists
+  it in the set-aside section (`server::elsewhere_rows`, appended to `/api/frozen`) and a click
+  resumes it THERE (`/api/resume` or `/api/thaw` with `host`); the TUI's `Enter` does the same
+  (`Action::RemoteThaw`) and then attaches. `reopen_conversation` refuses any row with a `host`.
+- **Federation:** the web server exports `GET /api/registry` (see above); each configured
+  `[[remotes]]` with an `api` gets a poller thread; `gather_conversations_stats` (the TUI and the
+  web data thread; `cycle-free` and the detail start-up merge once via `merge_now`, other one-shots never) merges the rows in with `Conversation.host = Some(name)`. A
+  remote row is `Live` but **not local**: every action that trusts a placement must go through
+  `is_remote()` / `flag_session()`, or it will hit a same-named local session. Remote sessions
+  are `"<session> @<host>"` everywhere a name is a key.
+- Actions on a remote row go to that remote's own API (`federation::proxy_post`, web
+  `remote_post`); `Enter` opens an `@host:<window>` ssh window (`remote::attach_remote`).
+- `[sandbox]` / `--sandbox` run the conversation under `srt` with a write set derived from the box; `deny_read` adds paths it must not even read (kernel-enforced).
+- **A remote conversation has ONE row here, `"<session> @<host>"`.** The ssh window attached to it lives in the hidden `__hive_remote` session (`config::REMOTE_SESSION`, filtered like `__hive_web`), named `"<session> @<host>:<index>"`. The sidebar click, the list's `Enter` and `Ctrl+g` all go through `remote::attach_window`, so they share that window; `/api/ambient` maps a client sitting in it back to the remote row (the sidebar's "you are here"), and `Ctrl+n/p` stop on every remote session the sidebar lists, opening its attach window on first visit: the stops come from this machine's own `/api/active` (`session::listed_remote_sessions` — the sidebar's source, one localhost request, no other machine contacted on a keypress), falling back to the attach windows already open when the dashboard is down.
+- **A project lives on one machine.** Shipping a project's own checkout records the host in `cache/project-hosts.json` (`projects::set_lives_on`); `connect`, new conversation, `wt new` and todo dispatch call `projects::require_local` and refuse until the box is unpacked back here. A bare `claude` started by hand is not stopped. Linked worktrees can still ship on their own.
+- A main-checkout box unpacks onto a machine with no repo (it is `git init`-ed: no remote to clone), and a released main checkout is stashed, not left dirty. `box pull` runs `boxes::check_target` before the remote packs and before it releases its copy.
+- On macOS the remote's `hive web` must run in the desktop session (a LaunchAgent), or Claude there cannot read its login from the keychain; under `srt` the keychain also needs `<user cache dir>/mds` writable. A Claude under `srt` in tmux does not accept typed input yet — see `docs/remote-boxes.md`.
+- **`Space` in the conversation and project details opens an action menu** (`ActionMenu`, `conversations.rs`). Its entries replay the screen's own keys (`MenuAct::Key`, so the menu cannot drift from them) plus `Move … to <remote>` / `Bring … back to this machine`, which run `hive box push|pull` as a subprocess (`BoxJob`) with a progress popup. While the menu is open a letter closes it; it never runs as the screen's key.
+- **The detail of a remote conversation is asked of that machine** (`gather_remote_resources`: CPU/mem from the federated row, the transcript tail from its `/api/messages`); nothing local is probed, the checkout left here being stale. `prefix + d` / `prefix + a` from an attach window resolve through the window's name (`current_window_conv`), after one `federation::merge_now`.
+- A main-checkout box whose branch was created on the other machine unpacks onto a clean checkout by creating that branch here (HEAD must be an ancestor of the box's tip); a same-named branch that exists but is not checked out is refused.
+- The sidebar appends every click and switch to `cache/sidebar-trace.log` (always on, 256KB cap): real Ghostty clicks cannot be reproduced from a test.
+- **What a request from another machine may do is narrower than the CLI.** `/api/box/*` takes
+  the WHOLE id only (no unique prefix); a received tar is refused if it holds a symbolic link
+  outside `tree/` (`boxes::validate_received` — unpack copies the transcript and memory with
+  calls that follow links); `mark --remove-worktree` is refused unless it names where the
+  conversation went and this machine's copy is still what the box holds
+  (`check_unchanged_since_pack`: HEAD unmoved, a linked worktree's files identical to the box's
+  by an rsync dry run, transcript not grown). Both directions of the HTTP transport go through
+  `boxes::receive_box` (scratch → validate → install), `pull`'s download included, and `unpack`
+  never honours `force` from the network. In `remote_post` a body's
+  `host` field routes only `/api/thaw` and `/api/discard-frozen` (`host_field_routes`); on any
+  other path it is ignored, or it would forward `kill-session` past its refusal.
+- **`push` records the move before it tidies.** Once the remote acknowledges the unpack, `ship`
+  sets `location` (and `lives_on`) first; a `--remove-local` that is then refused is a warning. A
+  request that fails without an answer says the state is unknown and names both ways out
+  (`box mark --location`, `box send`), since the remote may still finish the unpack.
+- **Restored ≠ resumed.** Once a box's files are on a machine, that machine owns the
+  conversation: `pull` restores, clears `location`, tells the remote (releasing its copy only
+  now), and then thaws. A thaw that fails is a warning (`thaw_box`) — printed on stdout and returned in the
+  unpack reply, so `push` says "lives on <remote> but is NOT running there" — the frozen entry
+  stays for the 💤 bucket; it is never an error that would have the caller retry onto a non-empty tree.
+- **The pack gate believes a status record only under a pid in the window's own process tree**
+  (`confirmed_status`, the `index_confirmed` rule), and a running window with no readable status
+  blocks the pack. The gather therefore sets `Conversation.pids` on every run, not only when
+  sampling resources.
+- Commands run over ssh get `remote::REMOTE_PATH` prefixed: a non-interactive macOS shell has no Homebrew or `~/.local/bin` on PATH.
+
 ## Tmux Integration
 
 - `prefix + s` — conversations popup, list view (`hive`)
@@ -1955,13 +2055,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 
 ## Testing
 
-562 distinct tests. Run with `cargo test`.
+650 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 945 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 383 · bin 530 (the superset — adds cli/daemon/serve)
-> · smoke 32.
+> `cargo test` prints 1089 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 439 · bin 610 (the superset — adds cli/daemon/serve)
+> · smoke 40.
 
-**Unit tests (530)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (610)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs
@@ -1998,6 +2098,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   ignored, gc drops ended conversations), and `annotate_attention` — including
   **the probe-call-count contract** (idle windows only, skipped sessions never,
   no shelling out on an empty cwd)
+- `common/boxes.rs`: the gate; bundle of unpushed commits under the BRANCH ref (not `HEAD`);
+  staged patch holds only the index; `--without-ignored`; worktree round trip identical incl. a
+  deleted tracked file; unpack refuses a dirty main checkout / non-empty worktree path
+- `common/federation.rs`, `remote.rs`, `registry.rs`: merge rules (host tag, local live wins,
+  remote history excluded, no re-export), `flag_session`, the bounded fetch, `attach_command`
+  quoting and port forwards; `serve/server.rs`: remote session views, local-only export,
+  `RemoteNotifier`, no git probe of remote windows; `sandbox.rs`: the derived write set
 - `ipc/messages.rs`: `blocks_human` is exactly the five decision states (the four
   prompt kinds plus `NeedsInput`), and `RunningWorkflow` is not one of them
 - `common/claude_sessions.rs`: the record parses from a verbatim live
@@ -2075,7 +2182,7 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
   blocked-vs-working split, closed convs contributing no status/resources, auth-profile
   defaulting, payload-free status labels)
 
-**Integration tests (32)** — `tests/cli_smoke.rs`, run the actual binary:
+**Integration tests (40)** — `tests/cli_smoke.rs`, run the actual binary:
 - `--version`, `--help`, all subcommand help pages
 - Read-only commands exit 0 (project list, wt list, todo list, conversations)
 - Invalid args exit non-zero
@@ -2087,6 +2194,13 @@ The collector stack lives outside this repo, in `claude-logging/otel-stack/`.
 - `stage` / `freeze` / `close` help lists their flags; outside a conversation they point at `--id`; `stage` rejects an unknown stage before touching anything
 - `task set --help` lists `--append` / `--body`; `task set` with nothing to set fails, and `--body` excludes `--append`
 - `wt prune --dry-run` over an empty registry is a no-op (isolated `$HOME`)
+- Boxes and federation, each in isolated `$HOME`s with a private tmux server and a fake `claude`
+  (which writes its own `sessions/<pid>.json`, as the pack gate requires of a running window):
+  pack → unpack → thaw round trip, incl. the refusal to overwrite a longer local transcript and
+  `--force`; push/pull between two homes over a fake ssh; the same over HTTP (opt-in, path-checked);
+  a project that lives elsewhere refuses local work; project export/import; a remote's parked
+  conversation listed and thawed there; a sandboxed thaw confined to the box's path set;
+  `web --bind` loopback
 
 No TUI rendering tests (interactive). No tmux-dependent tests (would need integration test
 infrastructure) — hence the pure `build_active`/`build_browse` functions take their tmux/flag

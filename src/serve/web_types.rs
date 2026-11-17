@@ -49,6 +49,12 @@ pub struct SessionView {
     /// Conversation messages for the dashboard (user + assistant)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<ConversationMessage>,
+    /// Machine this session runs on, when it is a federated remote's (`None` = here).
+    /// The session `name` then reads `"<session> @<host>"` so it never collides with a
+    /// local session of the same name; `pane` stays the REMOTE's coordinates, which is
+    /// what a proxied action sends back to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// One entry per Claude instance running in this tmux session. When more than
     /// one window is present the web dashboard renders the session as an accordion
     /// so a specific window can be selected. Empty when no Claude is running.
@@ -59,12 +65,19 @@ pub struct SessionView {
 /// One Claude instance (tmux window/pane) within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowView {
+    /// Machine this window runs on (`None` = here); see `SessionView::host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// tmux global pane id (e.g. "%1") — the unique selector used by the web API.
     pub pane_id: String,
     /// tmux window index.
     pub window_index: String,
     /// tmux window name.
     pub window_name: String,
+    /// The conversation's own title, for a window whose tmux name says nothing (a
+    /// machine with a stock tmux leaves it as the process name, `2.1.322`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Resolved Claude session id (jsonl basename), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -129,6 +142,10 @@ pub struct WindowView {
 pub struct ConversationView {
     /// Claude conversation UUID (the transcript basename) — the stable key.
     pub id: String,
+    /// Machine it lives on, when not this one. Actions on it (`/api/thaw`,
+    /// `/api/discard-frozen`) carry this back as `host` so they reach that machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// First 8 chars of the id ("—" for legacy composite `session#window` keys).
     pub short_id: String,
     /// User/AI conversation title, when the transcript carries one.
@@ -182,6 +199,14 @@ pub struct ConversationView {
     /// Listening TCP ports for the live process tree (empty for closed).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u16>,
+    /// For a conversation whose home is another machine: the session it belongs to THERE
+    /// (its project's or worktree's), under the bare name — what places it under the right
+    /// project in a list here while it is not running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_session: Option<String>,
+    /// Its home machine did not answer; what is shown is what this machine last recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home_unreachable: bool,
 }
 
 fn is_zero_f32(v: &f32) -> bool {

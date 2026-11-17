@@ -84,7 +84,8 @@ pub struct RegistrySnapshot {
 impl RegistrySnapshot {
     pub fn from_registry(reg: &ConversationRegistry) -> Self {
         let mut snap = Self::default();
-        for c in reg.conversations.values() {
+        // Local conversations only: a federated remote reports its own series.
+        for c in reg.conversations.values().filter(|c| !c.is_remote()) {
             // `parent` is "project" or "project/branch"; the project part is what groups.
             let project = c
                 .parent
@@ -559,6 +560,9 @@ mod tests {
             ports: Vec::new(),
             pids: Vec::new(),
             status_since_ms: None,
+            host: None,
+            location: None,
+            home_unreachable: false,
         }
     }
 

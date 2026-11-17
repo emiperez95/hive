@@ -143,14 +143,15 @@ pub struct Conversation {
     #[serde(default)]
     pub auth_config_dir: Option<String>,
     /// Runtime-only live resource sample (summed over the window's process tree);
-    /// 0 for closed conversations. Not persisted.
-    #[serde(skip)]
+    /// 0 for closed conversations. Not persisted, but sent to a federating peer.
+    #[serde(default)]
     pub cpu: f32,
-    #[serde(skip)]
+    #[serde(default)]
     pub mem_kb: u64,
     /// Runtime-only listening TCP ports for this live conversation's process tree;
-    /// empty for closed conversations. Not persisted.
-    #[serde(skip)]
+    /// empty for closed conversations. Not persisted, but sent to a federating peer —
+    /// `attach_remote` tunnels exactly these.
+    #[serde(default)]
     pub ports: Vec<u16>,
     /// Runtime-only process ids of this live conversation's window tree; empty for
     /// closed. Not persisted. Lets the web build the per-process breakdown.
@@ -159,8 +160,21 @@ pub struct Conversation {
     /// Runtime-only: when Claude last changed this conversation's status (epoch ms),
     /// from its own `sessions/<pid>.json` `statusUpdatedAt`. `None` when Claude has no
     /// record for it. The only first-party answer to "working since when".
-    #[serde(skip)]
+    #[serde(default)]
     pub status_since_ms: Option<i64>,
+    /// Machine this conversation LIVES on, when not this one (a federated remote's name).
+    /// `None` = here. A remote placement still makes it Live (see `Lifecycle`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Where a packed conversation was shipped to (overlay). `None` = held here. The side
+    /// holding a live placement or an un-shipped box owns the conversation; a shipped one
+    /// must not be offered here as a local thaw or recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Runtime-only: its home machine (`host`) did not answer, so everything shown about it
+    /// is what this machine last recorded. Only set on a row whose home is elsewhere.
+    #[serde(skip)]
+    pub home_unreachable: bool,
 }
 
 impl Conversation {
@@ -249,6 +263,9 @@ pub struct ConversationOverlay {
     /// any other move so a stale reason never follows the card around.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_note: Option<String>,
+    /// Remote this conversation was shipped to by `hive box push` (see `Conversation::location`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 impl ConversationOverlay {
@@ -362,7 +379,98 @@ pub struct ConversationRegistry {
     pub pending_parents: Vec<(String, String)>,
 }
 
+impl Conversation {
+    /// Lives on another machine (a federated remote). Such a conversation is `Live` —
+    /// its placement is real, just not on this tmux server — so every local action that
+    /// takes a placement at face value (kill-window, freeze, flags, switch) must check
+    /// this first.
+    pub fn is_remote(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// The session name this conversation goes by in every LOCAL flag set (favorite, mute,
+    /// skip, auto-approve) and in the web views. A remote session is `"<session> @<host>"`
+    /// — the bare name would collide with, and flag, a local session of the same name.
+    pub fn flag_session(&self) -> Option<String> {
+        let p = self.placement.as_ref()?;
+        Some(match &self.host {
+            Some(h) => format!("{} @{h}", p.session_name),
+            None => p.session_name.clone(),
+        })
+    }
+}
+
 impl ConversationRegistry {
+    /// Fold another machine's conversations in, tagged with `host` — their HOME.
+    ///
+    /// A conversation has one home machine, and its home is not a function of whether a
+    /// process happens to be running: a reboot there closes the window, it does not move
+    /// the conversation. So what is taken from a remote is:
+    ///
+    /// - everything it is running or has parked (frozen) — always;
+    /// - a CLOSED conversation when this machine has a reason to care where it is: it was
+    ///   shipped there from here (the local overlay's `location` names `host`), or its
+    ///   project's own checkout lives there (`project_hosts`). The rest of a remote's
+    ///   closed history is its own and stays there.
+    ///
+    /// A row the remote does not own (another machine's, or one it shipped away itself) is
+    /// never taken. Where an id is also live here, the local window wins: the side with
+    /// the running process is the one that can act on it. Anything else under that id (the
+    /// stale local copy of a conversation that was pushed away) is replaced.
+    pub fn merge_remote(
+        &mut self,
+        host: &str,
+        remote: Vec<Conversation>,
+        project_hosts: &HashMap<String, String>,
+    ) {
+        for mut c in remote {
+            if c.host.is_some() || c.location.is_some() {
+                continue; // not that machine's to report
+            }
+            let local = self.conversations.get(c.id.as_str());
+            if local.is_some_and(|l| l.lifecycle.is_actionable_here() && l.host.is_none()) {
+                continue;
+            }
+            let held = c.lifecycle.is_actionable_here() || c.is_frozen();
+            if !held {
+                let shipped_there = local.is_some_and(|l| l.location.as_deref() == Some(host));
+                let project_there = c
+                    .parent
+                    .as_deref()
+                    .map(|p| p.split('/').next().unwrap_or(p))
+                    .and_then(|k| project_hosts.get(k))
+                    .is_some_and(|h| h == host);
+                if !(shipped_there || project_there) {
+                    continue;
+                }
+            }
+            c.host = Some(host.to_string());
+            self.conversations.insert(c.id.as_str().to_string(), c);
+        }
+    }
+
+    /// Give every conversation that was shipped away its home, whether or not that machine
+    /// reported it. Run after the merges.
+    ///
+    /// What is left with a `location` and no `host` is this machine's stale copy of a
+    /// conversation that lives on `location` and that no merge replaced: the home did not
+    /// answer (`up` is not `true` for it), or answered without it. Either way it is still
+    /// that machine's conversation — it must stay listed, as not running there, rather
+    /// than vanish or pass for a local one that could be resumed here.
+    pub fn settle_homes(&mut self, up: &HashMap<String, bool>) {
+        for c in self.conversations.values_mut() {
+            if c.host.is_some() || c.lifecycle.is_actionable_here() {
+                continue;
+            }
+            let Some(home) = c.location.clone() else {
+                continue;
+            };
+            c.home_unreachable = up.get(&home) != Some(&true);
+            c.host = Some(home);
+            c.placement = None;
+        }
+    }
+
     pub fn from_shadow(
         hook: &crate::ipc::messages::HookState,
         disk_ids: &[String],
@@ -405,6 +513,7 @@ impl ConversationRegistry {
             let archive_reason = overlay.and_then(|o| o.archive_reason.clone());
             let forked_from = overlay.and_then(|o| o.forked_from.clone());
             let archived_at = overlay.and_then(|o| o.archived_at.clone());
+            let location = overlay.and_then(|o| o.location.clone());
             conversations.insert(
                 id.to_string(),
                 Conversation {
@@ -430,6 +539,9 @@ impl ConversationRegistry {
                     ports: Vec::new(),
                     pids: Vec::new(),
                     status_since_ms: None,
+                    host: None,
+                    location,
+                    home_unreachable: false,
                 },
             );
         }
@@ -489,6 +601,9 @@ impl ConversationRegistry {
                             ports: Vec::new(),
                             pids: Vec::new(),
                             status_since_ms: None,
+                            host: None,
+                            location: None,
+                            home_unreachable: false,
                         },
                     );
                 }
@@ -786,6 +901,9 @@ mod tests {
             ports: Vec::new(),
             pids: Vec::new(),
             status_since_ms: None,
+            host: None,
+            location: None,
+            home_unreachable: false,
         }
     }
 
@@ -1222,6 +1340,9 @@ mod tests {
             ports: Vec::new(),
             pids: Vec::new(),
             status_since_ms: None,
+            host: None,
+            location: None,
+            home_unreachable: false,
         }
     }
 
@@ -1627,5 +1748,176 @@ mod tests {
         reg.apply_frozen(&fs);
 
         assert!(!reg.conversations["live1"].is_frozen());
+    }
+
+    // ── Federation: merging another machine's conversations ──
+
+    fn wire_conv(id: &str, live: bool, session: &str, frozen: bool) -> Conversation {
+        let mut v = serde_json::json!({
+            "id": id, "cwd": "/p",
+            "lifecycle": if live { "Live" } else { "Closed" },
+        });
+        if live {
+            v["placement"] = serde_json::json!({
+                "session_name": session, "window_index": "1", "window_name": "w"
+            });
+        }
+        if frozen {
+            v["frozen"] = serde_json::json!({
+                "note": "parked", "pinned": true, "frozen_at": "2026-10-20T00:00:00Z"
+            });
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn merge_remote_tags_host_and_keeps_the_placement_live() {
+        let mut reg = ConversationRegistry::default();
+        reg.merge_remote(
+            "mini",
+            vec![wire_conv("r1", true, "📊 Avateen", false)],
+            &HashMap::new(),
+        );
+        let c = &reg.conversations["r1"];
+        assert_eq!(c.host.as_deref(), Some("mini"));
+        assert!(c.is_remote() && c.lifecycle.is_actionable_here());
+        assert_eq!(c.flag_session().as_deref(), Some("📊 Avateen @mini"));
+    }
+
+    #[test]
+    fn merge_remote_takes_only_what_the_remote_is_holding() {
+        let mut reg = ConversationRegistry::default();
+        reg.merge_remote(
+            "mini",
+            vec![
+                wire_conv("live", true, "s", false),
+                wire_conv("parked", false, "s", true),
+                wire_conv("history", false, "s", false), // the remote's own closed past
+            ],
+            &HashMap::new(),
+        );
+        assert!(reg.conversations.contains_key("live"));
+        assert!(reg.conversations.contains_key("parked"));
+        assert!(!reg.conversations.contains_key("history"));
+    }
+
+    #[test]
+    fn a_local_live_window_beats_a_remote_claim_but_a_stale_local_copy_does_not() {
+        let mut reg = ConversationRegistry::default();
+        reg.conversations
+            .insert("both".into(), wire_conv("both", true, "local", false));
+        reg.conversations
+            .insert("pushed".into(), wire_conv("pushed", false, "", false));
+        reg.merge_remote(
+            "mini",
+            vec![
+                wire_conv("both", true, "remote", false),
+                wire_conv("pushed", true, "remote", false),
+            ],
+            &HashMap::new(),
+        );
+        assert!(
+            reg.conversations["both"].host.is_none(),
+            "local process wins"
+        );
+        assert_eq!(
+            reg.conversations["pushed"].host.as_deref(),
+            Some("mini"),
+            "the closed local copy of a pushed conversation yields to the live remote one"
+        );
+    }
+
+    #[test]
+    fn a_closed_remote_conversation_is_kept_when_its_home_is_known_to_be_there() {
+        // Shipped from here: the local copy's overlay names the remote.
+        let mut reg = ConversationRegistry::default();
+        let mut shipped = wire_conv("shipped", false, "", false);
+        shipped.location = Some("mini".into());
+        reg.conversations.insert("shipped".into(), shipped);
+        // Started over there, in a project whose checkout lives there.
+        let mut born_there = wire_conv("born", false, "", false);
+        born_there.parent = Some("argus/feat".into());
+        let mut elsewhere = wire_conv("other", false, "", false);
+        elsewhere.parent = Some("unrelated".into());
+        let hosts = HashMap::from([("argus".to_string(), "mini".to_string())]);
+        reg.merge_remote(
+            "mini",
+            vec![
+                wire_conv("shipped", false, "", false),
+                born_there,
+                elsewhere,
+            ],
+            &hosts,
+        );
+        // A reboot over there closed them; they are still that machine's conversations.
+        for id in ["shipped", "born"] {
+            let c = &reg.conversations[id];
+            assert_eq!(c.host.as_deref(), Some("mini"), "{id}");
+            assert!(!c.lifecycle.is_actionable_here() && !c.home_unreachable);
+        }
+        assert!(!reg.conversations.contains_key("other"));
+        // The same project on ANOTHER remote does not count.
+        let mut reg = ConversationRegistry::default();
+        let mut born = wire_conv("born", false, "", false);
+        born.parent = Some("argus".into());
+        reg.merge_remote("pc", vec![born], &hosts);
+        assert!(reg.conversations.is_empty());
+    }
+
+    #[test]
+    fn a_row_the_remote_shipped_away_itself_is_not_its_to_report() {
+        let mut gone = wire_conv("gone", false, "", true);
+        gone.location = Some("pc".into());
+        let mut reg = ConversationRegistry::default();
+        reg.merge_remote("mini", vec![gone], &HashMap::new());
+        assert!(reg.conversations.is_empty());
+    }
+
+    #[test]
+    fn a_shipped_conversation_keeps_its_row_when_its_home_is_silent_or_down() {
+        let shipped = |loc: &str| {
+            let mut c = wire_conv(loc, false, "", false);
+            c.location = Some(loc.into());
+            c
+        };
+        let mut reg = ConversationRegistry::default();
+        reg.conversations.insert("mini".into(), shipped("mini"));
+        reg.conversations.insert("pc".into(), shipped("pc"));
+        reg.conversations
+            .insert("here".into(), wire_conv("here", false, "", false));
+        // Running here despite a stale location: the process wins, it is local.
+        let mut running = wire_conv("run", true, "s", false);
+        running.location = Some("mini".into());
+        reg.conversations.insert("run".into(), running);
+
+        reg.settle_homes(&HashMap::from([("mini".to_string(), true)]));
+        let m = &reg.conversations["mini"];
+        assert_eq!(m.host.as_deref(), Some("mini"));
+        assert!(!m.home_unreachable, "it answered, just without this one");
+        let p = &reg.conversations["pc"];
+        assert_eq!(p.host.as_deref(), Some("pc"));
+        assert!(p.home_unreachable, "never heard from");
+        assert!(reg.conversations["here"].host.is_none());
+        assert!(reg.conversations["run"].host.is_none());
+    }
+
+    #[test]
+    fn merge_remote_never_reexports_a_third_machines_rows() {
+        let mut c = wire_conv("x", true, "s", false);
+        c.host = Some("other".into());
+        let mut reg = ConversationRegistry::default();
+        reg.merge_remote("mini", vec![c], &HashMap::new());
+        assert!(reg.conversations.is_empty());
+    }
+
+    #[test]
+    fn host_and_location_survive_the_wire_and_default_when_absent() {
+        let c = wire_conv("x", true, "s", false);
+        let back: Conversation = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(back.host.is_none() && back.location.is_none());
+        let mut c = c;
+        c.ports = vec![3000];
+        let back: Conversation = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.ports, vec![3000], "attach_remote tunnels these");
     }
 }

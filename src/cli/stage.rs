@@ -201,6 +201,8 @@ fn freeze_subject(s: &Subject, note: &str, now: bool) -> Result<()> {
         window_name: p.window_name.clone(),
         cwd: s.conv.cwd.clone(),
         claude_session_id: Some(id.to_string()),
+        // `hive freeze` runs from inside the conversation's own window: always local.
+        host: None,
     };
     freeze_window(&target, note)?;
     println!("Froze {} — thaw it from the board or the TUI", short(id));
@@ -208,6 +210,11 @@ fn freeze_subject(s: &Subject, note: &str, now: bool) -> Result<()> {
 }
 
 fn placement(c: &Conversation) -> Result<&crate::common::registry::TmuxPlacement> {
+    // A federated remote's window is on another machine: acting on its placement here would
+    // freeze or kill whatever local window shares the session name.
+    if let Some(host) = &c.host {
+        return Err(anyhow!("{} runs on {host}, not here", short(c.id.as_str())));
+    }
     c.placement.as_ref().ok_or_else(|| {
         anyhow!(
             "{} isn't running in a tmux window here",

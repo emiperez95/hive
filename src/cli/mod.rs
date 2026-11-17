@@ -3,6 +3,7 @@
 //! This module defines the CLI interface (via clap) and re-exports all
 //! subcommand handlers. `main.rs` parses args and dispatches here.
 
+pub mod boxes;
 pub mod conversations;
 pub mod fork;
 pub mod hook;
@@ -118,6 +119,17 @@ pub enum Command {
     Wt {
         #[command(subcommand)]
         command: WtCommand,
+    },
+    /// Move a conversation between machines as a directory of files
+    #[command(name = "box")]
+    BoxCmd {
+        #[command(subcommand)]
+        command: BoxCommand,
+    },
+    /// Manage remote machines running hive
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
     },
     /// Manage per-session todos
     Todo {
@@ -257,6 +269,10 @@ pub enum Command {
         /// TTS service URL (e.g. http://10.18.1.2:9800)
         #[arg(long)]
         tts_host: Option<String>,
+        /// Address to bind (default 0.0.0.0, or `[web] bind`). `127.0.0.1` keeps the
+        /// dashboard off the network; reach it through an ssh forward.
+        #[arg(long)]
+        bind: Option<String>,
     },
 }
 
@@ -331,12 +347,144 @@ pub enum ProjectCommand {
         /// Project key to unarchive
         key: String,
     },
+    /// Print projects as TOML for `project import` on another machine
+    Export {
+        /// Only this project (default: all)
+        key: Option<String>,
+    },
+    /// Merge projects from a TOML file (`-` = stdin); existing keys are kept
+    Import {
+        file: String,
+        /// Overwrite projects that already exist
+        #[arg(long)]
+        force: bool,
+    },
     /// List all configured projects
     List {
         /// Include archived projects
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BoxCommand {
+    /// Pack a conversation (and its working tree) into ~/.hive/boxes/<id>; freezes its window
+    Pack {
+        /// Conversation id or unique prefix
+        conversation: String,
+        /// Pack even if the conversation is busy or has background work (that work is lost)
+        #[arg(long)]
+        force: bool,
+        /// Leave git-ignored files (node_modules, target/, .env…) out of the box
+        #[arg(long)]
+        without_ignored: bool,
+    },
+    /// Restore a box onto this machine
+    Unpack {
+        /// Box id (or unique prefix) under ~/.hive/boxes, or a path to a box directory
+        target: String,
+        /// Resume the conversation in a tmux window afterwards
+        #[arg(long)]
+        thaw: bool,
+        /// Overwrite a longer local transcript
+        #[arg(long)]
+        force: bool,
+        /// Run the resumed conversation under `srt`, so its write set is exactly the box's
+        #[arg(long)]
+        sandbox: bool,
+    },
+    /// List boxes on this machine
+    List,
+    /// Pack a conversation, copy it to a remote and resume it there
+    Push {
+        conversation: String,
+        /// Remote name (`hive remote list`)
+        remote: String,
+        /// Pack even if it is mid-turn or has background work (that work is lost)
+        #[arg(long)]
+        force: bool,
+        /// Leave git-ignored files (build output, node_modules) out of the box
+        #[arg(long)]
+        without_ignored: bool,
+        /// Unpack on the remote without resuming
+        #[arg(long)]
+        no_thaw: bool,
+        /// Remove this machine's linked-worktree copy once it is on the remote
+        #[arg(long)]
+        remove_local: bool,
+        /// Have the remote run it under `srt` (a remote with `[sandbox] enabled` always does)
+        #[arg(long)]
+        sandbox: bool,
+        /// Use ssh + rsync even though the remote has an `api` (the default is HTTP)
+        #[arg(long)]
+        via_ssh: bool,
+    },
+    /// Transfer a box that is already packed to a remote and resume it there
+    Send {
+        /// Box id (or unique prefix) or a path to a box directory
+        target: String,
+        /// Remote name (`hive remote list`)
+        remote: String,
+        /// Unpack on the remote without resuming
+        #[arg(long)]
+        no_thaw: bool,
+        /// Remove this machine's linked-worktree copy once it is on the remote
+        #[arg(long)]
+        remove_local: bool,
+        /// Have the remote run it under `srt`
+        #[arg(long)]
+        sandbox: bool,
+        /// Use ssh + rsync even though the remote has an `api`
+        #[arg(long)]
+        via_ssh: bool,
+    },
+    /// Bring a shipped conversation back from the remote it lives on
+    Pull {
+        conversation: String,
+        /// Remote to pull from (default: wherever it was shipped)
+        #[arg(long)]
+        from: Option<String>,
+        /// Have the remote pack even if it is mid-turn there (that work is lost)
+        #[arg(long)]
+        force: bool,
+        /// Remove the remote's linked-worktree copy once the box is on this disk
+        #[arg(long)]
+        remove_remote: bool,
+        /// Use ssh + rsync even though the remote has an `api`
+        #[arg(long)]
+        via_ssh: bool,
+    },
+    /// Record where a conversation lives (run by push/pull, also over ssh)
+    #[command(hide = true)]
+    Mark {
+        id: String,
+        /// Where it now lives; omit for "here"
+        #[arg(long)]
+        location: Option<String>,
+        /// Also remove this machine's working copy (refused unless it still matches the box)
+        #[arg(long)]
+        remove_worktree: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RemoteCommand {
+    /// Register another machine running hive
+    Add {
+        name: String,
+        /// ssh target, e.g. you@mini.local
+        #[arg(long)]
+        ssh: String,
+        /// Its dashboard API, e.g. http://mini.local:8375
+        #[arg(long)]
+        api: Option<String>,
+        /// Path to hive on the remote if ssh's PATH can't find it
+        #[arg(long)]
+        hive_path: Option<String>,
+    },
+    /// List registered remotes
+    List,
 }
 
 #[derive(Subcommand, Debug)]

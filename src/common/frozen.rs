@@ -46,6 +46,11 @@ pub struct FrozenEntry {
     pub note: String,
     /// RFC3339 timestamp of when it was frozen.
     pub frozen_at: String,
+    /// `srt` settings file to relaunch under (see `common::sandbox`). `None` falls back to
+    /// the settings last recorded for this conversation, so a sandboxed box stays
+    /// sandboxed across freeze → thaw without anyone threading a flag through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
 impl FrozenEntry {
@@ -173,6 +178,9 @@ pub struct FreezeTarget {
     pub window_name: String,
     pub cwd: String,
     pub claude_session_id: Option<String>,
+    /// Set when the window runs on a federated remote: the freeze is then performed THERE,
+    /// through its dashboard API, and `session_name` is the remote's own session name.
+    pub host: Option<String>,
 }
 
 /// Freeze one Claude window: record its resume metadata, then kill just that tmux window.
@@ -180,6 +188,21 @@ pub struct FreezeTarget {
 /// The parent session and its other windows are left running; if this was the session's last
 /// window, tmux destroys the (now empty) session on its own. Returns the new entry's key.
 pub fn freeze_window(target: &FreezeTarget, note: &str) -> Result<String> {
+    if let Some(host) = &target.host {
+        crate::common::federation::proxy_post(
+            host,
+            "/api/freeze",
+            &serde_json::json!({
+                "session": target.session_name,
+                "window_index": target.window_index,
+                "window_name": target.window_name,
+                "cwd": target.cwd,
+                "session_id": target.claude_session_id,
+                "note": note,
+            }),
+        )?;
+        return Ok(target.claude_session_id.clone().unwrap_or_default());
+    }
     // Capture the auth profile before we touch the window.
     let claude_config_dir = capture_config_dir(&target.session_name);
 
@@ -192,6 +215,7 @@ pub fn freeze_window(target: &FreezeTarget, note: &str) -> Result<String> {
         claude_config_dir,
         note: note.trim().to_string(),
         frozen_at: chrono::Utc::now().to_rfc3339(),
+        sandbox: None,
     };
     let key = entry.key();
 
@@ -292,6 +316,23 @@ pub fn thaw_window(key: &str) -> Result<String> {
     let startup = match &entry.claude_session_id {
         Some(id) => format!("claude --resume {id}"),
         None => "claude -c".to_string(),
+    };
+    // Sandboxed conversations stay sandboxed: the explicit settings on the entry, else the
+    // ones recorded the last time this conversation was launched under `srt`.
+    let sandbox = entry
+        .sandbox
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let p = crate::common::sandbox::settings_path(entry.claude_session_id.as_deref()?)?;
+            p.is_file().then_some(p)
+        });
+    let startup = match sandbox {
+        Some(settings) => {
+            crate::common::sandbox::require_srt()?;
+            crate::common::sandbox::wrap(&settings, &startup)
+        }
+        None => startup,
     };
 
     // Exact match — a bare `-t` prefix-matches a longer session name (see `tmux::exact`),
@@ -462,6 +503,7 @@ mod tests {
             claude_config_dir: None,
             note: "blocked on API".to_string(),
             frozen_at: ts.to_string(),
+            sandbox: None,
         }
     }
 

@@ -1,6 +1,8 @@
 //! Common types and utilities shared between TUI and hook command.
 
 pub mod activity;
+// A conversation packed into a directory that moves between machines.
+pub mod boxes;
 pub mod chrome;
 // Claude's own per-process session registry — the first-party status source.
 pub mod claude_sessions;
@@ -11,6 +13,8 @@ pub mod debug;
 // Split a conversation in two: `--resume <id> --fork-session` in another window.
 #[allow(dead_code)]
 pub mod fork;
+// Other machines' conversations, merged into this registry.
+pub mod federation;
 pub mod frozen;
 // How hive runs git against trees it didn't make: no fsmonitor/hooks, no locks, capped network.
 pub mod gitcmd;
@@ -23,11 +27,14 @@ pub mod persistence;
 pub mod ports;
 pub mod process;
 pub mod projects;
+// ssh + rsync to another machine running hive.
+pub mod remote;
 // Leftover Workflow agent worktrees/branches and the rules for removing them.
 pub mod prune;
 // Read-only shadow model (Increment 0); wired into views in a later increment.
 #[allow(dead_code)]
 pub mod registry;
+pub mod sandbox;
 // The terminal emulator around tmux (Ghostty): panes, the sidebar split.
 pub mod terminal;
 // What hive wants from a Ghostty config (read, never written): the sidebar launch setup.

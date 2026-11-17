@@ -80,9 +80,22 @@ fn ambient_json(gen: u64) -> String {
         .collect();
     muted_projects.sort();
     let client = crate::common::tmux::pick_client(&clients);
+    // A client sitting in an attach window is ON that remote conversation: report the row
+    // the panel draws for it, not the hidden session that holds the ssh window.
+    let mut at = client.map(|c| (c.session.clone(), c.window_index.clone()));
+    if let Some((session, window)) = &at {
+        if session == crate::common::config::REMOTE_SESSION {
+            if let Some((_, listed, remote_idx)) = crate::common::remote::attach_windows()
+                .into_iter()
+                .find(|(idx, _, _)| idx == window)
+            {
+                at = Some((listed, remote_idx));
+            }
+        }
+    }
     serde_json::json!({
-        "session": client.map(|c| c.session.clone()),
-        "window_index": client.map(|c| c.window_index.clone()),
+        "session": at.as_ref().map(|a| a.0.clone()),
+        "window_index": at.as_ref().map(|a| a.1.clone()),
         "tty": client.map(|c| c.tty.clone()),
         "global_mute": muted,
         "muted_projects": muted_projects,
@@ -194,8 +207,17 @@ struct SendRequest {
 /// Run the HTTP web server on the given port.
 /// When `dev` is true, serves web.html from disk (re-read per request) for live editing.
 /// When `tts_host` is set, enables TTS proxy endpoints.
-pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<()> {
-    let bind_addr = format!("0.0.0.0:{}", port);
+pub fn run_web_server(
+    port: u16,
+    dev: bool,
+    tts_host: Option<String>,
+    bind: Option<String>,
+) -> Result<()> {
+    let host = bind
+        .or_else(|| crate::common::config::HiveConfig::load().web.bind)
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let lan = bind_is_exposed(&host);
+    let bind_addr = format!("{host}:{port}");
     let server = Server::http(&bind_addr)
         .map_err(|e| anyhow::anyhow!("Failed to bind {}: {}", bind_addr, e))?;
 
@@ -205,13 +227,13 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             .join("src/serve/web.html");
         if path.exists() {
             eprintln!(
-                "Hive web dashboard running at http://0.0.0.0:{} (dev mode)",
-                port
+                "Hive web dashboard running at http://{}:{} (dev mode)",
+                host, port
             );
             eprintln!("  Serving HTML from: {}", path.display());
             Some(path)
         } else {
-            eprintln!("Hive web dashboard running at http://0.0.0.0:{}", port);
+            eprintln!("Hive web dashboard running at http://{}:{}", host, port);
             eprintln!(
                 "  warn: --dev but {} not found, using embedded HTML",
                 path.display()
@@ -219,16 +241,20 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             None
         }
     } else {
-        eprintln!("Hive web dashboard running at http://0.0.0.0:{}", port);
+        eprintln!("Hive web dashboard running at http://{}:{}", host, port);
         None
     };
 
-    // Print access URLs
-    if let Some(hostname) = get_local_hostname() {
-        eprintln!("  Local: http://{}:{}", hostname, port);
-    }
-    for (label, ip) in get_all_ips(port) {
-        eprintln!("  {}: http://{}:{}", label, ip, port);
+    // Print access URLs — only the ones that actually reach it.
+    if lan {
+        if let Some(hostname) = get_local_hostname() {
+            eprintln!("  Local: http://{}:{}", hostname, port);
+        }
+        for (label, ip) in get_all_ips(port) {
+            eprintln!("  {}: http://{}:{}", label, ip, port);
+        }
+    } else {
+        eprintln!("  Bound to {host} only — not reachable from the network");
     }
 
     // Shared data between the data thread and request handlers. `shared_active` is
@@ -246,6 +272,12 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     let shared_metrics: Arc<Mutex<Option<crate::serve::metrics::RegistrySnapshot>>> =
         Arc::new(Mutex::new(None));
     let metrics_for_thread = Arc::clone(&shared_metrics);
+    // Fourth projection: THIS machine's own live + parked conversations as the registry's
+    // native JSON, for a federating peer's `/api/registry` poll. Pre-serialised once per
+    // cycle so the handler is a clone, and local-only so two peers federating each other
+    // can't echo rows back and forth.
+    let shared_registry: Arc<Mutex<String>> = Arc::new(Mutex::new("[]".to_string()));
+    let registry_for_thread = Arc::clone(&shared_registry);
 
     // Background data refresh thread (1s interval, same as TUI)
     std::thread::spawn(move || {
@@ -258,6 +290,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         // Which windows pinged and nobody has looked at yet. Same observer, same
         // reason: it needs to see transitions, and this is the thread that does.
         let mut pings = crate::serve::server::UnseenPings::default();
+        // Remote conversations that start waiting on a human ring HERE, since the remote's
+        // own hook notifier can only notify the remote's screen.
+        let mut remote_notifier = crate::serve::server::RemoteNotifier::default();
 
         loop {
             // Gather the conversation registry ONCE, then project it into the Active view
@@ -285,6 +320,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                     .map(|c| (c.session, c.window_index))
                     .collect();
             crate::serve::server::mark_pings(&mut active, &mut pings, &focused);
+            for alert in remote_notifier.observe(&active) {
+                crate::serve::server::deliver_remote_alert(&alert, &reg);
+            }
             let conversations = build_conversation_views(&reg);
             // Taken from the FULL registry, not `conversations` — that view drops archived
             // entries, which the backlog counts must still see.
@@ -305,6 +343,9 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             if let Ok(mut data) = metrics_for_thread.lock() {
                 *data = Some(snapshot);
             }
+            if let Ok(mut data) = registry_for_thread.lock() {
+                *data = crate::serve::server::local_registry_json(&reg);
+            }
 
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -323,6 +364,36 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
         // other arm keeps matching the full URL, because the API endpoints parse
         // their own query params.
         let path = url.split('?').next().unwrap_or("/");
+
+        // Federation: a request that names a remote's session is performed by that remote
+        // (or, for `switch`, by opening the local ssh window). Everything else falls
+        // through to the local handlers below untouched.
+        let mut prebody: Option<String> = None;
+        if path.starts_with(crate::serve::boxes_api::PREFIX) {
+            // Transfers and unpacks take seconds; own thread, so the dashboard never waits.
+            std::thread::spawn(move || crate::serve::boxes_api::handle(request));
+            continue;
+        }
+        if method == Method::Get {
+            if let Some(resp) = remote_get(&shared_active, &url, path) {
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(resp).with_header(header));
+                continue;
+            }
+        } else if method == Method::Post && REMOTE_POST_PATHS.contains(&path) {
+            let body = read_body(&mut request, &mut prebody);
+            if let Some((code, resp)) = remote_post(&shared_active, path, &body) {
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(
+                    Response::from_string(resp)
+                        .with_header(header)
+                        .with_status_code(code),
+                );
+                continue;
+            }
+            // Not a remote's: the local handler reads the body we already consumed.
+            prebody = Some(body);
+        }
 
         match (method, url.as_str()) {
             (Method::Get, _) if path == "/" => {
@@ -569,13 +640,27 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let id = req.get("id")?.as_str()?;
-                    let placement = shared_conversations
+                    let conv = shared_conversations
                         .lock()
                         .ok()?
                         .iter()
                         .find(|c| c.id == id && c.lifecycle == "live")?
-                        .placement
-                        .clone()?;
+                        .clone();
+                    // A federated remote's window is on THAT machine: the placement here
+                    // names its tmux session and index, which a local kill-window would
+                    // apply to whatever local window shares them. Its own API closes it.
+                    if let Some(host) = &conv.host {
+                        let out = crate::common::federation::proxy_post(
+                            host,
+                            "/api/close-window",
+                            &serde_json::json!({ "id": id }),
+                        );
+                        return Some(match out {
+                            Ok(v) => v.to_string(),
+                            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+                        });
+                    }
+                    let placement = conv.placement.clone()?;
                     let target = crate::common::tmux::exact_window(
                         &placement.session_name,
                         &placement.window_index,
@@ -604,6 +689,15 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         .unwrap();
                 let response = Response::from_string(body).with_header(header);
                 let _ = request.respond(response);
+            }
+
+            (Method::Get, "/api/registry") => {
+                let json = shared_registry
+                    .lock()
+                    .map(|d| d.clone())
+                    .unwrap_or_else(|_| "[]".to_string());
+                let header = Header::from_bytes("Content-Type", "application/json").unwrap();
+                let _ = request.respond(Response::from_string(json).with_header(header));
             }
 
             (Method::Get, "/api/active") => {
@@ -714,8 +808,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             (Method::Post, "/api/web-event") => {
                 // Web dashboard viewing/focus telemetry — a stream separate from tmux focus.
                 // Accepts normal fetch and `navigator.sendBeacon` (fired on tab-hide/close).
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 if let Ok(req) = serde_json::from_str::<serde_json::Value>(&body) {
                     match req.get("event").and_then(|v| v.as_str()) {
                         Some("web_view") => {
@@ -835,8 +928,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/send") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
 
                 let result: Result<(), String> = (|| {
                     let req: SendRequest =
@@ -877,8 +969,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/toggle-flag") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let session = req.get("session")?.as_str()?;
@@ -1028,8 +1119,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/conv-notes") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let id = req.get("id")?.as_str()?;
@@ -1107,8 +1197,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             // client" is nobody. Focus is logged by the `after-select-window` hook, so
             // there is deliberately no `log_focus` call here — it would double-count.
             (Method::Post, "/api/switch") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let session = req.get("session")?.as_str()?;
@@ -1145,8 +1234,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             // keyed by project key, honoured by the hook notifier for future sessions of
             // that project. Same file the TUI's project-detail `m` writes.
             (Method::Post, "/api/toggle-project-mute") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let key = req.get("key")?.as_str()?.to_string();
@@ -1177,8 +1265,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/connect") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let session_name = req.get("session_name")?.as_str()?;
@@ -1324,8 +1411,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             //   worktree — a new worktree on `branch`, started on the todo (a job)
             // The todo stays active: starting work isn't finishing it.
             (Method::Post, "/api/todo-dispatch") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Result<String, String> {
                     let req: serde_json::Value =
                         serde_json::from_str(&body).map_err(|_| "invalid request")?;
@@ -1408,8 +1494,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/todos") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let session = req.get("session")?.as_str()?.to_string();
@@ -1497,8 +1582,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/kill-session") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let session = req.get("session")?.as_str()?;
@@ -1528,6 +1612,12 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         })
                     })
                     .collect();
+                // Plus what is set aside on OTHER machines: a conversation whose home is
+                // elsewhere and is not running there stays listed here.
+                let mut list = list;
+                if let Ok(convs) = shared_conversations.lock() {
+                    list.extend(crate::serve::server::elsewhere_rows(&convs));
+                }
                 let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let _ = request.respond(Response::from_string(json).with_header(header));
@@ -1536,8 +1626,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             (Method::Post, "/api/freeze") => {
                 // Freeze one Claude window. The frontend posts the window's identity (it has
                 // it from /api/active); we kill that window and record it for resume.
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     use crate::common::frozen::{freeze_window, FreezeTarget};
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -1560,6 +1649,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                         window_name,
                         cwd,
                         claude_session_id,
+                        host: None,
                     };
                     match freeze_window(&target, note) {
                         Ok(_) => Some(r#"{"ok":true}"#.to_string()),
@@ -1575,8 +1665,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
                 // Reopen a closed (resumable) conversation by id: resume it in its
                 // project/worktree session under its auth profile, creating the session
                 // if needed. Frozen conversations go through /api/thaw instead.
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let id = req.get("id")?.as_str()?;
@@ -1599,8 +1688,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/thaw") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let key = req.get("key")?.as_str()?;
@@ -1617,8 +1705,7 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
             }
 
             (Method::Post, "/api/discard-frozen") => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
+                let body = read_body(&mut request, &mut prebody);
                 let json = (|| -> Option<String> {
                     let req: serde_json::Value = serde_json::from_str(&body).ok()?;
                     let key = req.get("key")?.as_str()?;
@@ -1696,7 +1783,151 @@ pub fn run_web_server(port: u16, dev: bool, tts_host: Option<String>) -> Result<
     Ok(())
 }
 
-/// Percent-decoding for URL query parameters (handles multi-byte UTF-8).
+/// Read the request body once. The federation pre-dispatch may already have consumed it
+/// (to look for a remote session), in which case the local handler gets that copy.
+fn read_body(request: &mut tiny_http::Request, prebody: &mut Option<String>) -> String {
+    if let Some(b) = prebody.take() {
+        return b;
+    }
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+    body
+}
+
+/// POST endpoints that act on a session and so may be aimed at a remote one.
+const REMOTE_POST_PATHS: &[&str] = &[
+    "/api/send",
+    "/api/freeze",
+    "/api/todos",
+    "/api/thaw",
+    "/api/discard-frozen",
+    "/api/resume",
+    "/api/kill-session",
+    "/api/switch",
+];
+
+/// GET endpoints keyed by `?session=`.
+const REMOTE_GET_PATHS: &[&str] = &["/api/messages", "/api/session-info", "/api/todos"];
+
+/// Whether a request's own `host` field may choose where it is forwarded. True only for
+/// the endpoints keyed by conversation id, which have no session name to resolve a host from.
+fn host_field_routes(path: &str) -> bool {
+    matches!(path, "/api/thaw" | "/api/discard-frozen" | "/api/resume")
+}
+
+/// Whether a bind address is reachable from other machines. Anything that is not a
+/// loopback address counts: `0.0.0.0`, `::`, a LAN address, or a name we cannot parse.
+fn bind_is_exposed(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => bare != "localhost",
+    }
+}
+
+/// `(host, remote's own session name)` when `session` is a federated remote's view name.
+fn remote_of(shared_active: &Mutex<Vec<SessionView>>, session: &str) -> Option<(String, String)> {
+    let data = shared_active.lock().ok()?;
+    let host = data.iter().find(|s| s.name == session)?.host.clone()?;
+    let real = crate::common::federation::real_session(session, &host);
+    Some((host, real))
+}
+
+fn remote_get(shared_active: &Mutex<Vec<SessionView>>, url: &str, path: &str) -> Option<String> {
+    if !REMOTE_GET_PATHS.contains(&path) {
+        return None;
+    }
+    let session = query_param(url, "session")?;
+    let (host, real) = remote_of(shared_active, &session)?;
+    // Rebuild the query with the remote's own session name; everything else (the window's
+    // pane id, …) is the remote's coordinates already.
+    let query: Vec<String> = url
+        .split_once('?')?
+        .1
+        .split('&')
+        .map(|p| match p.split_once('=') {
+            Some(("session", _)) => format!("session={}", crate::common::federation::enc(&real)),
+            _ => p.to_string(),
+        })
+        .collect();
+    Some(
+        crate::common::federation::proxy_get(&host, &format!("{path}?{}", query.join("&")))
+            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string()),
+    )
+}
+
+fn remote_post(
+    shared_active: &Mutex<Vec<SessionView>>,
+    path: &str,
+    body: &str,
+) -> Option<(u16, String)> {
+    let mut req: serde_json::Value = serde_json::from_str(body).ok()?;
+    let err = |m: String| (400, serde_json::json!({ "error": m }).to_string());
+    // Thaw / discard are keyed by conversation id and name their host explicitly. Only
+    // those two: a `host` on any other path would forward it past the per-path rules below
+    // (kill-session is refused for a remote session; a `host` field must not un-refuse it).
+    let named_host = req
+        .get("host")
+        .and_then(|h| h.as_str())
+        .map(String::from)
+        .filter(|_| host_field_routes(path));
+    if let Some(host) = named_host {
+        // The remote must see its own request, not one that names a host to forward to.
+        if let Some(o) = req.as_object_mut() {
+            o.remove("host");
+        }
+        return Some(
+            match crate::common::federation::proxy_post(&host, path, &req) {
+                Ok(v) => (200, v.to_string()),
+                Err(e) => err(e.to_string()),
+            },
+        );
+    }
+    let session = req.get("session")?.as_str()?.to_string();
+    let (host, real) = remote_of(shared_active, &session)?;
+    match path {
+        // Another machine's tmux session is not ours to kill.
+        "/api/kill-session" => Some(err(format!("runs on {host} — kill it there"))),
+        "/api/switch" => {
+            // "Switch to" a remote window = open (or find) the local ssh window for it
+            // and move the attached client there.
+            let index = req.get("window_index").and_then(|w| {
+                w.as_str()
+                    .map(String::from)
+                    .or_else(|| w.as_u64().map(|n| n.to_string()))
+            });
+            let id = shared_active.lock().ok().and_then(|d| {
+                let s = d.iter().find(|s| s.name == session)?;
+                let w = match &index {
+                    Some(i) => s.windows.iter().find(|w| &w.window_index == i)?,
+                    None => s.windows.first()?,
+                };
+                w.session_id.clone()
+            })?;
+            let conv = crate::common::federation::find_conversation(&id)?;
+            Some(match crate::common::remote::attach_remote(&conv) {
+                Ok((local, idx)) => {
+                    let clients = crate::common::tmux::list_clients();
+                    let ok = crate::common::tmux::pick_client(&clients).is_some_and(|c| {
+                        crate::common::tmux::switch_client_to(&c.tty, &local, Some(&idx))
+                    });
+                    (200, serde_json::json!({ "ok": ok }).to_string())
+                }
+                Err(e) => err(e.to_string()),
+            })
+        }
+        _ => {
+            req["session"] = serde_json::Value::String(real);
+            Some(
+                match crate::common::federation::proxy_post(&host, path, &req) {
+                    Ok(v) => (200, v.to_string()),
+                    Err(e) => err(e.to_string()),
+                },
+            )
+        }
+    }
+}
+
 /// Extract and URL-decode a query-string parameter from a request URL.
 fn query_param(url: &str, key: &str) -> Option<String> {
     url.split('?').nth(1).and_then(|qs| {
@@ -1711,6 +1942,7 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Percent-decoding for URL query parameters (handles multi-byte UTF-8).
 fn urldecode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.bytes();
@@ -1817,5 +2049,36 @@ mod tests {
         f.bump();
         assert_eq!(waiter.join().unwrap(), 1);
         assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_host_field_only_routes_the_endpoints_keyed_by_conversation_id() {
+        assert!(host_field_routes("/api/thaw"));
+        assert!(host_field_routes("/api/discard-frozen"));
+        assert!(host_field_routes("/api/resume"));
+        for p in REMOTE_POST_PATHS {
+            let by_id = matches!(*p, "/api/thaw" | "/api/discard-frozen" | "/api/resume");
+            assert_eq!(host_field_routes(p), by_id, "{p}");
+        }
+    }
+
+    #[test]
+    fn kill_session_naming_a_host_is_not_forwarded() {
+        // No such session in the views, so it is not a remote one: the request must fall
+        // through to the local handler (None), never be proxied to the host it names.
+        let views = Mutex::new(Vec::new());
+        let body = r#"{"session":"anything","host":"mini"}"#;
+        assert!(remote_post(&views, "/api/kill-session", body).is_none());
+        assert!(remote_post(&views, "/api/send", body).is_none());
+    }
+
+    #[test]
+    fn only_a_loopback_bind_is_off_the_network() {
+        for h in ["127.0.0.1", "::1", "[::1]", "localhost"] {
+            assert!(!bind_is_exposed(h), "{h}");
+        }
+        for h in ["0.0.0.0", "::", "[::]", "10.0.0.5", "mini.local", "0"] {
+            assert!(bind_is_exposed(h), "{h}");
+        }
     }
 }

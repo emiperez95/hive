@@ -203,8 +203,13 @@ pub(crate) fn gather_active_views(reg: &ConversationRegistry, sys: &System) -> V
 
     // Group live conversations by the tmux session running them.
     let mut convs_by_session: HashMap<String, Vec<&Conversation>> = HashMap::new();
+    let mut remote_convs: Vec<&Conversation> = Vec::new();
     for c in reg.conversations.values() {
         if !c.lifecycle.is_actionable_here() {
+            continue;
+        }
+        if c.is_remote() {
+            remote_convs.push(c);
             continue;
         }
         if let Some(p) = &c.placement {
@@ -301,11 +306,80 @@ pub(crate) fn gather_active_views(reg: &ConversationRegistry, sys: &System) -> V
                 .map(|t| t.len() as u32)
                 .unwrap_or(0),
             messages: Vec::new(),
+            host: None,
             windows,
         });
     }
 
+    results.extend(remote_session_views(&remote_convs, &skipped_sessions));
     results
+}
+
+/// What a federating peer should see of this machine: every conversation whose HOME is
+/// here — running, parked or closed (the registry is already age-bounded) — and never
+/// another machine's rows, nor one this machine shipped away (`location`): those are
+/// somebody else's to report. Which of the closed ones a peer keeps is the peer's rule
+/// (`ConversationRegistry::merge_remote`).
+pub(crate) fn local_registry_json(reg: &ConversationRegistry) -> String {
+    let mine: Vec<&Conversation> = reg
+        .conversations
+        .values()
+        .filter(|c| !c.is_remote() && c.location.is_none())
+        .collect();
+    serde_json::to_string(&mine).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// One [`SessionView`] per (host, remote session), named `"<session> @<host>"` so it can't
+/// collide with a local session of the same name (every lookup in the API is by name).
+/// There is no local tmux session behind these, hence no processes, todos or attach flag —
+/// those belong to the machine that runs them. Skip is the exception: it is this machine's
+/// own preference, kept under the listed name, so it applies here like to any session.
+fn remote_session_views(
+    convs: &[&Conversation],
+    skipped: &std::collections::HashSet<String>,
+) -> Vec<SessionView> {
+    let mut by_session: std::collections::BTreeMap<(String, String), Vec<&Conversation>> =
+        Default::default();
+    for c in convs {
+        if let (Some(host), Some(p)) = (&c.host, &c.placement) {
+            by_session
+                .entry((host.clone(), p.session_name.clone()))
+                .or_default()
+                .push(c);
+        }
+    }
+    by_session
+        .into_iter()
+        .map(|((host, session), mut cs)| {
+            cs.sort_by(|a, b| window_index_of(a).cmp(window_index_of(b)));
+            let windows: Vec<WindowView> =
+                cs.iter().map(|c| conv_to_window_view(c, false)).collect();
+            let mut ports: Vec<u16> = windows.iter().flat_map(|w| w.ports.clone()).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            let name = format!("{session} @{host}");
+            SessionView {
+                // Skip is a local preference kept under the listed name, so it applies to
+                // a remote session like any other: unranked, never a `Ctrl+g` target.
+                skipped: skipped.contains(&name),
+                name,
+                status: aggregate_status(&windows),
+                cpu: windows.iter().map(|w| w.cpu).sum(),
+                mem_kb: windows.iter().map(|w| w.mem_kb).sum(),
+                ports,
+                processes: Vec::new(),
+                cwd: cs.first().map(|c| c.cwd.clone()).filter(|c| !c.is_empty()),
+                last_activity: windows.iter().filter_map(|w| w.last_activity.clone()).max(),
+                attached: false,
+                pane: windows.first().and_then(|w| w.pane.clone()),
+                claude_continue_failed: false,
+                todo_count: 0,
+                messages: Vec::new(),
+                host: Some(host),
+                windows,
+            }
+        })
+        .collect()
 }
 
 /// A live conversation's tmux window index (for ordering windows within a session).
@@ -330,9 +404,11 @@ fn conv_to_window_view(c: &Conversation, is_auto_approve: bool) -> WindowView {
     };
     let status = mask_auto_approve(c.status.as_ref().map(|s| s.status.clone()), is_auto_approve);
     WindowView {
+        host: c.host.clone(),
         pane_id: pane_id.clone(),
         window_index: window_index.clone(),
         window_name,
+        title: c.title.clone().filter(|t| !t.is_empty()),
         session_id: Some(c.id.as_str().to_string()),
         status,
         cpu: c.cpu,
@@ -500,7 +576,10 @@ pub(crate) fn annotate_attention(
         }
         for w in view.windows.iter_mut() {
             let idle = matches!(w.status, None | Some(SessionStatus::Waiting));
+            // Never probe a remote window: its cwd is a path on ANOTHER machine, and since
+            // boxes need identical paths it may well name a real — unrelated — directory here.
             w.unreviewed_work = idle
+                && w.host.is_none()
                 && w.cwd
                     .as_deref()
                     .is_some_and(|cwd| !cwd.is_empty() && unreviewed(cwd));
@@ -591,6 +670,84 @@ pub(crate) fn mark_pings(
     }
     pings.last.retain(|id, _| live.contains(id));
     pings.unseen.retain(|id| live.contains(id));
+}
+
+/// A remote conversation that just started waiting on a decision.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RemoteAlert {
+    pub id: String,
+    /// The view name (`"<session> @<host>"`) — also the key local session mutes use.
+    pub session: String,
+    pub text: String,
+}
+
+/// Spots remote conversations entering a blocked state, so the local machine can raise the
+/// notification the remote's own screen would otherwise swallow.
+///
+/// Mirrors the local hook notifier on purpose: it rings for conversations that need a
+/// human, not for every finished turn. A first sighting never rings (the remote may have
+/// been blocked for hours before hive started watching), and a conversation that stays
+/// blocked rings once. In memory, like `UnseenPings`.
+#[derive(Default)]
+pub(crate) struct RemoteNotifier {
+    blocked: HashMap<String, bool>,
+}
+
+impl RemoteNotifier {
+    pub(crate) fn observe(&mut self, views: &[SessionView]) -> Vec<RemoteAlert> {
+        let mut alerts = Vec::new();
+        let mut seen = HashSet::new();
+        for v in views.iter().filter(|v| v.host.is_some()) {
+            for w in &v.windows {
+                let Some(id) = &w.session_id else { continue };
+                let now = w.status.as_ref().is_some_and(SessionStatus::blocks_human);
+                if self.blocked.insert(id.clone(), now) == Some(false) && now {
+                    alerts.push(RemoteAlert {
+                        id: id.clone(),
+                        session: v.name.clone(),
+                        text: match &w.status {
+                            Some(SessionStatus::NeedsPermission { tool_name, .. }) => {
+                                format!("needs permission: {tool_name}")
+                            }
+                            Some(SessionStatus::EditApproval { filename }) => {
+                                format!("edit approval: {filename}")
+                            }
+                            Some(SessionStatus::PlanReview) => "plan ready".to_string(),
+                            Some(SessionStatus::QuestionAsked) => "question asked".to_string(),
+                            _ => "needs attention".to_string(),
+                        },
+                    });
+                }
+                seen.insert(id.clone());
+            }
+        }
+        self.blocked.retain(|id, _| seen.contains(id));
+        alerts
+    }
+}
+
+/// Ring for `alert` unless a mute level silences it (global / project / session, with the
+/// per-conversation `M` override winning over all three — the local hook's own rule).
+pub(crate) fn deliver_remote_alert(alert: &RemoteAlert, reg: &ConversationRegistry) {
+    use crate::common::persistence::{is_globally_muted, load_muted_projects, load_muted_sessions};
+    let global = is_globally_muted();
+    let session_muted = load_muted_sessions().contains(&alert.session);
+    let project_muted = reg
+        .conversations
+        .get(&alert.id)
+        .and_then(|c| c.parent.as_deref())
+        .map(|p| p.split('/').next().unwrap_or(p).to_string())
+        .is_some_and(|k| load_muted_projects().contains(&k));
+    let overridden = (global || session_muted || project_muted)
+        && crate::common::registry::ConversationSidecar::load().notify_override(&alert.id);
+    if crate::cli::hook::should_notify(global, project_muted, session_muted, overridden) {
+        let text = if overridden {
+            format!("🔔 {}", alert.text)
+        } else {
+            alert.text.clone()
+        };
+        crate::daemon::notifier::notify_needs_attention(&alert.session, &text);
+    }
 }
 
 /// Assign each rankable window its position in the attention order.
@@ -689,6 +846,7 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
         pane_id: p.pane_id.clone(),
     });
     ConversationView {
+        host: c.host.clone(),
         id: c.id.as_str().to_string(),
         short_id,
         title: c.title.clone(),
@@ -714,7 +872,52 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
         cpu: c.cpu,
         mem_kb: c.mem_kb,
         ports: c.ports.clone(),
+        home_session: c
+            .is_remote()
+            .then(|| crate::common::conversations::target_session(c))
+            .flatten(),
+        home_unreachable: c.home_unreachable,
     }
+}
+
+/// The conversations whose home is another machine and that are NOT running there, as
+/// extra rows for the sidebar's set-aside section (`/api/frozen`): parked there, closed
+/// there (a reboot, a closed window), or on a machine that does not answer. A click
+/// resumes it on its home — `host` and `frozen` say which request does that.
+pub(crate) fn elsewhere_rows(convs: &[ConversationView]) -> Vec<serde_json::Value> {
+    convs
+        .iter()
+        .filter(|c| c.lifecycle != "live" && !c.archived)
+        .filter_map(|c| {
+            let host = c.host.as_deref()?;
+            let what = c
+                .title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| c.short_id.clone());
+            let state = if c.home_unreachable {
+                format!("{host} is unreachable")
+            } else if c.frozen {
+                format!("frozen on {host}")
+            } else {
+                format!("not running on {host}")
+            };
+            Some(serde_json::json!({
+                "key": c.id,
+                "session_name": c.home_session.clone().unwrap_or_else(|| format!("@{host}")),
+                "window_label": what,
+                "note": format!("{what} · {state}"),
+                "relative": c
+                    .last_activity
+                    .as_deref()
+                    .map(crate::common::frozen::relative_time)
+                    .unwrap_or_default(),
+                "host": host,
+                "frozen": c.frozen,
+                "unreachable": c.home_unreachable,
+            }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -727,6 +930,7 @@ mod tests {
             pane_id: "%1".into(),
             window_index: "1".into(),
             window_name: "w".into(),
+            title: None,
             session_id: Some(id.into()),
             status,
             cpu: 0.0,
@@ -741,6 +945,7 @@ mod tests {
             attention_rank: None,
             unseen: false,
             status_since_ms: None,
+            host: None,
         }
     }
 
@@ -760,6 +965,7 @@ mod tests {
             skipped,
             todo_count: 0,
             messages: vec![],
+            host: None,
             windows,
         }
     }
@@ -767,6 +973,7 @@ mod tests {
     fn conv(id: &str, lifecycle: &str, frozen: bool) -> ConversationView {
         ConversationView {
             id: id.into(),
+            host: None,
             short_id: id.chars().take(8).collect(),
             title: None,
             cwd: None,
@@ -783,6 +990,8 @@ mod tests {
             pinned: false,
             archived: false,
             auth_profile: None,
+            home_session: None,
+            home_unreachable: false,
             cpu: 0.0,
             mem_kb: 0,
             ports: vec![],
@@ -1268,5 +1477,178 @@ mod tests {
         assert!(!ping_step(Some(SessionStatus::Working), &mut p, false));
         // A turn ending in the window you're on is not news.
         assert!(!ping_step(Some(SessionStatus::Waiting), &mut p, true));
+    }
+
+    // ── Federation views + notifier ──
+
+    fn wire(id: &str, session: &str, idx: &str, host: &str) -> Conversation {
+        let mut c: Conversation = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": "/p", "lifecycle": "Live",
+            "placement": {"session_name": session, "window_index": idx, "window_name": "w",
+                          "pane_id": "%9"},
+        }))
+        .unwrap();
+        c.host = Some(host.to_string());
+        c
+    }
+
+    #[test]
+    fn remote_sessions_are_named_with_their_host_and_keep_remote_coordinates() {
+        let a = wire("a", "📊 Avateen", "2", "mini");
+        let b = wire("b", "📊 Avateen", "1", "mini");
+        let views = remote_session_views(&[&a, &b], &Default::default());
+        assert_eq!(views.len(), 1);
+        assert!(!views[0].skipped);
+        let skipped = std::collections::HashSet::from(["📊 Avateen @mini".to_string()]);
+        assert!(remote_session_views(&[&a, &b], &skipped)[0].skipped);
+        let v = &views[0];
+        assert_eq!(
+            v.name, "📊 Avateen @mini",
+            "can't collide with a local session"
+        );
+        assert_eq!(v.host.as_deref(), Some("mini"));
+        assert_eq!(v.windows[0].window_index, "1", "ordered by window index");
+        assert!(v.windows.iter().all(|w| w.host.as_deref() == Some("mini")));
+        // The pane is the REMOTE's: a proxied action sends it straight back.
+        assert_eq!(v.pane.as_ref().unwrap().0, "📊 Avateen");
+    }
+
+    #[test]
+    fn two_hosts_with_the_same_session_name_stay_apart() {
+        let a = wire("a", "s", "1", "mini");
+        let b = wire("b", "s", "1", "nuc");
+        assert_eq!(
+            remote_session_views(&[&a, &b], &Default::default()).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_peer_registry_is_every_conversation_whose_home_is_here() {
+        let mut reg = ConversationRegistry::default();
+        reg.conversations.insert("l".into(), {
+            let mut c = wire("l", "s", "1", "x");
+            c.host = None;
+            c
+        });
+        reg.conversations
+            .insert("r".into(), wire("r", "s", "1", "mini"));
+        // Closed here is still homed here: a peer that shipped it to us must keep seeing it.
+        let mut closed: Conversation =
+            serde_json::from_value(serde_json::json!({"id":"c","cwd":"/p","lifecycle":"Closed"}))
+                .unwrap();
+        reg.conversations.insert("c".into(), closed.clone());
+        // Shipped away from here: its new home reports it, not us.
+        closed.location = Some("pc".into());
+        reg.conversations.insert("gone".into(), closed);
+        let json = local_registry_json(&reg);
+        let ids: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&"l".to_string()) && ids.contains(&"c".to_string()));
+        assert!(!ids.contains(&"r".to_string()) && !ids.contains(&"gone".to_string()));
+    }
+
+    #[test]
+    fn a_conversation_not_running_on_its_home_is_a_row_that_says_so() {
+        let mut parked = conv("parked00", "closed", true);
+        parked.host = Some("mini".into());
+        parked.title = Some("Argus build".into());
+        parked.home_session = Some("🛰 Argus".into());
+        let mut closed = conv("closed00", "closed", false);
+        closed.host = Some("mini".into());
+        let mut dark = conv("dark0000", "closed", false);
+        dark.host = Some("pc".into());
+        dark.home_unreachable = true;
+        let mut running = conv("running0", "live", false);
+        running.host = Some("mini".into());
+        let local = conv("local000", "closed", true);
+        let rows = elsewhere_rows(&[parked, closed, dark, running, local]);
+        let by: std::collections::HashMap<&str, &serde_json::Value> = rows
+            .iter()
+            .map(|r| (r["key"].as_str().unwrap(), r))
+            .collect();
+        assert_eq!(
+            by.len(),
+            3,
+            "running ones and local ones are not set aside elsewhere"
+        );
+        assert_eq!(by["parked00"]["note"], "Argus build · frozen on mini");
+        assert_eq!(by["parked00"]["session_name"], "🛰 Argus");
+        assert_eq!(by["parked00"]["frozen"], true);
+        assert_eq!(by["closed00"]["note"], "closed00 · not running on mini");
+        assert_eq!(by["closed00"]["frozen"], false);
+        assert_eq!(by["closed00"]["host"], "mini");
+        assert_eq!(by["dark0000"]["note"], "dark0000 · pc is unreachable");
+    }
+
+    fn blocked_view(id: &str, blocked: bool) -> SessionView {
+        let mut w = win(
+            id,
+            Some(if blocked {
+                SessionStatus::PlanReview
+            } else {
+                SessionStatus::Waiting
+            }),
+            "/p",
+        );
+        w.session_id = Some(id.to_string());
+        let mut v = session("s @mini", false, vec![w]);
+        v.host = Some("mini".into());
+        v
+    }
+
+    #[test]
+    fn remote_notifier_rings_once_on_entering_blocked_and_never_on_first_sight() {
+        let mut n = RemoteNotifier::default();
+        assert!(
+            n.observe(&[blocked_view("a", true)]).is_empty(),
+            "first sighting"
+        );
+        assert!(
+            n.observe(&[blocked_view("a", true)]).is_empty(),
+            "still blocked"
+        );
+        assert!(n.observe(&[blocked_view("a", false)]).is_empty());
+        let alerts = n.observe(&[blocked_view("a", true)]);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].session, "s @mini");
+        assert_eq!(alerts[0].text, "plan ready");
+    }
+
+    #[test]
+    fn remote_notifier_ignores_local_windows() {
+        let mut n = RemoteNotifier::default();
+        let mut local = blocked_view("a", false);
+        local.host = None;
+        n.observe(&[local.clone()]);
+        local.windows[0].status = Some(SessionStatus::PlanReview);
+        assert!(n.observe(&[local]).is_empty());
+    }
+
+    #[test]
+    fn a_remote_window_is_never_probed_for_unreviewed_work() {
+        let mut remote = win("r", Some(SessionStatus::Waiting), "/same/path/as/local");
+        remote.host = Some("mini".into());
+        let local = win("l", Some(SessionStatus::Waiting), "/same/path/as/local");
+        let mut views = vec![session("s", false, vec![local, remote])];
+        let mut probed = Vec::new();
+        annotate_attention(
+            &mut views,
+            &mut StateAges::default(),
+            &mut |cwd| {
+                probed.push(cwd.to_string());
+                true
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            probed.len(),
+            1,
+            "only the local window was probed: {probed:?}"
+        );
+        assert!(views[0].windows[0].unreviewed_work && !views[0].windows[1].unreviewed_work);
     }
 }

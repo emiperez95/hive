@@ -25,6 +25,8 @@ pub fn run_wt_new(
 ) -> Result<String> {
     use anyhow::Context;
 
+    crate::common::projects::require_local(project)?;
+
     // 1. Load project config, resolve worktrees dir, build default session name
     let registry = ProjectRegistry::load();
     let config = registry

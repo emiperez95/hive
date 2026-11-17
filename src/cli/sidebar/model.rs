@@ -53,6 +53,9 @@ pub struct Conv {
     pub session: String,
     /// `None` for a session with no windows — switching goes to the session.
     pub window_index: Option<String>,
+    /// The tmux window's own name, as its machine reports it (empty for a windowless
+    /// session). `title` is what is shown; this is what names a remote attach window.
+    pub window_name: String,
     pub session_id: Option<String>,
     pub pane_id: Option<String>,
     pub title: String,
@@ -172,11 +175,25 @@ pub fn conv_rows(
     };
     let mut out = Vec::new();
     for s in sessions {
-        let place = place_of(&s.name, projects);
+        // A federated remote's session is `"<session> @<host>"`: place it by the bare name
+        // and carry the host in the label, so it groups with its project but reads as
+        // living elsewhere.
+        let mut place = match &s.host {
+            Some(h) => place_of(
+                s.name.strip_suffix(&format!(" @{h}")).unwrap_or(&s.name),
+                projects,
+            ),
+            None => place_of(&s.name, projects),
+        };
+        if let Some(h) = &s.host {
+            place.key = format!("{} @{h}", place.key);
+            place.label = format!("{} @{h}", place.label);
+        }
         if s.windows.is_empty() {
             out.push(Conv {
                 session: s.name.clone(),
                 window_index: None,
+                window_name: String::new(),
                 session_id: None,
                 pane_id: None,
                 title: split_emoji(&s.name).1.to_string(),
@@ -203,10 +220,13 @@ pub fn conv_rows(
             out.push(Conv {
                 session: s.name.clone(),
                 window_index: Some(w.window_index.clone()),
+                window_name: w.window_name.clone(),
                 session_id: w.session_id.clone(),
                 pane_id: Some(w.pane_id.clone()),
                 title: if named {
                     w.window_name.clone()
+                } else if let Some(t) = &w.title {
+                    t.clone()
                 } else {
                     format!("Window {}", w.window_index)
                 },
@@ -819,6 +839,8 @@ mod tests {
             window_label: "w".into(),
             note: note.into(),
             relative: "4d ago".into(),
+            host: None,
+            frozen: true,
         }
     }
 
@@ -1050,6 +1072,15 @@ mod tests {
     }
 
     #[test]
+    fn a_window_tmux_never_named_shows_the_conversations_own_title() {
+        // A machine with a stock tmux leaves the window named after the process.
+        let mut w = win("0", "2.1.322", 2, Some(0), SessionStatus::Waiting);
+        w.title = Some("Argus build".into());
+        let convs = conv_rows(&[session("s", false, vec![w])], &Projects::default(), now());
+        assert_eq!(convs[0].title, "Argus build");
+    }
+
+    #[test]
     fn place_resolves_worktrees_projects_and_strangers() {
         let projects = Projects::new(vec![project("ava", "Avateen", false)]);
         let p = place_of("📊 [ava] live-avatar", &projects);
@@ -1105,5 +1136,24 @@ mod tests {
             "needs"
         );
         assert_eq!(dur(3600), "1h");
+    }
+
+    #[test]
+    fn a_remote_session_groups_with_its_project_but_reads_as_living_elsewhere() {
+        let projects = Projects::new(vec![project("ava", "Avateen", false)]);
+        let mut remote = session(
+            "📁 Avateen @mini",
+            false,
+            vec![win("1", "w", 2, None, SessionStatus::Waiting)],
+        );
+        remote.host = Some("mini".into());
+        let rows = conv_rows(&[remote], &projects, chrono::Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].place.label, "Avateen @mini");
+        assert_eq!(rows[0].place.key, "ava @mini");
+        assert_eq!(
+            rows[0].place.emoji, "📁",
+            "the project's own emoji, found by the bare name"
+        );
     }
 }

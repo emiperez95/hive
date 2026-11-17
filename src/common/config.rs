@@ -5,7 +5,7 @@
 //! don't churn that file. Loading is best-effort: a missing or malformed file
 //! yields defaults (every feature off), never an error.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::common::persistence::hive_home;
 
@@ -13,6 +13,17 @@ use crate::common::persistence::hive_home;
 /// Filtered out of every session listing (see `common::tmux`) so it never shows
 /// up as a switch/cycle target in the TUI, the web dashboard, or `hive start`.
 pub const WEB_SESSION: &str = "__hive_web";
+
+/// The reserved tmux session holding the ssh windows attached to conversations on OTHER
+/// machines. Hidden like [`WEB_SESSION`]: a conversation that lives elsewhere has exactly one
+/// row (`"<session> @<host>"`), and a local session named after its project would be a
+/// second one for work that is not here.
+pub const REMOTE_SESSION: &str = "__hive_remote";
+
+/// Sessions that are hive's own plumbing, never a place work happens.
+pub fn is_hidden_session(name: &str) -> bool {
+    name == WEB_SESSION || name == REMOTE_SESSION
+}
 
 fn default_web_port() -> u16 {
     8375
@@ -33,6 +44,17 @@ pub struct WebConfig {
     /// TTS read-aloud host, passed through as `--tts-host`. Off when unset.
     #[serde(default)]
     pub tts_host: Option<String>,
+    /// Accept conversation boxes pushed over HTTP (`PUT /api/box/<id>`, `…/unpack`, `…/pack`).
+    /// Default **off**: those endpoints write files, and the dashboard has no authentication
+    /// (it is a trusted-LAN surface), so a server takes them only if told to. Unpack
+    /// additionally refuses any path outside a registered project or its worktrees dir.
+    #[serde(default)]
+    pub accept_boxes: bool,
+    /// Address the dashboard binds to. Default `0.0.0.0` (the phone reaches it over the LAN);
+    /// set `127.0.0.1` on a machine that must not be reachable from the network — a server
+    /// holding other programs' credentials — and reach it through an ssh forward instead.
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -41,6 +63,8 @@ impl Default for WebConfig {
             autostart: false,
             port: default_web_port(),
             tts_host: None,
+            accept_boxes: false,
+            bind: None,
         }
     }
 }
@@ -67,12 +91,34 @@ pub struct ModelPrice {
     pub cache_read: f64,
 }
 
+/// One `[[remotes]]` entry — another machine running hive (see `docs/remote-boxes.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Short name shown as `@name` on rows.
+    pub name: String,
+    /// ssh target (`user@host`), used for box transfer and `ssh -t … tmux attach`.
+    pub ssh: String,
+    /// The remote's dashboard API (`http://host:8375`), for federation. Optional: a remote
+    /// without one can still receive boxes but contributes no rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// Where `hive` is on the remote when a non-interactive ssh PATH can't find it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive_path: Option<String>,
+}
+
 /// The parsed `config.toml`. Unknown tables (e.g. a legacy `[defaults]`) are
 /// ignored, so this can grow without disturbing what's already on disk.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HiveConfig {
     #[serde(default)]
     pub web: WebConfig,
+    /// `[sandbox]` — run boxes under `srt` so their write set is a fact (see `sandbox`).
+    #[serde(default)]
+    pub sandbox: crate::common::sandbox::SandboxConfig,
+    /// `[[remotes]]` — other machines this hive federates with.
+    #[serde(default)]
+    pub remotes: Vec<RemoteConfig>,
     /// `[pricing.<model>]` blocks. **Ships empty on purpose.**
     ///
     /// Transcripts carry token counts but no cost, so a dollar figure requires a
@@ -163,6 +209,39 @@ impl HiveConfig {
             eprintln!("Warning: failed to parse {}: {}", path.display(), e);
             Self::default()
         })
+    }
+}
+
+impl HiveConfig {
+    pub fn remote(&self, name: &str) -> Option<&RemoteConfig> {
+        self.remotes.iter().find(|r| r.name == name)
+    }
+
+    /// Append a `[[remotes]]` block to `config.toml`. Appends text rather than rewriting the
+    /// file so the user's comments and the placeholder `[pricing]` blocks survive.
+    pub fn add_remote(remote: &RemoteConfig) -> anyhow::Result<()> {
+        use std::io::Write;
+        if Self::load().remote(&remote.name).is_some() {
+            anyhow::bail!("remote '{}' already exists", remote.name);
+        }
+        let path = hive_home()
+            .map(|p| p.join("config.toml"))
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        #[derive(Serialize)]
+        struct One<'a> {
+            remotes: [&'a RemoteConfig; 1],
+        }
+        let block = toml::to_string(&One { remotes: [remote] })?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let existing_len = f.metadata()?.len();
+        write!(f, "{}{}", if existing_len > 0 { "\n" } else { "" }, block)?;
+        Ok(())
     }
 }
 
