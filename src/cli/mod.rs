@@ -401,8 +401,10 @@ pub enum BoxCommand {
         conversation: String,
         /// Remote name (`hive remote list`)
         remote: String,
+        /// Pack even if it is mid-turn or has background work (that work is lost)
         #[arg(long)]
         force: bool,
+        /// Leave git-ignored files (build output, node_modules) out of the box
         #[arg(long)]
         without_ignored: bool,
         /// Unpack on the remote without resuming
@@ -422,13 +424,18 @@ pub enum BoxCommand {
     Send {
         /// Box id (or unique prefix) or a path to a box directory
         target: String,
+        /// Remote name (`hive remote list`)
         remote: String,
+        /// Unpack on the remote without resuming
         #[arg(long)]
         no_thaw: bool,
+        /// Remove this machine's linked-worktree copy once it is on the remote
         #[arg(long)]
         remove_local: bool,
+        /// Have the remote run it under `srt`
         #[arg(long)]
         sandbox: bool,
+        /// Use ssh + rsync even though the remote has an `api`
         #[arg(long)]
         via_ssh: bool,
     },
@@ -438,11 +445,13 @@ pub enum BoxCommand {
         /// Remote to pull from (default: wherever it was shipped)
         #[arg(long)]
         from: Option<String>,
+        /// Have the remote pack even if it is mid-turn there (that work is lost)
         #[arg(long)]
         force: bool,
         /// Remove the remote's linked-worktree copy once the box is on this disk
         #[arg(long)]
         remove_remote: bool,
+        /// Use ssh + rsync even though the remote has an `api`
         #[arg(long)]
         via_ssh: bool,
     },
@@ -453,6 +462,7 @@ pub enum BoxCommand {
         /// Where it now lives; omit for "here"
         #[arg(long)]
         location: Option<String>,
+        /// Also remove this machine's working copy (refused unless it still matches the box)
         #[arg(long)]
         remove_worktree: bool,
     },

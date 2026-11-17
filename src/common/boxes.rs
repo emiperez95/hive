@@ -852,13 +852,17 @@ pub fn tar_box(dir: &Path, out: &Path) -> Result<()> {
 /// client that retries after a timeout would otherwise share (and delete) the first
 /// request's directory.
 pub fn scratch_path(id: &str, tag: &str) -> Result<PathBuf> {
+    Ok(scratch_in(&boxes_dir()?, id, tag))
+}
+
+fn scratch_in(boxes: &Path, id: &str, tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    Ok(boxes_dir()?.join(format!(
+    boxes.join(format!(
         "{id}.{tag}-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
-    )))
+    ))
 }
 
 /// Receive a box sent by another machine: extract `input` into a scratch directory,
@@ -867,13 +871,17 @@ pub fn scratch_path(id: &str, tag: &str) -> Result<PathBuf> {
 /// the answer to this machine's own `pull` — so neither can skip the checks, and a
 /// transfer that fails halfway leaves the box that was already here untouched.
 pub fn receive_box(input: &mut dyn std::io::Read, id: &str) -> Result<PathBuf> {
+    receive_box_in(&boxes_dir()?, input, id)
+}
+
+fn receive_box_in(boxes: &Path, input: &mut dyn std::io::Read, id: &str) -> Result<PathBuf> {
     if !valid_id(id) {
         bail!("invalid box id");
     }
-    fs::create_dir_all(boxes_dir()?)?;
-    let scratch = scratch_path(id, "incoming")?;
+    fs::create_dir_all(boxes)?;
+    let scratch = scratch_in(boxes, id, "incoming");
     let _ = fs::remove_dir_all(&scratch);
-    let r = untar_box(input, &scratch).and_then(|_| install_received_box(&scratch, id));
+    let r = untar_box(input, &scratch).and_then(|_| install_in(boxes, &scratch, id));
     if r.is_err() {
         let _ = fs::remove_dir_all(&scratch);
     }
@@ -948,10 +956,12 @@ pub fn validate_received(scratch: &Path, id: &str) -> Result<Manifest> {
 fn tree_differences(root: &Path, tree: &Path, with_ignored: bool) -> Result<Vec<String>> {
     let mut cmd = Command::new("rsync");
     cmd.args(["-a", "-n", "-i", "--delete", "--exclude", "/.git"]);
+    // Unique per call: this runs on the web server's concurrent request threads.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let excl = std::env::temp_dir().join(format!(
         "hive-excl-{}-{}",
         std::process::id(),
-        tree.to_string_lossy().len()
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     if !with_ignored {
         fs::write(&excl, ignored_excludes(root)?)?;
@@ -1032,10 +1042,9 @@ pub fn check_unchanged_since_pack(m: &Manifest, box_dir: &Path) -> Result<()> {
 
 /// Move a freshly extracted box into `~/.hive/boxes/<id>` once its manifest checks out
 /// (right id, supported version). A re-send replaces the earlier copy.
-pub fn install_received_box(scratch: &Path, id: &str) -> Result<PathBuf> {
+fn install_in(dir: &Path, scratch: &Path, id: &str) -> Result<PathBuf> {
     validate_received(scratch, id)?;
-    let dir = boxes_dir()?;
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(dir)?;
     let final_dir = dir.join(id);
     let _ = fs::remove_dir_all(&final_dir);
     fs::rename(scratch, &final_dir)?;
@@ -1967,5 +1976,91 @@ mod tests {
             .to_string();
         assert!(e.contains("has moved since the box was packed"), "{e}");
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_linked_worktree_with_files_the_box_lacks_is_not_removed() {
+        let tmp = tempdir("unchanged-wt");
+        let (_origin, main) = init_repo(&tmp);
+        let wt = tmp.join("wt");
+        sh(
+            &main,
+            &["worktree", "add", "-q", "-b", "feat", &wt.to_string_lossy()],
+        );
+        let dest = tmp.join("box");
+        let p = pack_worktree(&wt, &dest, true).unwrap();
+        assert!(!p.main_checkout);
+        let m = manifest_for(&wt, &p, "abc-1");
+        fs::write(dest.join("transcript.jsonl"), "{}\n").unwrap();
+        check_unchanged_since_pack(&m, &dest).unwrap();
+
+        // A file made after the pack: `worktree remove --force` would discard it.
+        fs::write(wt.join("new.txt"), "only here\n").unwrap();
+        let e = check_unchanged_since_pack(&m, &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not hold") && e.contains("new.txt"), "{e}");
+        fs::remove_file(wt.join("new.txt")).unwrap();
+        check_unchanged_since_pack(&m, &dest).unwrap();
+
+        // An uncommitted edit to a tracked file: HEAD has not moved, the content has.
+        fs::write(wt.join("a.txt"), "edited after the pack, longer\n").unwrap();
+        let e = check_unchanged_since_pack(&m, &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not hold") && e.contains("a.txt"), "{e}");
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_branch_named_like_a_path_in_the_tree_still_packs() {
+        // `rev-list docs --not --remotes` is "ambiguous argument" when `docs` is also a path.
+        let tmp = tempdir("branch-path");
+        let (_origin, main) = init_repo(&tmp);
+        sh(&main, &["checkout", "-q", "-b", "a.txt"]);
+        fs::write(main.join("b.txt"), "new\n").unwrap();
+        sh(&main, &["add", "."]);
+        sh(&main, &["commit", "-qm", "on a branch named like a file"]);
+        let p = pack_worktree(&main, &tmp.join("box"), true).unwrap();
+        assert_eq!(p.branch, "a.txt");
+        assert!(p.has_bundle);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_transfer_that_fails_leaves_the_box_that_was_here_and_a_good_one_replaces_it() {
+        let tmp = tempdir("receive");
+        let boxes = tmp.join("boxes");
+        fs::create_dir_all(boxes.join("abc-1")).unwrap();
+        fs::write(boxes.join("abc-1/marker"), "the box already here").unwrap();
+        let entries = |d: &Path| -> Vec<String> {
+            let mut v: Vec<String> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Not a tar at all, then a tar that is not a box, then a box sent under another id.
+        assert!(receive_box_in(&boxes, &mut &b"not a tar"[..], "abc-1").is_err());
+        let mut junk = tar_entry("hello.txt", b"hi");
+        junk.extend(vec![0u8; 1024]);
+        assert!(receive_box_in(&boxes, &mut junk.as_slice(), "abc-1").is_err());
+        let (src_tmp, scratch) = received_box("receive-src", "abc-2");
+        let tar = tmp.join("b.tar");
+        tar_box(&scratch, &tar).unwrap();
+        assert!(receive_box_in(&boxes, &mut fs::File::open(&tar).unwrap(), "abc-1").is_err());
+        assert_eq!(entries(&boxes), vec!["abc-1"], "no scratch left behind");
+        assert!(boxes.join("abc-1/marker").is_file());
+
+        // Under its own id it installs, replacing nothing else.
+        let dir = receive_box_in(&boxes, &mut fs::File::open(&tar).unwrap(), "abc-2").unwrap();
+        assert_eq!(dir, boxes.join("abc-2"));
+        assert_eq!(read_manifest(&dir).unwrap().id, "abc-2");
+        assert_eq!(entries(&boxes), vec!["abc-1", "abc-2"]);
+        for t in [tmp, src_tmp] {
+            let _ = fs::remove_dir_all(t);
+        }
     }
 }

@@ -311,13 +311,33 @@ fn ship(
         id,
         &[("thaw", thaw), ("sandbox", sandbox)],
         None,
-    )?;
+    )
+    .map_err(|e| {
+        // The request can fail while the unpack itself goes on (project hooks outlast the
+        // read bound; the link drops). Which machine holds the conversation is then not
+        // known here, and saying only "failed" would invite a local thaw of something
+        // that is about to run over there.
+        anyhow!(
+            "{e:#}\nthe box reached {name}, but whether it was unpacked there is not known. \
+             Look on {name} before resuming it here; if it is there, record that with \
+             `hive box mark {id} --location {name}`, otherwise retry with `hive box send {id} {name}`",
+            name = r.name
+        )
+    })?;
     print!("{out}");
     let not_running = out.lines().any(|l| l.starts_with("warning: "));
-    ship_mark(id, Some(r.name.clone()), remove_local.then_some(m))?;
+    // The remote has it. Record that FIRST — everything after this point is tidying, and
+    // none of it may leave this machine believing the conversation is still its own (it
+    // would offer a local thaw of something now running elsewhere).
+    ship_mark(id, Some(r.name.clone()), None)?;
     // The project's own checkout went with it: the project lives there now.
     if m.main_checkout {
         crate::common::projects::set_lives_on(&m.project_key, Some(&r.name))?;
+    }
+    if remove_local {
+        if let Err(e) = ship_mark(id, Some(r.name.clone()), Some(m)) {
+            eprintln!("warning: this machine's working copy was kept: {e:#}");
+        }
     }
     if not_running {
         println!(

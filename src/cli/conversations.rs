@@ -2823,7 +2823,11 @@ fn conversations_loop(
                 KeyCode::Delete => {
                     let c = conv_detail.as_ref().unwrap().conv.clone();
                     if c.is_frozen() {
-                        let _ = discard_conv(&c);
+                        if let Err(e) = discard_conv(&c) {
+                            // A remote discard is a network call: say when it did not
+                            // happen, or the row just reappears on the next poll.
+                            notice = Some((format!("discard failed: {e}"), Instant::now()));
+                        }
                         conv_detail = None;
                         reg = gather_conversations_stats(&mut sys);
                         flags = Flags::load();
@@ -3236,7 +3240,11 @@ fn conversations_loop(
                         wt_confirm = Some((d.key.clone(), w.branch.clone()));
                     } else if let Some(c) = d.selected_conv().cloned() {
                         if c.is_frozen() {
-                            let _ = discard_conv(&c);
+                            if let Err(e) = discard_conv(&c) {
+                                // A remote discard is a network call: say when it did not
+                                // happen, or the row just reappears on the next poll.
+                                notice = Some((format!("discard failed: {e}"), Instant::now()));
+                            }
                             reg = gather_conversations_stats(&mut sys);
                             flags = Flags::load();
                             let key = detail.as_ref().unwrap().key.clone();
@@ -3796,7 +3804,11 @@ fn conversations_loop(
                     Some(Row::Conv { ci, .. }) => {
                         let c = convs[*ci].clone();
                         if c.is_frozen() {
-                            let _ = discard_conv(&c);
+                            if let Err(e) = discard_conv(&c) {
+                                // A remote discard is a network call: say when it did not
+                                // happen, or the row just reappears on the next poll.
+                                notice = Some((format!("discard failed: {e}"), Instant::now()));
+                            }
                             reg = gather_conversations_stats(&mut sys);
                             flags = Flags::load();
                             (groups, convs, collapsed) =
@@ -4127,7 +4139,11 @@ fn conversations_loop(
             KeyCode::Delete => {
                 if let Some(c) = selected_conv(&rows, &convs) {
                     if c.is_frozen() {
-                        let _ = discard_conv(&c);
+                        if let Err(e) = discard_conv(&c) {
+                            // A remote discard is a network call: say when it did not
+                            // happen, or the row just reappears on the next poll.
+                            notice = Some((format!("discard failed: {e}"), Instant::now()));
+                        }
                         reg = gather_conversations_stats(&mut sys);
                         flags = Flags::load();
                         (groups, convs, collapsed) = rebuild(&view, &reg, &flags.skipped, &query);

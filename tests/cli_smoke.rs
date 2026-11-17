@@ -1782,6 +1782,29 @@ fn box_transfer_over_http_is_opt_in_and_path_checked() {
         .join(id)
         .join("manifest.json")
         .is_file());
+    // A body that cannot be read is refused, not taken as "no location" (which would
+    // claim the conversation back for the machine that got the request).
+    let r = http(pb, "POST", &format!("/api/box/{id}/mark"), "not json");
+    assert!(r.contains("bad request body"), "{r}");
+    // `force` is not honoured from the network: with turns on B that the box lacks, an
+    // unpack asking for it is refused and B's transcript is untouched.
+    let b_transcript = hb
+        .join(".claude/projects")
+        .join(&slug)
+        .join(format!("{id}.jsonl"));
+    let before = std::fs::read(&b_transcript).unwrap();
+    let mut longer = before.clone();
+    longer.extend_from_slice(b"{\"type\":\"user\",\"message\":\"a turn only B has\"}\n");
+    std::fs::write(&b_transcript, &longer).unwrap();
+    let r = http(
+        pb,
+        "POST",
+        &format!("/api/box/{id}/unpack"),
+        r#"{"force":true}"#,
+    );
+    assert!(r.contains("longer transcript"), "{r}");
+    assert_eq!(std::fs::read(&b_transcript).unwrap(), longer);
+    std::fs::write(&b_transcript, &before).unwrap();
 
     // Pull it home over HTTP.
     std::fs::remove_file(&argv_log).unwrap();

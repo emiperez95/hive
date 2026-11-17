@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 641 tests (601 unit + 40 CLI smoke)
+cargo test                # 645 tests (605 unit + 40 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 1074 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 601 unit + 40 smoke.
+> `cargo test` prints 1081 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 605 unit + 40 smoke.
 
 ## The TUI (conversation-first)
 
@@ -564,7 +564,13 @@ All hive data lives under `~/.hive/`. The janus-wt-portal agent is installed to 
 │   ├── skipped.txt            # skipped-from-cycling session names
 │   ├── restore.txt            # sessions to restore
 │   ├── muted-global           # global mute flag (empty file)
+│   ├── project-hosts.json     # projects whose own checkout was shipped: key → remote (gates `require_local`)
+│   ├── sandbox/<id>.json      # srt settings for a sandboxed conversation (read back by thaw and by pack)
+│   ├── sidebar-trace.log      # every sidebar click and switch (always on, 256KB cap)
 │   └── debug.log              # debug log (--debug)
+├── boxes/                     # packed conversations, one dir per conversation id (see Remote boxes)
+│   └── <uuid>/                #   manifest.json, commits.bundle, staged.patch, tree/, transcript.jsonl, memory/, …
+│                              #   (`<uuid>.tmp-*` / `.incoming-*` / `.outgoing-*` are in-flight scratch)
 └── projects/                  # per-project config
     └── {project_key}/
         ├── hooks/             # lifecycle hook scripts
@@ -1366,8 +1372,16 @@ into explicitly.
 | GET | `/api/board` | Board cards: live + skipped + frozen conversations, each with its hand-set `stage` |
 | POST | `/api/close-window` | Close a live conversation's tmux window by id (board menu; the window is looked up server-side) |
 | POST | `/api/stage` | Move a card: `{"id", "stage": "now"\|"waiting"\|"later"\|"done"\|null, "note"?}` — note kept only for waiting |
+| GET | `/api/registry` | Federation wire: this machine's own conversations (never a remote's) as `Conversation` rows, polled by other hives |
+| PUT / GET | `/api/box/<id>` | Receive / hand out a box as a tar. Off unless `[web] accept_boxes = true`; whole id only |
+| POST | `/api/box/<id>/pack\|unpack\|mark` | The remote half of `hive box push\|pull` — see **Remote boxes** for what a network request may not do |
 | GET | `/hls/{id}/playlist.m3u8` | Proxy HLS playlist from TTS server (same-origin for iOS) |
 | GET | `/hls/{id}/*.m4s` | Proxy HLS fMP4 segments from TTS server |
+
+`/api/send`, `/api/freeze`, `/api/todos`, `/api/switch`, `/api/thaw`, `/api/discard-frozen` and
+the `?session=` reads (`/api/messages`, `/api/session-info`, `/api/todos`) are **proxied to the
+machine that runs the session** when it is a federated `"<session> @<host>"` row (`remote_post` /
+`remote_get`); `/api/kill-session` on one is refused.
 
 **Frontend features (web.html):**
 
@@ -1997,6 +2011,10 @@ Full design, evidence and **as-built deviations / unverified parts** are in
   never honours `force` from the network. In `remote_post` a body's
   `host` field routes only `/api/thaw` and `/api/discard-frozen` (`host_field_routes`); on any
   other path it is ignored, or it would forward `kill-session` past its refusal.
+- **`push` records the move before it tidies.** Once the remote acknowledges the unpack, `ship`
+  sets `location` (and `lives_on`) first; a `--remove-local` that is then refused is a warning. A
+  request that fails without an answer says the state is unknown and names both ways out
+  (`box mark --location`, `box send`), since the remote may still finish the unpack.
 - **Restored ≠ resumed.** Once a box's files are on a machine, that machine owns the
   conversation: `pull` restores, clears `location`, tells the remote (releasing its copy only
   now), and then thaws. A thaw that fails is a warning (`thaw_box`) — printed on stdout and returned in the
@@ -2021,13 +2039,13 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 
 ## Testing
 
-641 distinct tests. Run with `cargo test`.
+645 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 1074 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 433 · bin 601 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 1081 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 436 · bin 605 (the superset — adds cli/daemon/serve)
 > · smoke 40.
 
-**Unit tests (601)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (605)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs

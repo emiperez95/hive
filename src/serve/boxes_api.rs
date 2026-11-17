@@ -78,7 +78,10 @@ pub fn handle(mut request: Request) {
         (Method::Post, Some(a)) => {
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body)?;
-            let req: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            // A body we cannot read is refused, never read as "all flags off": for `mark`
+            // that would mean "no location", i.e. claim the conversation back for this
+            // machine while it runs on another.
+            let req = parse_body(&body)?;
             let flag = |k: &str| req.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
             match a {
                 "pack" => {
@@ -122,6 +125,15 @@ pub fn handle(mut request: Request) {
     });
 }
 
+/// The JSON object an action is posted with. Anything else — empty, malformed, an array —
+/// is an error.
+fn parse_body(body: &str) -> anyhow::Result<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) if v.is_object() => Ok(v),
+        _ => anyhow::bail!("bad request body: expected a JSON object"),
+    }
+}
+
 /// PUT: extract into scratch, validate, install.
 fn receive(id: &str, request: &mut Request) -> anyhow::Result<serde_json::Value> {
     boxes::receive_box(request.as_reader(), id)?;
@@ -143,6 +155,16 @@ fn tar_for_download(id: &str) -> anyhow::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_that_is_not_a_json_object_is_refused_not_read_as_defaults() {
+        for bad in ["", "not json", "[]", "null", "{\"location\":"] {
+            assert!(parse_body(bad).is_err(), "{bad:?}");
+        }
+        let ok = parse_body(r#"{"location":"mini","remove_worktree":true}"#).unwrap();
+        assert_eq!(ok["location"], "mini");
+        assert!(parse_body("{}").is_ok());
+    }
 
     #[test]
     fn parse_accepts_plain_ids_and_actions_only() {

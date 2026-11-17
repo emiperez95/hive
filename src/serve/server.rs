@@ -328,8 +328,9 @@ pub(crate) fn local_registry_json(reg: &ConversationRegistry) -> String {
 
 /// One [`SessionView`] per (host, remote session), named `"<session> @<host>"` so it can't
 /// collide with a local session of the same name (every lookup in the API is by name).
-/// There is no local tmux session behind these, hence no processes, todos, attach flag or
-/// skip state — those belong to the machine that runs them.
+/// There is no local tmux session behind these, hence no processes, todos or attach flag —
+/// those belong to the machine that runs them. Skip is the exception: it is this machine's
+/// own preference, kept under the listed name, so it applies here like to any session.
 fn remote_session_views(
     convs: &[&Conversation],
     skipped: &std::collections::HashSet<String>,
