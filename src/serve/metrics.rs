@@ -562,6 +562,7 @@ mod tests {
             status_since_ms: None,
             host: None,
             location: None,
+            home_unreachable: false,
         }
     }
 

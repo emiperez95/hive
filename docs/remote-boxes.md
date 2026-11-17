@@ -390,6 +390,33 @@ What it took to run a real project (Argus) there, beyond the throwaway runs abov
 - Known: `/api/send` delivered a long kickoff prompt truncated (the remote Claude reported
   the end missing). Not yet traced.
 
+### Home, not process (2026-11-17)
+
+The homeserver installed a macOS update and rebooted. Argus's window died with tmux, and its
+`@homeserver` row vanished from the Mac: the merge only took what a remote was *holding*
+(running or frozen), so a conversation that was merely closed there did not exist here. Nothing
+was lost — the transcript was on that disk — but "where is it" had become "is a process alive",
+and three records (`location`, `project-hosts.json`, whatever the remote reported) could
+disagree. `Ctrl+n/p` showed the same split from another side: they listed only attach windows
+already open, while the sidebar listed the dashboard's rows.
+
+The model now:
+
+- A conversation has one **home**. `box push`/`pull` are the only things that change it.
+- **State** (running, frozen, closed) is reported by the home and is independent of it.
+- This machine lists every conversation whose home it has a reason to track — what a remote is
+  running or has frozen, plus the closed ones it shipped there or whose project lives there —
+  and keeps the row, marked unreachable, when the home does not answer.
+- One merged list feeds the sidebar, the TUI and the keys. `Ctrl+n/p` read the dashboard's
+  `/api/active` (falling back to open attach windows when it is down).
+
+Not done: nothing reopens conversations after a reboot on a headless machine (the recovery
+screen only offers); a conversation *started* on a remote in a project that does not live there
+is still listed only while it runs or is frozen; and the phone dashboard's Resume view does not
+pass `host`, so it cannot resume a remote closed row yet. The not-running path is covered by
+unit tests of the merge, the settle pass and the rows — it was not exercised against a real
+closed remote conversation, because the only one available was running.
+
 ## Open questions
 
 - Ignored artifacts: rsync (default on same OS/arch, measured cheap) vs rebuild via hooks.

@@ -319,20 +319,32 @@ pub fn merge_now(reg: &mut crate::common::registry::ConversationRegistry) {
         .filter_map(|r| r.api.map(|api| (r.name, api)))
         .map(|(name, api)| std::thread::spawn(move || (name, fetch_registry(&api))))
         .collect();
+    let hosts = crate::common::projects::project_hosts();
+    let mut up = std::collections::HashMap::new();
     for h in handles {
-        if let Ok((name, Ok(conversations))) = h.join() {
-            reg.merge_remote(&name, conversations);
+        if let Ok((name, fetched)) = h.join() {
+            up.insert(name.clone(), fetched.is_ok());
+            if let Ok(conversations) = fetched {
+                reg.merge_remote(&name, conversations, &hosts);
+            }
         }
     }
+    reg.settle_homes(&up);
 }
 
-/// Fold every reachable remote into `reg`. A down remote contributes nothing.
+/// Fold every reachable remote into `reg`, then give each conversation that was shipped
+/// away its home row (`settle_homes`). A down remote contributes no rows of its own, but
+/// the conversations this machine knows it holds stay listed, marked unreachable.
 pub fn merge_into(reg: &mut crate::common::registry::ConversationRegistry) {
+    let hosts = crate::common::projects::project_hosts();
+    let mut up = std::collections::HashMap::new();
     for s in snapshots() {
+        up.insert(s.name.clone(), s.up == Some(true));
         if s.up == Some(true) {
-            reg.merge_remote(&s.name, s.conversations);
+            reg.merge_remote(&s.name, s.conversations, &hosts);
         }
     }
+    reg.settle_homes(&up);
 }
 
 #[cfg(test)]

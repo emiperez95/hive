@@ -881,7 +881,7 @@ impl App {
             }
             Item::Frozen { idx, .. } => {
                 if let Some(f) = self.frozen.get(*idx) {
-                    self.api.thaw(f.key.clone());
+                    self.api.thaw(f.key.clone(), f.host.clone(), f.frozen);
                 }
             }
             Item::Section { sect, .. } => {
@@ -1726,6 +1726,8 @@ mod tests {
             window_label: "w".into(),
             note: "parked".into(),
             relative: "2d ago".into(),
+            host: None,
+            frozen: true,
         }];
         screen(&mut a, 40, 40);
         let items = a.items();

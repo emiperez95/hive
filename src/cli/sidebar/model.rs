@@ -839,6 +839,8 @@ mod tests {
             window_label: "w".into(),
             note: note.into(),
             relative: "4d ago".into(),
+            host: None,
+            frozen: true,
         }
     }
 

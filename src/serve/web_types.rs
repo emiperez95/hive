@@ -199,6 +199,14 @@ pub struct ConversationView {
     /// Listening TCP ports for the live process tree (empty for closed).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u16>,
+    /// For a conversation whose home is another machine: the session it belongs to THERE
+    /// (its project's or worktree's), under the bare name — what places it under the right
+    /// project in a list here while it is not running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_session: Option<String>,
+    /// Its home machine did not answer; what is shown is what this machine last recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home_unreachable: bool,
 }
 
 fn is_zero_f32(v: &f32) -> bool {

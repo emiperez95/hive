@@ -424,6 +424,11 @@ fn hosts_file() -> Option<PathBuf> {
     crate::common::persistence::cache_dir().map(|c| c.join("project-hosts.json"))
 }
 
+/// Every project whose own checkout lives on another machine: key → remote name.
+pub fn project_hosts() -> HashMap<String, String> {
+    load_hosts()
+}
+
 fn load_hosts() -> HashMap<String, String> {
     hosts_file()
         .and_then(|p| std::fs::read_to_string(p).ok())

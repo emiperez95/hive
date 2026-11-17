@@ -1612,6 +1612,12 @@ pub fn run_web_server(
                         })
                     })
                     .collect();
+                // Plus what is set aside on OTHER machines: a conversation whose home is
+                // elsewhere and is not running there stays listed here.
+                let mut list = list;
+                if let Ok(convs) = shared_conversations.lock() {
+                    list.extend(crate::serve::server::elsewhere_rows(&convs));
+                }
                 let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
                 let header = Header::from_bytes("Content-Type", "application/json").unwrap();
                 let _ = request.respond(Response::from_string(json).with_header(header));
@@ -1795,6 +1801,7 @@ const REMOTE_POST_PATHS: &[&str] = &[
     "/api/todos",
     "/api/thaw",
     "/api/discard-frozen",
+    "/api/resume",
     "/api/kill-session",
     "/api/switch",
 ];
@@ -1805,7 +1812,7 @@ const REMOTE_GET_PATHS: &[&str] = &["/api/messages", "/api/session-info", "/api/
 /// Whether a request's own `host` field may choose where it is forwarded. True only for
 /// the endpoints keyed by conversation id, which have no session name to resolve a host from.
 fn host_field_routes(path: &str) -> bool {
-    matches!(path, "/api/thaw" | "/api/discard-frozen")
+    matches!(path, "/api/thaw" | "/api/discard-frozen" | "/api/resume")
 }
 
 /// Whether a bind address is reachable from other machines. Anything that is not a
@@ -2048,8 +2055,9 @@ mod tests {
     fn a_host_field_only_routes_the_endpoints_keyed_by_conversation_id() {
         assert!(host_field_routes("/api/thaw"));
         assert!(host_field_routes("/api/discard-frozen"));
+        assert!(host_field_routes("/api/resume"));
         for p in REMOTE_POST_PATHS {
-            let by_id = matches!(*p, "/api/thaw" | "/api/discard-frozen");
+            let by_id = matches!(*p, "/api/thaw" | "/api/discard-frozen" | "/api/resume");
             assert_eq!(host_field_routes(p), by_id, "{p}");
         }
     }

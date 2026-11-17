@@ -315,13 +315,16 @@ pub(crate) fn gather_active_views(reg: &ConversationRegistry, sys: &System) -> V
     results
 }
 
-/// What a federating peer should see of this machine: its own live windows and parked
-/// (frozen) conversations, never another machine's rows and never closed history.
+/// What a federating peer should see of this machine: every conversation whose HOME is
+/// here — running, parked or closed (the registry is already age-bounded) — and never
+/// another machine's rows, nor one this machine shipped away (`location`): those are
+/// somebody else's to report. Which of the closed ones a peer keeps is the peer's rule
+/// (`ConversationRegistry::merge_remote`).
 pub(crate) fn local_registry_json(reg: &ConversationRegistry) -> String {
     let mine: Vec<&Conversation> = reg
         .conversations
         .values()
-        .filter(|c| !c.is_remote() && (c.lifecycle.is_actionable_here() || c.is_frozen()))
+        .filter(|c| !c.is_remote() && c.location.is_none())
         .collect();
     serde_json::to_string(&mine).unwrap_or_else(|_| "[]".to_string())
 }
@@ -869,7 +872,52 @@ fn build_conversation_view(c: &Conversation, projects: &ProjectRegistry) -> Conv
         cpu: c.cpu,
         mem_kb: c.mem_kb,
         ports: c.ports.clone(),
+        home_session: c
+            .is_remote()
+            .then(|| crate::common::conversations::target_session(c))
+            .flatten(),
+        home_unreachable: c.home_unreachable,
     }
+}
+
+/// The conversations whose home is another machine and that are NOT running there, as
+/// extra rows for the sidebar's set-aside section (`/api/frozen`): parked there, closed
+/// there (a reboot, a closed window), or on a machine that does not answer. A click
+/// resumes it on its home — `host` and `frozen` say which request does that.
+pub(crate) fn elsewhere_rows(convs: &[ConversationView]) -> Vec<serde_json::Value> {
+    convs
+        .iter()
+        .filter(|c| c.lifecycle != "live" && !c.archived)
+        .filter_map(|c| {
+            let host = c.host.as_deref()?;
+            let what = c
+                .title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| c.short_id.clone());
+            let state = if c.home_unreachable {
+                format!("{host} is unreachable")
+            } else if c.frozen {
+                format!("frozen on {host}")
+            } else {
+                format!("not running on {host}")
+            };
+            Some(serde_json::json!({
+                "key": c.id,
+                "session_name": c.home_session.clone().unwrap_or_else(|| format!("@{host}")),
+                "window_label": what,
+                "note": format!("{what} · {state}"),
+                "relative": c
+                    .last_activity
+                    .as_deref()
+                    .map(crate::common::frozen::relative_time)
+                    .unwrap_or_default(),
+                "host": host,
+                "frozen": c.frozen,
+                "unreachable": c.home_unreachable,
+            }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -942,6 +990,8 @@ mod tests {
             pinned: false,
             archived: false,
             auth_profile: None,
+            home_session: None,
+            home_unreachable: false,
             cpu: 0.0,
             mem_kb: 0,
             ports: vec![],
@@ -1474,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    fn the_peer_registry_is_local_only_and_holds_no_history() {
+    fn the_peer_registry_is_every_conversation_whose_home_is_here() {
         let mut reg = ConversationRegistry::default();
         reg.conversations.insert("l".into(), {
             let mut c = wire("l", "s", "1", "x");
@@ -1483,8 +1533,55 @@ mod tests {
         });
         reg.conversations
             .insert("r".into(), wire("r", "s", "1", "mini"));
+        // Closed here is still homed here: a peer that shipped it to us must keep seeing it.
+        let mut closed: Conversation =
+            serde_json::from_value(serde_json::json!({"id":"c","cwd":"/p","lifecycle":"Closed"}))
+                .unwrap();
+        reg.conversations.insert("c".into(), closed.clone());
+        // Shipped away from here: its new home reports it, not us.
+        closed.location = Some("pc".into());
+        reg.conversations.insert("gone".into(), closed);
         let json = local_registry_json(&reg);
-        assert!(json.contains("\"l\"") && !json.contains("\"r\""), "{json}");
+        let ids: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&"l".to_string()) && ids.contains(&"c".to_string()));
+        assert!(!ids.contains(&"r".to_string()) && !ids.contains(&"gone".to_string()));
+    }
+
+    #[test]
+    fn a_conversation_not_running_on_its_home_is_a_row_that_says_so() {
+        let mut parked = conv("parked00", "closed", true);
+        parked.host = Some("mini".into());
+        parked.title = Some("Argus build".into());
+        parked.home_session = Some("🛰 Argus".into());
+        let mut closed = conv("closed00", "closed", false);
+        closed.host = Some("mini".into());
+        let mut dark = conv("dark0000", "closed", false);
+        dark.host = Some("pc".into());
+        dark.home_unreachable = true;
+        let mut running = conv("running0", "live", false);
+        running.host = Some("mini".into());
+        let local = conv("local000", "closed", true);
+        let rows = elsewhere_rows(&[parked, closed, dark, running, local]);
+        let by: std::collections::HashMap<&str, &serde_json::Value> = rows
+            .iter()
+            .map(|r| (r["key"].as_str().unwrap(), r))
+            .collect();
+        assert_eq!(
+            by.len(),
+            3,
+            "running ones and local ones are not set aside elsewhere"
+        );
+        assert_eq!(by["parked00"]["note"], "Argus build · frozen on mini");
+        assert_eq!(by["parked00"]["session_name"], "🛰 Argus");
+        assert_eq!(by["parked00"]["frozen"], true);
+        assert_eq!(by["closed00"]["note"], "closed00 · not running on mini");
+        assert_eq!(by["closed00"]["frozen"], false);
+        assert_eq!(by["closed00"]["host"], "mini");
+        assert_eq!(by["dark0000"]["note"], "dark0000 · pc is unreachable");
     }
 
     fn blocked_view(id: &str, blocked: bool) -> SessionView {

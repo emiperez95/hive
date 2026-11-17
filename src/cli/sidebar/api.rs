@@ -33,6 +33,12 @@ pub struct FrozenItem {
     pub note: String,
     #[serde(default)]
     pub relative: String,
+    /// Set when the conversation's home is another machine (see `elsewhere_rows`).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// For a remote row: parked there (thaw) rather than closed there (resume).
+    #[serde(default)]
+    pub frozen: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -292,9 +298,20 @@ impl Api {
     }
 
     /// Reports the error text, if any, through `Refresh`.
-    pub fn thaw(&self, key: String) {
+    /// Bring a set-aside conversation back: thaw a frozen one, or — for a row whose home is
+    /// another machine and that is merely closed there — resume it on that machine. `host`
+    /// rides along so the dashboard forwards the request to the machine that can do it.
+    pub fn thaw(&self, key: String, host: Option<String>, frozen: bool) {
         self.spawn(move |p| {
-            let v = post(p, "/api/thaw", &serde_json::json!({ "key": key })).and_then(|b| json(&b));
+            let (path, mut body) = if host.is_some() && !frozen {
+                ("/api/resume", serde_json::json!({ "id": key }))
+            } else {
+                ("/api/thaw", serde_json::json!({ "key": key }))
+            };
+            if let Some(h) = host {
+                body["host"] = h.into();
+            }
+            let v = post(p, path, &body).and_then(|b| json(&b));
             let err = match v {
                 Some(v) => v["error"].as_str().map(str::to_string),
                 None => Some("couldn't reach hive".into()),

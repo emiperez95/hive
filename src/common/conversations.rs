@@ -594,6 +594,13 @@ pub fn target_session(c: &Conversation) -> Option<String> {
 pub fn reopen_conversation(c: &Conversation, fallback_session: Option<String>) -> Result<String> {
     // Shipped away by `hive box push`: the other side owns it, and resuming here would fork
     // the transcript. Bringing it back is an explicit `box pull`.
+    if let Some(host) = &c.host {
+        anyhow::bail!(
+            "{} lives on '{host}'; resume it there, or run `hive box pull {}` to bring it back",
+            c.id.as_str(),
+            c.id.as_str()
+        );
+    }
     if let Some(loc) = &c.location {
         anyhow::bail!(
             "{} was shipped to '{loc}'; run `hive box pull {}` to bring it back",

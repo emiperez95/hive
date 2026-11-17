@@ -5,7 +5,7 @@ Interactive Claude Code session dashboard for tmux. Runs as a popup (`prefix + d
 ## Quick Reference
 
 ```bash
-cargo test                # 645 tests (605 unit + 40 CLI smoke)
+cargo test                # 650 tests (610 unit + 40 CLI smoke)
 cargo build               # dev build
 cargo clippy --all-targets -- -D warnings
 cargo fmt                 # CI has a fmt gate — run before committing
@@ -13,8 +13,8 @@ cargo install --path . --root ~/.local  # install binary
 hive setup                # register hooks + tmux keybinding
 ```
 
-> `cargo test` prints 1081 passing because `common/` + `ipc/` compile into **both** the lib and
-> bin targets and run twice. Distinct tests: 605 unit + 40 smoke.
+> `cargo test` prints 1089 passing because `common/` + `ipc/` compile into **both** the lib and
+> bin targets and run twice. Distinct tests: 610 unit + 40 smoke.
 
 ## The TUI (conversation-first)
 
@@ -1983,7 +1983,23 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 - `push`/`pull` move a box over HTTP when the remote has an `api` (`serve/boxes_api.rs`; the server must set `[web] accept_boxes = true`; no auth — trusted LAN — but unpack refuses any path outside a registered project) or over ssh (`HIVE_SSH` overrides the program — tests use a fake that
   runs the command under a second `$HOME`). The overlay's `location` records where a shipped
   conversation lives; `reopen_conversation` refuses it.
-- **Federation:** the web server exports `GET /api/registry` (local rows only); each configured
+- **A conversation has a HOME machine, and its home is not its process.** Home changes only by
+  `box push` / `pull`; a reboot or a closed window there changes its state, never where it is.
+  Three rules implement that, and every surface reads the one merged list they produce:
+  - *Export*: `/api/registry` is every conversation homed on that machine — running, frozen
+    or closed — and never one it shipped away (`location` set) or another machine's.
+  - *Merge* (`registry::merge_remote`): running and frozen rows are always taken; a CLOSED one
+    only when this machine has a reason to track it — it was shipped there from here (the local
+    overlay's `location`), or its project's checkout lives there (`project-hosts.json`).
+  - *Settle* (`settle_homes`, after the merges): a shipped conversation the remote did not
+    report still becomes a `host` row — closed, `home_unreachable` when that machine did not
+    answer. It never falls back to looking like a local closed conversation.
+
+  A row with `host` set and no live placement is "not running on its home": the sidebar lists
+  it in the set-aside section (`server::elsewhere_rows`, appended to `/api/frozen`) and a click
+  resumes it THERE (`/api/resume` or `/api/thaw` with `host`); the TUI's `Enter` does the same
+  (`Action::RemoteThaw`) and then attaches. `reopen_conversation` refuses any row with a `host`.
+- **Federation:** the web server exports `GET /api/registry` (see above); each configured
   `[[remotes]]` with an `api` gets a poller thread; `gather_conversations_stats` (the TUI and the
   web data thread; `cycle-free` and the detail start-up merge once via `merge_now`, other one-shots never) merges the rows in with `Conversation.host = Some(name)`. A
   remote row is `Live` but **not local**: every action that trusts a placement must go through
@@ -1992,7 +2008,7 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 - Actions on a remote row go to that remote's own API (`federation::proxy_post`, web
   `remote_post`); `Enter` opens an `@host:<window>` ssh window (`remote::attach_remote`).
 - `[sandbox]` / `--sandbox` run the conversation under `srt` with a write set derived from the box; `deny_read` adds paths it must not even read (kernel-enforced).
-- **A remote conversation has ONE row here, `"<session> @<host>"`.** The ssh window attached to it lives in the hidden `__hive_remote` session (`config::REMOTE_SESSION`, filtered like `__hive_web`), named `"<session> @<host>:<index>"`. The sidebar click, the list's `Enter` and `Ctrl+g` all go through `remote::attach_window`, so they share that window; `/api/ambient` maps a client sitting in it back to the remote row (the sidebar's "you are here"), and `Ctrl+n/p` cycle through open attach windows (`remote::attach_windows`, no network on a keypress).
+- **A remote conversation has ONE row here, `"<session> @<host>"`.** The ssh window attached to it lives in the hidden `__hive_remote` session (`config::REMOTE_SESSION`, filtered like `__hive_web`), named `"<session> @<host>:<index>"`. The sidebar click, the list's `Enter` and `Ctrl+g` all go through `remote::attach_window`, so they share that window; `/api/ambient` maps a client sitting in it back to the remote row (the sidebar's "you are here"), and `Ctrl+n/p` stop on every remote session the sidebar lists, opening its attach window on first visit: the stops come from this machine's own `/api/active` (`session::listed_remote_sessions` — the sidebar's source, one localhost request, no other machine contacted on a keypress), falling back to the attach windows already open when the dashboard is down.
 - **A project lives on one machine.** Shipping a project's own checkout records the host in `cache/project-hosts.json` (`projects::set_lives_on`); `connect`, new conversation, `wt new` and todo dispatch call `projects::require_local` and refuse until the box is unpacked back here. A bare `claude` started by hand is not stopped. Linked worktrees can still ship on their own.
 - A main-checkout box unpacks onto a machine with no repo (it is `git init`-ed: no remote to clone), and a released main checkout is stashed, not left dirty. `box pull` runs `boxes::check_target` before the remote packs and before it releases its copy.
 - On macOS the remote's `hive web` must run in the desktop session (a LaunchAgent), or Claude there cannot read its login from the keychain; under `srt` the keychain also needs `<user cache dir>/mds` writable. A Claude under `srt` in tmux does not accept typed input yet — see `docs/remote-boxes.md`.
@@ -2039,13 +2055,13 @@ Full design, evidence and **as-built deviations / unverified parts** are in
 
 ## Testing
 
-645 distinct tests. Run with `cargo test`.
+650 distinct tests. Run with `cargo test`.
 
-> `cargo test` prints 1081 passing: `common/` + `ipc/` compile into **both** the lib and bin
-> targets and run twice. Per target: lib 436 · bin 605 (the superset — adds cli/daemon/serve)
+> `cargo test` prints 1089 passing: `common/` + `ipc/` compile into **both** the lib and bin
+> targets and run twice. Per target: lib 439 · bin 610 (the superset — adds cli/daemon/serve)
 > · smoke 40.
 
-**Unit tests (605)** — in-module `#[cfg(test)]` blocks:
+**Unit tests (610)** — in-module `#[cfg(test)]` blocks:
 - `cli/sidebar/`: `model` (attention follows the server rank across sessions, Live groups by
   session in server order, Skipped/Frozen fold and nest project → worktree, Projects view puts
   busy projects first and never hides an archived one with conversations, held-for vs

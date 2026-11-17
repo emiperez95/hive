@@ -1731,7 +1731,8 @@ fn conv_menu(conv: &Conversation, remotes: &[String]) -> ActionMenu {
     if !shipped {
         items.push(key(
             match (remote, live) {
-                (true, _) => "Open it (attach to the other machine)",
+                (true, true) => "Open it (attach to the other machine)",
+                (true, false) => "Resume it on the other machine",
                 (false, true) => "Switch to it",
                 (false, false) => "Resume it",
             },
@@ -2113,7 +2114,7 @@ fn gather_remote_resources(conv: &Conversation, host: &str) -> ConvResources {
         .map(|body| remote_preview(&body))
         .unwrap_or_default();
     ConvResources {
-        running: true,
+        running: conv.lifecycle.is_actionable_here(),
         cpu: conv.cpu,
         mem_kb: conv.mem_kb,
         processes: Vec::new(),
@@ -2330,13 +2331,42 @@ fn run_conversations_tui(opts: &ConvOptions) -> Result<()> {
             }
         }
         Action::RemoteThaw(c) => {
-            let host = c.host.as_deref().unwrap_or_default();
-            crate::common::federation::proxy_post(
-                host,
-                "/api/thaw",
-                &serde_json::json!({ "key": c.id.as_str() }),
-            )?;
-            println!("Thawed {} on {host}", short_id(c.id.as_str()));
+            // Not running on its home: thaw it there if it was parked, resume it there if
+            // it was merely closed (a reboot, a closed window). Then land on it.
+            let host = c.host.clone().unwrap_or_default();
+            if c.home_unreachable {
+                return Err(anyhow!(
+                    "{} lives on {host}, which is not answering",
+                    short_id(c.id.as_str())
+                ));
+            }
+            let (path, body) = if c.is_frozen() {
+                ("/api/thaw", serde_json::json!({ "key": c.id.as_str() }))
+            } else {
+                ("/api/resume", serde_json::json!({ "id": c.id.as_str() }))
+            };
+            crate::common::federation::proxy_post(&host, path, &body)?;
+            println!("Resumed {} on {host}", short_id(c.id.as_str()));
+            // Its window exists once that machine's next gather sees it; ask a few times.
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                let mut reg = ConversationRegistry::default();
+                crate::common::federation::merge_now(&mut reg);
+                let live = reg
+                    .conversations
+                    .get(c.id.as_str())
+                    .filter(|r| r.lifecycle.is_actionable_here() && r.placement.is_some());
+                if let Some(r) = live {
+                    let (session, index) = crate::common::remote::attach_remote(r)?;
+                    if std::env::var_os("TMUX").is_some() {
+                        switch_to_session(&session);
+                        select_window(&session, &index);
+                    } else {
+                        attach_or_switch(&session);
+                    }
+                    break;
+                }
+            }
         }
         Action::AttachRemote(c) => {
             let (session, index) = crate::common::remote::attach_remote(&c)?;
@@ -6330,7 +6360,12 @@ fn conv_line(
         } else {
             Style::default().fg(Color::Magenta)
         };
-        spans.push(Span::styled(format!("  @{host}"), col));
+        let tag = match (c.home_unreachable, c.lifecycle.is_actionable_here()) {
+            (true, _) => format!("  @{host} (unreachable)"),
+            (false, false) if !c.is_frozen() => format!("  @{host} (not running)"),
+            _ => format!("  @{host}"),
+        };
+        spans.push(Span::styled(tag, col));
     }
     let tag = |on: bool, text: &'static str, fg: Color| -> Option<Span<'static>> {
         on.then(|| {
@@ -7575,6 +7610,7 @@ mod tests {
             status_since_ms: None,
             host: None,
             location: None,
+            home_unreachable: false,
         }
     }
 

@@ -235,16 +235,26 @@ fn cycle_among(
     current: Option<String>,
     eligible: impl Fn(&String) -> bool,
 ) -> Result<()> {
-    // Conversations on other machines are stops too, through the attach window each one has
-    // here (no network on a keypress: only those already opened). They cycle under the name
-    // the panel lists them by, `"<session> @<host>"`.
+    // Conversations on other machines are stops too, under the name the panel lists them
+    // by, `"<session> @<host>"`. Which ones exist is asked of the same place the sidebar
+    // asks — this machine's dashboard, whose list is already federated — so a row the panel
+    // shows is a stop here whether or not its attach window has been opened yet. That is
+    // one request to localhost; no other machine is contacted on a keypress.
     let attached: std::collections::HashMap<String, String> =
         crate::common::remote::attach_windows()
             .into_iter()
             .map(|(idx, listed, _)| (listed, idx))
             .collect();
+    let remote = listed_remote_sessions();
     let mut names = get_current_tmux_session_names();
-    names.extend(attached.keys().cloned());
+    names.extend(remote.iter().map(|r| r.listed.clone()));
+    // With the dashboard down, the attach windows already open are still stops.
+    names.extend(
+        attached
+            .keys()
+            .filter(|a| !remote.iter().any(|r| &r.listed == *a))
+            .cloned(),
+    );
     let all_sessions = sidebar_order(names, &ProjectRegistry::load());
 
     let filtered: Vec<&String> = all_sessions.iter().filter(|name| eligible(name)).collect();
@@ -301,14 +311,74 @@ fn cycle_among(
         }
     };
 
-    match attached.get(target) {
-        Some(idx) => {
-            switch_to_session(crate::common::config::REMOTE_SESSION);
-            select_window(crate::common::config::REMOTE_SESSION, idx);
-        }
-        None => switch_to_session(target),
+    if let Some(idx) = attached.get(target) {
+        switch_to_session(crate::common::config::REMOTE_SESSION);
+        select_window(crate::common::config::REMOTE_SESSION, idx);
+    } else if let Some(r) = remote.iter().find(|r| &r.listed == target) {
+        // Listed but not opened yet: open its attach window, as a click on the row does.
+        let real = crate::common::federation::real_session(&r.listed, &r.host);
+        let (session, idx) =
+            crate::common::remote::attach_window(&r.host, &real, &r.window_index, &r.ports)?;
+        switch_to_session(&session);
+        select_window(&session, &idx);
+    } else {
+        switch_to_session(target);
     }
     Ok(())
+}
+
+/// A remote session as the sidebar lists it, with what opening its attach window needs.
+#[derive(Debug, PartialEq)]
+struct RemoteStop {
+    listed: String,
+    host: String,
+    window_index: String,
+    ports: Vec<u16>,
+}
+
+/// The remote sessions in the dashboard's `/api/active` answer — the sidebar's own source.
+/// Empty when the dashboard is not running (the caller then falls back to open windows).
+fn listed_remote_sessions() -> Vec<RemoteStop> {
+    let port = crate::common::config::HiveConfig::load().web.port;
+    crate::common::federation::http_request(
+        &format!("http://127.0.0.1:{port}"),
+        "GET",
+        "/api/active",
+        None,
+    )
+    .map(|body| remote_stops(&body))
+    .unwrap_or_default()
+}
+
+/// Pure half of [`listed_remote_sessions`]: sessions carrying a `host`, each with the
+/// first of its windows (the one a click on the session's row opens).
+fn remote_stops(active_json: &str) -> Vec<RemoteStop> {
+    let v: serde_json::Value = serde_json::from_str(active_json).unwrap_or_default();
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let host = s.get("host")?.as_str()?.to_string();
+            let listed = s.get("name")?.as_str()?.to_string();
+            let w = s.get("windows")?.as_array()?.first()?;
+            let window_index = w.get("window_index")?.as_str()?.to_string();
+            let ports = w
+                .get("ports")
+                .and_then(|p| p.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_u64().and_then(|p| u16::try_from(p).ok()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(RemoteStop {
+                listed,
+                host,
+                window_index,
+                ports,
+            })
+        })
+        .collect()
 }
 
 /// Cycle to next/prev tmux window within the current session. `pane` is the
@@ -447,5 +517,25 @@ mod order_tests {
             sidebar_order(tmux, &r),
             ["🐝 hive", "🌐 [network] wt", "🌐 network", "⛅ aws-hub"]
         );
+    }
+
+    #[test]
+    fn remote_rows_in_the_dashboards_list_are_cycle_stops_before_they_are_opened() {
+        let active = r#"[
+            {"name":"🐝 hive","windows":[{"window_index":"1"}]},
+            {"name":"🛰 Argus @homeserver","host":"homeserver",
+             "windows":[{"window_index":"0","ports":[8080,99999]},{"window_index":"3"}]},
+            {"name":"empty @mini","host":"mini","windows":[]}
+        ]"#;
+        assert_eq!(
+            remote_stops(active),
+            vec![RemoteStop {
+                listed: "🛰 Argus @homeserver".into(),
+                host: "homeserver".into(),
+                window_index: "0".into(),
+                ports: vec![8080],
+            }]
+        );
+        assert!(remote_stops("not json").is_empty());
     }
 }
